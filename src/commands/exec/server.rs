@@ -122,9 +122,8 @@ pub fn local_select(args: &[Vec<u8>]) -> RespValue {
         return RespValue::Error("ERR wrong number of arguments for 'select' command".into());
     }
     match crate::util::parse_i64(&args[1]) {
-        Some(0) => RespValue::Simple("OK".into()),
-        Some(n) if n > 0 => RespValue::Error(format!("ERR DB index is out of range")),
-        _ => RespValue::Error("ERR invalid DB index".into()),
+        Some(n) if n >= 0 && (n as usize) < crate::server::MAX_DB => RespValue::Simple("OK".into()),
+        _ => RespValue::Error("ERR DB index is out of range".into()),
     }
 }
 

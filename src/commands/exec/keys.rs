@@ -1,5 +1,6 @@
 use crate::commands::{integer, ok, Command, OpContext, ShardPart, KeyRange, FLAG_FAST, FLAG_GLOBAL, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE};
 use crate::core::compact::CompactString;
+use crate::core::db::DbSlice;
 use crate::core::PrimeValue;
 use crate::error::{CmdResult, RespError, RespValue};
 use crate::util::parse_i64;
@@ -623,6 +624,68 @@ fn merge_rand(parts: &[ShardPart], _args: &[Vec<u8>], _keys: &[usize], _now: u64
 }
 
 // ---------------------------------------------------------------------------
+// MOVE — move a key to another DB (runs on the shard, which has all DBs)
+// ---------------------------------------------------------------------------
+
+/// Move `key` from `src` to `dst` (different DBs on the same shard), carrying
+/// value, TTL and sticky flag. Returns 0 if the key is missing or the
+/// destination key exists, 1 otherwise.
+pub fn move_key(src: &mut DbSlice, dst: &mut DbSlice, key: &[u8], now_ms: u64) -> i64 {
+    if !src.contains(key, now_ms) || dst.contains(key, now_ms) {
+        return 0;
+    }
+    let Some((value, expire_at, sticky)) = src.take(key, now_ms) else {
+        return 0;
+    };
+    dst.insert(CompactString::from_bytes(key), value);
+    if let Some(at) = expire_at {
+        dst.set_expiry(key, at, now_ms);
+    }
+    dst.set_sticky_flag(key, sticky);
+    1
+}
+
+/// Validate and execute `MOVE key <db>` against a shard's DB vector. Both
+/// `db_idx` and the target DB must already exist (the shard ensures this).
+/// Mirrors `GenericFamily::Move`: DB range and same-DB errors are sent as-is
+/// (no `ERR ` prefix), matching upstream `kDbIndOutOfRangeErr` and
+/// "source and destination objects are the same".
+pub fn exec_move_on_dbs(
+    dbs: &mut [DbSlice],
+    db_idx: usize,
+    args: &[Vec<u8>],
+    now_ms: u64,
+) -> CmdResult {
+    let Some(target) = args.get(2).and_then(|a| parse_i64(a)) else {
+        return CmdResult::err("DB index is out of range");
+    };
+    if target < 0 || (target as usize) >= crate::server::MAX_DB {
+        return CmdResult::err("DB index is out of range");
+    }
+    let target = target as usize;
+    if target == db_idx {
+        return CmdResult::err("source and destination objects are the same");
+    }
+    if dbs.len() <= db_idx || dbs.len() <= target {
+        return CmdResult::err("ERR internal: MOVE target DB not active");
+    }
+    let (lo, hi) = if db_idx < target { (db_idx, target) } else { (target, db_idx) };
+    let (left, right) = dbs.split_at_mut(hi);
+    let (src, dst) = if db_idx < target {
+        (&mut left[lo], &mut right[0])
+    } else {
+        (&mut right[0], &mut left[lo])
+    };
+    CmdResult::Ok(RespValue::Integer(move_key(src, dst, &args[1], now_ms)))
+}
+
+/// Never invoked: MOVE runs as a global transaction handled by `Shard::run_move`,
+/// which has access to both the source and target DBs.
+fn exec_move(_ctx: &mut OpContext) -> CmdResult {
+    CmdResult::err("ERR internal: MOVE handled at shard level")
+}
+
+// ---------------------------------------------------------------------------
 // Command definitions
 // ---------------------------------------------------------------------------
 
@@ -744,6 +807,14 @@ pub static CMD_STICK: Command = Command {
     flags: FLAG_WRITE | FLAG_MULTI_KEY,
     key_range: KeyRange::ALL,
     exec: exec_stick,
+    merge: Some(merge_sum),
+};
+pub static CMD_MOVE: Command = Command {
+    name: "MOVE",
+    arity: 3,
+    flags: FLAG_WRITE | FLAG_GLOBAL,
+    key_range: KeyRange::ONE,
+    exec: exec_move,
     merge: Some(merge_sum),
 };
 pub static CMD_RENAME: Command = Command {
@@ -1199,6 +1270,58 @@ mod tests {
         assert_eq!(int_of(cmd(&mut db, &[b"COPY", b"s", b"d"])), 1);
         assert!(db.is_sticky(b"d"));
         assert_eq!(int_of(cmd(&mut db, &[b"STICK", b"d"])), 0);
+    }
+
+    fn move_dbs(dbs: &mut [DbSlice], db_idx: usize, now: u64, args: &[&[u8]]) -> CmdResult {
+        let argv: Vec<Vec<u8>> = args.iter().map(|a| a.to_vec()).collect();
+        exec_move_on_dbs(dbs, db_idx, &argv, now)
+    }
+
+    /// Port of `GenericFamilyTest.Move`.
+    #[test]
+    fn move_key() {
+        let now = 1000;
+        let mut dbs = vec![DbSlice::new(0), DbSlice::new(1)];
+
+        // Missing key: 0.
+        assert_eq!(int_of(move_dbs(&mut dbs, 0, now, &[b"MOVE", b"a", b"1"])), 0);
+
+        // Non-existent DB indices.
+        assert_eq!(
+            err_of(move_dbs(&mut dbs, 0, now, &[b"MOVE", b"a", b"-1"])),
+            "DB index is out of range"
+        );
+        assert_eq!(
+            err_of(move_dbs(&mut dbs, 0, now, &[b"MOVE", b"a", b"100500"])),
+            "DB index is out of range"
+        );
+        assert_eq!(
+            err_of(move_dbs(&mut dbs, 0, now, &[b"MOVE", b"a", b"0"])),
+            "source and destination objects are the same"
+        );
+
+        // MOVE moves value & expiry & stickiness.
+        str_of(&mut dbs[0], "a", "test");
+        dbs[0].set_expiry(b"a", now + 1000, now);
+        dbs[0].set_sticky_flag(b"a", true);
+        assert_eq!(int_of(move_dbs(&mut dbs, 0, now, &[b"MOVE", b"a", b"1"])), 1);
+        assert!(!dbs[0].contains(b"a", now));
+        assert_eq!(dbs[1].ttl_ms(b"a", now), 1000);
+        assert!(dbs[1].is_sticky(b"a"));
+        match dbs[1].find(b"a", now) {
+            Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"test"),
+            o => panic!("expected string, got {:?}", o),
+        }
+
+        // MOVE doesn't move if the destination key exists.
+        str_of(&mut dbs[1], "a", "existing");
+        str_of(&mut dbs[0], "a", "other");
+        assert_eq!(int_of(move_dbs(&mut dbs, 0, now, &[b"MOVE", b"a", b"1"])), 0);
+        match dbs[1].find(b"a", now) {
+            Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"existing"),
+            o => panic!("expected string, got {:?}", o),
+        }
+        assert!(dbs[0].contains(b"a", now));
     }
 }
 

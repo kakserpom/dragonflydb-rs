@@ -28,6 +28,8 @@ struct Conn {
     deliver_seq: u64,
     /// Replies received out of order (seq -> encoded bytes).
     buffered: BTreeMap<u64, Vec<u8>>,
+    /// The connection's currently selected DB index.
+    db_idx: usize,
 }
 
 /// A single-threaded kqueue-based IO event loop. Owns all client sockets, the
@@ -153,6 +155,7 @@ impl IoLoop {
                 dispatch_seq: 0,
                 deliver_seq: 0,
                 buffered: BTreeMap::new(),
+                db_idx: 0,
             },
         );
         self.fd_to_id.insert(fd, conn_id);
@@ -226,6 +229,19 @@ impl IoLoop {
             return;
         }
         if cmd.has_flag(FLAG_LOCAL) {
+            if cmd.name == "SELECT" {
+                let v = server::local_select(&args);
+                if matches!(&v, RespValue::Simple(_)) {
+                    if let (Some(db), Some(conn)) = (
+                        args.get(1).and_then(|a| crate::util::parse_i64(a)),
+                        self.conns.get_mut(&conn_id),
+                    ) {
+                        conn.db_idx = db as usize;
+                    }
+                }
+                self.deliver(conn_id, seq, encode_value(&v));
+                return;
+            }
             let v = self.run_local(cmd, &args);
             self.deliver(conn_id, seq, encode_value(&v));
             return;
@@ -268,11 +284,13 @@ impl IoLoop {
     }
 
     fn send_single(&self, conn_id: u64, seq: u64, shard: usize, args: Vec<Vec<u8>>, owned: Vec<usize>) {
+        let db_idx = self.conns.get(&conn_id).map(|c| c.db_idx).unwrap_or(0);
         let op = SingleOp {
             conn_id,
             seq,
             args,
             owned_key_idxs: owned,
+            db_idx,
             reply: self.env.reply_bus_tx.clone(),
         };
         let _ = self.env.shard_txs[shard].send(ShardMsg::Single(op));
@@ -287,7 +305,8 @@ impl IoLoop {
         shards: Vec<usize>,
         first_key_idx: usize,
     ) {
-        let msg = CoordMsg { conn_id, seq, args, keys, shards, first_key_idx };
+        let db_idx = self.conns.get(&conn_id).map(|c| c.db_idx).unwrap_or(0);
+        let msg = CoordMsg { conn_id, seq, args, keys, shards, first_key_idx, db_idx };
         let _ = self.env.coord_tx.send(msg);
     }
 

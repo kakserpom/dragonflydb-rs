@@ -3,9 +3,10 @@ use std::sync::mpsc;
 
 use crate::commands::exec::server::now_ms;
 use crate::commands::{OpContext, ShardPart};
+use crate::core::compact::CompactString;
 use crate::core::DbSlice;
 use crate::error::CmdResult;
-use crate::server::{command_for, encode_result, Reply, ShardMsg, SingleOp};
+use crate::server::{command_for, encode_result, Reply, ShardMsg, SingleOp, MAX_DB};
 
 /// Context for an active transaction on this shard, stored between TxLock and
 /// TxExec.
@@ -13,11 +14,12 @@ struct TxCtx {
     args: Vec<Vec<u8>>,
     owned_key_idxs: Vec<usize>,
     first_key_idx: usize,
+    db_idx: usize,
 }
 
 struct Shard {
     shard_id: usize,
-    /// Logical databases, index 0..N. Only db0 is used today.
+    /// Logical databases, index 0..N, grown lazily on demand.
     dbs: Vec<DbSlice>,
     /// The tx currently holding this shard, if any. While set, single ops are
     /// queued so a multi-shard transaction executes atomically w.r.t. singles.
@@ -58,19 +60,23 @@ impl Shard {
                     self.execute_single(op);
                 }
             }
-            ShardMsg::TxLock { tx_id, args, owned_key_idxs, first_key_idx, ack, .. } => {
+            ShardMsg::TxLock { tx_id, args, owned_key_idxs, first_key_idx, db_idx, ack, .. } => {
                 self.active_tx = Some(tx_id);
                 self.tx_ctx.insert(
                     tx_id,
-                    TxCtx { args, owned_key_idxs, first_key_idx },
+                    TxCtx { args, owned_key_idxs, first_key_idx, db_idx },
                 );
                 let _ = ack.send(());
             }
             ShardMsg::TxExec { tx_id, result_tx } => {
                 let part = match self.tx_ctx.remove(&tx_id) {
                     Some(ctx) => {
-                        let result =
-                            self.run_exec(&ctx.args, &ctx.owned_key_idxs, ctx.first_key_idx);
+                        let result = self.run_exec(
+                            &ctx.args,
+                            &ctx.owned_key_idxs,
+                            ctx.first_key_idx,
+                            ctx.db_idx,
+                        );
                         ShardPart {
                             shard: self.shard_id,
                             owned_key_idxs: ctx.owned_key_idxs,
@@ -96,12 +102,12 @@ impl Shard {
                     }
                 }
             }
-            ShardMsg::StoreValue { tx_id, key, value, expire_at, sticky, ack } => {
+            ShardMsg::StoreValue { tx_id, key, value, expire_at, sticky, db_idx, ack } => {
                 self.active_tx = Some(tx_id);
                 match value {
                     Some(v) => {
-                        let db = &mut self.dbs[0];
-                        db.insert(crate::core::compact::CompactString::from_bytes(&key), v);
+                        let db = self.ensure_db(db_idx);
+                        db.insert(CompactString::from_bytes(&key), v);
                         match expire_at {
                             Some(at) => db.set_expiry(&key, at, now_ms()),
                             None => db.clear_expiry(&key),
@@ -109,7 +115,7 @@ impl Shard {
                         db.set_sticky_flag(&key, sticky);
                     }
                     None => {
-                        self.dbs[0].remove(&key);
+                        self.ensure_db(db_idx).remove(&key);
                     }
                 }
                 let _ = ack.send(());
@@ -120,7 +126,7 @@ impl Shard {
     fn execute_single(&mut self, op: SingleOp) {
         let first_key_idx =
             command_for(&op.args).map(|c| c.key_range.first).unwrap_or(0);
-        let result = self.run_exec(&op.args, &op.owned_key_idxs, first_key_idx);
+        let result = self.run_exec(&op.args, &op.owned_key_idxs, first_key_idx, op.db_idx);
         let reply = Reply {
             conn_id: op.conn_id,
             seq: op.seq,
@@ -129,11 +135,16 @@ impl Shard {
         let _ = op.reply.send(reply);
     }
 
-    fn run_exec(&mut self, args: &[Vec<u8>], owned: &[usize], first_key_idx: usize) -> CmdResult {
+    fn run_exec(&mut self, args: &[Vec<u8>], owned: &[usize], first_key_idx: usize, db_idx: usize) -> CmdResult {
         let Some(cmd) = command_for(args) else {
             return CmdResult::err("ERR unknown command");
         };
-        let db = &mut self.dbs[0];
+        // MOVE operates on two DBs on the same shard, so it needs the raw
+        // `dbs` vector rather than a single `OpContext`.
+        if cmd.name == "MOVE" {
+            return self.run_move(args, db_idx);
+        }
+        let db = self.ensure_db(db_idx);
         let mut ctx = OpContext {
             db,
             args,
@@ -142,5 +153,27 @@ impl Shard {
             now_ms: now_ms(),
         };
         (cmd.exec)(&mut ctx)
+    }
+
+    /// Ensure db `db_idx` exists (created lazily, like `ActivateDb`).
+    fn ensure_db(&mut self, db_idx: usize) -> &mut DbSlice {
+        if self.dbs.len() <= db_idx {
+            self.dbs.resize_with(db_idx + 1, || DbSlice::new(self.shard_id));
+        }
+        &mut self.dbs[db_idx]
+    }
+
+    /// `MOVE key <db>`: move the value, TTL and sticky flag to another DB on
+    /// the same shard. Runs on every shard (global tx); only the shard owning
+    /// `key` can move it. Returns 0 if the key is missing or the destination
+    /// key already exists, 1 otherwise.
+    fn run_move(&mut self, args: &[Vec<u8>], db_idx: usize) -> CmdResult {
+        if let Some(t) = args.get(2).and_then(|a| crate::util::parse_i64(a)) {
+            if (0..MAX_DB as i64).contains(&t) {
+                self.ensure_db(db_idx);
+                self.ensure_db(t as usize);
+            }
+        }
+        crate::commands::exec::keys::exec_move_on_dbs(&mut self.dbs, db_idx, args, now_ms())
     }
 }

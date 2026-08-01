@@ -2,6 +2,9 @@ pub mod coordinator;
 pub mod event_loop;
 pub mod shard;
 
+/// Number of logical databases (matches upstream `FLAGS_dbnum` default).
+pub const MAX_DB: usize = 16;
+
 use std::os::fd::RawFd;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -56,6 +59,8 @@ pub struct SingleOp {
     pub seq: u64,
     pub args: Vec<Vec<u8>>,
     pub owned_key_idxs: Vec<usize>,
+    /// The connection's selected DB index.
+    pub db_idx: usize,
     pub reply: ReplyBus,
 }
 
@@ -70,6 +75,7 @@ pub enum ShardMsg {
         args: Vec<Vec<u8>>,
         owned_key_idxs: Vec<usize>,
         first_key_idx: usize,
+        db_idx: usize,
         ack: mpsc::Sender<()>,
     },
     TxExec {
@@ -91,6 +97,8 @@ pub enum ShardMsg {
         expire_at: Option<u64>,
         /// Applies/clears the STICK flag on the stored key.
         sticky: bool,
+        /// The DB index to write into.
+        db_idx: usize,
         ack: mpsc::Sender<()>,
     },
 }
@@ -106,6 +114,8 @@ pub struct CoordMsg {
     /// Involved shards (all shards for global commands).
     pub shards: Vec<usize>,
     pub first_key_idx: usize,
+    /// The connection's selected DB index.
+    pub db_idx: usize,
 }
 
 /// Shared handles owned by the IO thread.

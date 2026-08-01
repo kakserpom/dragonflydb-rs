@@ -90,6 +90,17 @@ impl DbSlice {
         v
     }
 
+    /// Remove `key`, returning its value, absolute expiry in ms (if any) and
+    /// sticky flag. Used by MOVE to transfer a key between DBs on one shard.
+    pub fn take(&mut self, key: &[u8], now_ms: u64) -> Option<(PrimeValue, Option<u64>, bool)> {
+        self.expire_if_needed(key, now_ms);
+        let value = self.prime_table.remove(key)?;
+        let expire_at = self.expire.remove(key);
+        let sticky = self.sticky.remove(key);
+        self.refresh_stats();
+        Some((value, expire_at, sticky))
+    }
+
     pub fn remove_if_exists(&mut self, key: &[u8]) -> bool {
         self.remove(key).is_some()
     }

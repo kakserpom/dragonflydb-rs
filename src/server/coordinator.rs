@@ -112,6 +112,7 @@ impl Coordinator {
                 args: msg.args.clone(),
                 owned_key_idxs: owned_for(&owned, s),
                 first_key_idx: msg.first_key_idx,
+                db_idx: msg.db_idx,
                 ack: ack_tx,
             });
             if ok.is_ok() {
@@ -140,12 +141,12 @@ impl Coordinator {
 
         match self.finish_tx(msg, parts) {
             CmdResult::DeferredStore { key, value, reply } => {
-                self.perform_deferred_store(&key, value, None, false);
+                self.perform_deferred_store(&key, value, None, false, msg.db_idx);
                 CmdResult::Ok(reply)
             }
             CmdResult::DeferredStores { stores, reply } => {
                 for (key, value, expire_at, sticky) in stores {
-                    self.perform_deferred_store(&key, value, expire_at, sticky);
+                    self.perform_deferred_store(&key, value, expire_at, sticky, msg.db_idx);
                 }
                 CmdResult::Ok(reply)
             }
@@ -161,6 +162,7 @@ impl Coordinator {
         value: Option<crate::core::PrimeValue>,
         expire_at: Option<u64>,
         sticky: bool,
+        db_idx: usize,
     ) {
         let tx_id = self.next_tx_id();
         let shard = shard_for_key(key, self.num_shards);
@@ -172,6 +174,7 @@ impl Coordinator {
                 value,
                 expire_at,
                 sticky,
+                db_idx,
                 ack: ack_tx,
             })
             .is_ok()
