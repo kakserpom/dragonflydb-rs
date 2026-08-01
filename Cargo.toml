@@ -12,7 +12,7 @@ name = "dragonflydb"
 path = "src/main.rs"
 
 [dependencies]
-hashbrown = "0.15"
+hashbrown = "0.17"
 libc = "0.2"
 mimalloc = "0.1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
