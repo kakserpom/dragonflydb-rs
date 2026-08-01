@@ -1,0 +1,21 @@
+[package]
+name = "dragonflydb-rs"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "dragonflydb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dragonflydb"
+path = "src/main.rs"
+
+[dependencies]
+hashbrown = "0.15"
+libc = "0.2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
