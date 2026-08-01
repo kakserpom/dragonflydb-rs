@@ -89,6 +89,8 @@ pub enum ShardMsg {
         value: Option<crate::core::PrimeValue>,
         /// Absolute expiry in ms to set on the stored key, if any.
         expire_at: Option<u64>,
+        /// Applies/clears the STICK flag on the stored key.
+        sticky: bool,
         ack: mpsc::Sender<()>,
     },
 }

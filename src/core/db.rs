@@ -1,4 +1,5 @@
 use hashbrown::HashMap;
+use hashbrown::HashSet;
 
 use crate::core::compact::CompactString;
 use crate::core::stream::StreamId;
@@ -12,6 +13,8 @@ pub struct DbSlice {
     prime_table: HashMap<CompactString, PrimeValue>,
     /// Expiration map: key -> unix time (ms) at which it expires.
     expire: HashMap<CompactString, u64>,
+    /// Sticky keys (STICK): never expire, even with a TTL.
+    sticky: HashSet<CompactString>,
     /// Resolved stream IDs for blocking XREAD `$` arguments: a blocked read
     /// resolves `$` once (to the stream's last ID at call time) and the
     /// coordinator re-runs the command, so we remember the resolved ID here.
@@ -32,6 +35,7 @@ impl DbSlice {
             shard_id,
             prime_table: HashMap::new(),
             expire: HashMap::new(),
+            sticky: HashSet::new(),
             stream_block_watermarks: HashMap::new(),
             stats: DbStats::default(),
         }
@@ -81,6 +85,7 @@ impl DbSlice {
         let v = self.prime_table.remove(key);
         if v.is_some() {
             self.expire.remove(key);
+            self.sticky.remove(key);
         }
         v
     }
@@ -119,9 +124,13 @@ impl DbSlice {
         }
     }
 
-    /// Returns true if the key was removed due to expiration.
+    /// Returns true if the key was removed due to expiration. Sticky keys never
+    /// expire (mirrors Dragonfly's `DbEntry::IsSticky`).
     pub fn expire_if_needed(&mut self, key: &[u8], now_ms: u64) -> bool {
         self.stats.expired_checked += 1;
+        if self.sticky.contains(key) {
+            return false;
+        }
         let Some(&at) = self.expire.get(key) else {
             return false;
         };
@@ -141,6 +150,31 @@ impl DbSlice {
     /// Absolute expiration time in ms for a key, if any (no expiry check).
     pub fn expire_at(&self, key: &[u8]) -> Option<u64> {
         self.expire.get(key).copied()
+    }
+
+    /// Mark a key sticky if it exists and was not already sticky. Returns true
+    /// if the flag was newly applied (mirrors OpStick).
+    pub fn set_sticky(&mut self, key: &[u8], now_ms: u64) -> bool {
+        self.expire_if_needed(key, now_ms);
+        if self.prime_table.contains_key(key) && !self.sticky.contains(key) {
+            self.sticky.insert(CompactString::from_bytes(key));
+            return true;
+        }
+        false
+    }
+
+    /// Whether the key is sticky.
+    pub fn is_sticky(&self, key: &[u8]) -> bool {
+        self.sticky.contains(key)
+    }
+
+    /// Set the sticky flag unconditionally (used when applying deferred stores).
+    pub fn set_sticky_flag(&mut self, key: &[u8], sticky: bool) {
+        if sticky {
+            self.sticky.insert(CompactString::from_bytes(key));
+        } else {
+            self.sticky.remove(key);
+        }
     }
 
     /// Iterate over all (key, value) pairs. The iterator borrows self mutably

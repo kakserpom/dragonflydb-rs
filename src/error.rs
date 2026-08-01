@@ -2,6 +2,10 @@ use std::fmt;
 
 use crate::core::PrimeValue;
 
+/// A single deferred store: key, optional value (`None` deletes), absolute
+/// expiry in ms (if any), and whether the STICK flag should be applied.
+pub type DeferredStoreItem = (Vec<u8>, Option<PrimeValue>, Option<u64>, bool);
+
 /// Outcome of a command execution.
 ///
 /// * `Ok(reply)`   - the reply value to encode
@@ -25,9 +29,10 @@ pub enum CmdResult {
         reply: RespValue,
     },
     DeferredStores {
-        /// `(key, value, expire_at)` triples; `None` value deletes the key and
-        /// `Some(expire_at)` sets the absolute expiry in ms on the stored key.
-        stores: Vec<(Vec<u8>, Option<PrimeValue>, Option<u64>)>,
+        /// `(key, value, expire_at, sticky)` tuples; `None` value deletes the
+        /// key, `Some(expire_at)` sets the absolute expiry in ms on the stored
+        /// key, and `sticky` applies/clears the STICK flag.
+        stores: Vec<DeferredStoreItem>,
         reply: RespValue,
     },
 }
@@ -45,10 +50,7 @@ impl CmdResult {
     pub fn deferred_store(key: Vec<u8>, value: Option<PrimeValue>, reply: RespValue) -> Self {
         CmdResult::DeferredStore { key, value, reply }
     }
-    pub fn deferred_stores(
-        stores: Vec<(Vec<u8>, Option<PrimeValue>, Option<u64>)>,
-        reply: RespValue,
-    ) -> Self {
+    pub fn deferred_stores(stores: Vec<DeferredStoreItem>, reply: RespValue) -> Self {
         CmdResult::DeferredStores { stores, reply }
     }
     pub fn is_err(&self) -> bool {

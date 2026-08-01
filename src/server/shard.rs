@@ -96,7 +96,7 @@ impl Shard {
                     }
                 }
             }
-            ShardMsg::StoreValue { tx_id, key, value, expire_at, ack } => {
+            ShardMsg::StoreValue { tx_id, key, value, expire_at, sticky, ack } => {
                 self.active_tx = Some(tx_id);
                 match value {
                     Some(v) => {
@@ -106,6 +106,7 @@ impl Shard {
                             Some(at) => db.set_expiry(&key, at, now_ms()),
                             None => db.clear_expiry(&key),
                         }
+                        db.set_sticky_flag(&key, sticky);
                     }
                     None => {
                         self.dbs[0].remove(&key);

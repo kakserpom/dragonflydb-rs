@@ -1,7 +1,9 @@
 use crate::commands::{integer, ok, Command, OpContext, ShardPart, KeyRange, FLAG_FAST, FLAG_GLOBAL, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE};
 use crate::core::compact::CompactString;
+use crate::core::PrimeValue;
 use crate::error::{CmdResult, RespError, RespValue};
 use crate::util::parse_i64;
+use xxhash_rust::xxh3::xxh3_64;
 
 // ---------------------------------------------------------------------------
 // DEL / EXISTS
@@ -29,14 +31,65 @@ fn merge_sum(parts: &[ShardPart], _args: &[Vec<u8>], _keys: &[usize], _now: u64)
     CmdResult::Ok(integer(total))
 }
 
+// ---------------------------------------------------------------------------
+// DELEX — conditional delete (IFEQ/IFNE/IFDEQ/IFDNE)
+// ---------------------------------------------------------------------------
+
+fn exec_delex(ctx: &mut OpContext) -> CmdResult {
+    let key_idx = ctx.owned_keys[0];
+    let key = &ctx.args[key_idx];
+
+    // `DELEX key` with no condition behaves like DEL.
+    if ctx.args.len() == 2 {
+        return CmdResult::Ok(integer(if ctx.db.remove_if_exists(key) { 1 } else { 0 }));
+    }
+    // Otherwise the syntax is `DELEX key <cond> <value>` exactly.
+    if ctx.args.len() != 4 {
+        return CmdResult::Err(RespError::new(
+            "ERR wrong number of arguments for 'delex' command",
+        ));
+    }
+
+    let opt = &ctx.args[2];
+    let compare_value = &ctx.args[3];
+    let digest_mode = opt.eq_ignore_ascii_case(b"IFDEQ") || opt.eq_ignore_ascii_case(b"IFDNE");
+    let negate = opt.eq_ignore_ascii_case(b"IFNE") || opt.eq_ignore_ascii_case(b"IFDNE");
+    if !opt.eq_ignore_ascii_case(b"IFEQ")
+        && !opt.eq_ignore_ascii_case(b"IFNE")
+        && !digest_mode
+    {
+        return CmdResult::Err(RespError::new(format!(
+            "ERR Unknown subcommand or wrong number of arguments for '{}'. Try DELEX HELP.",
+            String::from_utf8_lossy(opt)
+        )));
+    }
+
+    let matches = match ctx.db.find(key, ctx.now_ms) {
+        None => return CmdResult::Ok(integer(0)),
+        Some(PrimeValue::Str(s)) => {
+            if digest_mode {
+                format!("{:016x}", xxh3_64(s.as_bytes())).as_bytes() == compare_value.as_slice()
+            } else {
+                s.as_bytes() == compare_value.as_slice()
+            }
+        }
+        Some(_) => return CmdResult::Err(RespError::wrong_type()),
+    };
+
+    if matches != negate {
+        ctx.db.remove(key);
+        return CmdResult::Ok(integer(1));
+    }
+    CmdResult::Ok(integer(0))
+}
+
 fn exec_exists(ctx: &mut OpContext) -> CmdResult {
     let mut count = 0i64;
     for &ki in ctx.owned_keys {
         if ctx.db.contains(&ctx.args[ki], ctx.now_ms) {
             count += 1;
         }
-    }
-    CmdResult::Ok(integer(count))
+    }    CmdResult::Ok(integer(count))
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +347,16 @@ fn match_class(pattern: &[u8], p: usize, ch: u8) -> Option<(bool, usize)> {
 // with the EXISTS handler and UNLINK with the DEL handler).
 // ---------------------------------------------------------------------------
 
+fn exec_stick(ctx: &mut OpContext) -> CmdResult {
+    let mut count = 0i64;
+    for &ki in ctx.owned_keys {
+        if ctx.db.set_sticky(&ctx.args[ki], ctx.now_ms) {
+            count += 1;
+        }
+    }
+    CmdResult::Ok(integer(count))
+}
+
 // ---------------------------------------------------------------------------
 // RENAME / RENAMENX
 // ---------------------------------------------------------------------------
@@ -330,12 +393,14 @@ fn rename_common(ctx: &mut OpContext, destination_should_not_exist: bool) -> Cmd
             return CmdResult::Ok(integer(0));
         }
         let exp = ctx.db.expire_at(src);
+        let sticky = ctx.db.is_sticky(src);
         let val = ctx.db.remove(src).expect("key exists");
         ctx.db.insert(CompactString::from_bytes(dst), val);
         match exp {
             Some(at) => ctx.db.set_expiry(dst, at, ctx.now_ms),
             None => ctx.db.clear_expiry(dst),
         }
+        ctx.db.set_sticky_flag(dst, sticky);
         return if destination_should_not_exist {
             CmdResult::Ok(integer(1))
         } else {
@@ -346,12 +411,13 @@ fn rename_common(ctx: &mut OpContext, destination_should_not_exist: bool) -> Cmd
     // Cross-shard: report a store plan without mutating. The coordinator
     // applies it only if the merge confirms (RENAMENX requires an absent
     // destination). The source deletion and destination write (with the source
-    // TTL) happen atomically via deferred stores.
+    // TTL and stickiness) happen atomically via deferred stores.
     let exp = ctx.db.expire_at(src);
+    let sticky = ctx.db.is_sticky(src);
     let val = ctx.db.find(src, ctx.now_ms).expect("key exists").clone();
     let reply = if destination_should_not_exist { integer(1) } else { ok() };
     CmdResult::deferred_stores(
-        vec![(src.to_vec(), None, None), (dst.to_vec(), Some(val), exp)],
+        vec![(src.to_vec(), None, None, false), (dst.to_vec(), Some(val), exp, sticky)],
         reply,
     )
 }
@@ -444,19 +510,23 @@ fn exec_copy(ctx: &mut OpContext) -> CmdResult {
             return CmdResult::Ok(integer(0));
         }
         let exp = ctx.db.expire_at(src);
+        let sticky = ctx.db.is_sticky(src);
         let val = ctx.db.find(src, ctx.now_ms).expect("key exists").clone();
         ctx.db.insert(CompactString::from_bytes(dst), val);
         match exp {
             Some(at) => ctx.db.set_expiry(dst, at, ctx.now_ms),
             None => ctx.db.clear_expiry(dst),
         }
+        ctx.db.set_sticky_flag(dst, sticky);
         return CmdResult::Ok(integer(1));
     }
 
-    // Cross-shard: report the copy plan (destination write with the source TTL).
+    // Cross-shard: report the copy plan (destination write with the source TTL
+    // and stickiness).
     let exp = ctx.db.expire_at(src);
+    let sticky = ctx.db.is_sticky(src);
     let val = ctx.db.find(src, ctx.now_ms).expect("key exists").clone();
-    CmdResult::deferred_stores(vec![(dst.to_vec(), Some(val), exp)], integer(1))
+    CmdResult::deferred_stores(vec![(dst.to_vec(), Some(val), exp, sticky)], integer(1))
 }
 
 fn merge_copy(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u64) -> CmdResult {
@@ -572,6 +642,14 @@ pub static CMD_EXISTS: Command = Command {
     exec: exec_exists,
     merge: Some(merge_sum),
 };
+pub static CMD_DELEX: Command = Command {
+    name: "DELEX",
+    arity: -2,
+    flags: FLAG_WRITE | FLAG_FAST,
+    key_range: KeyRange::ONE,
+    exec: exec_delex,
+    merge: None,
+};
 pub static CMD_EXPIRE: Command = Command {
     name: "EXPIRE",
     arity: -3,
@@ -660,6 +738,14 @@ pub static CMD_UNLINK: Command = Command {
     exec: exec_del,
     merge: Some(merge_sum),
 };
+pub static CMD_STICK: Command = Command {
+    name: "STICK",
+    arity: -2,
+    flags: FLAG_WRITE | FLAG_MULTI_KEY,
+    key_range: KeyRange::ALL,
+    exec: exec_stick,
+    merge: Some(merge_sum),
+};
 pub static CMD_RENAME: Command = Command {
     name: "RENAME",
     arity: 3,
@@ -738,6 +824,8 @@ mod tests {
         let (exec, first_key_idx, owned): (crate::commands::ExecFn, usize, Vec<usize>) =
             match cmd.as_slice() {
                 b"DEL" => (exec_del, 1, (1..argv.len()).collect()),
+                b"DELEX" => (exec_delex, 1, (1..2).collect()),
+                b"STICK" => (exec_stick, 1, (1..argv.len()).collect()),
                 b"UNLINK" => (exec_del, 1, (1..argv.len()).collect()),
                 b"TOUCH" => (exec_exists, 1, (1..argv.len()).collect()),
                 b"RENAME" => (exec_rename, 1, (1..3).collect()),
@@ -986,6 +1074,131 @@ mod tests {
         assert_eq!(val(cmd(&mut db, &[b"RENAME", b"src", b"dst"])), val(CmdResult::Ok(ok())));
         assert_eq!(db.ttl_ms(b"dst", 0), 10_000);
         assert!(!db.contains(b"src", 0));
+    }
+
+    /// Port of `GenericFamilyTest.Delex`.
+    #[test]
+    fn delex() {
+        let mut db = DbSlice::new(0);
+
+        // DELEX without condition behaves like DEL.
+        str_of(&mut db, "key1", "value1");
+        assert_eq!(int_of(cmd(&mut db, &[b"DELEX", b"key1"])), 1);
+        assert!(!db.contains(b"key1", 0));
+
+        // Non-existent key returns 0.
+        assert_eq!(int_of(cmd(&mut db, &[b"DELEX", b"nonexistent"])), 0);
+
+        // IFEQ deletes when values match, not otherwise.
+        str_of(&mut db, "key2", "value2");
+        assert_eq!(int_of(cmd(&mut db, &[b"DELEX", b"key2", b"IFEQ", b"value2"])), 1);
+        assert!(!db.contains(b"key2", 0));
+
+        str_of(&mut db, "key3", "value3");
+        assert_eq!(int_of(cmd(&mut db, &[b"DELEX", b"key3", b"IFEQ", b"wrongvalue"])), 0);
+        assert!(db.contains(b"key3", 0));
+
+        // IFNE deletes when values differ, not otherwise.
+        str_of(&mut db, "key4", "value4");
+        assert_eq!(int_of(cmd(&mut db, &[b"DELEX", b"key4", b"IFNE", b"differentvalue"])), 1);
+        assert!(!db.contains(b"key4", 0));
+
+        str_of(&mut db, "key5", "value5");
+        assert_eq!(int_of(cmd(&mut db, &[b"DELEX", b"key5", b"IFNE", b"value5"])), 0);
+        assert!(db.contains(b"key5", 0));
+
+        // IFDEQ uses the same digest as DIGEST.
+        str_of(&mut db, "key6", "value6");
+        let digest = format!("{:016x}", xxh3_64(b"value6"));
+        assert_eq!(int_of(cmd(&mut db, &[b"DELEX", b"key6", b"IFDEQ", digest.as_bytes()])), 1);
+        assert!(!db.contains(b"key6", 0));
+
+        str_of(&mut db, "key7", "value7");
+        assert_eq!(int_of(cmd(&mut db, &[b"DELEX", b"key7", b"IFDEQ", b"0000000000000000"])), 0);
+        assert!(db.contains(b"key7", 0));
+
+        // IFDNE deletes when digests differ, not when they match.
+        str_of(&mut db, "key8", "value8");
+        assert_eq!(int_of(cmd(&mut db, &[b"DELEX", b"key8", b"IFDNE", b"0000000000000000"])), 1);
+        assert!(!db.contains(b"key8", 0));
+
+        str_of(&mut db, "key9", "value9");
+        let digest9 = format!("{:016x}", xxh3_64(b"value9"));
+        assert_eq!(int_of(cmd(&mut db, &[b"DELEX", b"key9", b"IFDNE", digest9.as_bytes()])), 0);
+        assert!(db.contains(b"key9", 0));
+
+        // Condition against a non-string key is WRONGTYPE.
+        db.insert(CompactString::from("list1"), PrimeValue::List(crate::core::quicklist::QuickList::default()));
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"DELEX", b"list1", b"IFEQ", b"item"])),
+            "WRONGTYPE Operation against a key holding the wrong kind of value"
+        );
+
+        // Invalid option is an unknown-subcommand error.
+        str_of(&mut db, "key10", "value10");
+        assert!(err_of(cmd(&mut db, &[b"DELEX", b"key10", b"INVALID", b"value"]))
+            .contains("Unknown subcommand"));
+
+        // Wrong number of arguments in several shapes.
+        str_of(&mut db, "key11", "v");
+        assert!(err_of(cmd(&mut db, &[b"DELEX", b"key11", b"randomarg"])).contains("wrong number"));
+        assert!(err_of(cmd(&mut db, &[b"DELEX", b"key12", b"IFEQ"])).contains("wrong number"));
+        assert!(err_of(cmd(&mut db, &[b"DELEX", b"key13", b"xyz"])).contains("wrong number"));
+        assert!(err_of(cmd(&mut db, &[b"DELEX", b"key14", b"IFEQ", b"val", b"extra"]))
+            .contains("wrong number"));
+    }
+
+    /// Port of `GenericFamilyTest.Stick`.
+    #[test]
+    fn stick() {
+        let mut db = DbSlice::new(0);
+
+        // STICK returns 0 on non-existent keys.
+        assert_eq!(int_of(cmd(&mut db, &[b"STICK", b"a", b"b"])), 0);
+
+        for key in ["a", "b", "c", "d"] {
+            str_of(&mut db, key, ".");
+        }
+
+        // STICK is applied only once per key.
+        assert_eq!(int_of(cmd(&mut db, &[b"STICK", b"a", b"b"])), 2);
+        assert_eq!(int_of(cmd(&mut db, &[b"STICK", b"a", b"b"])), 0);
+        assert_eq!(int_of(cmd(&mut db, &[b"STICK", b"a", b"c"])), 1);
+        assert_eq!(int_of(cmd(&mut db, &[b"STICK", b"b", b"d"])), 1);
+        assert_eq!(int_of(cmd(&mut db, &[b"STICK", b"c", b"d"])), 0);
+
+        // Stickiness persists across writes (SET/APPEND replace the value).
+        str_of(&mut db, "a", "new");
+        assert_eq!(int_of(cmd(&mut db, &[b"STICK", b"a"])), 0);
+
+        // RENAME moves stickiness (single-shard path here).
+        assert_eq!(val(cmd(&mut db, &[b"RENAME", b"a", b"k"])), val(CmdResult::Ok(ok())));
+        assert_eq!(int_of(cmd(&mut db, &[b"STICK", b"k"])), 0);
+        assert_eq!(db.ttl_ms(b"k", 0), -1);
+    }
+
+    /// A sticky key does not expire even with a TTL.
+    #[test]
+    fn stick_prevents_expiry() {
+        let mut db = DbSlice::new(0);
+        str_of(&mut db, "k", "v");
+        db.set_expiry(b"k", 10_000, 0);
+        assert_eq!(int_of(cmd(&mut db, &[b"STICK", b"k"])), 1);
+        assert!(db.contains(b"k", 50_000));
+        assert!(!db.is_sticky(b"x"));
+        assert_eq!(int_of(cmd(&mut db, &[b"DEL", b"k"])), 1);
+        assert!(!db.is_sticky(b"k"));
+    }
+
+    /// COPY carries stickiness to the destination.
+    #[test]
+    fn copy_preserves_sticky() {
+        let mut db = DbSlice::new(0);
+        str_of(&mut db, "s", "v");
+        assert_eq!(int_of(cmd(&mut db, &[b"STICK", b"s"])), 1);
+        assert_eq!(int_of(cmd(&mut db, &[b"COPY", b"s", b"d"])), 1);
+        assert!(db.is_sticky(b"d"));
+        assert_eq!(int_of(cmd(&mut db, &[b"STICK", b"d"])), 0);
     }
 }
 

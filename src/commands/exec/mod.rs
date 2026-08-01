@@ -48,6 +48,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     // keys
     keys::CMD_DEL,
     keys::CMD_EXISTS,
+    keys::CMD_DELEX,
     keys::CMD_EXPIRE,
     keys::CMD_PEXPIRE,
     keys::CMD_EXPIREAT,
@@ -59,6 +60,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     keys::CMD_KEYS,
     keys::CMD_TOUCH,
     keys::CMD_UNLINK,
+    keys::CMD_STICK,
     keys::CMD_RENAME,
     keys::CMD_RENAMENX,
     keys::CMD_COPY,
