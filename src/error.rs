@@ -25,8 +25,9 @@ pub enum CmdResult {
         reply: RespValue,
     },
     DeferredStores {
-        /// `(key, value)` pairs; `None` deletes the key.
-        stores: Vec<(Vec<u8>, Option<PrimeValue>)>,
+        /// `(key, value, expire_at)` triples; `None` value deletes the key and
+        /// `Some(expire_at)` sets the absolute expiry in ms on the stored key.
+        stores: Vec<(Vec<u8>, Option<PrimeValue>, Option<u64>)>,
         reply: RespValue,
     },
 }
@@ -44,7 +45,10 @@ impl CmdResult {
     pub fn deferred_store(key: Vec<u8>, value: Option<PrimeValue>, reply: RespValue) -> Self {
         CmdResult::DeferredStore { key, value, reply }
     }
-    pub fn deferred_stores(stores: Vec<(Vec<u8>, Option<PrimeValue>)>, reply: RespValue) -> Self {
+    pub fn deferred_stores(
+        stores: Vec<(Vec<u8>, Option<PrimeValue>, Option<u64>)>,
+        reply: RespValue,
+    ) -> Self {
         CmdResult::DeferredStores { stores, reply }
     }
     pub fn is_err(&self) -> bool {

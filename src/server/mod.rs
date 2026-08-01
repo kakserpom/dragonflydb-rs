@@ -87,6 +87,8 @@ pub enum ShardMsg {
         key: Vec<u8>,
         /// `None` deletes the key.
         value: Option<crate::core::PrimeValue>,
+        /// Absolute expiry in ms to set on the stored key, if any.
+        expire_at: Option<u64>,
         ack: mpsc::Sender<()>,
     },
 }

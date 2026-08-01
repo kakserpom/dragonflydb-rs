@@ -931,17 +931,17 @@ fn merge_smove(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u64)
     let mut new_src = src;
     new_src.remove(member.as_slice());
     dest.insert(CompactString::from_bytes(member));
-    let mut stores: Vec<(Vec<u8>, Option<PrimeValue>)> = Vec::with_capacity(2);
+    let mut stores: Vec<(Vec<u8>, Option<PrimeValue>, Option<u64>)> = Vec::with_capacity(2);
     if new_src.is_empty() {
-        stores.push((args[src_idx].clone(), None));
+        stores.push((args[src_idx].clone(), None, None));
     } else {
         let mut set = Set::new();
         set.extend(new_src.into_iter());
-        stores.push((args[src_idx].clone(), Some(PrimeValue::Set(set))));
+        stores.push((args[src_idx].clone(), Some(PrimeValue::Set(set)), None));
     }
     let mut dest_set = Set::new();
     dest_set.extend(dest.into_iter());
-    stores.push((args[dest_idx].clone(), Some(PrimeValue::Set(dest_set))));
+    stores.push((args[dest_idx].clone(), Some(PrimeValue::Set(dest_set)), None));
     CmdResult::deferred_stores(stores, integer(1))
 }
 
@@ -1221,7 +1221,7 @@ mod tests {
         match r {
             CmdResult::DeferredStores { stores, reply } => {
                 let mut out = Vec::with_capacity(stores.len());
-                for (key, value) in stores {
+                for (key, value, _expiry) in stores {
                     let members = match value {
                         Some(PrimeValue::Set(s)) => {
                             let mut v: Vec<String> =

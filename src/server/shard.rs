@@ -96,13 +96,16 @@ impl Shard {
                     }
                 }
             }
-            ShardMsg::StoreValue { tx_id, key, value, ack } => {
+            ShardMsg::StoreValue { tx_id, key, value, expire_at, ack } => {
                 self.active_tx = Some(tx_id);
                 match value {
                     Some(v) => {
                         let db = &mut self.dbs[0];
                         db.insert(crate::core::compact::CompactString::from_bytes(&key), v);
-                        db.clear_expiry(&key);
+                        match expire_at {
+                            Some(at) => db.set_expiry(&key, at, now_ms()),
+                            None => db.clear_expiry(&key),
+                        }
                     }
                     None => {
                         self.dbs[0].remove(&key);

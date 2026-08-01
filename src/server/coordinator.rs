@@ -140,12 +140,12 @@ impl Coordinator {
 
         match self.finish_tx(msg, parts) {
             CmdResult::DeferredStore { key, value, reply } => {
-                self.perform_deferred_store(&key, value);
+                self.perform_deferred_store(&key, value, None);
                 CmdResult::Ok(reply)
             }
             CmdResult::DeferredStores { stores, reply } => {
-                for (key, value) in stores {
-                    self.perform_deferred_store(&key, value);
+                for (key, value, expire_at) in stores {
+                    self.perform_deferred_store(&key, value, expire_at);
                 }
                 CmdResult::Ok(reply)
             }
@@ -155,7 +155,12 @@ impl Coordinator {
 
     /// Store (or delete) a key produced by a multi-shard command on its shard,
     /// holding the shard lock like a normal transaction.
-    fn perform_deferred_store(&mut self, key: &[u8], value: Option<crate::core::PrimeValue>) {
+    fn perform_deferred_store(
+        &mut self,
+        key: &[u8],
+        value: Option<crate::core::PrimeValue>,
+        expire_at: Option<u64>,
+    ) {
         let tx_id = self.next_tx_id();
         let shard = shard_for_key(key, self.num_shards);
         let (ack_tx, ack_rx) = mpsc::channel();
@@ -164,6 +169,7 @@ impl Coordinator {
                 tx_id,
                 key: key.to_vec(),
                 value,
+                expire_at,
                 ack: ack_tx,
             })
             .is_ok()

@@ -1,4 +1,5 @@
-use crate::commands::{integer, Command, OpContext, ShardPart, KeyRange, FLAG_FAST, FLAG_GLOBAL, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE};
+use crate::commands::{integer, ok, Command, OpContext, ShardPart, KeyRange, FLAG_FAST, FLAG_GLOBAL, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE};
+use crate::core::compact::CompactString;
 use crate::error::{CmdResult, RespError, RespValue};
 use crate::util::parse_i64;
 
@@ -289,6 +290,269 @@ fn match_class(pattern: &[u8], p: usize, ch: u8) -> Option<(bool, usize)> {
 }
 
 // ---------------------------------------------------------------------------
+// TOUCH / UNLINK: same semantics as EXISTS / DEL (reference registers TOUCH
+// with the EXISTS handler and UNLINK with the DEL handler).
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// RENAME / RENAMENX
+// ---------------------------------------------------------------------------
+
+fn rename_common(ctx: &mut OpContext, destination_should_not_exist: bool) -> CmdResult {
+    let src_idx = ctx.first_key_idx;
+    let dst_idx = src_idx + 1;
+    let src = &ctx.args[src_idx];
+    let dst = &ctx.args[dst_idx];
+    let owns_src = ctx.owned_keys.contains(&src_idx);
+    let owns_dst = ctx.owned_keys.contains(&dst_idx);
+
+    if !owns_src {
+        // Destination shard: report whether the destination exists.
+        let dst_exists = ctx.db.contains(dst, ctx.now_ms);
+        return CmdResult::Ok(integer(dst_exists as i64));
+    }
+
+    if !ctx.db.contains(src, ctx.now_ms) {
+        return CmdResult::Err(RespError::new("ERR no such key"));
+    }
+    if src == dst {
+        // RENAME is a no-op, RENAMENX treats it as an existing destination.
+        return if destination_should_not_exist {
+            CmdResult::Ok(integer(0))
+        } else {
+            CmdResult::Ok(ok())
+        };
+    }
+
+    if owns_dst {
+        // Single-shard fast path: both keys live on this shard.
+        if destination_should_not_exist && ctx.db.contains(dst, ctx.now_ms) {
+            return CmdResult::Ok(integer(0));
+        }
+        let exp = ctx.db.expire_at(src);
+        let val = ctx.db.remove(src).expect("key exists");
+        ctx.db.insert(CompactString::from_bytes(dst), val);
+        match exp {
+            Some(at) => ctx.db.set_expiry(dst, at, ctx.now_ms),
+            None => ctx.db.clear_expiry(dst),
+        }
+        return if destination_should_not_exist {
+            CmdResult::Ok(integer(1))
+        } else {
+            CmdResult::Ok(ok())
+        };
+    }
+
+    // Cross-shard: report a store plan without mutating. The coordinator
+    // applies it only if the merge confirms (RENAMENX requires an absent
+    // destination). The source deletion and destination write (with the source
+    // TTL) happen atomically via deferred stores.
+    let exp = ctx.db.expire_at(src);
+    let val = ctx.db.find(src, ctx.now_ms).expect("key exists").clone();
+    let reply = if destination_should_not_exist { integer(1) } else { ok() };
+    CmdResult::deferred_stores(
+        vec![(src.to_vec(), None, None), (dst.to_vec(), Some(val), exp)],
+        reply,
+    )
+}
+
+fn exec_rename(ctx: &mut OpContext) -> CmdResult {
+    rename_common(ctx, false)
+}
+
+fn exec_renamenx(ctx: &mut OpContext) -> CmdResult {
+    rename_common(ctx, true)
+}
+
+fn merge_rename(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u64) -> CmdResult {
+    let dst_idx = keys[1];
+    let mut dst_exists: Option<bool> = None;
+    let mut stores: Option<CmdResult> = None;
+    let mut first_err = None;
+    for p in parts {
+        if p.result.is_err() {
+            if first_err.is_none() {
+                first_err = Some(p.result.clone());
+            }
+            continue;
+        }
+        if p.owned_key_idxs.contains(&dst_idx)
+            && let CmdResult::Ok(RespValue::Integer(v)) = &p.result
+        {
+            dst_exists = Some(*v != 0);
+        }
+        if matches!(p.result, CmdResult::DeferredStores { .. }) {
+            stores = Some(p.result.clone());
+        }
+    }
+    if let Some(e) = first_err {
+        return e;
+    }
+    if args[0].eq_ignore_ascii_case(b"RENAMENX") && dst_exists == Some(true) {
+        return CmdResult::Ok(integer(0));
+    }
+    if let Some(s) = stores {
+        return s;
+    }
+    parts
+        .first()
+        .map(|p| p.result.clone())
+        .unwrap_or_else(|| CmdResult::err("ERR internal: rename merge"))
+}
+
+// ---------------------------------------------------------------------------
+// COPY
+// ---------------------------------------------------------------------------
+
+fn exec_copy(ctx: &mut OpContext) -> CmdResult {
+    let src_idx = ctx.first_key_idx;
+    let dst_idx = src_idx + 1;
+    let src = &ctx.args[src_idx];
+    let dst = &ctx.args[dst_idx];
+
+    let mut i = dst_idx + 1;
+    let mut replace = false;
+    while i < ctx.args.len() {
+        if ctx.args[i].eq_ignore_ascii_case(b"REPLACE") && !replace {
+            replace = true;
+            i += 1;
+        } else {
+            return CmdResult::Err(RespError::syntax());
+        }
+    }
+
+    if src == dst {
+        return CmdResult::Err(RespError::new("source and destination objects are the same"));
+    }
+
+    let owns_src = ctx.owned_keys.contains(&src_idx);
+    let owns_dst = ctx.owned_keys.contains(&dst_idx);
+
+    if !owns_src {
+        // Destination shard: report whether the destination exists.
+        let dst_exists = ctx.db.contains(dst, ctx.now_ms);
+        return CmdResult::Ok(integer(dst_exists as i64));
+    }
+
+    if !ctx.db.contains(src, ctx.now_ms) {
+        return CmdResult::Ok(integer(0));
+    }
+
+    if owns_dst {
+        // Single-shard fast path: both keys live on this shard.
+        if ctx.db.contains(dst, ctx.now_ms) && !replace {
+            return CmdResult::Ok(integer(0));
+        }
+        let exp = ctx.db.expire_at(src);
+        let val = ctx.db.find(src, ctx.now_ms).expect("key exists").clone();
+        ctx.db.insert(CompactString::from_bytes(dst), val);
+        match exp {
+            Some(at) => ctx.db.set_expiry(dst, at, ctx.now_ms),
+            None => ctx.db.clear_expiry(dst),
+        }
+        return CmdResult::Ok(integer(1));
+    }
+
+    // Cross-shard: report the copy plan (destination write with the source TTL).
+    let exp = ctx.db.expire_at(src);
+    let val = ctx.db.find(src, ctx.now_ms).expect("key exists").clone();
+    CmdResult::deferred_stores(vec![(dst.to_vec(), Some(val), exp)], integer(1))
+}
+
+fn merge_copy(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u64) -> CmdResult {
+    let dst_idx = keys[1];
+    let mut replace = false;
+    for a in &args[dst_idx + 1..] {
+        if a.eq_ignore_ascii_case(b"REPLACE") {
+            replace = true;
+        }
+    }
+    let mut dst_exists: Option<bool> = None;
+    let mut stores: Option<CmdResult> = None;
+    let mut first_err = None;
+    for p in parts {
+        if p.result.is_err() {
+            if first_err.is_none() {
+                first_err = Some(p.result.clone());
+            }
+            continue;
+        }
+        if p.owned_key_idxs.contains(&dst_idx)
+            && let CmdResult::Ok(RespValue::Integer(v)) = &p.result
+        {
+            dst_exists = Some(*v != 0);
+        }
+        if matches!(p.result, CmdResult::DeferredStores { .. }) {
+            stores = Some(p.result.clone());
+        }
+    }
+    if let Some(e) = first_err {
+        return e;
+    }
+    if !replace && dst_exists == Some(true) {
+        return CmdResult::Ok(integer(0));
+    }
+    if let Some(s) = stores {
+        return s;
+    }
+    parts
+        .first()
+        .map(|p| p.result.clone())
+        .unwrap_or_else(|| CmdResult::err("ERR internal: copy merge"))
+}
+
+// ---------------------------------------------------------------------------
+// EXPIRETIME / PEXPIRETIME
+// ---------------------------------------------------------------------------
+
+fn expiretime_common(ctx: &mut OpContext, ms: bool) -> CmdResult {
+    let key = &ctx.args[ctx.owned_keys[0]];
+    if !ctx.db.contains(key, ctx.now_ms) {
+        return CmdResult::Ok(integer(-2));
+    }
+    match ctx.db.expire_at(key) {
+        Some(at) => {
+            if ms {
+                CmdResult::Ok(integer(at as i64))
+            } else {
+                CmdResult::Ok(integer((at as i64 + 500) / 1000))
+            }
+        }
+        None => CmdResult::Ok(integer(-1)),
+    }
+}
+
+fn exec_expiretime(ctx: &mut OpContext) -> CmdResult {
+    expiretime_common(ctx, false)
+}
+
+fn exec_pexpiretime(ctx: &mut OpContext) -> CmdResult {
+    expiretime_common(ctx, true)
+}
+
+// ---------------------------------------------------------------------------
+// RANDOMKEY
+// ---------------------------------------------------------------------------
+
+fn exec_randomkey(ctx: &mut OpContext) -> CmdResult {
+    let keys: Vec<Vec<u8>> = ctx.db.iter().map(|(k, _)| k.as_bytes().to_vec()).collect();
+    if keys.is_empty() {
+        return CmdResult::Ok(RespValue::Nil);
+    }
+    let idx = (crate::util::shard_hash(&ctx.now_ms.to_le_bytes()) as usize) % keys.len();
+    CmdResult::Ok(RespValue::Bulk(keys[idx].clone()))
+}
+
+fn merge_rand(parts: &[ShardPart], _args: &[Vec<u8>], _keys: &[usize], _now: u64) -> CmdResult {
+    for p in parts {
+        if let CmdResult::Ok(RespValue::Bulk(_)) = &p.result {
+            return p.result.clone();
+        }
+    }
+    CmdResult::Ok(RespValue::Nil)
+}
+
+// ---------------------------------------------------------------------------
 // Command definitions
 // ---------------------------------------------------------------------------
 
@@ -380,3 +644,348 @@ pub static CMD_KEYS: Command = Command {
     exec: exec_keys,
     merge: Some(merge_concat),
 };
+pub static CMD_TOUCH: Command = Command {
+    name: "TOUCH",
+    arity: -2,
+    flags: FLAG_READONLY | FLAG_FAST | FLAG_MULTI_KEY,
+    key_range: KeyRange::ALL,
+    exec: exec_exists,
+    merge: Some(merge_sum),
+};
+pub static CMD_UNLINK: Command = Command {
+    name: "UNLINK",
+    arity: -2,
+    flags: FLAG_WRITE | FLAG_MULTI_KEY,
+    key_range: KeyRange::ALL,
+    exec: exec_del,
+    merge: Some(merge_sum),
+};
+pub static CMD_RENAME: Command = Command {
+    name: "RENAME",
+    arity: 3,
+    flags: FLAG_WRITE,
+    key_range: KeyRange::TWO,
+    exec: exec_rename,
+    merge: Some(merge_rename),
+};
+pub static CMD_RENAMENX: Command = Command {
+    name: "RENAMENX",
+    arity: 3,
+    flags: FLAG_WRITE,
+    key_range: KeyRange::TWO,
+    exec: exec_renamenx,
+    merge: Some(merge_rename),
+};
+pub static CMD_COPY: Command = Command {
+    name: "COPY",
+    arity: -3,
+    flags: FLAG_WRITE,
+    key_range: KeyRange::TWO,
+    exec: exec_copy,
+    merge: Some(merge_copy),
+};
+pub static CMD_RANDOMKEY: Command = Command {
+    name: "RANDOMKEY",
+    arity: 1,
+    flags: FLAG_READONLY | FLAG_GLOBAL,
+    key_range: KeyRange::NONE,
+    exec: exec_randomkey,
+    merge: Some(merge_rand),
+};
+pub static CMD_EXPIRETIME: Command = Command {
+    name: "EXPIRETIME",
+    arity: 2,
+    flags: FLAG_READONLY | FLAG_FAST,
+    key_range: KeyRange::ONE,
+    exec: exec_expiretime,
+    merge: None,
+};
+pub static CMD_PEXPIRETIME: Command = Command {
+    name: "PEXPIRETIME",
+    arity: 2,
+    flags: FLAG_READONLY | FLAG_FAST,
+    key_range: KeyRange::ONE,
+    exec: exec_pexpiretime,
+    merge: None,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::db::DbSlice;
+    use crate::core::PrimeValue;
+
+    fn val(r: CmdResult) -> RespValue {
+        r.into_resp_value()
+    }
+
+    fn int_of(r: CmdResult) -> i64 {
+        match r {
+            CmdResult::Ok(RespValue::Integer(v)) => v,
+            o => panic!("expected integer, got {:?}", o.into_resp_value()),
+        }
+    }
+
+    fn err_of(r: CmdResult) -> String {
+        match r {
+            CmdResult::Err(e) => e.message,
+            o => panic!("expected error, got {:?}", o.into_resp_value()),
+        }
+    }
+
+    fn dispatch_at(db: &mut DbSlice, now_ms: u64, argv: &[Vec<u8>]) -> CmdResult {
+        let cmd = argv[0].to_ascii_uppercase();
+        let (exec, first_key_idx, owned): (crate::commands::ExecFn, usize, Vec<usize>) =
+            match cmd.as_slice() {
+                b"DEL" => (exec_del, 1, (1..argv.len()).collect()),
+                b"UNLINK" => (exec_del, 1, (1..argv.len()).collect()),
+                b"TOUCH" => (exec_exists, 1, (1..argv.len()).collect()),
+                b"RENAME" => (exec_rename, 1, (1..3).collect()),
+                b"RENAMENX" => (exec_renamenx, 1, (1..3).collect()),
+                b"COPY" => (exec_copy, 1, (1..3).collect()),
+                b"RANDOMKEY" => (exec_randomkey, 1, vec![]),
+                b"EXPIRETIME" => (exec_expiretime, 1, (1..2).collect()),
+                b"PEXPIRETIME" => (exec_pexpiretime, 1, (1..2).collect()),
+                b"EXISTS" => (exec_exists, 1, (1..argv.len()).collect()),
+                b"PEXPIREAT" => (exec_pexpireat, 1, (1..2).collect()),
+                _ => panic!("unhandled command {:?}", argv[0]),
+            };
+        let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx, now_ms };
+        exec(&mut ctx)
+    }
+
+    fn cmd(db: &mut DbSlice, args: &[&[u8]]) -> CmdResult {
+        dispatch_at(db, 0, &args.iter().map(|a| a.to_vec()).collect::<Vec<_>>())
+    }
+
+    fn cmd_at(db: &mut DbSlice, now_ms: u64, args: &[&[u8]]) -> CmdResult {
+        dispatch_at(db, now_ms, &args.iter().map(|a| a.to_vec()).collect::<Vec<_>>())
+    }
+
+    fn str_of(db: &mut DbSlice, key: &str, value: &str) {
+        db.insert(
+            CompactString::from_bytes(key.as_bytes()),
+            PrimeValue::Str(CompactString::from(value)),
+        );
+    }
+
+    /// Port of `GenericFamilyTest.Touch`.
+    #[test]
+    fn touch() {
+        let mut db = DbSlice::new(0);
+        str_of(&mut db, "x", "0");
+        str_of(&mut db, "y", "1");
+        assert_eq!(int_of(cmd(&mut db, &[b"TOUCH", b"x", b"y", b"x"])), 3);
+        assert_eq!(int_of(cmd(&mut db, &[b"TOUCH", b"z", b"x", b"w"])), 1);
+    }
+
+    /// Port of `GenericFamilyTest.Rename`.
+    #[test]
+    fn rename() {
+        let mut db = DbSlice::new(0);
+        str_of(&mut db, "x", "xxx");
+        str_of(&mut db, "b", "bbb");
+
+        assert_eq!(err_of(cmd(&mut db, &[b"RENAME", b"z", b"b"])), "ERR no such key");
+        assert_eq!(val(cmd(&mut db, &[b"RENAME", b"x", b"b"])), val(CmdResult::Ok(ok())));
+
+        // x no longer exists, b holds the old value of x.
+        assert_eq!(int_of(cmd(&mut db, &[b"EXISTS", b"x", b"b"])), 1);
+        match db.find(b"b", 0) {
+            Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"xxx"),
+            o => panic!("expected string, got {:?}", o),
+        }
+        assert!(!db.contains(b"x", 0));
+    }
+
+    /// Port of `GenericFamilyTest.RenameBinary`.
+    #[test]
+    fn rename_binary() {
+        let mut db = DbSlice::new(0);
+        str_of(&mut db, "\u{1}\u{2}\u{3}\u{4}", "bar");
+        cmd(&mut db, &[b"RENAME", "\u{1}\u{2}\u{3}\u{4}".as_bytes(), "\u{5}\u{6}\u{7}\u{8}".as_bytes()]);
+        assert!(!db.contains("\u{1}\u{2}\u{3}\u{4}".as_bytes(), 0));
+        match db.find("\u{5}\u{6}\u{7}\u{8}".as_bytes(), 0) {
+            Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"bar"),
+            o => panic!("expected string, got {:?}", o),
+        }
+    }
+
+    /// Port of `GenericFamilyTest.RenameNx`.
+    #[test]
+    fn renamenx() {
+        let mut db = DbSlice::new(0);
+        str_of(&mut db, "x", "xxx");
+        str_of(&mut db, "b", "bbb");
+
+        assert_eq!(err_of(cmd(&mut db, &[b"RENAMENX", b"z", b"b"])), "ERR no such key");
+        assert_eq!(int_of(cmd(&mut db, &[b"RENAMENX", b"x", b"b"])), 0); // b exists
+        assert_eq!(int_of(cmd(&mut db, &[b"RENAMENX", b"x", b"y"])), 1);
+        match db.find(b"y", 0) {
+            Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"xxx"),
+            o => panic!("expected string, got {:?}", o),
+        }
+        assert_eq!(int_of(cmd(&mut db, &[b"RENAMENX", b"y", b"y"])), 0);
+    }
+
+    /// Port of `GenericFamilyTest.RenameSameName`.
+    #[test]
+    fn rename_same_name() {
+        let mut db = DbSlice::new(0);
+        assert_eq!(err_of(cmd(&mut db, &[b"RENAME", b"key", b"key"])), "ERR no such key");
+
+        str_of(&mut db, "key", "value");
+        assert_eq!(val(cmd(&mut db, &[b"RENAME", b"key", b"key"])), val(CmdResult::Ok(ok())));
+    }
+
+    /// Port of `GenericFamilyTest.Copy`.
+    #[test]
+    fn copy() {
+        let mut db = DbSlice::new(0);
+        str_of(&mut db, "x", "xxx");
+        str_of(&mut db, "b", "bbb");
+
+        assert_eq!(int_of(cmd(&mut db, &[b"COPY", b"z", b"b"])), 0);
+        assert_eq!(int_of(cmd(&mut db, &[b"COPY", b"b", b"c"])), 1);
+        match db.find(b"c", 0) {
+            Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"bbb"),
+            o => panic!("expected string, got {:?}", o),
+        }
+
+        assert_eq!(int_of(cmd(&mut db, &[b"COPY", b"x", b"b", b"REPLACE"])), 1);
+        // Both keys now hold x's value.
+        assert_eq!(int_of(cmd(&mut db, &[b"EXISTS", b"x", b"b"])), 2);
+        match db.find(b"x", 0) {
+            Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"xxx"),
+            o => panic!("expected string, got {:?}", o),
+        }
+        match db.find(b"b", 0) {
+            Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"xxx"),
+            o => panic!("expected string, got {:?}", o),
+        }
+    }
+
+    /// Port of `GenericFamilyTest.CopyNonString`: any value type is copied.
+    #[test]
+    fn copy_non_string() {
+        let mut db = DbSlice::new(0);
+        db.insert(CompactString::from("x"), PrimeValue::List(crate::core::quicklist::QuickList::default()));
+        assert_eq!(int_of(cmd(&mut db, &[b"COPY", b"x", b"b"])), 1);
+        assert!(db.contains(b"b", 0));
+        assert_eq!(int_of(cmd(&mut db, &[b"DEL", b"x"])), 1);
+        assert_eq!(int_of(cmd(&mut db, &[b"DEL", b"b"])), 1);
+    }
+
+    /// Port of `GenericFamilyTest.CopyTTL`: TTL is preserved on copy.
+    #[test]
+    fn copy_ttl() {
+        let mut db = DbSlice::new(0);
+        str_of(&mut db, "k1", "bar");
+        db.set_expiry(b"k1", 10_000, 0);
+
+        assert_eq!(int_of(cmd(&mut db, &[b"COPY", b"k1", b"k2"])), 1);
+        assert_eq!(db.ttl_ms(b"k2", 0), 10_000);
+    }
+
+    /// Port of `GenericFamilyTest.CopySameName`.
+    #[test]
+    fn copy_same_name() {
+        let mut db = DbSlice::new(0);
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"COPY", b"k1", b"k1"])),
+            "source and destination objects are the same"
+        );
+
+        str_of(&mut db, "k1", "v");
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"COPY", b"k1", b"k1"])),
+            "source and destination objects are the same"
+        );
+    }
+
+    /// Port of `GenericFamilyTest.CopyToDB`: unknown option is a syntax error.
+    #[test]
+    fn copy_to_db_unsupported() {
+        let mut db = DbSlice::new(0);
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"COPY", b"k1", b"k1", b"DB", b"SOME_DB"])),
+            "ERR syntax error"
+        );
+    }
+
+    /// Port of `GenericFamilyTest.CopyKeyExists`.
+    #[test]
+    fn copy_key_exists() {
+        let mut db = DbSlice::new(0);
+        str_of(&mut db, "source", "value1");
+        str_of(&mut db, "destination", "value2");
+
+        assert_eq!(int_of(cmd(&mut db, &[b"COPY", b"source", b"destination"])), 0);
+        assert_eq!(int_of(cmd(&mut db, &[b"COPY", b"source", b"destination", b"REPLACE"])), 1);
+        match db.find(b"destination", 0) {
+            Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"value1"),
+            o => panic!("expected string, got {:?}", o),
+        }
+        // Source is untouched.
+        match db.find(b"source", 0) {
+            Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"value1"),
+            o => panic!("expected string, got {:?}", o),
+        }
+    }
+
+    /// Port of `GenericFamilyTest.RandomKey`.
+    #[test]
+    fn randomkey() {
+        let mut db = DbSlice::new(0);
+        assert!(matches!(val(cmd(&mut db, &[b"RANDOMKEY"])), RespValue::Nil));
+
+        str_of(&mut db, "k1", "1");
+        match val(cmd(&mut db, &[b"RANDOMKEY"])) {
+            RespValue::Bulk(b) => assert_eq!(b, b"k1"),
+            o => panic!("expected bulk, got {:?}", o),
+        }
+    }
+
+    /// Port of `GenericFamilyTest.ExpireTime`.
+    #[test]
+    fn expiretime() {
+        let mut db = DbSlice::new(0);
+        assert_eq!(int_of(cmd(&mut db, &[b"EXPIRETIME", b"foo"])), -2);
+        assert_eq!(int_of(cmd(&mut db, &[b"PEXPIRETIME", b"foo"])), -2);
+
+        str_of(&mut db, "foo", "bar");
+        assert_eq!(int_of(cmd(&mut db, &[b"EXPIRETIME", b"foo"])), -1);
+        assert_eq!(int_of(cmd(&mut db, &[b"PEXPIRETIME", b"foo"])), -1);
+
+        // pexpireat foo <now + 5000> -> absolute expiry in ms.
+        cmd_at(&mut db, 0, &[b"PEXPIREAT", b"foo", b"5000"]);
+        assert_eq!(int_of(cmd_at(&mut db, 0, &[b"EXPIRETIME", b"foo"])), 5);
+        assert_eq!(int_of(cmd_at(&mut db, 0, &[b"PEXPIRETIME", b"foo"])), 5000);
+    }
+
+    /// Port of `GenericFamilyTest.Unlink`: same reply as DEL.
+    #[test]
+    fn unlink() {
+        let mut db = DbSlice::new(0);
+        str_of(&mut db, "s1", "v");
+        str_of(&mut db, "s2", "v");
+        assert_eq!(int_of(cmd(&mut db, &[b"UNLINK", b"s1", b"s2"])), 2);
+        assert!(!db.contains(b"s1", 0));
+        assert!(!db.contains(b"s2", 0));
+    }
+
+    /// RENAME carries the source TTL to the destination (mirrors OpRen).
+    #[test]
+    fn rename_preserves_ttl() {
+        let mut db = DbSlice::new(0);
+        str_of(&mut db, "src", "v");
+        db.set_expiry(b"src", 10_000, 0);
+        str_of(&mut db, "dst", "old");
+        db.set_expiry(b"dst", 99_000, 0);
+
+        assert_eq!(val(cmd(&mut db, &[b"RENAME", b"src", b"dst"])), val(CmdResult::Ok(ok())));
+        assert_eq!(db.ttl_ms(b"dst", 0), 10_000);
+        assert!(!db.contains(b"src", 0));
+    }
+}
+
