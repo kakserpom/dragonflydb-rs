@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
-use crate::commands::{integer, ok, Command, OpContext, ShardPart, KeyRange, FLAG_FAST, FLAG_GLOBAL, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE};
+use crate::commands::{integer, ok, Command, OpContext, ShardPart, KeyRange, FLAG_FAST, FLAG_GLOBAL, FLAG_MOVABLEKEYS, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE};
 use crate::core::compact::CompactString;
 use crate::core::db::DbSlice;
+use crate::core::quicklist::{ListItem, QuickList};
 use crate::core::value::ObjType;
 use crate::core::PrimeValue;
 use crate::error::{CmdResult, RespError, RespValue};
-use crate::util::{parse_i64, parse_u64, shard_hash};
+use crate::util::{parse_double, parse_i64, parse_u64, shard_hash};
 use xxhash_rust::xxh3::xxh3_64;
 
 // ---------------------------------------------------------------------------
@@ -984,6 +985,349 @@ fn merge_scan(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64)
 }
 
 // ---------------------------------------------------------------------------
+// SORT / SORT_RO
+// ---------------------------------------------------------------------------
+
+/// Options parsed from a SORT/SORT_RO argument list, mirroring the reference
+/// `SortParams`.
+struct SortOpts {
+    alpha: bool,
+    reversed: bool,
+    to_sort: bool,
+    store_key: Option<usize>,
+    by_pattern: Option<Vec<u8>>,
+    get_patterns: Vec<Vec<u8>>,
+    bounds: Option<(usize, usize)>,
+}
+
+/// Parse SORT options from `args[2..]`. Mirrors the reference grammar
+/// (Options(ALPHA, DESC/ASC, LIMIT, STORE, BY, GET)): options may appear in
+/// any order and repeat (last one wins), unknown options are a syntax error,
+/// and STORE is rejected for SORT_RO. LIMIT values must fit in u32; anything
+/// else (including negatives) is an integer error.
+fn parse_sort_opts(args: &[Vec<u8>], is_ro: bool) -> Result<SortOpts, RespError> {
+    let mut opts = SortOpts {
+        alpha: false,
+        reversed: false,
+        to_sort: true,
+        store_key: None,
+        by_pattern: None,
+        get_patterns: Vec::new(),
+        bounds: None,
+    };
+    let mut i = 2;
+    while i < args.len() {
+        let opt = args[i].to_ascii_uppercase();
+        let next = || args.get(i + 1).ok_or_else(RespError::syntax);
+        match opt.as_slice() {
+            b"ALPHA" => {
+                opts.alpha = true;
+                i += 1;
+            }
+            b"ASC" => {
+                opts.reversed = false;
+                i += 1;
+            }
+            b"DESC" => {
+                opts.reversed = true;
+                i += 1;
+            }
+            b"LIMIT" => {
+                let off = parse_limit_u32(args.get(i + 1).ok_or_else(RespError::syntax)?)?;
+                let cnt = parse_limit_u32(args.get(i + 2).ok_or_else(RespError::syntax)?)?;
+                opts.bounds = Some((off, cnt));
+                i += 3;
+            }
+            b"STORE" => {
+                if is_ro {
+                    return Err(RespError::syntax());
+                }
+                opts.store_key = Some(i + 1);
+                i += 2;
+            }
+            b"BY" => {
+                opts.by_pattern = Some(next()?.to_vec());
+                i += 2;
+            }
+            b"GET" => {
+                opts.get_patterns.push(next()?.to_vec());
+                i += 2;
+            }
+            _ => return Err(RespError::syntax()),
+        }
+    }
+    // "nosort" (BY with no '*') disables sorting; 2+ '*' is a syntax error.
+    if let Some(p) = &opts.by_pattern {
+        let stars = p.iter().filter(|&&b| b == b'*').count();
+        if stars == 0 {
+            opts.to_sort = false;
+            opts.by_pattern = None;
+        } else if stars != 1 {
+            return Err(RespError::syntax());
+        }
+    }
+    // Each GET pattern must be "#" or contain at most one '*'.
+    for p in &opts.get_patterns {
+        if p != b"#" && p.iter().filter(|&&b| b == b'*').count() > 1 {
+            return Err(RespError::syntax());
+        }
+    }
+    Ok(opts)
+}
+
+fn parse_limit_u32(s: &[u8]) -> Result<usize, RespError> {
+    match parse_i64(s) {
+        Some(v) if (0..=u32::MAX as i64).contains(&v) => Ok(v as usize),
+        _ => Err(RespError::integer()),
+    }
+}
+
+/// One sortable element, the analogue of the reference `SortEntry`.
+struct SortEntry {
+    /// Sort key: the parsed string (alpha mode) or the raw score string
+    /// (numeric mode, used for the lexicographic tie-break).
+    key: Vec<u8>,
+    /// Numeric score (only meaningful in non-alpha mode).
+    score: f64,
+    /// The element used for the reply and GET pattern substitution: the
+    /// original container member, or the BY-bound element for BY lookups.
+    result: Vec<u8>,
+    /// Fetched GET pattern values, one per pattern.
+    get_values: Vec<Vec<u8>>,
+}
+
+/// Comparator mirroring `SortEntry::less`/`SortEntry::greater`: numeric score
+/// first with a lexicographic key tie-break, reversed for DESC.
+fn sort_entry_cmp(l: &SortEntry, r: &SortEntry, alpha: bool, reversed: bool) -> std::cmp::Ordering {
+    let ord = if alpha {
+        l.key.cmp(&r.key)
+    } else {
+        l.score
+            .partial_cmp(&r.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| l.key.cmp(&r.key))
+    };
+    if reversed {
+        ord.reverse()
+    } else {
+        ord
+    }
+}
+
+/// Parse one sort key. In alpha mode the raw bytes are kept as-is; in numeric
+/// mode the value must be a double (empty parses to 0, NaN or garbage is the
+/// reference's "can't be converted into double" error).
+fn parse_sort_value(raw: Vec<u8>, alpha: bool) -> Result<(Vec<u8>, f64), RespError> {
+    if alpha || raw.is_empty() {
+        return Ok((raw, 0.0));
+    }
+    match parse_double(&raw) {
+        Some(f) if !f.is_nan() => Ok((raw, f)),
+        _ => Err(RespError::new(SORT_SCORE_ERR)),
+    }
+}
+
+/// Fetch a string value by key for GET/BY lookups, defaulting to the empty
+/// string when missing or not a string (mirrors `OpFetchStringValue`). Note:
+/// only the local shard's data is consulted, so multi-shard deployments with
+/// external GET/BY keys on other shards read them as empty (a port limitation).
+fn local_string_value(db: &mut DbSlice, key: &[u8], now_ms: u64) -> Vec<u8> {
+    match db.find(key, now_ms) {
+        Some(PrimeValue::Str(s)) => s.as_bytes().to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+/// Fetch a container's elements in iteration order, mirroring
+/// `OpFetchContainerElements`. Prunes expired set members and removes the key
+/// when the set became empty. Returns an empty vector for a missing or empty
+/// container; wrong types are an error.
+fn fetch_container_elements(
+    db: &mut DbSlice,
+    key: &[u8],
+    now_ms: u64,
+) -> Result<Vec<Vec<u8>>, RespError> {
+    match db.find_mut(key, now_ms) {
+        None => Ok(Vec::new()),
+        Some(PrimeValue::List(l)) => Ok(l.iter().map(|it| it.as_bytes()).collect()),
+        Some(PrimeValue::Set(s)) => {
+            s.prune_expired(now_ms);
+            let elems = s.members().into_iter().map(|m| m.as_bytes().to_vec()).collect();
+            if s.is_empty() {
+                db.remove(key);
+            }
+            Ok(elems)
+        }
+        Some(PrimeValue::ZSet(z)) => Ok(z.iter().map(|(m, _)| m.as_bytes().to_vec()).collect()),
+        Some(_) => Err(RespError::wrong_type()),
+    }
+}
+
+/// Expand a GET/BY pattern by substituting the element into the first '*'.
+/// Patterns without a '*' are used literally.
+fn expand_pattern(pattern: &[u8], element: &[u8]) -> Vec<u8> {
+    let star_pos = pattern.iter().position(|&b| b == b'*');
+    match star_pos {
+        Some(p) => {
+            let mut out = Vec::with_capacity(pattern.len() + element.len());
+            out.extend_from_slice(&pattern[..p]);
+            out.extend_from_slice(element);
+            out.extend_from_slice(&pattern[p + 1..]);
+            out
+        }
+        None => pattern.to_vec(),
+    }
+}
+
+/// The reference error for a non-numeric element under numeric SORT.
+const SORT_SCORE_ERR: &str = "One or more scores can't be converted into double";
+
+/// Shared executor for SORT and SORT_RO. On a multi-shard STORE the shard that
+/// owns the source key returns the computed list via `DeferredStore` and the
+/// merge forwards it; the shard owning only the destination returns an empty
+/// array and is ignored.
+fn exec_sort(ctx: &mut OpContext) -> CmdResult {
+    let is_ro = ctx.args[0].eq_ignore_ascii_case(b"SORT_RO");
+    let opts = match parse_sort_opts(ctx.args, is_ro) {
+        Ok(o) => o,
+        Err(e) => return CmdResult::Err(e),
+    };
+    let key_idx = ctx.first_key_idx;
+    // A shard owning only the STORE destination has nothing to contribute.
+    if !ctx.owned_keys.contains(&key_idx) {
+        return CmdResult::Ok(RespValue::Array(vec![]));
+    }
+    let key = &ctx.args[key_idx];
+
+    // Missing source key -> empty array (the STORE destination is untouched).
+    if !ctx.db.contains(key, ctx.now_ms) {
+        return CmdResult::Ok(RespValue::Array(vec![]));
+    }
+    let elems = match fetch_container_elements(ctx.db, key, ctx.now_ms) {
+        Ok(e) => e,
+        Err(e) => return CmdResult::Err(e),
+    };
+
+    let mut entries: Vec<SortEntry> = Vec::with_capacity(elems.len());
+    if !opts.to_sort {
+        // BY nosort: preserve insertion order, no parsing, no sorting.
+        for el in &elems {
+            entries.push(SortEntry {
+                key: el.clone(),
+                score: 0.0,
+                result: el.clone(),
+                get_values: Vec::new(),
+            });
+        }
+    } else if let Some(by) = &opts.by_pattern {
+        // Sort by external key values; reply with the original elements.
+        for el in &elems {
+            let ext_key = expand_pattern(by, el);
+            let external = local_string_value(ctx.db, &ext_key, ctx.now_ms);
+            let (key, score) = match parse_sort_value(external, opts.alpha) {
+                Ok(k) => k,
+                Err(e) => return CmdResult::Err(e),
+            };
+            entries.push(SortEntry { key, score, result: el.clone(), get_values: Vec::new() });
+        }
+    } else {
+        // Sort the elements themselves.
+        for el in &elems {
+            let (key, score) = match parse_sort_value(el.clone(), opts.alpha) {
+                Ok(k) => k,
+                Err(e) => return CmdResult::Err(e),
+            };
+            entries.push(SortEntry { key, score, result: el.clone(), get_values: Vec::new() });
+        }
+    }
+
+    if opts.to_sort {
+        entries.sort_by(|l, r| sort_entry_cmp(l, r, opts.alpha, opts.reversed));
+    }
+
+    // LIMIT is applied to the sorted entries.
+    let (off, cnt) = opts.bounds.unwrap_or((0, entries.len()));
+    let start = off.min(entries.len());
+    let end = (off.saturating_add(cnt)).min(entries.len());
+
+    // Fetch GET pattern values for the entries in range.
+    if !opts.get_patterns.is_empty() {
+        for e in entries.iter_mut() {
+            e.get_values.resize(opts.get_patterns.len(), Vec::new());
+        }
+        for (pi, pattern) in opts.get_patterns.iter().enumerate() {
+            for e in entries.iter_mut() {
+                let value = if pattern == b"#" {
+                    e.result.clone()
+                } else {
+                    local_string_value(ctx.db, &expand_pattern(pattern, &e.result), ctx.now_ms)
+                };
+                e.get_values[pi] = value;
+            }
+        }
+    }
+
+    // Flatten the values to reply or store: with GET patterns all pattern
+    // values per entry in order, otherwise the elements themselves.
+    let has_get = !opts.get_patterns.is_empty();
+    let stored: Vec<Vec<u8>> = if has_get {
+        let mut out = Vec::new();
+        for e in &entries[start..end] {
+            out.extend(e.get_values.iter().cloned());
+        }
+        out
+    } else {
+        entries[start..end].iter().map(|e| e.result.clone()).collect()
+    };
+    let count = stored.len() as i64;
+
+    if let Some(dest_idx) = opts.store_key {
+        let dest = &ctx.args[dest_idx];
+        let value = if stored.is_empty() {
+            None
+        } else {
+            let mut list = QuickList::new();
+            for v in &stored {
+                list.push_back(ListItem::from_bytes(v));
+            }
+            Some(PrimeValue::List(list))
+        };
+        // Single-shard command: write the destination here. Multi-shard:
+        // hand it to the coordinator as a deferred store.
+        if ctx.owned_keys.contains(&dest_idx) {
+            match value {
+                Some(v) => {
+                    ctx.db.clear_expiry(dest);
+                    ctx.db.insert(CompactString::from_bytes(dest), v);
+                }
+                None => {
+                    ctx.db.remove(dest);
+                }
+            }
+            return CmdResult::Ok(integer(count));
+        }
+        return CmdResult::deferred_store(dest.clone(), value, integer(count));
+    }
+
+    CmdResult::Ok(RespValue::Array(stored.into_iter().map(RespValue::Bulk).collect()))
+}
+
+/// Merge for SORT: forward the source shard's result (an array, or a
+/// `DeferredStore` for multi-shard STORE). Other shards only owned the
+/// destination and returned placeholders.
+fn merge_sort(parts: &[ShardPart], _args: &[Vec<u8>], keys: &[usize], _now: u64) -> CmdResult {
+    for p in parts {
+        if let CmdResult::Err(e) = &p.result {
+            return CmdResult::Err(e.clone());
+        }
+        if p.owned_key_idxs.contains(&keys[0]) {
+            return p.result.clone();
+        }
+    }
+    parts[0].result.clone()
+}
+
+// ---------------------------------------------------------------------------
 // Command definitions
 // ---------------------------------------------------------------------------
 
@@ -1171,6 +1515,22 @@ pub static CMD_SCAN: Command = Command {
     exec: exec_scan,
     merge: Some(merge_scan),
 };
+pub static CMD_SORT: Command = Command {
+    name: "SORT",
+    arity: -2,
+    flags: FLAG_WRITE | FLAG_MOVABLEKEYS,
+    key_range: KeyRange::ONE,
+    exec: exec_sort,
+    merge: Some(merge_sort),
+};
+pub static CMD_SORT_RO: Command = Command {
+    name: "SORT_RO",
+    arity: -2,
+    flags: FLAG_READONLY | FLAG_MOVABLEKEYS,
+    key_range: KeyRange::ONE,
+    exec: exec_sort,
+    merge: Some(merge_sort),
+};
 
 #[cfg(test)]
 mod tests {
@@ -1179,6 +1539,15 @@ mod tests {
     use crate::core::set::Set;
     use crate::core::PrimeValue;
     use crate::core::zset::ZSet;
+
+    macro_rules! bvecs {
+        () => {
+            Vec::<Vec<u8>>::new()
+        };
+        ($($x:literal),* $(,)?) => {
+            vec![$(($x).as_bytes().to_vec()),*]
+        };
+    }
 
     fn val(r: CmdResult) -> RespValue {
         r.into_resp_value()
@@ -1214,6 +1583,10 @@ mod tests {
                 b"EXPIRETIME" => (exec_expiretime, 1, (1..2).collect()),
                 b"PEXPIRETIME" => (exec_pexpiretime, 1, (1..2).collect()),
                 b"SCAN" => (exec_scan, 1, vec![]),
+                b"SORT" | b"SORT_RO" => (exec_sort, 1, (1..argv.len()).collect()),
+                b"TTL" => (exec_ttl, 1, (1..2).collect()),
+                b"PTTL" => (exec_pttl, 1, (1..2).collect()),
+                b"EXPIRE" => (exec_expire, 1, (1..2).collect()),
                 b"KEYS" => (exec_keys, 1, vec![]),
                 b"EXISTS" => (exec_exists, 1, (1..argv.len()).collect()),
                 b"PEXPIREAT" => (exec_pexpireat, 1, (1..2).collect()),
@@ -1767,6 +2140,373 @@ mod tests {
         assert_eq!(keys, vec![b"k1".to_vec(), b"k2".to_vec()]);
 
         assert_eq!(scan_keys(&mut db, 0, &[b"SCAN", b"0", b"MINMSZ", b"500"]), vec![b"k1".to_vec()]);
+    }
+
+    fn list_of(db: &mut DbSlice, key: &str, items: &[&str]) {
+        let ql = QuickList::from_items(
+            items.iter().map(|s| ListItem::Str(CompactString::from(*s))).collect(),
+        );
+        db.insert(CompactString::from_bytes(key.as_bytes()), PrimeValue::List(ql));
+    }
+
+    fn set_of(db: &mut DbSlice, key: &str, members: &[&str]) {
+        let mut s = Set::new();
+        for &m in members {
+            s.add(CompactString::from(m));
+        }
+        db.insert(CompactString::from_bytes(key.as_bytes()), PrimeValue::Set(s));
+    }
+
+    fn zset_of(db: &mut DbSlice, key: &str, members: &[&str]) {
+        let mut z = ZSet::new();
+        for &m in members {
+            z.insert(CompactString::from(m), 0.0);
+        }
+        db.insert(CompactString::from_bytes(key.as_bytes()), PrimeValue::ZSet(z));
+    }
+
+    /// Reply values as bulk strings.
+    fn bulks(r: CmdResult) -> Vec<Vec<u8>> {
+        match val(r) {
+            RespValue::Array(a) => a
+                .iter()
+                .map(|v| match v {
+                    RespValue::Bulk(b) => b.clone(),
+                    o => panic!("expected bulk, got {:?}", o),
+                })
+                .collect(),
+            RespValue::Bulk(b) => vec![b.clone()],
+            o => panic!("expected array, got {:?}", o),
+        }
+    }
+
+    fn lrange_of(db: &mut DbSlice, key: &str) -> Vec<Vec<u8>> {
+        match db.find(key.as_bytes(), 0) {
+            Some(PrimeValue::List(l)) => l.iter().map(|it| it.as_bytes()).collect(),
+            o => panic!("expected list, got {:?}", o),
+        }
+    }
+
+    /// Port of `GenericFamilyTest.Sort`: numeric/alpha/desc/limit sorting over
+    /// lists, sets, intsets and sorted sets, plus error cases.
+    #[test]
+    fn sort() {
+        let mut db = DbSlice::new(0);
+        list_of(&mut db, "list-1", &["3.5", "1.2", "10.1", "2.20", "200"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1"])), bvecs!["1.2", "2.20", "3.5", "10.1", "200"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"ALPHA"])), bvecs!["1.2", "10.1", "2.20", "200", "3.5"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"DESC"])), bvecs!["200", "10.1", "3.5", "2.20", "1.2"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"DESC", b"ALPHA"])), bvecs!["3.5", "200", "2.20", "10.1", "1.2"]);
+        // ASC/DESC last-one-wins.
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"DESC", b"ASC"])), bvecs!["1.2", "2.20", "3.5", "10.1", "200"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"ASC", b"DESC"])), bvecs!["200", "10.1", "3.5", "2.20", "1.2"]);
+        // Limits.
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"0", b"5"])), bvecs!["1.2", "2.20", "3.5", "10.1", "200"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"0", b"10"])), bvecs!["1.2", "2.20", "3.5", "10.1", "200"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"2", b"2"])), bvecs!["3.5", "10.1"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"1", b"1"])), bvecs!["2.20"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"4", b"2"])), bvecs!["200"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"5", b"2"])), bvecs![]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"DESC", b"LIMIT", b"0", b"5"])), bvecs!["200", "10.1", "3.5", "2.20", "1.2"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"DESC", b"LIMIT", b"2", b"2"])), bvecs!["3.5", "2.20"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"DESC", b"LIMIT", b"1", b"1"])), bvecs!["10.1"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"DESC", b"LIMIT", b"5", b"2"])), bvecs![]);
+
+        set_of(&mut db, "set-1", &["5.3", "4.4", "60", "99.9", "100", "9"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"set-1"])), bvecs!["4.4", "5.3", "9", "60", "99.9", "100"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"set-1", b"ALPHA"])), bvecs!["100", "4.4", "5.3", "60", "9", "99.9"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"set-1", b"DESC"])), bvecs!["100", "99.9", "60", "9", "5.3", "4.4"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"set-1", b"DESC", b"ALPHA"])), bvecs!["99.9", "9", "60", "5.3", "4.4", "100"]);
+
+        set_of(&mut db, "intset-1", &["5", "4", "3", "2", "1"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"intset-1"])), bvecs!["1", "2", "3", "4", "5"]);
+
+        zset_of(&mut db, "zset-1", &["3.3", "30.1", "8.2"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"zset-1"])), bvecs!["3.3", "8.2", "30.1"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"zset-1", b"ALPHA"])), bvecs!["3.3", "30.1", "8.2"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"zset-1", b"DESC"])), bvecs!["30.1", "8.2", "3.3"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"zset-1", b"DESC", b"ALPHA"])), bvecs!["8.2", "30.1", "3.3"]);
+
+        // Missing key -> empty array.
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-2"])), bvecs![]);
+
+        // Non-numeric and NaN elements error.
+        list_of(&mut db, "list-2", &["NOTADOUBLE"]);
+        assert_eq!(err_of(cmd(&mut db, &[b"SORT", b"list-2"])), SORT_SCORE_ERR);
+        list_of(&mut db, "NANvalue", &["nan"]);
+        assert_eq!(err_of(cmd(&mut db, &[b"SORT", b"NANvalue"])), SORT_SCORE_ERR);
+
+        // Wrong type.
+        str_of(&mut db, "foo", "bar");
+        assert_eq!(err_of(cmd(&mut db, &[b"SORT", b"foo"])), "WRONGTYPE Operation against a key holding the wrong kind of value");
+
+        // Empty string parses to 0 and ties are broken lexicographically.
+        list_of(&mut db, "list-3", &[""]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-3"])), vec![vec![]]);
+        list_of(&mut db, "list-3", &["", "2", "0", "", "-0.14", "0.12", "-0", "-123123", "7654"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-3"])), bvecs!["-123123", "-0.14", "", "", "-0", "0", "0.12", "2", "7654"]);
+    }
+
+    /// Port of `GenericFamilyTest.SortBug3636`: alpha sort of floats with a
+    /// stable size.
+    #[test]
+    fn sort_bug3636() {
+        let mut db = DbSlice::new(0);
+        list_of(
+            &mut db,
+            "foo",
+            &[
+                "1.100000023841858", "1.100000023841858", "1.100000023841858", "-15710",
+                "1.100000023841858", "1.100000023841858", "1.100000023841858", "-15710", "-15710",
+                "1.100000023841858", "-15710", "-15710", "-15710", "-15710", "1.100000023841858",
+                "-15710", "-15710",
+            ],
+        );
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"foo", b"desc", b"alpha"])).len(), 17);
+    }
+
+    /// Port of `GenericFamilyTest.SortStore`.
+    #[test]
+    fn sort_store() {
+        let mut db = DbSlice::new(0);
+        list_of(&mut db, "list-1", &["3.5", "1.2", "10.1", "2.20", "200"]);
+        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-1", b"store", b"list-2"])), 5);
+        assert_eq!(lrange_of(&mut db, "list-2"), bvecs!["1.2", "2.20", "3.5", "10.1", "200"]);
+        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-1", b"ALPHA", b"store", b"list-2"])), 5);
+        assert_eq!(lrange_of(&mut db, "list-2"), bvecs!["1.2", "10.1", "2.20", "200", "3.5"]);
+        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-1", b"DESC", b"store", b"list-2"])), 5);
+        assert_eq!(lrange_of(&mut db, "list-2"), bvecs!["200", "10.1", "3.5", "2.20", "1.2"]);
+        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-1", b"ALPHA", b"DESC", b"store", b"list-2"])), 5);
+        assert_eq!(lrange_of(&mut db, "list-2"), bvecs!["3.5", "200", "2.20", "10.1", "1.2"]);
+
+        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"2", b"2", b"store", b"list-2"])), 2);
+        assert_eq!(lrange_of(&mut db, "list-2"), bvecs!["3.5", "10.1"]);
+        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"1", b"1", b"store", b"list-2"])), 1);
+        assert_eq!(lrange_of(&mut db, "list-2"), bvecs!["2.20"]);
+        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"5", b"2", b"store", b"list-2"])), 0);
+        assert_eq!(int_of(cmd(&mut db, &[b"EXISTS", b"list-2"])), 0);
+
+        set_of(&mut db, "set-1", &["5.3", "4.4", "60", "99.9", "100", "9"]);
+        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"set-1", b"store", b"list-3"])), 6);
+        assert_eq!(lrange_of(&mut db, "list-3"), bvecs!["4.4", "5.3", "9", "60", "99.9", "100"]);
+
+        zset_of(&mut db, "zset-1", &["3.3", "30.1", "8.2"]);
+        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"zset-1", b"store", b"list-4"])), 3);
+        assert_eq!(lrange_of(&mut db, "list-4"), bvecs!["3.3", "8.2", "30.1"]);
+
+        // Same key overwrite.
+        list_of(&mut db, "list-1", &["3.5", "1.2", "10.1", "2.20", "200"]);
+        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-1", b"store", b"list-1"])), 5);
+        assert_eq!(lrange_of(&mut db, "list-1"), bvecs!["1.2", "2.20", "3.5", "10.1", "200"]);
+    }
+
+    /// Port of `GenericFamilyTest.SortStoreEmptyResult`: an empty stored result
+    /// must delete the destination key rather than leaving an empty list.
+    #[test]
+    fn sort_store_empty_result() {
+        let mut db = DbSlice::new(0);
+        list_of(&mut db, "list-src", &["3", "1", "2"]);
+        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-src", b"LIMIT", b"10", b"5", b"store", b"dest"])), 0);
+        assert_eq!(int_of(cmd(&mut db, &[b"EXISTS", b"dest"])), 0);
+
+        str_of(&mut db, "dest", "old");
+        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-src", b"LIMIT", b"0", b"0", b"store", b"dest"])), 0);
+        assert_eq!(int_of(cmd(&mut db, &[b"EXISTS", b"dest"])), 0);
+    }
+
+    /// Port of `GenericFamilyTest.SortStoreResetsExpiry`: SORT STORE clears the
+    /// destination's expiry.
+    #[test]
+    fn sort_store_resets_expiry() {
+        let mut db = DbSlice::new(0);
+        set_of(&mut db, "src", &["3", "1", "2"]);
+        set_of(&mut db, "dest", &["old"]);
+        cmd_at(&mut db, 0, &[b"EXPIRE", b"dest", b"100"]);
+        assert!(int_of(cmd_at(&mut db, 0, &[b"TTL", b"dest"])) > 0);
+
+        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"src", b"store", b"dest"])), 3);
+        assert_eq!(int_of(cmd_at(&mut db, 0, &[b"TTL", b"dest"])), -1);
+        assert_eq!(lrange_of(&mut db, "dest"), bvecs!["1", "2", "3"]);
+
+        set_of(&mut db, "myset", &["c", "a", "b"]);
+        cmd_at(&mut db, 0, &[b"EXPIRE", b"myset", b"100"]);
+        assert!(int_of(cmd_at(&mut db, 0, &[b"TTL", b"myset"])) > 0);
+        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"myset", b"ALPHA", b"store", b"myset"])), 3);
+        assert_eq!(int_of(cmd_at(&mut db, 0, &[b"TTL", b"myset"])), -1);
+        assert_eq!(lrange_of(&mut db, "myset"), bvecs!["a", "b", "c"]);
+    }
+
+    /// Port of `GenericFamilyTest.Sort_RO`.
+    #[test]
+    fn sort_ro() {
+        let mut db = DbSlice::new(0);
+        list_of(&mut db, "list-1", &["3.5", "1.2", "10.1", "2.20", "200"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"list-1"])), bvecs!["1.2", "2.20", "3.5", "10.1", "200"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"list-1", b"ALPHA"])), bvecs!["1.2", "10.1", "2.20", "200", "3.5"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"list-1", b"DESC"])), bvecs!["200", "10.1", "3.5", "2.20", "1.2"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"list-1", b"DESC", b"ALPHA"])), bvecs!["3.5", "200", "2.20", "10.1", "1.2"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"list-1", b"LIMIT", b"2", b"2"])), bvecs!["3.5", "10.1"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"list-1", b"DESC", b"LIMIT", b"1", b"1"])), bvecs!["10.1"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"list-1", b"LIMIT", b"5", b"2"])), bvecs![]);
+
+        set_of(&mut db, "set-1", &["5.3", "4.4", "60", "99.9", "100", "9"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"set-1"])), bvecs!["4.4", "5.3", "9", "60", "99.9", "100"]);
+        set_of(&mut db, "intset-1", &["5", "4", "3", "2", "1"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"intset-1"])), bvecs!["1", "2", "3", "4", "5"]);
+        zset_of(&mut db, "zset-1", &["3.3", "30.1", "8.2"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"zset-1"])), bvecs!["3.3", "8.2", "30.1"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"zset-1", b"ALPHA"])), bvecs!["3.3", "30.1", "8.2"]);
+
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"list-2"])), bvecs![]);
+        list_of(&mut db, "list-2", &["NOTADOUBLE"]);
+        assert_eq!(err_of(cmd(&mut db, &[b"SORT_RO", b"list-2"])), SORT_SCORE_ERR);
+        str_of(&mut db, "foo", "bar");
+        assert_eq!(err_of(cmd(&mut db, &[b"SORT_RO", b"foo"])), "WRONGTYPE Operation against a key holding the wrong kind of value");
+
+        list_of(&mut db, "list-3", &["", "2", "0", "", "-0.14", "0.12", "-0", "-123123", "7654"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"list-3"])), bvecs!["-123123", "-0.14", "", "", "-0", "0", "0.12", "2", "7654"]);
+        list_of(&mut db, "NANvalue", &["nan"]);
+        assert_eq!(err_of(cmd(&mut db, &[b"SORT_RO", b"NANvalue"])), SORT_SCORE_ERR);
+
+        // STORE is rejected for SORT_RO.
+        assert_eq!(err_of(cmd(&mut db, &[b"SORT_RO", b"list-1", b"store", b"list-2"])), "ERR syntax error");
+    }
+
+    /// Port of `GenericFamilyTest.SortROBug3636`.
+    #[test]
+    fn sort_ro_bug3636() {
+        let mut db = DbSlice::new(0);
+        list_of(
+            &mut db,
+            "foo",
+            &[
+                "1.100000023841858", "1.100000023841858", "1.100000023841858", "-15710",
+                "1.100000023841858", "1.100000023841858", "1.100000023841858", "-15710", "-15710",
+                "1.100000023841858", "-15710", "-15710", "-15710", "-15710", "1.100000023841858",
+                "-15710", "-15710",
+            ],
+        );
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"foo", b"desc", b"alpha"])).len(), 17);
+    }
+
+    /// Port of `GenericFamilyTest.SortNegativeLimit`.
+    #[test]
+    fn sort_negative_limit() {
+        let mut db = DbSlice::new(0);
+        list_of(&mut db, "list-neg", &["1", "2", "3", "4", "5"]);
+        let cases: [[&[u8]; 2]; 3] = [[b"-1", b"2"], [b"0", b"-1"], [b"-1", b"-1"]];
+        for limit in &cases {
+            assert_eq!(
+                err_of(cmd(&mut db, &[b"SORT", b"list-neg", b"LIMIT", limit[0], limit[1]])),
+                "ERR value is not an integer or out of range"
+            );
+        }
+    }
+
+    /// Port of `GenericFamilyTest.SortBy`.
+    #[test]
+    fn sort_by() {
+        let mut db = DbSlice::new(0);
+        list_of(&mut db, "list-1", &["1", "2", "3"]);
+        str_of(&mut db, "w_1", "30");
+        str_of(&mut db, "w_2", "20");
+        str_of(&mut db, "w_3", "10");
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"w_*"])), bvecs!["3", "2", "1"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"w_*", b"DESC"])), bvecs!["1", "2", "3"]);
+
+        str_of(&mut db, "s_1", "c");
+        str_of(&mut db, "s_2", "b");
+        str_of(&mut db, "s_3", "a");
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"s_*", b"ALPHA"])), bvecs!["3", "2", "1"]);
+        // nosort preserves insertion order.
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"nosort"])), bvecs!["1", "2", "3"]);
+        // Missing weights read as 0.
+        cmd(&mut db, &[b"DEL", b"w_1"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"w_*"])), bvecs!["1", "3", "2"]);
+        str_of(&mut db, "w_1", "30");
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"w_*", b"LIMIT", b"1", b"2"])), bvecs!["2", "1"]);
+        assert_eq!(err_of(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"w_*_*"])), "ERR syntax error");
+    }
+
+    /// Port of `GenericFamilyTest.SortGet`.
+    #[test]
+    fn sort_get() {
+        let mut db = DbSlice::new(0);
+        list_of(&mut db, "mylist", &["1", "2", "3"]);
+        str_of(&mut db, "obj_1", "first");
+        str_of(&mut db, "obj_2", "second");
+        str_of(&mut db, "obj_3", "third");
+        str_of(&mut db, "weight_1", "30");
+        str_of(&mut db, "weight_2", "20");
+        str_of(&mut db, "weight_3", "10");
+
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"obj_*"])), bvecs!["first", "second", "third"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"#"])), bvecs!["1", "2", "3"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"#", b"GET", b"obj_*"])), bvecs!["1", "first", "2", "second", "3", "third"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"BY", b"weight_*", b"GET", b"obj_*"])), bvecs!["third", "second", "first"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"BY", b"weight_*", b"GET", b"#", b"GET", b"obj_*"])), bvecs!["3", "third", "2", "second", "1", "first"]);
+
+        // Missing GET key -> empty string.
+        cmd(&mut db, &[b"DEL", b"obj_2"]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"obj_*"])), bvecs!["first", "", "third"]);
+        str_of(&mut db, "obj_2", "second");
+
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"DESC", b"GET", b"obj_*"])), bvecs!["third", "second", "first"]);
+
+        list_of(&mut db, "strlist", &["c", "b", "a"]);
+        str_of(&mut db, "obj_a", "alpha");
+        str_of(&mut db, "obj_b", "beta");
+        str_of(&mut db, "obj_c", "gamma");
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"strlist", b"ALPHA", b"GET", b"obj_*"])), bvecs!["alpha", "beta", "gamma"]);
+
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"#", b"GET", b"obj_*", b"LIMIT", b"1", b"2"])), bvecs!["2", "second", "3", "third"]);
+
+        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"#", b"GET", b"obj_*", b"STORE", b"result"])), 6);
+        assert_eq!(lrange_of(&mut db, "result"), bvecs!["1", "first", "2", "second", "3", "third"]);
+
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"BY", b"nosort", b"GET", b"obj_*"])), bvecs!["first", "second", "third"]);
+        assert_eq!(err_of(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"obj_*_*"])), "ERR syntax error");
+
+        // Empty source list.
+        list_of(&mut db, "emptylist", &[]);
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"emptylist", b"GET", b"obj_*"])), bvecs![]);
+
+        // Literal pattern without '*'.
+        str_of(&mut db, "fixed_key", "fixed_value");
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"fixed_key"])), bvecs!["fixed_value", "fixed_value", "fixed_value"]);
+
+        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"mylist", b"GET", b"#", b"GET", b"obj_*"])), bvecs!["1", "first", "2", "second", "3", "third"]);
+    }
+
+    /// Port of `GenericFamilyTest.SortDeletesEmptySet`: iterating an
+    /// all-expired set removes the key.
+    #[test]
+    fn sort_deletes_empty_set() {
+        let mut db = DbSlice::new(0);
+        let mut s = Set::new();
+        for i in 0..20 {
+            s.add_expirable(CompactString::from(format!("m{i}")), 1000, false);
+        }
+        db.insert(CompactString::from("skey"), PrimeValue::Set(s));
+        let now = 2000;
+        assert_eq!(int_of(cmd_at(&mut db, now, &[b"EXISTS", b"skey"])), 1);
+        assert_eq!(bulks(cmd_at(&mut db, now, &[b"SORT", b"skey"])), bvecs![]);
+        assert_eq!(int_of(cmd_at(&mut db, now, &[b"EXISTS", b"skey"])), 0);
+    }
+
+    /// Port of `GenericFamilyTest.SortByPatternDeletesEmptySet`.
+    #[test]
+    fn sort_by_pattern_deletes_empty_set() {
+        let mut db = DbSlice::new(0);
+        let mut s = Set::new();
+        for i in 0..20 {
+            s.add_expirable(CompactString::from(format!("m{i}")), 1000, false);
+        }
+        db.insert(CompactString::from("skey"), PrimeValue::Set(s));
+        let now = 2000;
+        assert_eq!(int_of(cmd_at(&mut db, now, &[b"EXISTS", b"skey"])), 1);
+        assert_eq!(bulks(cmd_at(&mut db, now, &[b"SORT", b"skey", b"BY", b"nosort"])), bvecs![]);
+        assert_eq!(int_of(cmd_at(&mut db, now, &[b"EXISTS", b"skey"])), 0);
     }
 }
 

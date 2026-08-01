@@ -131,15 +131,41 @@ impl ServerEnv {
         shard_for_key(key, self.num_shards)
     }
 
-    /// Key indices for a command. Handles movable keys (XREAD/XREADGROUP) by
-    /// locating the STREAMS section.
+    /// Key indices for a command. Handles movable keys (XREAD/XREADGROUP,
+    /// SORT's runtime STORE destination) by scanning the argument list.
     pub fn extract_keys(&self, cmd: &'static Command, args: &[Vec<u8>]) -> Vec<usize> {
         if cmd.flags & crate::commands::FLAG_MOVABLEKEYS != 0 {
-            extract_movable_keys(args)
+            if cmd.name == "SORT" || cmd.name == "SORT_RO" {
+                extract_sort_keys(args)
+            } else {
+                extract_movable_keys(args)
+            }
         } else {
             cmd.key_range.keys(args.len())
         }
     }
+}
+
+/// Key indices for SORT/SORT_RO: the source key plus the STORE destination
+/// when present (mirrors `CO::STORE_LAST_KEY`). Options are skipped so a GET
+/// pattern argument is never mistaken for a STORE key.
+pub fn extract_sort_keys(args: &[Vec<u8>]) -> Vec<usize> {
+    let mut keys = vec![1];
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].to_ascii_uppercase().as_slice() {
+            b"LIMIT" => i += 3,
+            b"STORE" => {
+                if i + 1 < args.len() {
+                    keys.push(i + 1);
+                }
+                i += 2;
+            }
+            b"BY" | b"GET" => i += 2,
+            _ => i += 1, // ALPHA / ASC / DESC and anything malformed (exec errors)
+        }
+    }
+    keys
 }
 
 pub fn extract_movable_keys(args: &[Vec<u8>]) -> Vec<usize> {
