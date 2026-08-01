@@ -6,6 +6,9 @@ use dragonflydb::server::event_loop::IoLoop;
 use dragonflydb::server::{coordinator, shard};
 use dragonflydb::server::{Reply, ReplyBus, ServerEnv};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut port: u16 = 6379;
