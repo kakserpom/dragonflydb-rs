@@ -68,6 +68,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     keys::CMD_RANDOMKEY,
     keys::CMD_EXPIRETIME,
     keys::CMD_PEXPIRETIME,
+    keys::CMD_SCAN,
     // lists
     lists::CMD_LPUSH,
     lists::CMD_RPUSH,

@@ -1,9 +1,12 @@
+use std::collections::HashMap;
+
 use crate::commands::{integer, ok, Command, OpContext, ShardPart, KeyRange, FLAG_FAST, FLAG_GLOBAL, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE};
 use crate::core::compact::CompactString;
 use crate::core::db::DbSlice;
+use crate::core::value::ObjType;
 use crate::core::PrimeValue;
 use crate::error::{CmdResult, RespError, RespValue};
-use crate::util::parse_i64;
+use crate::util::{parse_i64, parse_u64, shard_hash};
 use xxhash_rust::xxh3::xxh3_64;
 
 // ---------------------------------------------------------------------------
@@ -686,6 +689,301 @@ fn exec_move(_ctx: &mut OpContext) -> CmdResult {
 }
 
 // ---------------------------------------------------------------------------
+// SCAN (global: per-shard cursors merged by the coordinator)
+// ---------------------------------------------------------------------------
+
+/// Dragonfly encodes the shard index in the low 10 bits of the SCAN cursor
+/// (`cursor % 1024`), with the continuation position in the high bits.
+const SCAN_SHARD_BITS: u32 = 10;
+
+#[derive(Clone, Copy)]
+enum ScanMask {
+    Volatile,
+    Permanent,
+    Accessed,
+    Untouched,
+}
+
+/// A TYPE filter. `Some(t)` matches values of type `t`; `None` matches nothing
+/// (a valid but unrepresentable pseudo-type like "key").
+type ScanType = Option<ObjType>;
+
+struct ScanOpts {
+    limit: usize,
+    pattern: Option<Vec<u8>>,
+    type_filter: Option<ScanType>,
+    mask: Option<ScanMask>,
+    min_malloc_size: usize,
+}
+
+/// Map a TYPE argument (case-insensitive) to a filter, or `None` for an
+/// unknown name. Pseudo-types from `kObjTypeToString` ("key", "ReJSON-RL",
+/// "MBbloom--", "CMSk-TYPE", "TopK-TYPE", "MBbloomCF") are valid but never
+/// match a stored value.
+fn scan_type_from_name(s: &[u8]) -> Option<ScanType> {
+    if let Some(t) = ObjType::from_name(s) {
+        return Some(Some(t));
+    }
+    match s.to_ascii_lowercase().as_slice() {
+        b"key" | b"rejson-rl" | b"mbbloom--" | b"cmsk-type" | b"topk-type" | b"mbbloomcf" => {
+            Some(None)
+        }
+        _ => None,
+    }
+}
+
+/// Parse the optional SCAN clauses (COUNT/MATCH/TYPE/BUCKET/ATTR/MINMSZ),
+/// mirroring `ScanOpts::TryFrom`. NOVALUES is rejected for SCAN (it is only
+/// valid for HSCAN).
+fn parse_scan_opts(args: &[Vec<u8>]) -> Result<ScanOpts, RespError> {
+    let mut opts = ScanOpts {
+        limit: 10,
+        pattern: None,
+        type_filter: None,
+        mask: None,
+        min_malloc_size: 0,
+    };
+    let mut i = 2;
+    while i < args.len() {
+        let opt = args[i].to_ascii_uppercase();
+        let next = || args.get(i + 1).ok_or_else(RespError::syntax).map(|a| a.as_slice());
+        match opt.as_slice() {
+            b"COUNT" => {
+                let n = parse_u64(next()?).ok_or_else(RespError::integer)? as usize;
+                opts.limit = n.max(1);
+                i += 2;
+            }
+            b"MATCH" => {
+                let p = next()?;
+                if p != b"*" {
+                    opts.pattern = Some(p.to_vec());
+                }
+                i += 2;
+            }
+            b"TYPE" => {
+                opts.type_filter = Some(scan_type_from_name(next()?).ok_or_else(RespError::syntax)?);
+                i += 2;
+            }
+            b"BUCKET" => {
+                let _ = parse_u64(next()?).ok_or_else(RespError::integer)?;
+                i += 2;
+            }
+            b"ATTR" => {
+                let m = next()?;
+                opts.mask = Some(match m.to_ascii_lowercase().as_slice() {
+                    b"v" => ScanMask::Volatile,
+                    b"p" => ScanMask::Permanent,
+                    b"a" => ScanMask::Accessed,
+                    b"u" => ScanMask::Untouched,
+                    _ => return Err(RespError::syntax()),
+                });
+                i += 2;
+            }
+            b"MINMSZ" => {
+                opts.min_malloc_size = parse_u64(next()?).ok_or_else(RespError::integer)? as usize;
+                i += 2;
+            }
+            _ => return Err(RespError::syntax()),
+        }
+    }
+    Ok(opts)
+}
+
+/// Apply the SCAN filters to one key, mirroring `ScanCb`: type, ATTR mask
+/// (volatile/permanent by TTL, accessed/untouched by the touched flag), MINMSZ
+/// and the MATCH glob. (BUCKET is parsed but not filtered on.)
+fn scan_key_matches(db: &DbSlice, key: &CompactString, val: &PrimeValue, opts: &ScanOpts) -> bool {
+    if let Some(filter) = opts.type_filter {
+        let ok = match filter {
+            Some(t) => val.obj_type() == t,
+            None => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    if let Some(mask) = opts.mask {
+        let has_ttl = db.expire_at(key.as_bytes()).is_some();
+        let ok = match mask {
+            ScanMask::Volatile => has_ttl,
+            ScanMask::Permanent => !has_ttl,
+            ScanMask::Accessed => db.is_touched(key.as_bytes()),
+            ScanMask::Untouched => !db.is_touched(key.as_bytes()),
+        };
+        if !ok {
+            return false;
+        }
+    }
+    if opts.min_malloc_size > 0 && val.malloc_used() < opts.min_malloc_size {
+        return false;
+    }
+    match &opts.pattern {
+        Some(pattern) => glob_match(pattern, key.as_bytes()),
+        None => true,
+    }
+}
+
+/// Build the SCAN reply: `[cursor, keys]` with the cursor as a decimal string.
+fn scan_reply(cursor: u64, keys: Vec<Vec<u8>>) -> RespValue {
+    RespValue::Array(vec![
+        RespValue::Bulk(cursor.to_string().into_bytes()),
+        RespValue::Array(keys.into_iter().map(RespValue::Bulk).collect()),
+    ])
+}
+
+const SCAN_HELP: &[&str] = &[
+    "SCAN cursor [MATCH <glob>] [TYPE <type>] [COUNT <count>] [ATTR <mask>] [MINMSZ <len>]",
+    "    MATCH <glob> - pattern to match keys against",
+    "    TYPE <type> - type of values to match",
+    "    COUNT <count> - number of keys to return",
+    "    ATTR <v|p|a|u> - filter by attributes: v - volatile (ttl), ",
+    "    p - persistent (no ttl), a - accessed since creation, u - untouched",
+    "    MINMSZ <len> - keeps keys with values, whose allocated size is greater or equal to",
+    "        the specified length",
+];
+
+/// Executed on every shard for a SCAN. Shards below the cursor's shard index
+/// were already consumed; the cursor's shard resumes at `cursor >> 10`, and
+/// higher shards start from position 0. Matched keys are sorted by shard hash
+/// so the continuation position is stable across calls.
+fn exec_scan(ctx: &mut OpContext) -> CmdResult {
+    if ctx.args[1].eq_ignore_ascii_case(b"HELP") {
+        return CmdResult::Ok(RespValue::Array(
+            SCAN_HELP.iter().map(|s| RespValue::Simple(s.to_string())).collect(),
+        ));
+    }
+    let cursor = match parse_u64(&ctx.args[1]) {
+        Some(c) => c,
+        None => return CmdResult::err("ERR invalid cursor"),
+    };
+    let opts = match parse_scan_opts(ctx.args) {
+        Ok(o) => o,
+        Err(e) => return CmdResult::Err(e),
+    };
+
+    let shard_id = ctx.db.shard_id() as u64;
+    let sid = cursor % 1024;
+    if shard_id < sid {
+        return CmdResult::Ok(scan_reply(0, Vec::new()));
+    }
+    let start_pos = if sid == shard_id { (cursor >> SCAN_SHARD_BITS) as usize } else { 0 };
+
+    let db = &*ctx.db;
+    let mut matched: Vec<(u64, Vec<u8>)> = db
+        .iter()
+        .filter(|(k, v)| scan_key_matches(db, k, v, &opts))
+        .map(|(k, _)| (shard_hash(k.as_bytes()), k.as_bytes().to_vec()))
+        .collect();
+    matched.sort_by_key(|(h, _)| *h);
+
+    let next = (start_pos + opts.limit).min(matched.len());
+    let keys: Vec<Vec<u8>> = matched
+        .iter()
+        .skip(start_pos)
+        .take(opts.limit)
+        .map(|(_, k)| k.clone())
+        .collect();
+    let cursor_out = if next >= matched.len() {
+        0
+    } else {
+        ((next as u64) << SCAN_SHARD_BITS) | shard_id
+    };
+    CmdResult::Ok(scan_reply(cursor_out, keys))
+}
+
+/// Decode a per-shard SCAN result `[cursor, keys]` into its continuation token
+/// and key list.
+fn decode_scan_shard(result: &CmdResult) -> Result<(u64, Vec<Vec<u8>>), RespError> {
+    match result {
+        CmdResult::Ok(RespValue::Array(a)) if a.len() == 2 => {
+            let token = match &a[0] {
+                RespValue::Bulk(b) => String::from_utf8_lossy(b).parse::<u64>().unwrap_or(0),
+                _ => 0,
+            };
+            let keys = match &a[1] {
+                RespValue::Array(arr) => arr
+                    .iter()
+                    .map(|v| match v {
+                        RespValue::Bulk(b) => b.clone(),
+                        _ => Vec::new(),
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            Ok((token, keys))
+        }
+        _ => Err(RespError::new("ERR internal: bad scan shard result")),
+    }
+}
+
+/// Merge per-shard SCAN results, mirroring `ScanGeneric`: walk the shards in id
+/// order (resuming at the cursor's shard) until `limit` keys were collected,
+/// encoding the continuation as `(position << 10) | shard_id`.
+fn merge_scan(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64) -> CmdResult {
+    if args[1].eq_ignore_ascii_case(b"HELP") {
+        return parts[0].result.clone();
+    }
+    let cursor = match parse_u64(&args[1]) {
+        Some(c) => c,
+        None => return CmdResult::err("ERR invalid cursor"),
+    };
+    let opts = match parse_scan_opts(args) {
+        Ok(o) => o,
+        Err(e) => return CmdResult::Err(e),
+    };
+    for p in parts {
+        if let CmdResult::Err(e) = &p.result {
+            return CmdResult::Err(e.clone());
+        }
+    }
+    let sid = (cursor % 1024) as usize;
+    let shard_count = parts.iter().map(|p| p.shard).max().unwrap_or(0) + 1;
+    if sid >= shard_count {
+        return CmdResult::Ok(scan_reply(0, Vec::new()));
+    }
+
+    let by_shard: HashMap<usize, &ShardPart> = parts.iter().map(|p| (p.shard, p)).collect();
+    let mut result: Vec<Vec<u8>> = Vec::new();
+    let mut remaining = opts.limit;
+    let mut final_cursor: u64 = 0;
+    let mut s = sid;
+    while s < shard_count {
+        if remaining == 0 {
+            break;
+        }
+        let Some(part) = by_shard.get(&s) else {
+            s += 1;
+            continue;
+        };
+        let (token, keys_s) = match decode_scan_shard(&part.result) {
+            Ok(t) => t,
+            Err(e) => return CmdResult::Err(e),
+        };
+        let pos_start = if s == sid { (cursor >> SCAN_SHARD_BITS) as usize } else { 0 };
+        let take = keys_s.len().min(remaining);
+        result.extend(keys_s[..take].iter().cloned());
+        remaining -= take;
+        if token == 0 {
+            // Shard `s` was fully consumed; move on to the next shard.
+            if remaining == 0 && s + 1 < shard_count {
+                final_cursor = (s + 1) as u64;
+                break;
+            }
+            s += 1;
+            continue;
+        }
+        // Shard `s` still has more keys; continue within it next time.
+        final_cursor = if take < keys_s.len() {
+            (((pos_start + take) as u64) << SCAN_SHARD_BITS) | s as u64
+        } else {
+            token
+        };
+        break;
+    }
+    CmdResult::Ok(scan_reply(final_cursor, result))
+}
+
+// ---------------------------------------------------------------------------
 // Command definitions
 // ---------------------------------------------------------------------------
 
@@ -865,12 +1163,22 @@ pub static CMD_PEXPIRETIME: Command = Command {
     exec: exec_pexpiretime,
     merge: None,
 };
+pub static CMD_SCAN: Command = Command {
+    name: "SCAN",
+    arity: -2,
+    flags: FLAG_READONLY | FLAG_FAST | FLAG_GLOBAL,
+    key_range: KeyRange::NONE,
+    exec: exec_scan,
+    merge: Some(merge_scan),
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::db::DbSlice;
+    use crate::core::set::Set;
     use crate::core::PrimeValue;
+    use crate::core::zset::ZSet;
 
     fn val(r: CmdResult) -> RespValue {
         r.into_resp_value()
@@ -905,6 +1213,8 @@ mod tests {
                 b"RANDOMKEY" => (exec_randomkey, 1, vec![]),
                 b"EXPIRETIME" => (exec_expiretime, 1, (1..2).collect()),
                 b"PEXPIRETIME" => (exec_pexpiretime, 1, (1..2).collect()),
+                b"SCAN" => (exec_scan, 1, vec![]),
+                b"KEYS" => (exec_keys, 1, vec![]),
                 b"EXISTS" => (exec_exists, 1, (1..argv.len()).collect()),
                 b"PEXPIREAT" => (exec_pexpireat, 1, (1..2).collect()),
                 _ => panic!("unhandled command {:?}", argv[0]),
@@ -919,6 +1229,29 @@ mod tests {
 
     fn cmd_at(db: &mut DbSlice, now_ms: u64, args: &[&[u8]]) -> CmdResult {
         dispatch_at(db, now_ms, &args.iter().map(|a| a.to_vec()).collect::<Vec<_>>())
+    }
+
+    fn array_keys(r: CmdResult) -> Vec<Vec<u8>> {
+        match val(r) {
+            RespValue::Array(ks) => ks
+                .iter()
+                .map(|v| match v {
+                    RespValue::Bulk(b) => b.clone(),
+                    o => panic!("expected bulk key, got {:?}", o),
+                })
+                .collect(),
+            o => panic!("expected array, got {:?}", o),
+        }
+    }
+
+    /// Run a SCAN/KEYS-ish command and return its key list. For SCAN the reply
+    /// is `[cursor, keys]`; for KEYS it is a plain key array.
+    fn scan_keys(db: &mut DbSlice, now_ms: u64, args: &[&[u8]]) -> Vec<Vec<u8>> {
+        let r = dispatch_at(db, now_ms, &args.iter().map(|a| a.to_vec()).collect::<Vec<_>>());
+        match val(r) {
+            RespValue::Array(a) if a.len() == 2 => array_keys(CmdResult::Ok(a[1].clone())),
+            o => panic!("expected scan reply [cursor, keys], got {:?}", o),
+        }
     }
 
     fn str_of(db: &mut DbSlice, key: &str, value: &str) {
@@ -1322,6 +1655,118 @@ mod tests {
             o => panic!("expected string, got {:?}", o),
         }
         assert!(dbs[0].contains(b"a", now));
+    }
+
+    /// Port of `GenericFamilyTest.Scan` (SCAN clauses) plus the KEYS tail. The
+    /// reference test flushes the DB before the KEYS assertions; here the
+    /// empty-key case is checked on a fresh DbSlice instead.
+    #[test]
+    fn scan() {
+        let mut db = DbSlice::new(0);
+        for i in 0..10 {
+            str_of(&mut db, &format!("key{i}"), "bar");
+        }
+        for i in 0..10 {
+            str_of(&mut db, &format!("str{i}"), "bar");
+        }
+        for i in 0..10 {
+            db.insert(
+                CompactString::from_bytes(format!("set{i}").as_bytes()),
+                PrimeValue::Set(Set::new()),
+            );
+        }
+        for i in 0..10 {
+            db.insert(
+                CompactString::from_bytes(format!("zset{i}").as_bytes()),
+                PrimeValue::ZSet(ZSet::new()),
+            );
+        }
+
+        let keys = scan_keys(&mut db, 0, &[b"SCAN", b"0", b"COUNT", b"20", b"TYPE", b"string"]);
+        assert!(keys.len() > 10);
+        assert!(keys.iter().all(|k| k.starts_with(b"str") || k.starts_with(b"key")));
+
+        let keys = scan_keys(&mut db, 0, &[b"SCAN", b"0", b"COUNT", b"20", b"MATCH", b"zset*"]);
+        assert_eq!(keys.len(), 10);
+        assert!(keys.iter().all(|k| k.starts_with(b"zset")));
+
+        assert_eq!(err_of(cmd(&mut db, &[b"SCAN", b"0", b"COUNT"])), "ERR syntax error");
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"SCAN", b"0", b"COUNT", b"not-a-number"])),
+            "ERR value is not an integer or out of range"
+        );
+        assert_eq!(err_of(cmd(&mut db, &[b"SCAN", b"0", b"TYPE", b"not-a-type"])), "ERR syntax error");
+        assert_eq!(err_of(cmd(&mut db, &[b"SCAN", b"0", b"NOVALUES"])), "ERR syntax error");
+
+        // COUNT is a size_t hint: values above UINT32_MAX must still parse.
+        let resp = val(cmd(&mut db, &[b"SCAN", b"0", b"COUNT", b"5000000000"]));
+        match resp {
+            RespValue::Array(a) => assert_eq!(a.len(), 2),
+            o => panic!("expected scan reply array, got {:?}", o),
+        }
+    }
+
+    /// KEYS handles empty-string keys (reference `GenericFamilyTest.Scan` tail).
+    #[test]
+    fn keys_empty_string_key() {
+        let mut db = DbSlice::new(0);
+        str_of(&mut db, "", "foo");
+        str_of(&mut db, "bar", "1");
+
+        let mut keys = array_keys(cmd(&mut db, &[b"KEYS", b"*"]));
+        keys.sort();
+        assert_eq!(keys, vec![Vec::<u8>::new(), b"bar".to_vec()]);
+
+        assert_eq!(array_keys(cmd(&mut db, &[b"KEYS", b""])), vec![Vec::<u8>::new()]);
+    }
+
+    /// Port of `GenericFamilyTest.ScanWithAttr`: ATTR filters by TTL
+    /// (v/p) and by the touched flag (a/u), which is set by reads and TTL
+    /// lookups but not by plain SET inserts.
+    #[test]
+    fn scan_with_attr() {
+        let now = 0u64;
+        let mut db = DbSlice::new(0);
+        str_of(&mut db, "hello", "world");
+        str_of(&mut db, "foo", "bar");
+
+        // expire hello 1000 -> PEXPIREAT (ms) in the future.
+        cmd_at(&mut db, now, &[b"PEXPIREAT", b"hello", b"1000000"]);
+
+        assert_eq!(scan_keys(&mut db, now, &[b"SCAN", b"0", b"ATTR", b"v"]), vec![b"hello".to_vec()]);
+        assert_eq!(scan_keys(&mut db, now, &[b"SCAN", b"0", b"ATTR", b"p"]), vec![b"foo".to_vec()]);
+        // Before the GET, only "hello" was touched (by the expire lookup).
+        assert_eq!(scan_keys(&mut db, now, &[b"SCAN", b"0", b"ATTR", b"a"]), vec![b"hello".to_vec()]);
+        assert_eq!(scan_keys(&mut db, now, &[b"SCAN", b"0", b"ATTR", b"u"]), vec![b"foo".to_vec()]);
+
+        // GET "foo" is a read: it marks "foo" as touched.
+        match db.find(b"foo", now) {
+            Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"bar"),
+            o => panic!("expected string, got {:?}", o),
+        }
+
+        assert_eq!(scan_keys(&mut db, now, &[b"SCAN", b"0", b"ATTR", b"a"]).len(), 2);
+        assert_eq!(scan_keys(&mut db, now, &[b"SCAN", b"0", b"ATTR", b"u"]).len(), 0);
+    }
+
+    /// Port of `GenericFamilyTest.ScanMallocSize`: MINMSZ filters by the
+    /// value's approximated allocated size (0/496/1000 for 15/500/1000-byte
+    /// values).
+    #[test]
+    fn scan_malloc_size() {
+        let mut db = DbSlice::new(0);
+        let v1 = "a".repeat(1000);
+        let v2 = "b".repeat(500);
+        let v3 = "c".repeat(15);
+        str_of(&mut db, "k1", &v1);
+        str_of(&mut db, "k2", &v2);
+        str_of(&mut db, "k3", &v3);
+
+        let mut keys = scan_keys(&mut db, 0, &[b"SCAN", b"0", b"MINMSZ", b"15"]);
+        keys.sort();
+        assert_eq!(keys, vec![b"k1".to_vec(), b"k2".to_vec()]);
+
+        assert_eq!(scan_keys(&mut db, 0, &[b"SCAN", b"0", b"MINMSZ", b"500"]), vec![b"k1".to_vec()]);
     }
 }
 

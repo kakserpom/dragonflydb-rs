@@ -15,6 +15,9 @@ pub struct DbSlice {
     expire: HashMap<CompactString, u64>,
     /// Sticky keys (STICK): never expire, even with a TTL.
     sticky: HashSet<CompactString>,
+    /// Keys accessed since they were created (reads, TTL lookups). Backs the
+    /// SCAN `ATTR a|u` filter, mirroring Dragonfly's `WasTouched` flag.
+    touched: HashSet<CompactString>,
     /// Resolved stream IDs for blocking XREAD `$` arguments: a blocked read
     /// resolves `$` once (to the stream's last ID at call time) and the
     /// coordinator re-runs the command, so we remember the resolved ID here.
@@ -36,6 +39,7 @@ impl DbSlice {
             prime_table: HashMap::new(),
             expire: HashMap::new(),
             sticky: HashSet::new(),
+            touched: HashSet::new(),
             stream_block_watermarks: HashMap::new(),
             stats: DbStats::default(),
         }
@@ -49,20 +53,33 @@ impl DbSlice {
         self.prime_table.len()
     }
 
-    /// Look up a value, transparently removing it if expired.
+    /// Look up a value, transparently removing it if expired. Marks the key as
+    /// touched when found (backing SCAN `ATTR a`).
     pub fn find(&mut self, key: &[u8], now_ms: u64) -> Option<&PrimeValue> {
         self.expire_if_needed(key, now_ms);
-        self.prime_table.get(key)
+        let v = self.prime_table.get(key);
+        if v.is_some() {
+            self.touched.insert(CompactString::from_bytes(key));
+        }
+        v
     }
 
     pub fn find_mut(&mut self, key: &[u8], now_ms: u64) -> Option<&mut PrimeValue> {
         self.expire_if_needed(key, now_ms);
-        self.prime_table.get_mut(key)
+        let v = self.prime_table.get_mut(key);
+        if v.is_some() {
+            self.touched.insert(CompactString::from_bytes(key));
+        }
+        v
     }
 
     pub fn contains(&mut self, key: &[u8], now_ms: u64) -> bool {
         self.expire_if_needed(key, now_ms);
-        self.prime_table.contains_key(key)
+        let found = self.prime_table.contains_key(key);
+        if found {
+            self.touched.insert(CompactString::from_bytes(key));
+        }
+        found
     }
 
     pub fn insert(&mut self, key: CompactString, value: PrimeValue) {
@@ -86,6 +103,7 @@ impl DbSlice {
         if v.is_some() {
             self.expire.remove(key);
             self.sticky.remove(key);
+            self.touched.remove(key);
         }
         v
     }
@@ -97,6 +115,7 @@ impl DbSlice {
         let value = self.prime_table.remove(key)?;
         let expire_at = self.expire.remove(key);
         let sticky = self.sticky.remove(key);
+        self.touched.remove(key);
         self.refresh_stats();
         Some((value, expire_at, sticky))
     }
@@ -148,6 +167,7 @@ impl DbSlice {
         if now_ms >= at {
             self.prime_table.remove(key);
             self.expire.remove(key);
+            self.touched.remove(key);
             return true;
         }
         false
@@ -155,7 +175,11 @@ impl DbSlice {
 
     pub fn has_expiry(&mut self, key: &[u8], now_ms: u64) -> bool {
         self.expire_if_needed(key, now_ms);
-        self.expire.contains_key(key)
+        let has = self.expire.contains_key(key);
+        if has {
+            self.touched.insert(CompactString::from_bytes(key));
+        }
+        has
     }
 
     /// Absolute expiration time in ms for a key, if any (no expiry check).
@@ -177,6 +201,11 @@ impl DbSlice {
     /// Whether the key is sticky.
     pub fn is_sticky(&self, key: &[u8]) -> bool {
         self.sticky.contains(key)
+    }
+
+    /// Whether the key has been accessed since it was created (SCAN `ATTR a|u`).
+    pub fn is_touched(&self, key: &[u8]) -> bool {
+        self.touched.contains(key)
     }
 
     /// Set the sticky flag unconditionally (used when applying deferred stores).
