@@ -71,6 +71,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     keys::CMD_SCAN,
     keys::CMD_SORT,
     keys::CMD_SORT_RO,
+    keys::CMD_FIELDEXPIRE,
+    keys::CMD_FIELDTTL,
     // lists
     lists::CMD_LPUSH,
     lists::CMD_RPUSH,

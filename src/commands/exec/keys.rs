@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::commands::{integer, ok, Command, OpContext, ShardPart, KeyRange, FLAG_FAST, FLAG_GLOBAL, FLAG_MOVABLEKEYS, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE};
+use crate::commands::{integer, ok, Command, OpContext, ShardPart, KeyRange, FLAG_DENYOOM, FLAG_FAST, FLAG_GLOBAL, FLAG_MOVABLEKEYS, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE};
 use crate::core::compact::CompactString;
 use crate::core::db::DbSlice;
 use crate::core::quicklist::{ListItem, QuickList};
@@ -1328,6 +1328,114 @@ fn merge_sort(parts: &[ShardPart], _args: &[Vec<u8>], keys: &[usize], _now: u64)
 }
 
 // ---------------------------------------------------------------------------
+// FIELDEXPIRE / FIELDTTL
+// ---------------------------------------------------------------------------
+
+/// Ceiling for FIELDEXPIRE TTLs, shared with the reference
+/// `kMaxExpireDeadlineSec` (dragonfly/src/server/common.h).
+const MAX_EXPIRE_SEC: i64 = (1u64 << 28) as i64 - 1;
+
+/// FIELDEXPIRE key ttl_sec field [field ...]
+///
+/// Sets the per-member/field TTL of a set or hash. Replies an integer per
+/// field: 1 on success, -2 for a missing key, field or wrong type (mirroring
+/// `OpFieldExpire`, which never errors on a wrong type). A key emptied by
+/// lazy pruning is deleted. Stale (already expired) members are pruned first,
+/// matching the reference's `Find` which lazily removes them, so they reply
+/// -2 rather than being re-armed.
+fn exec_fieldexpire(ctx: &mut OpContext) -> CmdResult {
+    let key_idx = ctx.owned_keys[0];
+    let key = &ctx.args[key_idx];
+    let ttl_sec = match parse_i64(&ctx.args[key_idx + 1]) {
+        Some(v) if (1..=MAX_EXPIRE_SEC).contains(&v) => v as u64,
+        _ => return CmdResult::Err(RespError::integer()),
+    };
+    let fields = &ctx.args[key_idx + 2..];
+    let expire_ms = ctx.now_ms.saturating_add(ttl_sec.saturating_mul(1000));
+
+    let res = match ctx.db.find_mut(key, ctx.now_ms) {
+        Some(PrimeValue::Set(s)) => {
+            s.prune_expired(ctx.now_ms);
+            let mut out = Vec::with_capacity(fields.len());
+            for f in fields {
+                if s.contains(f) {
+                    s.add_expirable(CompactString::from_bytes(f), expire_ms, false);
+                    out.push(1);
+                } else {
+                    out.push(-2);
+                }
+            }
+            if s.is_empty() {
+                ctx.db.remove(key);
+            }
+            out
+        }
+        Some(PrimeValue::Hash(h)) => {
+            h.prune_expired(ctx.now_ms);
+            let mut out = Vec::with_capacity(fields.len());
+            for f in fields {
+                if h.contains(f) {
+                    let v = h.get(f).cloned().unwrap_or_else(|| CompactString::from_bytes(f));
+                    h.add_expirable(CompactString::from_bytes(f), v, Some(expire_ms), false);
+                    out.push(1);
+                } else {
+                    out.push(-2);
+                }
+            }
+            if h.is_empty() {
+                ctx.db.remove(key);
+            }
+            out
+        }
+        Some(_) | None => vec![-2; fields.len()],
+    };
+    CmdResult::Ok(RespValue::Array(res.into_iter().map(integer).collect()))
+}
+
+/// FIELDTTL key field
+///
+/// Returns the remaining TTL in seconds of one set member / hash field:
+/// -2 for a missing key, -3 for a missing field, -1 for a field without a TTL.
+/// Wrong types are an error (unlike FIELDEXPIRE). Stale members are pruned
+/// lazily first, mirroring `OpFieldTtl`.
+fn exec_fieldttl(ctx: &mut OpContext) -> CmdResult {
+    let key_idx = ctx.owned_keys[0];
+    let key = &ctx.args[key_idx];
+    let field = &ctx.args[key_idx + 1];
+    let now_sec = (ctx.now_ms as i64) / 1000;
+    match ctx.db.find_mut(key, ctx.now_ms) {
+        Some(PrimeValue::Set(s)) => {
+            s.prune_expired(ctx.now_ms);
+            if !s.contains(field) {
+                if s.is_empty() {
+                    ctx.db.remove(key);
+                }
+                return CmdResult::Ok(integer(-3));
+            }
+            match s.member_expire_ms(field) {
+                Some(at) => CmdResult::Ok(integer((at as i64) / 1000 - now_sec)),
+                None => CmdResult::Ok(integer(-1)),
+            }
+        }
+        Some(PrimeValue::Hash(h)) => {
+            h.prune_expired(ctx.now_ms);
+            if !h.contains(field) {
+                if h.is_empty() {
+                    ctx.db.remove(key);
+                }
+                return CmdResult::Ok(integer(-3));
+            }
+            match h.field_expire_ms(field) {
+                Some(at) => CmdResult::Ok(integer((at as i64) / 1000 - now_sec)),
+                None => CmdResult::Ok(integer(-1)),
+            }
+        }
+        Some(_) => CmdResult::Err(RespError::wrong_type()),
+        None => CmdResult::Ok(integer(-2)),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Command definitions
 // ---------------------------------------------------------------------------
 
@@ -1531,6 +1639,22 @@ pub static CMD_SORT_RO: Command = Command {
     exec: exec_sort,
     merge: Some(merge_sort),
 };
+pub static CMD_FIELDEXPIRE: Command = Command {
+    name: "FIELDEXPIRE",
+    arity: -4,
+    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_FAST,
+    key_range: KeyRange::ONE,
+    exec: exec_fieldexpire,
+    merge: None,
+};
+pub static CMD_FIELDTTL: Command = Command {
+    name: "FIELDTTL",
+    arity: 3,
+    flags: FLAG_READONLY | FLAG_FAST,
+    key_range: KeyRange::ONE,
+    exec: exec_fieldttl,
+    merge: None,
+};
 
 #[cfg(test)]
 mod tests {
@@ -1584,6 +1708,14 @@ mod tests {
                 b"PEXPIRETIME" => (exec_pexpiretime, 1, (1..2).collect()),
                 b"SCAN" => (exec_scan, 1, vec![]),
                 b"SORT" | b"SORT_RO" => (exec_sort, 1, (1..argv.len()).collect()),
+                b"FIELDEXPIRE" => (exec_fieldexpire, 1, (1..2).collect()),
+                b"FIELDTTL" => (exec_fieldttl, 1, (1..2).collect()),
+                b"SADD" => (crate::commands::exec::sets::CMD_SADD.exec, 1, (1..2).collect()),
+                b"SMEMBERS" => (crate::commands::exec::sets::CMD_SMEMBERS.exec, 1, (1..2).collect()),
+                b"SADDEX" => (crate::commands::exec::sets::CMD_SADDEX.exec, 1, (1..2).collect()),
+                b"HSET" => (crate::commands::exec::hashes::CMD_HSET.exec, 1, (1..2).collect()),
+                b"HGETALL" => (crate::commands::exec::hashes::CMD_HGETALL.exec, 1, (1..2).collect()),
+                b"HSETEX" => (crate::commands::exec::hashes::CMD_HSETEX.exec, 1, (1..2).collect()),
                 b"TTL" => (exec_ttl, 1, (1..2).collect()),
                 b"PTTL" => (exec_pttl, 1, (1..2).collect()),
                 b"EXPIRE" => (exec_expire, 1, (1..2).collect()),
@@ -2507,6 +2639,119 @@ mod tests {
         assert_eq!(int_of(cmd_at(&mut db, now, &[b"EXISTS", b"skey"])), 1);
         assert_eq!(bulks(cmd_at(&mut db, now, &[b"SORT", b"skey", b"BY", b"nosort"])), bvecs![]);
         assert_eq!(int_of(cmd_at(&mut db, now, &[b"EXISTS", b"skey"])), 0);
+    }
+
+    /// Decode an integer array reply (FIELDEXPIRE results).
+    fn ints(r: CmdResult) -> Vec<i64> {
+        match val(r) {
+            RespValue::Array(v) => v
+                .into_iter()
+                .map(|x| match x {
+                    RespValue::Integer(i) => i,
+                    o => panic!("expected integer element, got {:?}", o),
+                })
+                .collect(),
+            o => panic!("expected array, got {:?}", o),
+        }
+    }
+
+    /// Port of `GenericFamilyTest.FieldTtl`.
+    #[test]
+    fn fieldttl() {
+        let mut db = DbSlice::new(0);
+        assert_eq!(int_of(cmd(&mut db, &[b"SADDEX", b"key", b"1", b"val1"])), 1);
+        assert_eq!(int_of(cmd(&mut db, &[b"SADDEX", b"key", b"2", b"val2"])), 1);
+        assert_eq!(int_of(cmd(&mut db, &[b"SADD", b"key", b"val3"])), 1);
+
+        assert_eq!(-2, int_of(cmd(&mut db, &[b"FIELDTTL", b"nokey", b"val1"])));
+        assert_eq!(-3, int_of(cmd(&mut db, &[b"FIELDTTL", b"key", b"bar"])));
+        assert_eq!(1, int_of(cmd(&mut db, &[b"FIELDTTL", b"key", b"val1"])));
+        assert_eq!(2, int_of(cmd(&mut db, &[b"FIELDTTL", b"key", b"val2"])));
+        assert_eq!(-1, int_of(cmd(&mut db, &[b"FIELDTTL", b"key", b"val3"])));
+
+        // 1100ms later val1 (ttl 1s) is expired, val2 has 1s left.
+        assert_eq!(-3, int_of(cmd_at(&mut db, 1100, &[b"FIELDTTL", b"key", b"val1"])));
+        assert_eq!(1, int_of(cmd_at(&mut db, 1100, &[b"FIELDTTL", b"key", b"val2"])));
+
+        str_of(&mut db, "str", "val");
+        assert!(err_of(cmd(&mut db, &[b"FIELDTTL", b"str", b"bar"])).starts_with("WRONGTYPE"));
+
+        assert_eq!(2, int_of(cmd(&mut db, &[b"HSETEX", b"k2", b"1", b"f1", b"v1", b"f2", b"v2"])));
+        assert_eq!(1, int_of(cmd(&mut db, &[b"HSET", b"k2", b"f3", b"v3"])));
+        assert_eq!(1, int_of(cmd(&mut db, &[b"FIELDTTL", b"k2", b"f1"])));
+        assert_eq!(-1, int_of(cmd(&mut db, &[b"FIELDTTL", b"k2", b"f3"])));
+        assert_eq!(-3, int_of(cmd(&mut db, &[b"FIELDTTL", b"k2", b"f4"])));
+    }
+
+    /// Port of `GenericFamilyTest.FieldExpireSet`.
+    #[test]
+    fn fieldexpire_set() {
+        let mut db = DbSlice::new(0);
+        assert_eq!(3, int_of(cmd(&mut db, &[b"SADD", b"key", b"a", b"b", b"c"])));
+        let now = 2_000u64;
+        assert_eq!(
+            ints(cmd_at(&mut db, now, &[b"FIELDEXPIRE", b"key", b"10", b"a", b"b", b"c"])),
+            [1, 1, 1]
+        );
+        assert_eq!(10, int_of(cmd_at(&mut db, now, &[b"FIELDTTL", b"key", b"a"])));
+        // 10s later all members expired; reading the set removes the key.
+        let later = now + 10_000;
+        assert_eq!(bulks(cmd_at(&mut db, later, &[b"SMEMBERS", b"key"])), bvecs![]);
+    }
+
+    /// Port of `GenericFamilyTest.FieldExpireHset`.
+    #[test]
+    fn fieldexpire_hset() {
+        let mut db = DbSlice::new(0);
+        assert_eq!(3, int_of(cmd(&mut db, &[b"HSET", b"key", b"k0", b"v", b"k1", b"v", b"k2", b"v"])));
+        let now = 2_000u64;
+        assert_eq!(
+            ints(cmd_at(&mut db, now, &[b"FIELDEXPIRE", b"key", b"10", b"k0", b"k1", b"k2"])),
+            [1, 1, 1]
+        );
+        assert_eq!(10, int_of(cmd_at(&mut db, now, &[b"FIELDTTL", b"key", b"k0"])));
+        let later = now + 10_000;
+        assert_eq!(bulks(cmd_at(&mut db, later, &[b"HGETALL", b"key"])), bvecs![]);
+    }
+
+    /// Port of `GenericFamilyTest.FieldExpireNoSuchField`.
+    #[test]
+    fn fieldexpire_no_such_field() {
+        let mut db = DbSlice::new(0);
+        assert_eq!(1, int_of(cmd(&mut db, &[b"SADD", b"key", b"a"])));
+        assert_eq!(1, int_of(cmd(&mut db, &[b"HSET", b"key2", b"k0", b"v0"])));
+        assert_eq!(ints(cmd(&mut db, &[b"FIELDEXPIRE", b"key", b"10", b"a", b"b"])), [1, -2]);
+        assert_eq!(ints(cmd(&mut db, &[b"FIELDEXPIRE", b"key2", b"10", b"k0", b"b"])), [1, -2]);
+    }
+
+    /// Port of `GenericFamilyTest.FieldExpireNoSuchKey`.
+    #[test]
+    fn fieldexpire_no_such_key() {
+        let mut db = DbSlice::new(0);
+        assert_eq!(ints(cmd(&mut db, &[b"FIELDEXPIRE", b"key", b"10", b"a", b"b"])), [-2, -2]);
+    }
+
+    #[test]
+    fn fieldexpire_errors_and_wrong_type() {
+        let mut db = DbSlice::new(0);
+        // ttl 0 is below the 1..=kMaxExpireDeadlineSec range -> integer error.
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"FIELDEXPIRE", b"key", b"0", b"a"])),
+            "ERR value is not an integer or out of range"
+        );
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"FIELDEXPIRE", b"key", b"-1", b"a"])),
+            "ERR value is not an integer or out of range"
+        );
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"FIELDEXPIRE", b"key", b"abc", b"a"])),
+            "ERR value is not an integer or out of range"
+        );
+        // A wrong-type key is reported per field as -2, not as an error.
+        str_of(&mut db, "str", "val");
+        assert_eq!(ints(cmd(&mut db, &[b"FIELDEXPIRE", b"str", b"10", b"a", b"b"])), [-2, -2]);
+        // FIELDTTL on the same key errors.
+        assert!(err_of(cmd(&mut db, &[b"FIELDTTL", b"str", b"a"])).starts_with("WRONGTYPE"));
     }
 }
 

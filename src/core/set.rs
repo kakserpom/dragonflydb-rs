@@ -88,6 +88,11 @@ impl Set {
         }
     }
 
+    /// Absolute expiry (in ms) of `member`, if it carries one.
+    pub fn member_expire_ms(&self, member: &[u8]) -> Option<u64> {
+        self.expiry.as_ref().and_then(|exp| exp.get(member).copied())
+    }
+
     /// Whether any member carries an expiry (SADDEX sets are never compacted
     /// into the "intset" form in the reference; no impact here).
     pub fn has_expiry(&self) -> bool {
