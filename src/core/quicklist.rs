@@ -48,7 +48,10 @@ const CHUNK_MAX_BYTES: usize = 8192;
 
 impl Chunk {
     fn new() -> Self {
-        Chunk { items: VecDeque::new(), bytes: 0 }
+        Chunk {
+            items: VecDeque::new(),
+            bytes: 0,
+        }
     }
 
     fn len(&self) -> usize {
@@ -104,7 +107,10 @@ impl Default for QuickList {
 
 impl QuickList {
     pub fn new() -> Self {
-        QuickList { chunks: VecDeque::new(), count: 0 }
+        QuickList {
+            chunks: VecDeque::new(),
+            count: 0,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -217,6 +223,16 @@ impl QuickList {
         self.chunks.iter().flat_map(|c| c.items.iter())
     }
 
+    /// Number of chunks (listpack nodes).
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Iterate over the chunks, one listpack node each.
+    pub fn chunks(&self) -> impl Iterator<Item = &VecDeque<ListItem>> {
+        self.chunks.iter().map(|c| &c.items)
+    }
+
     /// Return an iterator over elements [start, stop] inclusive using Redis index
     /// semantics; start/stop may be negative. Returns None if range is empty.
     pub fn range(&self, start: i64, stop: i64) -> Option<impl Iterator<Item = &ListItem>> {
@@ -316,7 +332,13 @@ impl QuickList {
                         let half = c.len() / 2;
                         let right: VecDeque<ListItem> = c.items.split_off(half);
                         let right_bytes = right.iter().map(|i| i.byte_len()).sum();
-                        self.chunks.insert(ci + 1, Chunk { items: right, bytes: right_bytes });
+                        self.chunks.insert(
+                            ci + 1,
+                            Chunk {
+                                items: right,
+                                bytes: right_bytes,
+                            },
+                        );
                     }
                     self.count += 1;
                     return;

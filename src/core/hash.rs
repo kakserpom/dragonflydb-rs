@@ -30,7 +30,10 @@ impl Default for Hash {
 
 impl Hash {
     pub fn new() -> Self {
-        Hash { repr: HashRepr::Small(Vec::new()), expiry: None }
+        Hash {
+            repr: HashRepr::Small(Vec::new()),
+            expiry: None,
+        }
     }
 
     /// Set a field, optionally attaching an absolute expiry `expire_ms`.
@@ -66,7 +69,12 @@ impl Hash {
 
     /// Set a field only if absent (HSETNX semantics): existing fields are left
     /// untouched, including their expiry.
-    pub fn add_or_skip(&mut self, field: CompactString, value: CompactString, expire_ms: Option<u64>) -> bool {
+    pub fn add_or_skip(
+        &mut self,
+        field: CompactString,
+        value: CompactString,
+        expire_ms: Option<u64>,
+    ) -> bool {
         if self.contains(field.as_bytes()) {
             return false;
         }
@@ -78,7 +86,9 @@ impl Hash {
     }
 
     fn set_expiry(&mut self, field: CompactString, expire_ms: u64) {
-        self.expiry.get_or_insert_with(HashMap::new).insert(field, expire_ms);
+        self.expiry
+            .get_or_insert_with(HashMap::new)
+            .insert(field, expire_ms);
     }
     fn clear_field_expiry(&mut self, field: &[u8]) {
         if let Some(exp) = &mut self.expiry {
@@ -115,6 +125,13 @@ impl Hash {
         self.expiry.is_some()
     }
 
+    /// Whether the hash is still in the compact (listpack) representation,
+    /// mirroring Dragonfly's `kEncodingListPack` encoding. Used by DUMP to pick
+    /// `RDB_TYPE_HASH_LISTPACK`.
+    pub fn is_small(&self) -> bool {
+        matches!(self.repr, HashRepr::Small(_))
+    }
+
     pub fn len(&self) -> usize {
         match &self.repr {
             HashRepr::Small(v) => v.len(),
@@ -128,9 +145,10 @@ impl Hash {
 
     pub fn get(&self, field: &[u8]) -> Option<&CompactString> {
         match &self.repr {
-            HashRepr::Small(v) => {
-                v.iter().find(|(f, _)| f.as_bytes() == field).map(|(_, val)| val)
-            }
+            HashRepr::Small(v) => v
+                .iter()
+                .find(|(f, _)| f.as_bytes() == field)
+                .map(|(_, val)| val),
             HashRepr::Large(m) => m.get(field),
         }
     }
@@ -199,10 +217,15 @@ impl Hash {
 
     fn sample_seed(&self) -> Vec<u8> {
         match &self.repr {
-            HashRepr::Small(v) => v.first().map(|(f, _)| f.as_bytes().to_vec()).unwrap_or_default(),
-            HashRepr::Large(m) => {
-                m.iter().next().map(|(f, _)| f.as_bytes().to_vec()).unwrap_or_default()
-            }
+            HashRepr::Small(v) => v
+                .first()
+                .map(|(f, _)| f.as_bytes().to_vec())
+                .unwrap_or_default(),
+            HashRepr::Large(m) => m
+                .iter()
+                .next()
+                .map(|(f, _)| f.as_bytes().to_vec())
+                .unwrap_or_default(),
         }
     }
 
@@ -236,7 +259,10 @@ impl Hash {
         }
         let mut rng = self.rng();
         (0..count)
-            .map(|_| self.pair_at((rng.next() as usize) % len).expect("non-empty hash"))
+            .map(|_| {
+                self.pair_at((rng.next() as usize) % len)
+                    .expect("non-empty hash")
+            })
             .collect()
     }
 
@@ -309,8 +335,14 @@ mod tests {
     #[test]
     fn hash_ops() {
         let mut h = Hash::new();
-        assert!(h.set(CompactString::from("f1"), CompactString::from("v1")).is_none());
-        assert!(h.set(CompactString::from("f1"), CompactString::from("v2")).is_some());
+        assert!(
+            h.set(CompactString::from("f1"), CompactString::from("v1"))
+                .is_none()
+        );
+        assert!(
+            h.set(CompactString::from("f1"), CompactString::from("v2"))
+                .is_some()
+        );
         assert_eq!(h.get(b"f1").map(|v| v.as_bytes()), Some(b"v2".as_slice()));
         assert_eq!(h.len(), 1);
         assert_eq!(h.remove(b"f1"), Some(CompactString::from("v2")));
@@ -321,7 +353,10 @@ mod tests {
     fn promotes_to_large() {
         let mut h = Hash::new();
         for i in 0..200 {
-            h.set(CompactString::from_bytes(format!("f{}", i).as_bytes()), CompactString::from("v"));
+            h.set(
+                CompactString::from_bytes(format!("f{}", i).as_bytes()),
+                CompactString::from("v"),
+            );
         }
         assert_eq!(h.len(), 200);
         assert!(matches!(h.repr, HashRepr::Large(_)));
@@ -333,8 +368,18 @@ mod tests {
     #[test]
     fn field_expiry_prunes() {
         let mut h = Hash::new();
-        assert!(h.add_expirable(CompactString::from("f1"), CompactString::from("v"), Some(1000), false));
-        assert!(!h.add_expirable(CompactString::from("f1"), CompactString::from("v2"), Some(2000), false));
+        assert!(h.add_expirable(
+            CompactString::from("f1"),
+            CompactString::from("v"),
+            Some(1000),
+            false
+        ));
+        assert!(!h.add_expirable(
+            CompactString::from("f1"),
+            CompactString::from("v2"),
+            Some(2000),
+            false
+        ));
         assert_eq!(h.field_expire_ms(b"f1"), Some(2000));
         h.prune_expired(1500);
         assert!(h.contains(b"f1"));
@@ -347,8 +392,18 @@ mod tests {
     #[test]
     fn field_expiry_keepttl() {
         let mut h = Hash::new();
-        h.add_expirable(CompactString::from("f1"), CompactString::from("v"), Some(1000), false);
-        assert!(!h.add_expirable(CompactString::from("f1"), CompactString::from("v2"), Some(2000), true));
+        h.add_expirable(
+            CompactString::from("f1"),
+            CompactString::from("v"),
+            Some(1000),
+            false,
+        );
+        assert!(!h.add_expirable(
+            CompactString::from("f1"),
+            CompactString::from("v2"),
+            Some(2000),
+            true
+        ));
         assert_eq!(h.field_expire_ms(b"f1"), Some(1000));
         assert!(h.has_expiry());
     }
@@ -358,16 +413,31 @@ mod tests {
         let mut h = Hash::new();
         h.set(CompactString::from("f1"), CompactString::from("v"));
         assert!(h.field_expire_ms(b"f1").is_none());
-        assert!(!h.add_expirable(CompactString::from("f1"), CompactString::from("v2"), Some(1000), true));
+        assert!(!h.add_expirable(
+            CompactString::from("f1"),
+            CompactString::from("v2"),
+            Some(1000),
+            true
+        ));
         assert_eq!(h.field_expire_ms(b"f1"), Some(1000));
     }
 
     #[test]
     fn plain_set_clears_expiry() {
         let mut h = Hash::new();
-        h.add_expirable(CompactString::from("f1"), CompactString::from("v"), Some(1000), false);
+        h.add_expirable(
+            CompactString::from("f1"),
+            CompactString::from("v"),
+            Some(1000),
+            false,
+        );
         assert_eq!(h.field_expire_ms(b"f1"), Some(1000));
-        assert!(!h.add_expirable(CompactString::from("f1"), CompactString::from("v2"), None, false));
+        assert!(!h.add_expirable(
+            CompactString::from("f1"),
+            CompactString::from("v2"),
+            None,
+            false
+        ));
         assert_eq!(h.field_expire_ms(b"f1"), None);
         assert!(!h.has_expiry());
     }
@@ -375,8 +445,18 @@ mod tests {
     #[test]
     fn remove_clears_expiry_entry() {
         let mut h = Hash::new();
-        h.add_expirable(CompactString::from("f1"), CompactString::from("v"), Some(1000), false);
-        h.add_expirable(CompactString::from("f2"), CompactString::from("v"), Some(2000), false);
+        h.add_expirable(
+            CompactString::from("f1"),
+            CompactString::from("v"),
+            Some(1000),
+            false,
+        );
+        h.add_expirable(
+            CompactString::from("f2"),
+            CompactString::from("v"),
+            Some(2000),
+            false,
+        );
         assert_eq!(h.remove(b"f1"), Some(CompactString::from("v")));
         assert_eq!(h.field_expire_ms(b"f2"), Some(2000));
     }
@@ -397,7 +477,8 @@ mod tests {
         assert!(pairs.iter().all(|(f, _)| h.contains(f.as_bytes())));
         let unique = h.rand_pairs_unique(7);
         assert_eq!(unique.len(), 7);
-        let names: std::collections::HashSet<_> = unique.iter().map(|(f, _)| f.as_bytes()).collect();
+        let names: std::collections::HashSet<_> =
+            unique.iter().map(|(f, _)| f.as_bytes()).collect();
         assert_eq!(names.len(), 7);
         assert_eq!(h.rand_pairs_unique(100).len(), 10);
     }

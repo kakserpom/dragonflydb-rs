@@ -4,6 +4,7 @@ use crate::commands::{integer, ok, Command, OpContext, ShardPart, KeyRange, FLAG
 use crate::core::compact::CompactString;
 use crate::core::db::DbSlice;
 use crate::core::quicklist::{ListItem, QuickList};
+use crate::core::rdb::{dump_value, restore_value, RestoreError, RestoreOutcome};
 use crate::core::value::ObjType;
 use crate::core::PrimeValue;
 use crate::error::{CmdResult, RespError, RespValue};
@@ -224,6 +225,66 @@ fn exec_type(ctx: &mut OpContext) -> CmdResult {
         Some(v) => CmdResult::Ok(RespValue::Simple(v.type_name().to_string())),
         None => CmdResult::Ok(RespValue::Simple("none".to_string())),
     }
+}
+
+// ---------------------------------------------------------------------------
+// DUMP / RESTORE
+// ---------------------------------------------------------------------------
+
+fn exec_dump(ctx: &mut OpContext) -> CmdResult {
+    let key = &ctx.args[ctx.owned_keys[0]];
+    match ctx.db.find(key, ctx.now_ms) {
+        Some(v) => CmdResult::Ok(RespValue::Bulk(dump_value(v))),
+        None => CmdResult::Ok(RespValue::Nil),
+    }
+}
+
+fn exec_restore(ctx: &mut OpContext) -> CmdResult {
+    let key_idx = ctx.owned_keys[0];
+    let key = &ctx.args[key_idx];
+    let ttl = match parse_i64(&ctx.args[key_idx + 1]) {
+        Some(v) => v,
+        None => return CmdResult::Err(RespError::integer()),
+    };
+    if ttl < 0 {
+        return CmdResult::Err(RespError::new("ERR Invalid TTL value, must be >= 0"));
+    }
+    let payload = &ctx.args[key_idx + 2];
+
+    let mut replace = false;
+    let mut absttl = false;
+    for opt in &ctx.args[key_idx + 3..] {
+        match opt.to_ascii_uppercase().as_slice() {
+            b"REPLACE" => replace = true,
+            b"ABSTTL" => absttl = true,
+            _ => return CmdResult::Err(RespError::syntax()),
+        }
+    }
+
+    if !replace && ctx.db.contains(key, ctx.now_ms) {
+        return CmdResult::Err(RespError::new("BUSYKEY Target key name already exists."));
+    }
+
+    let value = match restore_value(payload, ctx.now_ms) {
+        Ok(RestoreOutcome::Value(v)) => v,
+        Ok(RestoreOutcome::Expired) => return CmdResult::Ok(ok()),
+        Err(RestoreError::Expired) => return CmdResult::Ok(ok()),
+        Err(RestoreError::BadDataFormat) => {
+            return CmdResult::Err(RespError::new("ERR Bad data format"));
+        }
+    };
+
+    let key_cs = CompactString::from_bytes(key);
+    ctx.db.insert(key_cs.clone(), value);
+    if ttl > 0 {
+        let expire_at_ms = if absttl {
+            ttl
+        } else {
+            (ctx.now_ms as i64).saturating_add(ttl)
+        };
+        ctx.db.set_expiry(&key_cs, expire_at_ms.max(0) as u64, ctx.now_ms);
+    }
+    CmdResult::Ok(ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -1527,6 +1588,22 @@ pub static CMD_TYPE: Command = Command {
     exec: exec_type,
     merge: None,
 };
+pub static CMD_DUMP: Command = Command {
+    name: "DUMP",
+    arity: 2,
+    flags: FLAG_READONLY | FLAG_FAST,
+    key_range: KeyRange::ONE,
+    exec: exec_dump,
+    merge: None,
+};
+pub static CMD_RESTORE: Command = Command {
+    name: "RESTORE",
+    arity: -4,
+    flags: FLAG_WRITE | FLAG_DENYOOM,
+    key_range: KeyRange::ONE,
+    exec: exec_restore,
+    merge: None,
+};
 pub static CMD_KEYS: Command = Command {
     name: "KEYS",
     arity: 2,
@@ -1722,6 +1799,8 @@ mod tests {
                 b"KEYS" => (exec_keys, 1, vec![]),
                 b"EXISTS" => (exec_exists, 1, (1..argv.len()).collect()),
                 b"PEXPIREAT" => (exec_pexpireat, 1, (1..2).collect()),
+                b"DUMP" => (exec_dump, 1, (1..2).collect()),
+                b"RESTORE" => (exec_restore, 1, (1..2).collect()),
                 _ => panic!("unhandled command {:?}", argv[0]),
             };
         let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx, now_ms };
@@ -1774,6 +1853,89 @@ mod tests {
         str_of(&mut db, "y", "1");
         assert_eq!(int_of(cmd(&mut db, &[b"TOUCH", b"x", b"y", b"x"])), 3);
         assert_eq!(int_of(cmd(&mut db, &[b"TOUCH", b"z", b"x", b"w"])), 1);
+    }
+
+    /// DUMP + RESTORE round-trip through the command layer.
+    #[test]
+    fn dump_restore_roundtrip() {
+        let mut db = DbSlice::new(0);
+        str_of(&mut db, "src", "hello");
+
+        let dump = match val(cmd(&mut db, &[b"DUMP", b"src"])) {
+            RespValue::Bulk(b) => b,
+            o => panic!("expected bulk dump, got {:?}", o),
+        };
+        assert_eq!(&dump[0..1], &[0]); // RDB_TYPE_STRING
+
+        // DUMP on a missing key -> nil.
+        assert_eq!(val(cmd(&mut db, &[b"DUMP", b"nope"])), RespValue::Nil);
+
+        // RESTORE into a fresh key.
+        let payload: Vec<Vec<u8>> =
+            vec![b"RESTORE".to_vec(), b"dst".to_vec(), b"0".to_vec(), dump.clone()];
+        let mut argv = vec![b"RESTORE".to_vec()];
+        argv.extend_from_slice(&payload[1..]);
+        assert_eq!(
+            val(dispatch_at(&mut db, 1000, &argv)),
+            val(CmdResult::Ok(ok()))
+        );
+        match db.find(b"dst", 0) {
+            Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"hello"),
+            o => panic!("expected restored string, got {:?}", o),
+        }
+        assert_eq!(int_of(cmd(&mut db, &[b"TTL", b"dst"])), -1);
+
+        // Existing key without REPLACE -> BUSYKEY.
+        let argv = vec![
+            b"RESTORE".to_vec(),
+            b"src".to_vec(),
+            b"0".to_vec(),
+            dump.clone(),
+        ];
+        assert_eq!(
+            err_of(dispatch_at(&mut db, 1000, &argv)),
+            "BUSYKEY Target key name already exists."
+        );
+
+        // With REPLACE it overwrites.
+        let argv = vec![
+            b"RESTORE".to_vec(),
+            b"src".to_vec(),
+            b"0".to_vec(),
+            dump.clone(),
+            b"REPLACE".to_vec(),
+        ];
+        assert_eq!(
+            val(dispatch_at(&mut db, 1000, &argv)),
+            val(CmdResult::Ok(ok()))
+        );
+
+        // RESTORE with a relative TTL stores an expiry.
+        let argv = vec![
+            b"RESTORE".to_vec(),
+            b"tmp".to_vec(),
+            b"5000".to_vec(),
+            dump.clone(),
+        ];
+        assert_eq!(
+            val(dispatch_at(&mut db, 1000, &argv)),
+            val(CmdResult::Ok(ok()))
+        );
+        assert_eq!(int_of(cmd_at(&mut db, 1000, &[b"PTTL", b"tmp"])), 5000);
+        // Expired by 6000ms.
+        assert_eq!(int_of(cmd_at(&mut db, 6000, &[b"EXISTS", b"tmp"])), 0);
+
+        // Corrupt payload -> Bad data format.
+        let argv = vec![
+            b"RESTORE".to_vec(),
+            b"bad".to_vec(),
+            b"0".to_vec(),
+            b"garbage-not-an-rdb-payload".to_vec(),
+        ];
+        assert_eq!(
+            err_of(dispatch_at(&mut db, 1000, &argv)),
+            "ERR Bad data format"
+        );
     }
 
     /// Port of `GenericFamilyTest.Rename`.

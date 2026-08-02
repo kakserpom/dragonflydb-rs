@@ -78,6 +78,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     keys::CMD_SORT_RO,
     keys::CMD_FIELDEXPIRE,
     keys::CMD_FIELDTTL,
+    keys::CMD_DUMP,
+    keys::CMD_RESTORE,
     // lists
     lists::CMD_LPUSH,
     lists::CMD_RPUSH,

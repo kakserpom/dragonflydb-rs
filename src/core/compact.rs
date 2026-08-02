@@ -13,7 +13,7 @@ pub const INLINE_CAP: usize = 15;
 #[derive(Clone, Default)]
 pub struct CompactString {
     inline: [u8; INLINE_CAP],
-    len: u8,
+    len: usize,
     heap: Option<Box<[u8]>>,
 }
 
@@ -26,11 +26,11 @@ impl CompactString {
         if b.len() <= INLINE_CAP {
             let mut inline = [0u8; INLINE_CAP];
             inline[..b.len()].copy_from_slice(b);
-            Self { inline, len: b.len() as u8, heap: None }
+            Self { inline, len: b.len(), heap: None }
         } else {
             Self {
                 inline: [0u8; INLINE_CAP],
-                len: b.len() as u8,
+                len: b.len(),
                 heap: Some(b.to_vec().into_boxed_slice()),
             }
         }
@@ -38,8 +38,8 @@ impl CompactString {
 
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
-        if self.len as usize <= INLINE_CAP {
-            &self.inline[..self.len as usize]
+        if self.len <= INLINE_CAP {
+            &self.inline[..self.len]
         } else {
             self.heap.as_deref().unwrap()
         }
@@ -47,7 +47,7 @@ impl CompactString {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.len as usize
+        self.len
     }
 
     #[inline]

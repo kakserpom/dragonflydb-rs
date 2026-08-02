@@ -1,8 +1,13 @@
 pub mod compact;
+pub mod crc64;
 pub mod db;
 pub mod hash;
 pub mod hll;
+pub mod intset;
+pub mod listpack;
+pub mod lzf;
 pub mod quicklist;
+pub mod rdb;
 pub mod set;
 pub mod stream;
 pub mod value;
