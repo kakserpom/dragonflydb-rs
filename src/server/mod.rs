@@ -160,6 +160,25 @@ impl ServerEnv {
             // `LMPOP <numkeys> <key>...` / `BLMPOP <timeout> <numkeys> <key>...`
             let numkeys_idx = if cmd.name == "LMPOP" { 1 } else { 2 };
             extract_numkeys_keys(args, numkeys_idx)
+        } else if matches!(
+            cmd.name,
+            "ZUNION" | "ZINTER" | "ZDIFF" | "ZINTERCARD" | "ZMPOP" | "BZMPOP" | "ZUNIONSTORE"
+                | "ZINTERSTORE" | "ZDIFFSTORE"
+        ) {
+            // `ZUNION <numkeys> <key>...` / `ZUNIONSTORE <dest> <numkeys> <key>...` /
+            // `BZMPOP <timeout> <numkeys> <key>...`. The store variants add the
+            // destination key as a leading bonus key (mirrors the `STORE` bonus in
+            // `transaction.cc DetermineKeys`).
+            let numkeys_idx = if cmd.name.ends_with("STORE") || cmd.name == "BZMPOP" {
+                2
+            } else {
+                1
+            };
+            let mut keys = extract_numkeys_keys(args, numkeys_idx);
+            if cmd.name.ends_with("STORE") && !keys.is_empty() {
+                keys.insert(0, 1);
+            }
+            keys
         } else if cmd.flags & crate::commands::FLAG_MOVABLEKEYS != 0 {
             if cmd.name == "SORT" || cmd.name == "SORT_RO" {
                 extract_sort_keys(args)
@@ -261,6 +280,14 @@ pub fn blocking_timeout_ms(cmd: &Command, args: &[Vec<u8>]) -> Option<u64> {
             .map(secs_to_ms),
         "BLMPOP" => args
             .get(1)
+            .and_then(|a| crate::util::parse_list_timeout(a).ok())
+            .map(secs_to_ms),
+        "BZMPOP" => args
+            .get(1)
+            .and_then(|a| crate::util::parse_list_timeout(a).ok())
+            .map(secs_to_ms),
+        "BZPOPMIN" | "BZPOPMAX" => args
+            .last()
             .and_then(|a| crate::util::parse_list_timeout(a).ok())
             .map(secs_to_ms),
         _ => None,
