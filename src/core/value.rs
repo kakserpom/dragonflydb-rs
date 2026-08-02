@@ -6,6 +6,7 @@ use crate::core::hash::Hash;
 use crate::core::quicklist::QuickList;
 use crate::core::set::Set;
 use crate::core::stream::Stream;
+use crate::core::topk::Topk;
 use crate::core::zset::ZSet;
 
 /// The object type tag, mirroring Dragonfly's `ObjType`.
@@ -20,6 +21,7 @@ pub enum ObjType {
     Sbf,
     Cms,
     Cuckoo,
+    Topk,
 }
 
 /// A value stored in the prime table: the Rust analogue of Dragonfly's
@@ -35,6 +37,7 @@ pub enum PrimeValue {
     Sbf(SBF),
     Cms(Cms),
     Cuckoo(CuckooFilter),
+    Topk(Topk),
 }
 
 impl PrimeValue {
@@ -49,6 +52,7 @@ impl PrimeValue {
             PrimeValue::Sbf(_) => ObjType::Sbf,
             PrimeValue::Cms(_) => ObjType::Cms,
             PrimeValue::Cuckoo(_) => ObjType::Cuckoo,
+            PrimeValue::Topk(_) => ObjType::Topk,
         }
     }
 
@@ -63,6 +67,7 @@ impl PrimeValue {
             ObjType::Sbf => "MBbloom--",
             ObjType::Cms => "CMSk-TYPE",
             ObjType::Cuckoo => "MBbloomCF",
+            ObjType::Topk => "TopK-TYPE",
         }
     }
 
@@ -91,6 +96,7 @@ impl PrimeValue {
             PrimeValue::Sbf(s) => s.malloc_used(),
             PrimeValue::Cms(c) => c.malloc_used(),
             PrimeValue::Cuckoo(c) => c.malloc_used(),
+            PrimeValue::Topk(t) => t.malloc_used(),
             _ => 0,
         }
     }
@@ -111,6 +117,7 @@ impl ObjType {
             b"mbbloom--" => Some(ObjType::Sbf),
             b"cmsk-type" => Some(ObjType::Cms),
             b"mbbloomcf" => Some(ObjType::Cuckoo),
+            b"topk-type" => Some(ObjType::Topk),
             _ => None,
         }
     }

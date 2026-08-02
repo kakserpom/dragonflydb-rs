@@ -1,6 +1,7 @@
 pub mod bloom;
 pub mod cms;
 pub mod cuckoo;
+pub mod topk;
 pub mod compact;
 pub mod crc64;
 pub mod db;

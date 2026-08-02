@@ -4,7 +4,7 @@ Goal: 100% parity with DragonflyDB — every command in the reference
 `dragonfly/src/server/*.cc` registries ported to `src/commands/exec/*.rs`,
 with reference tests (`*_test.cc`) ported to Rust unit tests.
 
-Command counts: reference **289**, ported **196**, missing **93**.
+Command counts: reference **289**, ported **203**, missing **86**.
 
 Legend:
 - [x] ported
@@ -75,7 +75,7 @@ Legend:
 - [x] CMS.INCRBY, CMS.INFO, CMS.INITBYDIM, CMS.INITBYPROB, CMS.MERGE, CMS.QUERY
 - [x] CF.ADD, CF.ADDNX, CF.COMPACT, CF.COUNT, CF.DEL, CF.EXISTS, CF.INFO,
   CF.INSERT, CF.INSERTNX, CF.MEXISTS, CF.RESERVE
-- [ ] TOPK.ADD, TOPK.COUNT, TOPK.INCRBY, TOPK.INFO, TOPK.LIST, TOPK.QUERY,
+- [x] TOPK.ADD, TOPK.COUNT, TOPK.INCRBY, TOPK.INFO, TOPK.LIST, TOPK.QUERY,
   TOPK.RESERVE
 
 ## JSON module (`json_family.cc`) — 24 cmds

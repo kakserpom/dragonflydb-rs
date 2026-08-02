@@ -20,6 +20,7 @@ use hashbrown::HashMap;
 use crate::core::bloom::SBF;
 use crate::core::cms::Cms;
 use crate::core::cuckoo::CuckooFilter;
+use crate::core::topk::Topk;
 use crate::core::compact::CompactString;
 use crate::core::crc64;
 use crate::core::hash::Hash;
@@ -80,6 +81,10 @@ pub const RDB_TYPE_CMS: u8 = 41;
 /// (`CuckooFilter::serialize`); not part of the reference RDB type table (the
 /// reference serializes cuckoo filters through the module RDB interface).
 pub const RDB_TYPE_CUCKOO: u8 = 42;
+
+/// Port-local RDB type for the top-K sketch. The payload is the TOPK blob
+/// (`Topk::serialize`); not part of the reference RDB type table.
+pub const RDB_TYPE_TOPK: u8 = 43;
 
 const QUICKLIST_NODE_CONTAINER_PACKED: usize = 2;
 
@@ -227,6 +232,7 @@ fn rdb_object_type(pv: &PrimeValue) -> u8 {
         PrimeValue::Sbf(_) => RDB_TYPE_SBF,
         PrimeValue::Cms(_) => RDB_TYPE_CMS,
         PrimeValue::Cuckoo(_) => RDB_TYPE_CUCKOO,
+        PrimeValue::Topk(_) => RDB_TYPE_TOPK,
     }
 }
 
@@ -475,6 +481,7 @@ fn save_value(out: &mut Vec<u8>, pv: &PrimeValue) {
         PrimeValue::Sbf(s) => save_string(out, &s.serialize()),
         PrimeValue::Cms(c) => save_string(out, &c.serialize()),
         PrimeValue::Cuckoo(c) => save_string(out, &c.serialize()),
+        PrimeValue::Topk(t) => save_string(out, &t.serialize()),
     }
 }
 
@@ -1114,6 +1121,13 @@ fn load_value(r: &mut Reader, typ: u8, now_ms: u64) -> Result<RestoreOutcome, Re
             let blob = r.read_string()?;
             match CuckooFilter::deserialize(&blob) {
                 Some(cf) => Ok(RestoreOutcome::Value(PrimeValue::Cuckoo(cf))),
+                None => Err(RestoreError::BadDataFormat),
+            }
+        }
+        RDB_TYPE_TOPK => {
+            let blob = r.read_string()?;
+            match Topk::deserialize(&blob) {
+                Some(tk) => Ok(RestoreOutcome::Value(PrimeValue::Topk(tk))),
                 None => Err(RestoreError::BadDataFormat),
             }
         }
@@ -2081,6 +2095,7 @@ mod tests {
         use crate::core::bloom::SBF;
         use crate::core::cms::Cms;
         use crate::core::cuckoo::{CuckooFilter, CuckooFilterOptions};
+        use crate::core::topk::Topk;
 
         let mut sbf = SBF::new(32, 0.01, 2.0);
         sbf.add(b"a");
@@ -2098,8 +2113,16 @@ mod tests {
         cf.insert(CuckooFilter::hash(b"foo"));
         cf.insert(CuckooFilter::hash(b"bar"));
         cf.delete(CuckooFilter::hash(b"bar"));
+        let mut tk = Topk::new(5, 50, 7, 0.9);
+        tk.incr_by(b"foo", 10);
+        tk.incr_by(b"bar", 3);
 
-        for pv in [PrimeValue::Sbf(sbf), PrimeValue::Cms(cms), PrimeValue::Cuckoo(cf)] {
+        for pv in [
+            PrimeValue::Sbf(sbf),
+            PrimeValue::Cms(cms),
+            PrimeValue::Cuckoo(cf),
+            PrimeValue::Topk(tk),
+        ] {
             let dump = dump_value(&pv);
             match restore_value(&dump, now_ms()) {
                 Ok(RestoreOutcome::Value(v)) => {

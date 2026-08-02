@@ -2,6 +2,7 @@ pub mod bitops;
 pub mod bloom;
 pub mod cms;
 pub mod cuckoo;
+pub mod topk;
 pub mod geos;
 pub mod hashes;
 pub mod hlls;
@@ -82,6 +83,14 @@ pub const ALL_COMMANDS: &[Command] = &[
     cuckoo::CMD_CF_INSERT,
     cuckoo::CMD_CF_INSERTNX,
     cuckoo::CMD_CF_COMPACT,
+    // topk
+    topk::CMD_TOPK_RESERVE,
+    topk::CMD_TOPK_ADD,
+    topk::CMD_TOPK_INCRBY,
+    topk::CMD_TOPK_QUERY,
+    topk::CMD_TOPK_COUNT,
+    topk::CMD_TOPK_LIST,
+    topk::CMD_TOPK_INFO,
     // keys
     keys::CMD_DEL,
     keys::CMD_EXISTS,
