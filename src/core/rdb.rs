@@ -19,6 +19,7 @@ use hashbrown::HashMap;
 
 use crate::core::bloom::SBF;
 use crate::core::cms::Cms;
+use crate::core::cuckoo::CuckooFilter;
 use crate::core::compact::CompactString;
 use crate::core::crc64;
 use crate::core::hash::Hash;
@@ -74,6 +75,11 @@ pub const RDB_TYPE_SBF: u8 = 40;
 /// (`Cms::serialize`); not part of the reference RDB type table (the reference
 /// does not persist CMS values in RDB).
 pub const RDB_TYPE_CMS: u8 = 41;
+
+/// Port-local RDB type for the cuckoo filter. The payload is the CF blob
+/// (`CuckooFilter::serialize`); not part of the reference RDB type table (the
+/// reference serializes cuckoo filters through the module RDB interface).
+pub const RDB_TYPE_CUCKOO: u8 = 42;
 
 const QUICKLIST_NODE_CONTAINER_PACKED: usize = 2;
 
@@ -220,6 +226,7 @@ fn rdb_object_type(pv: &PrimeValue) -> u8 {
         PrimeValue::Stream(_) => RDB_TYPE_STREAM_LISTPACKS_3,
         PrimeValue::Sbf(_) => RDB_TYPE_SBF,
         PrimeValue::Cms(_) => RDB_TYPE_CMS,
+        PrimeValue::Cuckoo(_) => RDB_TYPE_CUCKOO,
     }
 }
 
@@ -467,6 +474,7 @@ fn save_value(out: &mut Vec<u8>, pv: &PrimeValue) {
         PrimeValue::Stream(s) => save_stream(out, s),
         PrimeValue::Sbf(s) => save_string(out, &s.serialize()),
         PrimeValue::Cms(c) => save_string(out, &c.serialize()),
+        PrimeValue::Cuckoo(c) => save_string(out, &c.serialize()),
     }
 }
 
@@ -1099,6 +1107,13 @@ fn load_value(r: &mut Reader, typ: u8, now_ms: u64) -> Result<RestoreOutcome, Re
             let blob = r.read_string()?;
             match Cms::deserialize(&blob) {
                 Some(cms) => Ok(RestoreOutcome::Value(PrimeValue::Cms(cms))),
+                None => Err(RestoreError::BadDataFormat),
+            }
+        }
+        RDB_TYPE_CUCKOO => {
+            let blob = r.read_string()?;
+            match CuckooFilter::deserialize(&blob) {
+                Some(cf) => Ok(RestoreOutcome::Value(PrimeValue::Cuckoo(cf))),
                 None => Err(RestoreError::BadDataFormat),
             }
         }
@@ -2065,6 +2080,7 @@ mod tests {
     fn module_types_dump_restore_round_trip() {
         use crate::core::bloom::SBF;
         use crate::core::cms::Cms;
+        use crate::core::cuckoo::{CuckooFilter, CuckooFilterOptions};
 
         let mut sbf = SBF::new(32, 0.01, 2.0);
         sbf.add(b"a");
@@ -2072,8 +2088,18 @@ mod tests {
         let mut cms = Cms::new(100, 5);
         cms.incr_by(b"foo", 5);
         cms.incr_by(b"bar", 3);
+        let mut cf = CuckooFilter::new(&CuckooFilterOptions {
+            capacity: 1000,
+            slots_per_bucket: 4,
+            max_iterations: 10,
+            expansion: 2,
+        });
+        cf.insert(CuckooFilter::hash(b"foo"));
+        cf.insert(CuckooFilter::hash(b"foo"));
+        cf.insert(CuckooFilter::hash(b"bar"));
+        cf.delete(CuckooFilter::hash(b"bar"));
 
-        for pv in [PrimeValue::Sbf(sbf), PrimeValue::Cms(cms)] {
+        for pv in [PrimeValue::Sbf(sbf), PrimeValue::Cms(cms), PrimeValue::Cuckoo(cf)] {
             let dump = dump_value(&pv);
             match restore_value(&dump, now_ms()) {
                 Ok(RestoreOutcome::Value(v)) => {

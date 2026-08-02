@@ -1,6 +1,7 @@
 use crate::core::bloom::SBF;
 use crate::core::cms::Cms;
 use crate::core::compact::CompactString;
+use crate::core::cuckoo::CuckooFilter;
 use crate::core::hash::Hash;
 use crate::core::quicklist::QuickList;
 use crate::core::set::Set;
@@ -18,6 +19,7 @@ pub enum ObjType {
     Stream,
     Sbf,
     Cms,
+    Cuckoo,
 }
 
 /// A value stored in the prime table: the Rust analogue of Dragonfly's
@@ -32,6 +34,7 @@ pub enum PrimeValue {
     Stream(Stream),
     Sbf(SBF),
     Cms(Cms),
+    Cuckoo(CuckooFilter),
 }
 
 impl PrimeValue {
@@ -45,6 +48,7 @@ impl PrimeValue {
             PrimeValue::Stream(_) => ObjType::Stream,
             PrimeValue::Sbf(_) => ObjType::Sbf,
             PrimeValue::Cms(_) => ObjType::Cms,
+            PrimeValue::Cuckoo(_) => ObjType::Cuckoo,
         }
     }
 
@@ -58,6 +62,7 @@ impl PrimeValue {
             ObjType::Stream => "stream",
             ObjType::Sbf => "MBbloom--",
             ObjType::Cms => "CMSk-TYPE",
+            ObjType::Cuckoo => "MBbloomCF",
         }
     }
 
@@ -85,6 +90,7 @@ impl PrimeValue {
             // Container types are not exercised by the SCAN MINMSZ tests.
             PrimeValue::Sbf(s) => s.malloc_used(),
             PrimeValue::Cms(c) => c.malloc_used(),
+            PrimeValue::Cuckoo(c) => c.malloc_used(),
             _ => 0,
         }
     }
@@ -104,6 +110,7 @@ impl ObjType {
             b"stream" => Some(ObjType::Stream),
             b"mbbloom--" => Some(ObjType::Sbf),
             b"cmsk-type" => Some(ObjType::Cms),
+            b"mbbloomcf" => Some(ObjType::Cuckoo),
             _ => None,
         }
     }

@@ -1,6 +1,7 @@
 pub mod bitops;
 pub mod bloom;
 pub mod cms;
+pub mod cuckoo;
 pub mod geos;
 pub mod hashes;
 pub mod hlls;
@@ -69,6 +70,18 @@ pub const ALL_COMMANDS: &[Command] = &[
     cms::CMD_CMS_QUERY,
     cms::CMD_CMS_INFO,
     cms::CMD_CMS_MERGE,
+    // cuckoo filters
+    cuckoo::CMD_CF_RESERVE,
+    cuckoo::CMD_CF_ADD,
+    cuckoo::CMD_CF_ADDNX,
+    cuckoo::CMD_CF_EXISTS,
+    cuckoo::CMD_CF_MEXISTS,
+    cuckoo::CMD_CF_INFO,
+    cuckoo::CMD_CF_COUNT,
+    cuckoo::CMD_CF_DEL,
+    cuckoo::CMD_CF_INSERT,
+    cuckoo::CMD_CF_INSERTNX,
+    cuckoo::CMD_CF_COMPACT,
     // keys
     keys::CMD_DEL,
     keys::CMD_EXISTS,
