@@ -6,7 +6,7 @@ use crate::commands::{OpContext, ShardPart};
 use crate::core::compact::CompactString;
 use crate::core::DbSlice;
 use crate::error::CmdResult;
-use crate::server::{command_for, encode_result, Reply, ShardMsg, SingleOp, MAX_DB};
+use crate::server::{command_for, encode_result, Reply, ShardMsg, SingleOp, WatchState, MAX_DB};
 
 /// Context for an active transaction on this shard, stored between TxLock and
 /// TxExec.
@@ -17,6 +17,10 @@ struct TxCtx {
     db_idx: usize,
 }
 
+/// A watch snapshot query queued while a transaction holds the shard:
+/// (keys, db index, reply channel).
+type PendingWatch = (Vec<Vec<u8>>, usize, mpsc::Sender<Vec<(Vec<u8>, WatchState)>>);
+
 struct Shard {
     shard_id: usize,
     /// Logical databases, index 0..N, grown lazily on demand.
@@ -26,6 +30,8 @@ struct Shard {
     active_tx: Option<u64>,
     tx_ctx: HashMap<u64, TxCtx>,
     pending_singles: VecDeque<SingleOp>,
+    /// Watch snapshots queued while a transaction holds the shard.
+    pending_watches: VecDeque<PendingWatch>,
 }
 
 pub fn spawn(shard_id: usize, rx: mpsc::Receiver<ShardMsg>) -> std::thread::JoinHandle<()> {
@@ -38,6 +44,7 @@ pub fn spawn(shard_id: usize, rx: mpsc::Receiver<ShardMsg>) -> std::thread::Join
                 active_tx: None,
                 tx_ctx: HashMap::new(),
                 pending_singles: VecDeque::new(),
+                pending_watches: VecDeque::new(),
             };
             shard.run(rx);
         })
@@ -100,6 +107,16 @@ impl Shard {
                             None => break,
                         }
                     }
+                    while let Some((keys, db_idx, tx)) = self.pending_watches.pop_front() {
+                        self.run_watch_query(&keys, db_idx, tx);
+                    }
+                }
+            }
+            ShardMsg::WatchQuery { keys, db_idx, result_tx } => {
+                if self.active_tx.is_some() {
+                    self.pending_watches.push_back((keys, db_idx, result_tx));
+                } else {
+                    self.run_watch_query(&keys, db_idx, result_tx);
                 }
             }
             ShardMsg::StoreValue { tx_id, key, value, expire_at, sticky, db_idx, ack } => {
@@ -132,7 +149,32 @@ impl Shard {
             seq: op.seq,
             bytes: encode_result(result),
         };
-        let _ = op.reply.send(reply);
+        op.reply.send(reply);
+    }
+
+    /// Snapshot the watched-state of each key, in input order.
+    fn run_watch_query(
+        &mut self,
+        keys: &[Vec<u8>],
+        db_idx: usize,
+        result_tx: mpsc::Sender<Vec<(Vec<u8>, WatchState)>>,
+    ) {
+        let now = now_ms();
+        let out = {
+            let db = self.ensure_db(db_idx);
+            keys.iter()
+                .map(|k| {
+                    let existed = db.contains(k, now);
+                    let state = WatchState {
+                        version: db.version_of(k),
+                        existed,
+                        db_epoch: db.db_epoch(),
+                    };
+                    (k.clone(), state)
+                })
+                .collect()
+        };
+        let _ = result_tx.send(out);
     }
 
     fn run_exec(&mut self, args: &[Vec<u8>], owned: &[usize], first_key_idx: usize, db_idx: usize) -> CmdResult {
@@ -143,6 +185,11 @@ impl Shard {
         // `dbs` vector rather than a single `OpContext`.
         if cmd.name == "MOVE" {
             return self.run_move(args, db_idx);
+        }
+        // FLUSHALL clears every DB on the shard and dirties every WATCH (across
+        // all DBs), mirroring upstream `FlushDbIndexes` + `InvalidateDbWatches`.
+        if cmd.name == "FLUSHALL" {
+            return self.run_flushall();
         }
         let db = self.ensure_db(db_idx);
         let mut ctx = OpContext {
@@ -168,12 +215,25 @@ impl Shard {
     /// `key` can move it. Returns 0 if the key is missing or the destination
     /// key already exists, 1 otherwise.
     fn run_move(&mut self, args: &[Vec<u8>], db_idx: usize) -> CmdResult {
-        if let Some(t) = args.get(2).and_then(|a| crate::util::parse_i64(a)) {
-            if (0..MAX_DB as i64).contains(&t) {
-                self.ensure_db(db_idx);
-                self.ensure_db(t as usize);
-            }
+        if let Some(t) = args.get(2).and_then(|a| crate::util::parse_i64(a))
+            && (0..MAX_DB as i64).contains(&t)
+        {
+            self.ensure_db(db_idx);
+            self.ensure_db(t as usize);
         }
         crate::commands::exec::keys::exec_move_on_dbs(&mut self.dbs, db_idx, args, now_ms())
+    }
+
+    /// `FLUSHALL`: drain every DB on this shard and bump each DB epoch so that
+    /// every WATCH (in any DB) becomes dirty at the next EXEC.
+    fn run_flushall(&mut self) -> CmdResult {
+        for db in self.dbs.iter_mut() {
+            let keys: Vec<CompactString> = db.iter().map(|(k, _)| k.clone()).collect();
+            for k in keys {
+                db.remove(k.as_bytes());
+            }
+            db.bump_db_epoch();
+        }
+        CmdResult::Ok(crate::commands::ok())
     }
 }

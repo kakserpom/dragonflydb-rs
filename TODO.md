@@ -4,7 +4,7 @@ Goal: 100% parity with DragonflyDB — every command in the reference
 `dragonfly/src/server/*.cc` registries ported to `src/commands/exec/*.rs`,
 with reference tests (`*_test.cc`) ported to Rust unit tests.
 
-Command counts: reference **289**, ported **155**, missing **134**.
+Command counts: reference **289**, ported **160**, missing **129**.
 
 Legend:
 - [x] ported
@@ -60,13 +60,13 @@ Legend:
   GEORADIUSBYMEMBER_RO, GEOSEARCH, GEOSEARCHSTORE
 
 ## Server / admin (`server_family.cc` + `main_service.cc`)
-- [x] AUTH, CLIENT, COMMAND, CONFIG, DBSIZE, FLUSHALL, FLUSHDB, HELLO, INFO,
-  PING, QUIT, RESET
-- [ ] ADDREPLICAOF, BGSAVE, DEBUG, DFLY, DISCARD, EVAL, EVALSHA, EXEC, FUNCTION,
-  LASTSAVE, LATENCY, MEMORY, MODULE, MONITOR, MULTI, PSUBSCRIBE, PUBLISH, PUBSUB,
+- [x] AUTH, CLIENT, COMMAND, CONFIG, DBSIZE, DISCARD, EXEC, FLUSHALL, FLUSHDB,
+  HELLO, INFO, MULTI, PING, QUIT, RESET, UNWATCH, WATCH
+- [ ] ADDREPLICAOF, BGSAVE, DEBUG, DFLY, EVAL, EVALSHA, FUNCTION,
+  LASTSAVE, LATENCY, MEMORY, MODULE, MONITOR, PSUBSCRIBE, PUBLISH, PUBSUB,
   PUNSUBSCRIBE, REPLCONF, REPLICAOF, REPLTAKEOVER, ROLE, SAVE, SCRIPT, SHRINK,
   SHUTDOWN, SLAVEOF, SLOWLOG, SPUBLISH, SSUBSCRIBE, SUBSCRIBE, SUNSUBSCRIBE,
-  UNSUBSCRIBE, UNWATCH, WAIT, WATCH
+  UNSUBSCRIBE, WAIT
 
 ## Module / probabilistic (`bloom_family.cc`, `cms_family.cc`, `cuckoo_filter_family.cc`, `topk_family.cc`)
 - [ ] BF.ADD, BF.EXISTS, BF.INFO, BF.LOADCHUNK, BF.MADD, BF.MEXISTS, BF.RESERVE,

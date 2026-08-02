@@ -9,12 +9,42 @@ use crate::error::RespValue;
 use crate::protocol::resp::RespParser;
 use crate::server::{
     command_for, encode_value, keys_per_shard, CoordMsg, Reply, ServerEnv, ShardMsg, SingleOp,
+    WatchState,
 };
 
 const EV_READ: i16 = libc::EVFILT_READ;
 const EV_WRITE: i16 = libc::EVFILT_WRITE;
 const EV_ADD_ENABLE: u16 = libc::EV_ADD | libc::EV_ENABLE;
 const EV_DELETE: u16 = libc::EV_DELETE;
+
+/// Phases of a connection-scoped MULTI/EXEC block (mirrors
+/// `ConnectionState::ExecInfo::ExecState`). `Collect` accepts queued commands;
+/// `Error` marks a block that will fail at EXEC (EXECABORT); commands arriving
+/// while in `Error` execute immediately, like upstream.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum MultiPhase {
+    #[default]
+    Inactive,
+    Collect,
+    Error,
+}
+
+/// A key watched by a connection via WATCH, with the state snapshot taken at
+/// watch time. At EXEC the live state is compared and any difference (or a
+/// FLUSHDB epoch bump) aborts the transaction.
+struct WatchedKey {
+    db: usize,
+    key: Vec<u8>,
+    state: WatchState,
+}
+
+/// Connection-scoped MULTI/EXEC state.
+#[derive(Default)]
+struct MultiState {
+    phase: MultiPhase,
+    /// Commands queued while the block is collecting (raw argument vectors).
+    queue: Vec<Vec<Vec<u8>>>,
+}
 
 struct Conn {
     conn_id: u64,
@@ -30,6 +60,14 @@ struct Conn {
     buffered: BTreeMap<u64, Vec<u8>>,
     /// The connection's currently selected DB index.
     db_idx: usize,
+    /// MULTI/EXEC transaction state.
+    multi: MultiState,
+    /// Keys this connection is watching (WATCH/UNWATCH).
+    watched: Vec<WatchedKey>,
+    /// Latch mirroring upstream `ExecInfo::watched_dirty`: set when any
+    /// watched key is observed modified, making the next EXEC abort even if a
+    /// later WATCH re-registers keys. Cleared by EXEC/DISCARD/RESET/UNWATCH.
+    watched_dirty: bool,
 }
 
 /// A single-threaded kqueue-based IO event loop. Owns all client sockets, the
@@ -156,6 +194,9 @@ impl IoLoop {
                 deliver_seq: 0,
                 buffered: BTreeMap::new(),
                 db_idx: 0,
+                multi: MultiState::default(),
+                watched: Vec::new(),
+                watched_dirty: false,
             },
         );
         self.fd_to_id.insert(fd, conn_id);
@@ -212,12 +253,7 @@ impl IoLoop {
     // ------------------------------------------------------------------
 
     fn dispatch(&mut self, conn_id: u64, args: Vec<Vec<u8>>) {
-        let seq = {
-            let conn = self.conns.get_mut(&conn_id).unwrap();
-            let seq = conn.dispatch_seq;
-            conn.dispatch_seq += 1;
-            seq
-        };
+        let seq = self.next_seq(conn_id);
 
         let Some(cmd) = command_for(&args) else {
             let msg = format!("ERR unknown command '{}'", String::from_utf8_lossy(&args[0]));
@@ -225,47 +261,374 @@ impl IoLoop {
             return;
         };
         if let Some(e) = cmd.check_arity(args.len()) {
+            // A validation failure while collecting poisons the transaction so
+            // EXEC will abort (EXECABORT). Unknown commands do not poison it.
+            if let Some(conn) = self.conns.get_mut(&conn_id)
+                && conn.multi.phase == MultiPhase::Collect
+            {
+                conn.multi.phase = MultiPhase::Error;
+            }
             self.deliver(conn_id, seq, encode_value(&RespValue::Error(e)));
             return;
         }
-        if cmd.has_flag(FLAG_LOCAL) {
-            if cmd.name == "SELECT" {
-                let v = server::local_select(&args);
-                if matches!(&v, RespValue::Simple(_)) {
-                    if let (Some(db), Some(conn)) = (
-                        args.get(1).and_then(|a| crate::util::parse_i64(a)),
-                        self.conns.get_mut(&conn_id),
-                    ) {
-                        conn.db_idx = db as usize;
-                    }
-                }
-                self.deliver(conn_id, seq, encode_value(&v));
-                return;
-            }
-            let v = self.run_local(cmd, &args);
-            self.deliver(conn_id, seq, encode_value(&v));
-            return;
-        }
-        if cmd.has_flag(FLAG_GLOBAL) {
-            let shards: Vec<usize> = (0..self.env.num_shards).collect();
-            self.send_coord(conn_id, seq, args, vec![], shards, cmd.key_range.first);
+
+        // Inside an open MULTI block everything except the exec-group commands
+        // and RESET is queued (upstream `StoreInMultiBlock`).
+        if self.in_multi(conn_id) && !matches!(cmd.name, "MULTI" | "EXEC" | "DISCARD" | "RESET") {
+            self.queue_cmd(conn_id, seq, cmd, args);
             return;
         }
 
-        let keys = self.env.extract_keys(cmd, &args);
+        match cmd.name {
+            "MULTI" => return self.local_multi(conn_id, seq),
+            "EXEC" => return self.local_exec(conn_id, seq),
+            "DISCARD" => return self.local_discard(conn_id, seq),
+            "RESET" => return self.local_reset(conn_id, seq),
+            "WATCH" => return self.local_watch(conn_id, seq, &args),
+            "UNWATCH" => return self.local_unwatch(conn_id, seq),
+            _ => {}
+        }
+        if cmd.has_flag(FLAG_LOCAL) {
+            let v = self.handle_local(conn_id, cmd, &args);
+            self.deliver(conn_id, seq, encode_value(&v));
+            return;
+        }
+        self.dispatch_keyed(conn_id, seq, cmd, &args);
+    }
+
+    /// Split a command by its keys and send it to a shard or the coordinator.
+    fn dispatch_keyed(&self, conn_id: u64, seq: u64, cmd: &'static Command, args: &[Vec<u8>]) {
+        if cmd.has_flag(FLAG_GLOBAL) {
+            let shards: Vec<usize> = (0..self.env.num_shards).collect();
+            self.send_coord(conn_id, seq, args.to_vec(), vec![], shards, cmd.key_range.first);
+            return;
+        }
+
+        let keys = self.env.extract_keys(cmd, args);
         if keys.is_empty() {
             // Malformed/movable-key command without keys: let the executor
             // validate and reply with an error from shard 0.
-            self.send_single(conn_id, seq, 0, args, vec![]);
+            self.send_single(conn_id, seq, 0, args.to_vec(), vec![]);
             return;
         }
-        let per = keys_per_shard(&args, &keys, self.env.num_shards);
+        let per = keys_per_shard(args, &keys, self.env.num_shards);
         if per.len() == 1 && !cmd.has_flag(FLAG_BLOCKING) {
-            self.send_single(conn_id, seq, per[0].0, args, per[0].1.clone());
+            self.send_single(conn_id, seq, per[0].0, args.to_vec(), per[0].1.clone());
         } else {
             let shards: Vec<usize> = per.iter().map(|(s, _)| *s).collect();
-            self.send_coord(conn_id, seq, args, keys, shards, cmd.key_range.first);
+            self.send_coord(conn_id, seq, args.to_vec(), keys, shards, cmd.key_range.first);
         }
+    }
+
+    /// Run a command queued inside a MULTI block. Its reply is delivered with a
+    /// fresh seq so the EXEC array header and all replies stay in order.
+    fn run_queued(&mut self, conn_id: u64, args: &[Vec<u8>]) {
+        let seq = self.next_seq(conn_id);
+        let Some(cmd) = command_for(args) else {
+            let bytes = encode_value(&RespValue::Error("ERR unknown command".into()));
+            self.deliver(conn_id, seq, bytes);
+            return;
+        };
+        if cmd.name == "UNWATCH" {
+            self.local_unwatch(conn_id, seq);
+            return;
+        }
+        if cmd.has_flag(FLAG_LOCAL) {
+            let v = self.handle_local(conn_id, cmd, args);
+            self.deliver(conn_id, seq, encode_value(&v));
+            return;
+        }
+        self.dispatch_keyed(conn_id, seq, cmd, args);
+    }
+
+    fn next_seq(&mut self, conn_id: u64) -> u64 {
+        let conn = self.conns.get_mut(&conn_id).unwrap();
+        let seq = conn.dispatch_seq;
+        conn.dispatch_seq += 1;
+        seq
+    }
+
+    fn in_multi(&self, conn_id: u64) -> bool {
+        self.conns
+            .get(&conn_id)
+            .map(|c| c.multi.phase == MultiPhase::Collect)
+            .unwrap_or(false)
+    }
+
+    fn handle_local(&mut self, conn_id: u64, cmd: &Command, args: &[Vec<u8>]) -> RespValue {
+        if cmd.name == "SELECT" {
+            let v = server::local_select(args);
+            if matches!(&v, RespValue::Simple(_))
+                && let (Some(db), Some(conn)) = (
+                    args.get(1).and_then(|a| crate::util::parse_i64(a)),
+                    self.conns.get_mut(&conn_id),
+                )
+            {
+                conn.db_idx = db as usize;
+            }
+            return v;
+        }
+        self.run_local(cmd, args)
+    }
+
+    // ------------------------------------------------------------------
+    // MULTI / EXEC / DISCARD / RESET
+    // ------------------------------------------------------------------
+
+    fn local_multi(&mut self, conn_id: u64, seq: u64) {
+        let phase = self
+            .conns
+            .get(&conn_id)
+            .map(|c| c.multi.phase)
+            .unwrap_or(MultiPhase::Inactive);
+        if phase == MultiPhase::Collect {
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error("ERR MULTI calls can not be nested".into())),
+            );
+            return;
+        }
+        if let Some(conn) = self.conns.get_mut(&conn_id) {
+            conn.multi = MultiState::default();
+            conn.multi.phase = MultiPhase::Collect;
+        }
+        self.deliver(conn_id, seq, encode_value(&RespValue::Simple("OK".into())));
+    }
+
+    fn local_discard(&mut self, conn_id: u64, seq: u64) {
+        let phase = self
+            .conns
+            .get(&conn_id)
+            .map(|c| c.multi.phase)
+            .unwrap_or(MultiPhase::Inactive);
+        // Upstream `MultiCleanup` runs before the IsInMulti check, so DISCARD
+        // outside a MULTI block still unwatches all keys and drains the queue.
+        if let Some(conn) = self.conns.get_mut(&conn_id) {
+            conn.multi = MultiState::default();
+            conn.watched.clear();
+            conn.watched_dirty = false;
+        }
+        if phase == MultiPhase::Inactive {
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error("ERR DISCARD without MULTI".into())),
+            );
+            return;
+        }
+        self.deliver(conn_id, seq, encode_value(&RespValue::Simple("OK".into())));
+    }
+
+    /// `WATCH key...`: snapshot each key's state on its shard and record it on
+    /// the connection. Replies OK. Mirrors upstream `Service::Watch`: if the
+    /// connection is already marked dirty (a watched key changed since the
+    /// last clear) the command is a no-op that will make EXEC abort.
+    fn local_watch(&mut self, conn_id: u64, seq: u64, args: &[Vec<u8>]) {
+        let (db_idx, already_dirty) = {
+            let conn = match self.conns.get(&conn_id) {
+                Some(c) => c,
+                None => return,
+            };
+            (conn.db_idx, conn.watched_dirty)
+        };
+        if already_dirty {
+            self.deliver(conn_id, seq, encode_value(&RespValue::Simple("OK".into())));
+            return;
+        }
+        let new_keys: Vec<Vec<u8>> = args[1..].to_vec();
+        // Re-verify every previously watched key against its stored snapshot:
+        // if any changed, latch the dirty flag so EXEC aborts (upstream marks
+        // the key dirty on every update and refuses to re-register afterwards).
+        let mut dirty = false;
+        let existing: Vec<Vec<u8>> = {
+            let conn = match self.conns.get(&conn_id) {
+                Some(c) => c,
+                None => return,
+            };
+            conn.watched.iter().map(|w| w.key.clone()).collect()
+        };
+        if !existing.is_empty() {
+            let states = self.watch_snapshot(&existing, db_idx);
+            let by_key: HashMap<&[u8], &WatchState> =
+                states.iter().map(|(k, s)| (k.as_slice(), s)).collect();
+            let conn = self.conns.get(&conn_id).unwrap();
+            dirty = conn.watched.iter().any(|w| {
+                by_key
+                    .get(w.key.as_slice())
+                    .map(|s| {
+                        s.version != w.state.version
+                            || s.existed != w.state.existed
+                            || s.db_epoch != w.state.db_epoch
+                    })
+                    .unwrap_or(true)
+            });
+        }
+        let states = self.watch_snapshot(&new_keys, db_idx);
+        if let Some(conn) = self.conns.get_mut(&conn_id) {
+            conn.watched_dirty |= dirty;
+            if !dirty {
+                for (key, state) in states {
+                    conn.watched.push(WatchedKey { db: db_idx, key, state });
+                }
+            }
+        }
+        self.deliver(conn_id, seq, encode_value(&RespValue::Simple("OK".into())));
+    }
+
+    fn local_unwatch(&mut self, conn_id: u64, seq: u64) {
+        if let Some(conn) = self.conns.get_mut(&conn_id) {
+            conn.watched.clear();
+            conn.watched_dirty = false;
+        }
+        self.deliver(conn_id, seq, encode_value(&RespValue::Simple("OK".into())));
+    }
+
+    fn local_exec(&mut self, conn_id: u64, seq: u64) {
+        let (phase, queue, watched, dirty) = {
+            let conn = match self.conns.get_mut(&conn_id) {
+                Some(c) => c,
+                None => return,
+            };
+            (
+                conn.multi.phase,
+                std::mem::take(&mut conn.multi.queue),
+                std::mem::take(&mut conn.watched),
+                std::mem::replace(&mut conn.watched_dirty, false),
+            )
+        };
+        if phase == MultiPhase::Inactive {
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error("EXEC without MULTI".into())),
+            );
+            return;
+        }
+        if phase == MultiPhase::Error {
+            if let Some(conn) = self.conns.get_mut(&conn_id) {
+                conn.multi = MultiState::default();
+            }
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error(
+                    "EXECABORT Transaction discarded because of previous errors".into(),
+                )),
+            );
+            return;
+        }
+
+        if let Some(conn) = self.conns.get_mut(&conn_id) {
+            conn.multi = MultiState::default();
+        }
+        // Watch guards: a nil reply aborts the transaction (upstream
+        // `watched_dirty` / `CheckWatchedKeyExpiry`).
+        if !watched.is_empty() || dirty {
+            let db_idx = self.conns.get(&conn_id).map(|c| c.db_idx).unwrap_or(0);
+            if watched.iter().any(|w| w.db != db_idx) {
+                self.deliver(
+                    conn_id,
+                    seq,
+                    encode_value(&RespValue::Error(
+                        "Dragonfly does not allow WATCH and EXEC on different databases".into(),
+                    )),
+                );
+                return;
+            }
+            if dirty {
+                self.deliver(conn_id, seq, encode_value(&RespValue::Nil));
+                return;
+            }
+            let keys: Vec<Vec<u8>> = watched.iter().map(|w| w.key.clone()).collect();
+            let states = self.watch_snapshot(&keys, db_idx);
+            let by_key: HashMap<&[u8], &WatchState> =
+                states.iter().map(|(k, s)| (k.as_slice(), s)).collect();
+            let is_dirty = watched.iter().any(|w| {
+                by_key
+                    .get(w.key.as_slice())
+                    .map(|s| {
+                        s.version != w.state.version
+                            || s.existed != w.state.existed
+                            || s.db_epoch != w.state.db_epoch
+                    })
+                    .unwrap_or(true)
+            });
+            if is_dirty {
+                self.deliver(conn_id, seq, encode_value(&RespValue::Nil));
+                return;
+            }
+        }
+        // The header plus each queued command's reply, delivered in seq order,
+        // concatenate into the EXEC RESP array.
+        let header = format!("*{}\r\n", queue.len()).into_bytes();
+        self.deliver(conn_id, seq, header);
+        for args in queue {
+            self.run_queued(conn_id, &args);
+        }
+    }
+
+    fn local_reset(&mut self, conn_id: u64, seq: u64) {
+        if let Some(conn) = self.conns.get_mut(&conn_id) {
+            conn.multi = MultiState::default();
+            conn.watched.clear();
+            conn.watched_dirty = false;
+            conn.db_idx = 0;
+        }
+        self.deliver(conn_id, seq, encode_value(&RespValue::Simple("RESET".into())));
+    }
+
+    /// Blocking read of every watched key's state across its shards, under the
+    /// shard lock (queued behind an active transaction like a single op).
+    fn watch_snapshot(&self, keys: &[Vec<u8>], db_idx: usize) -> Vec<(Vec<u8>, WatchState)> {
+        let mut by_shard: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (i, k) in keys.iter().enumerate() {
+            by_shard
+                .entry(crate::util::shard_for_key(k, self.env.num_shards))
+                .or_default()
+                .push(i);
+        }
+        let mut out: Vec<(Vec<u8>, WatchState)> = keys
+            .iter()
+            .map(|k| {
+                (
+                    k.clone(),
+                    WatchState { version: 0, existed: false, db_epoch: 0 },
+                )
+            })
+            .collect();
+        for (shard, idxs) in by_shard {
+            let ks: Vec<Vec<u8>> = idxs.iter().map(|&i| keys[i].clone()).collect();
+            let (tx, rx) = mpsc::channel();
+            if self.env.shard_txs[shard]
+                .send(ShardMsg::WatchQuery { keys: ks, db_idx, result_tx: tx })
+                .is_ok()
+                && let Ok(states) = rx.recv()
+            {
+                for (&i, (_, state)) in idxs.iter().zip(states.iter()) {
+                    out[i].1 = state.clone();
+                }
+            }
+        }
+        out
+    }
+
+    /// Validate and queue a command arriving inside a MULTI block.
+    fn queue_cmd(&mut self, conn_id: u64, seq: u64, cmd: &Command, args: Vec<Vec<u8>>) {
+        // These are forbidden inside a transaction and poison it
+        // (upstream `VerifyCommandState`).
+        if matches!(cmd.name, "WATCH" | "FLUSHALL" | "FLUSHDB") {
+            let msg = format!("ERR '{}' not allowed inside a transaction", cmd.name);
+            if let Some(conn) = self.conns.get_mut(&conn_id) {
+                conn.multi.phase = MultiPhase::Error;
+            }
+            self.deliver(conn_id, seq, encode_value(&RespValue::Error(msg)));
+            return;
+        }
+        if let Some(conn) = self.conns.get_mut(&conn_id) {
+            conn.multi.queue.push(args);
+        }
+        self.deliver(conn_id, seq, encode_value(&RespValue::Simple("QUEUED".into())));
     }
 
     fn run_local(&self, cmd: &Command, args: &[Vec<u8>]) -> RespValue {
@@ -329,11 +692,8 @@ impl IoLoop {
     }
 
     fn drain_bus(&mut self) {
-        loop {
-            match self.reply_bus_rx.try_recv() {
-                Ok(reply) => self.deliver(reply.conn_id, reply.seq, reply.bytes),
-                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
-            }
+        while let Ok(reply) = self.reply_bus_rx.try_recv() {
+            self.deliver(reply.conn_id, reply.seq, reply.bytes);
         }
     }
 

@@ -195,4 +195,10 @@ pub const ALL_COMMANDS: &[Command] = &[
     server::CMD_FLUSHDB,
     server::CMD_FLUSHALL,
     server::CMD_TIME,
+    server::CMD_MULTI,
+    server::CMD_EXEC,
+    server::CMD_DISCARD,
+    server::CMD_RESET,
+    server::CMD_WATCH,
+    server::CMD_UNWATCH,
 ];

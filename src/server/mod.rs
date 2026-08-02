@@ -22,6 +22,17 @@ pub struct Reply {
     pub bytes: ReplyBytes,
 }
 
+/// The watched-state snapshot of a single key, backing WATCH/EXEC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchState {
+    /// Key modification version at snapshot time.
+    pub version: u64,
+    /// Whether the key existed at snapshot time (after lazy expiry).
+    pub existed: bool,
+    /// DB epoch at snapshot time; a FLUSHDB bump dirties every WATCH.
+    pub db_epoch: u64,
+}
+
 /// A reply bus: a channel plus a kqueue wakeup pipe. Every reply sent through
 /// it pokes the IO thread so its event loop wakes without polling.
 #[derive(Clone)]
@@ -100,6 +111,13 @@ pub enum ShardMsg {
         /// The DB index to write into.
         db_idx: usize,
         ack: mpsc::Sender<()>,
+    },
+    /// Snapshot the (version, existed, db_epoch) of each key, in order. Queued
+    /// behind an active transaction like a single op. Backs WATCH.
+    WatchQuery {
+        keys: Vec<Vec<u8>>,
+        db_idx: usize,
+        result_tx: mpsc::Sender<Vec<(Vec<u8>, WatchState)>>,
     },
 }
 
@@ -188,7 +206,7 @@ pub fn extract_movable_keys(args: &[Vec<u8>]) -> Vec<usize> {
     for i in 1..args.len() {
         if args[i].eq_ignore_ascii_case(b"STREAMS") {
             let remaining = args.len() - i - 1;
-            if remaining == 0 || remaining % 2 != 0 {
+            if remaining == 0 || !remaining.is_multiple_of(2) {
                 return vec![];
             }
             let n = remaining / 2;

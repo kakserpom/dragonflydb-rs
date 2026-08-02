@@ -19,9 +19,8 @@ fn exec_dbsize(ctx: &mut OpContext) -> CmdResult {
 fn merge_dbsize(parts: &[ShardPart], _args: &[Vec<u8>], _keys: &[usize], _now: u64) -> CmdResult {
     let mut total = 0i64;
     for p in parts {
-        match &p.result {
-            CmdResult::Ok(RespValue::Integer(i)) => total += i,
-            _ => {}
+        if let CmdResult::Ok(RespValue::Integer(i)) = &p.result {
+            total += i;
         }
     }
     CmdResult::Ok(RespValue::Integer(total))
@@ -33,6 +32,8 @@ fn exec_flush(ctx: &mut OpContext) -> CmdResult {
     for k in keys {
         ctx.db.remove(k.as_bytes());
     }
+    // Dirty every WATCH in this DB, including watched keys that never existed.
+    ctx.db.bump_db_epoch();
     CmdResult::Ok(ok())
 }
 
@@ -63,14 +64,11 @@ fn exec_info(ctx: &mut OpContext) -> CmdResult {
 fn merge_info(parts: &[ShardPart], _args: &[Vec<u8>], _keys: &[usize], now_ms: u64) -> CmdResult {
     let (mut keys, mut expires) = (0i64, 0i64);
     for p in parts {
-        match &p.result {
-            CmdResult::Ok(RespValue::Array(a)) => {
-                if let (Some(RespValue::Integer(k)), Some(RespValue::Integer(e))) = (a.first(), a.get(1)) {
-                    keys += k;
-                    expires += e;
-                }
-            }
-            _ => {}
+        if let CmdResult::Ok(RespValue::Array(a)) = &p.result
+            && let (Some(RespValue::Integer(k)), Some(RespValue::Integer(e))) = (a.first(), a.get(1))
+        {
+            keys += k;
+            expires += e;
         }
     }
     let uptime = now_ms / 1000;
@@ -142,7 +140,7 @@ pub fn local_command(_args: &[Vec<u8>]) -> RespValue {
 pub fn local_hello(args: &[Vec<u8>]) -> RespValue {
     let proto = args.get(1).and_then(|a| crate::util::parse_i64(a)).unwrap_or(2);
     if proto != 2 && proto != 3 {
-        return RespValue::Error(format!("NOPROTO unsupported protocol version"));
+        return RespValue::Error("NOPROTO unsupported protocol version".into());
     }
     let mut m: Vec<(RespValue, RespValue)> = vec![
         (RespValue::Bulk(b"server".to_vec()), RespValue::Bulk(b"dragonflydb-rs".to_vec())),
@@ -300,6 +298,54 @@ pub static CMD_FLUSHALL: Command = Command {
 };
 pub static CMD_TIME: Command = Command {
     name: "TIME",
+    arity: 1,
+    flags: FLAG_FAST | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_MULTI: Command = Command {
+    name: "MULTI",
+    arity: 1,
+    flags: FLAG_FAST | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_EXEC: Command = Command {
+    name: "EXEC",
+    arity: 1,
+    flags: FLAG_FAST | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_DISCARD: Command = Command {
+    name: "DISCARD",
+    arity: 1,
+    flags: FLAG_FAST | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_WATCH: Command = Command {
+    name: "WATCH",
+    arity: -2,
+    flags: FLAG_FAST | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_UNWATCH: Command = Command {
+    name: "UNWATCH",
+    arity: 1,
+    flags: FLAG_FAST | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_RESET: Command = Command {
+    name: "RESET",
     arity: 1,
     flags: FLAG_FAST | FLAG_LOCAL,
     key_range: KeyRange::NONE,
