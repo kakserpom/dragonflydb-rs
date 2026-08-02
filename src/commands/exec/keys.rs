@@ -1046,6 +1046,151 @@ fn merge_scan(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64)
 }
 
 // ---------------------------------------------------------------------------
+// RM — cursor-based multi-key delete
+// ---------------------------------------------------------------------------
+
+const RM_HELP: &[&str] = &[
+    "RM cursor [MATCH <glob>] [TYPE <type>] [COUNT <count>]",
+    "    MATCH <glob> - pattern to match keys against",
+    "    TYPE <type> - type of values to match (string, list, set, zset, hash, stream)",
+    "    COUNT <count> - number of keys to delete per call",
+];
+
+/// `[cursor, deleted]` reply shape for RM.
+fn rm_reply(cursor: u64, deleted: u64) -> RespValue {
+    RespValue::Array(vec![
+        RespValue::Bulk(cursor.to_string().into_bytes()),
+        RespValue::Integer(deleted as i64),
+    ])
+}
+
+/// Per-shard half of RM, mirroring `OpScanAndDelete`. Only the shard the
+/// cursor points at acts; every other shard contributes nothing (matching the
+/// reference `RmGeneric`, which processes shards strictly sequentially). The
+/// continuation token is `(hash << 10) | shard_id` where `hash` is the shard
+/// hash of the last key examined: because deleting a key never changes the
+/// hashes of the survivors, that watermark stays valid across calls even
+/// though the table keeps shrinking. A token of 0 means the shard was
+/// exhausted.
+fn exec_rm(ctx: &mut OpContext) -> CmdResult {
+    if ctx.args[1].eq_ignore_ascii_case(b"HELP") {
+        return CmdResult::Ok(RespValue::Array(
+            RM_HELP.iter().map(|s| RespValue::Simple(s.to_string())).collect(),
+        ));
+    }
+    let cursor = match parse_u64(&ctx.args[1]) {
+        Some(c) => c,
+        None => return CmdResult::err("ERR invalid cursor"),
+    };
+    let opts = match parse_scan_opts(ctx.args) {
+        Ok(o) => o,
+        Err(e) => return CmdResult::Err(e),
+    };
+
+    let shard_id = ctx.db.shard_id() as u64;
+    let sid = cursor % 1024;
+    if shard_id != sid {
+        return CmdResult::Ok(rm_reply(0, 0));
+    }
+    let watermark = cursor >> SCAN_SHARD_BITS;
+
+    let mut matched: Vec<(u64, Vec<u8>)> = ctx
+        .db
+        .iter()
+        .filter(|(k, v)| scan_key_matches(ctx.db, k, v, &opts))
+        .map(|(k, _)| (shard_hash(k.as_bytes()), k.as_bytes().to_vec()))
+        .filter(|(h, _)| *h >= watermark)
+        .collect();
+    matched.sort_unstable_by_key(|(h, _)| *h);
+    let total = matched.len();
+
+    let mut deleted = 0u64;
+    let mut visited = 0usize;
+    let mut last_hash = watermark;
+    for (h, key) in matched {
+        if visited >= opts.limit {
+            break;
+        }
+        visited += 1;
+        last_hash = h;
+        if ctx.db.remove_if_exists(&key) {
+            deleted += 1;
+        }
+    }
+    let token = if visited >= total {
+        0
+    } else {
+        (last_hash << SCAN_SHARD_BITS) | shard_id
+    };
+    CmdResult::Ok(rm_reply(token, deleted))
+}
+
+/// Decode a per-shard RM result into its continuation token and deleted count.
+fn decode_rm_shard(result: &CmdResult) -> Result<(u64, u64), RespError> {
+    match result {
+        CmdResult::Ok(RespValue::Array(a)) if a.len() == 2 => {
+            let token = match &a[0] {
+                RespValue::Bulk(b) => String::from_utf8_lossy(b).parse::<u64>().unwrap_or(0),
+                _ => 0,
+            };
+            let deleted = match &a[1] {
+                RespValue::Integer(n) => (*n).max(0) as u64,
+                _ => 0,
+            };
+            Ok((token, deleted))
+        }
+        _ => Err(RespError::new("ERR internal: bad rm shard result")),
+    }
+}
+
+/// Merge per-shard RM results, mirroring `RmGeneric`: only the cursor's shard
+/// ran, so its token is forwarded as the continuation. A 0 token means that
+/// shard was exhausted, so the next call resumes at the following shard.
+fn merge_rm(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64) -> CmdResult {
+    if args[1].eq_ignore_ascii_case(b"HELP") {
+        return parts[0].result.clone();
+    }
+    let cursor = match parse_u64(&args[1]) {
+        Some(c) => c,
+        None => return CmdResult::err("ERR invalid cursor"),
+    };
+    let _opts = match parse_scan_opts(args) {
+        Ok(o) => o,
+        Err(e) => return CmdResult::Err(e),
+    };
+    for p in parts {
+        if let CmdResult::Err(e) = &p.result {
+            return CmdResult::Err(e.clone());
+        }
+    }
+    let sid = (cursor % 1024) as usize;
+    let shard_count = parts.iter().map(|p| p.shard).max().unwrap_or(0) + 1;
+    if sid >= shard_count {
+        return CmdResult::Ok(rm_reply(0, 0));
+    }
+
+    let by_shard: HashMap<usize, &ShardPart> = parts.iter().map(|p| (p.shard, p)).collect();
+    let Some(part) = by_shard.get(&sid) else {
+        return CmdResult::Ok(rm_reply(0, 0));
+    };
+    let (token, deleted) = match decode_rm_shard(&part.result) {
+        Ok(d) => d,
+        Err(e) => return CmdResult::Err(e),
+    };
+    // Only the cursor's shard ran (mirroring `RmGeneric`'s strictly sequential
+    // shard processing), so its token is the continuation. A 0 token means the
+    // shard was exhausted: resume at the next shard, or finish.
+    let cursor_out = if token != 0 {
+        token
+    } else if sid + 1 < shard_count {
+        (sid + 1) as u64
+    } else {
+        0
+    };
+    CmdResult::Ok(rm_reply(cursor_out, deleted))
+}
+
+// ---------------------------------------------------------------------------
 // SORT / SORT_RO
 // ---------------------------------------------------------------------------
 
@@ -1700,6 +1845,14 @@ pub static CMD_SCAN: Command = Command {
     exec: exec_scan,
     merge: Some(merge_scan),
 };
+pub static CMD_RM: Command = Command {
+    name: "RM",
+    arity: -2,
+    flags: FLAG_WRITE | FLAG_GLOBAL,
+    key_range: KeyRange::NONE,
+    exec: exec_rm,
+    merge: Some(merge_rm),
+};
 pub static CMD_SORT: Command = Command {
     name: "SORT",
     arity: -2,
@@ -1784,6 +1937,7 @@ mod tests {
                 b"EXPIRETIME" => (exec_expiretime, 1, (1..2).collect()),
                 b"PEXPIRETIME" => (exec_pexpiretime, 1, (1..2).collect()),
                 b"SCAN" => (exec_scan, 1, vec![]),
+                b"RM" => (exec_rm, 0, vec![]),
                 b"SORT" | b"SORT_RO" => (exec_sort, 1, (1..argv.len()).collect()),
                 b"FIELDEXPIRE" => (exec_fieldexpire, 1, (1..2).collect()),
                 b"FIELDTTL" => (exec_fieldttl, 1, (1..2).collect()),
@@ -2434,6 +2588,157 @@ mod tests {
         assert_eq!(keys, vec![b"k1".to_vec(), b"k2".to_vec()]);
 
         assert_eq!(scan_keys(&mut db, 0, &[b"SCAN", b"0", b"MINMSZ", b"500"]), vec![b"k1".to_vec()]);
+    }
+
+    /// Run one RM call and return (next_cursor, deleted).
+    fn rm_step(db: &mut DbSlice, cursor: &str, count: &str) -> (u64, i64) {
+        let argv = vec![
+            b"RM".to_vec(),
+            cursor.as_bytes().to_vec(),
+            b"COUNT".to_vec(),
+            count.as_bytes().to_vec(),
+        ];
+        match val(dispatch_at(db, 0, &argv)) {
+            RespValue::Array(a) if a.len() == 2 => {
+                let next = match &a[0] {
+                    RespValue::Bulk(b) => String::from_utf8_lossy(b).parse::<u64>().unwrap(),
+                    o => panic!("expected cursor, got {o:?}"),
+                };
+                let deleted = match &a[1] {
+                    RespValue::Integer(n) => *n,
+                    o => panic!("expected count, got {o:?}"),
+                };
+                (next, deleted)
+            }
+            o => panic!("expected rm reply, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn rm_deletes_in_pages() {
+        let mut db = DbSlice::new(0);
+        let keys: Vec<String> = (0..25).map(|i| format!("k{i:02}")).collect();
+        for k in &keys {
+            str_of(&mut db, k, "v");
+        }
+
+        // Deleting 10 at a time walks through the whole keyspace.
+        let mut cursor = 0u64;
+        let mut total = 0i64;
+        loop {
+            let (next, deleted) = rm_step(&mut db, &cursor.to_string(), "10");
+            total += deleted;
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+        assert_eq!(total, 25);
+        for k in &keys {
+            assert!(db.find(k.as_bytes(), 0).is_none());
+        }
+        // A further call on an empty database reports zero and stays at zero.
+        assert_eq!(rm_step(&mut db, "0", "10"), (0, 0));
+    }
+
+    #[test]
+    fn rm_matches_and_types() {
+        let mut db = DbSlice::new(0);
+        str_of(&mut db, "str1", "v");
+        str_of(&mut db, "str2", "v");
+        list_of(&mut db, "list1", &["a", "b"]);
+        set_of(&mut db, "set1", &["a"]);
+        zset_of(&mut db, "zset1", &["a"]);
+
+        // MATCH filters by glob.
+        let argv = vec![b"RM".to_vec(), b"0".to_vec(), b"COUNT".to_vec(), b"10".to_vec(), b"MATCH".to_vec(), b"str*".to_vec()];
+        match val(dispatch_at(&mut db, 0, &argv)) {
+            RespValue::Array(a) if a.len() == 2 => {
+                assert_eq!(a[0], RespValue::Bulk(b"0".to_vec()));
+                assert_eq!(a[1], RespValue::Integer(2));
+            }
+            o => panic!("expected rm reply, got {o:?}"),
+        }
+        assert!(db.find(b"str1", 0).is_none());
+        assert!(db.find(b"str2", 0).is_none());
+        assert!(db.find(b"list1", 0).is_some());
+
+        // TYPE filters by value type (list).
+        let argv = vec![b"RM".to_vec(), b"0".to_vec(), b"COUNT".to_vec(), b"10".to_vec(), b"TYPE".to_vec(), b"list".to_vec()];
+        match val(dispatch_at(&mut db, 0, &argv)) {
+            RespValue::Array(a) if a.len() == 2 => {
+                assert_eq!(a[0], RespValue::Bulk(b"0".to_vec()));
+                assert_eq!(a[1], RespValue::Integer(1));
+            }
+            o => panic!("expected rm reply, got {o:?}"),
+        }
+        assert!(db.find(b"list1", 0).is_none());
+        assert!(db.find(b"set1", 0).is_some());
+    }
+
+    #[test]
+    fn rm_help_and_invalid_cursor() {
+        let mut db = DbSlice::new(0);
+        str_of(&mut db, "k", "v");
+        let argv = bvecs!["RM", "HELP"];
+        match val(dispatch_at(&mut db, 0, &argv)) {
+            RespValue::Array(help) => {
+                assert!(help.iter().any(|v| matches!(v, RespValue::Simple(s) if s.contains("RM cursor"))));
+            }
+            o => panic!("expected help array, got {o:?}"),
+        }
+        assert_eq!(err_of(dispatch_at(&mut db, 0, &bvecs!["RM", "abc"])), "ERR invalid cursor");
+        // Invalid COUNT is an integer error.
+        assert!(err_of(dispatch_at(&mut db, 0, &bvecs!["RM", "0", "COUNT", "x"]))
+            .contains("not an integer"));
+    }
+
+    #[test]
+    fn rm_merge_accumulates_across_shards() {
+        let parts = |v: &[(usize, u64, u64)]| -> Vec<ShardPart> {
+            v.iter()
+                .map(|&(shard, token, deleted)| ShardPart {
+                    shard,
+                    owned_key_idxs: vec![],
+                    result: CmdResult::Ok(rm_reply(token, deleted)),
+                })
+                .collect()
+        };
+        let decode = |args: &[Vec<u8>], p: &[(usize, u64, u64)]| -> (u64, i64) {
+            match val(merge_rm(&parts(p), args, &[], 0)) {
+                RespValue::Array(a) if a.len() == 2 => {
+                    let c = match &a[0] {
+                        RespValue::Bulk(b) => String::from_utf8_lossy(b).parse::<u64>().unwrap(),
+                        o => panic!("expected cursor, got {o:?}"),
+                    };
+                    let d = match &a[1] {
+                        RespValue::Integer(n) => *n,
+                        o => panic!("expected count, got {o:?}"),
+                    };
+                    (c, d)
+                }
+                o => panic!("expected rm reply, got {o:?}"),
+            }
+        };
+        let args = vec![b"RM".to_vec(), b"0".to_vec(), b"COUNT".to_vec(), b"10".to_vec()];
+
+        // Shard 0 is mid-scan: its token is forwarded unchanged.
+        assert_eq!(decode(&args, &[(0, (2 << 10) | 0, 10), (1, 0, 0)]), ((2 << 10) | 0, 10));
+
+        // Shard 0 exhausted: resume at shard 1.
+        assert_eq!(decode(&args, &[(0, 0, 8), (1, (2 << 10) | 1, 10)]), (1, 8));
+        assert_eq!(decode(&args, &[(0, 0, 10), (1, 0, 3)]), (1, 10));
+
+        // Cursor already in shard 1, which still has more keys.
+        let args1 = vec![b"RM".to_vec(), b"1".to_vec(), b"COUNT".to_vec(), b"10".to_vec()];
+        assert_eq!(decode(&args1, &[(0, 0, 0), (1, (3 << 10) | 1, 10)]), ((3 << 10) | 1, 10));
+
+        // Last shard exhausted: the whole scan is finished.
+        assert_eq!(decode(&args1, &[(0, 0, 0), (1, 0, 10)]), (0, 10));
+
+        // Cursor past the last shard: empty reply.
+        let args2 = vec![b"RM".to_vec(), b"9".to_vec(), b"COUNT".to_vec(), b"10".to_vec()];
+        assert_eq!(decode(&args2, &[(0, 0, 0), (1, 0, 0)]), (0, 0));
     }
 
     fn list_of(db: &mut DbSlice, key: &str, items: &[&str]) {

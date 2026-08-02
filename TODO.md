@@ -4,7 +4,7 @@ Goal: 100% parity with DragonflyDB — every command in the reference
 `dragonfly/src/server/*.cc` registries ported to `src/commands/exec/*.rs`,
 with reference tests (`*_test.cc`) ported to Rust unit tests.
 
-Command counts: reference **289**, ported **170**, missing **119**.
+Command counts: reference **289**, ported **171**, missing **118**.
 
 Legend:
 - [x] ported
@@ -18,9 +18,9 @@ Legend:
 ## Key/generic family (`generic_family.cc`) — 33 cmds
 - [x] COPY, DELEX, DEL, DUMP, ECHO, EXISTS, EXPIRE, EXPIREAT, EXPIRETIME,
   FIELDEXPIRE, FIELDTTL, KEYS, MOVE, PERSIST, PEXPIRETIME, PEXPIRE, PEXPIREAT,
-  PING, PTTL, RANDOMKEY, RENAME, RENAMENX, RESTORE, SCAN, SELECT, SORT, SORT_RO,
-  STICK, TIME, TOUCH, TTL, TYPE, UNLINK
-- [ ] RM
+  PING, PTTL, RANDOMKEY, RENAME, RENAMENX, RESTORE, RM, SCAN, SELECT, SORT,
+  SORT_RO, STICK, TIME, TOUCH, TTL, TYPE, UNLINK
+- [ ] (none — family complete)
 
 ## Bit ops (`bitops_family.cc`) — 6 cmds
 - [x] BITCOUNT, BITFIELD, BITFIELD_RO, BITOP, BITPOS, GETBIT, SETBIT
