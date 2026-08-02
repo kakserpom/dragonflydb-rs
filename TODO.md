@@ -69,8 +69,9 @@ Legend:
   UNSUBSCRIBE, WAIT
 
 ## Module / probabilistic (`bloom_family.cc`, `cms_family.cc`, `cuckoo_filter_family.cc`, `topk_family.cc`)
-- [ ] BF.ADD, BF.EXISTS, BF.INFO, BF.LOADCHUNK, BF.MADD, BF.MEXISTS, BF.RESERVE,
+- [x] BF.ADD, BF.EXISTS, BF.INFO, BF.LOADCHUNK, BF.MADD, BF.MEXISTS, BF.RESERVE,
   BF.SCANDUMP
+  (BF.INSERT is not in Dragonfly's `bloom_family.cc` — marked Unsupported; excluded)
 - [ ] CMS.INCRBY, CMS.INFO, CMS.INITBYDIM, CMS.INITBYPROB, CMS.MERGE, CMS.QUERY
 - [ ] CF.ADD, CF.ADDNX, CF.COMPACT, CF.COUNT, CF.DEL, CF.EXISTS, CF.INFO,
   CF.INSERT, CF.INSERTNX, CF.MEXISTS, CF.RESERVE

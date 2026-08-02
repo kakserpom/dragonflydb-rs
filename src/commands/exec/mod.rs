@@ -1,4 +1,5 @@
 pub mod bitops;
+pub mod bloom;
 pub mod geos;
 pub mod hashes;
 pub mod hlls;
@@ -51,6 +52,15 @@ pub const ALL_COMMANDS: &[Command] = &[
     hlls::CMD_PFADD,
     hlls::CMD_PFCOUNT,
     hlls::CMD_PFMERGE,
+    // bloom filters
+    bloom::CMD_BF_RESERVE,
+    bloom::CMD_BF_ADD,
+    bloom::CMD_BF_MADD,
+    bloom::CMD_BF_EXISTS,
+    bloom::CMD_BF_MEXISTS,
+    bloom::CMD_BF_INFO,
+    bloom::CMD_BF_SCANDUMP,
+    bloom::CMD_BF_LOADCHUNK,
     // keys
     keys::CMD_DEL,
     keys::CMD_EXISTS,

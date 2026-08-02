@@ -780,16 +780,14 @@ struct ScanOpts {
 
 /// Map a TYPE argument (case-insensitive) to a filter, or `None` for an
 /// unknown name. Pseudo-types from `kObjTypeToString` ("key", "ReJSON-RL",
-/// "MBbloom--", "CMSk-TYPE", "TopK-TYPE", "MBbloomCF") are valid but never
-/// match a stored value.
+/// "CMSk-TYPE", "TopK-TYPE", "MBbloomCF") are valid but never match a stored
+/// value.
 fn scan_type_from_name(s: &[u8]) -> Option<ScanType> {
     if let Some(t) = ObjType::from_name(s) {
         return Some(Some(t));
     }
     match s.to_ascii_lowercase().as_slice() {
-        b"key" | b"rejson-rl" | b"mbbloom--" | b"cmsk-type" | b"topk-type" | b"mbbloomcf" => {
-            Some(None)
-        }
+        b"key" | b"rejson-rl" | b"cmsk-type" | b"topk-type" | b"mbbloomcf" => Some(None),
         _ => None,
     }
 }

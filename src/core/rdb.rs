@@ -11,12 +11,13 @@
 //! The CRC64 covers every byte before the 8 CRC bytes, including the version.
 //!
 //! Only the object types the Rust port can store are supported (string, list,
-//! set, hash, zset, stream). Module objects (JSON, SBF, ...) are absent here.
+//! set, hash, zset, stream, sbf). Module objects (JSON, ...) are absent here.
 
 use std::collections::BTreeMap;
 
 use hashbrown::HashMap;
 
+use crate::core::bloom::SBF;
 use crate::core::compact::CompactString;
 use crate::core::crc64;
 use crate::core::hash::Hash;
@@ -62,6 +63,11 @@ pub const RDB_TYPE_STREAM_LISTPACKS_3: u8 = 21;
 /// Dragonfly extension types (`rdb_extensions.h`).
 pub const RDB_TYPE_HASH_WITH_EXPIRY: u8 = 31;
 pub const RDB_TYPE_SET_WITH_EXPIRY: u8 = 32;
+
+/// Port-local RDB type for the scalable bloom filter. The payload is the SBF
+/// SCANDUMP blob (`SBF::serialize`); not part of the reference RDB type table
+/// (the reference does not persist SBF values in RDB).
+pub const RDB_TYPE_SBF: u8 = 40;
 
 const QUICKLIST_NODE_CONTAINER_PACKED: usize = 2;
 
@@ -206,6 +212,7 @@ fn rdb_object_type(pv: &PrimeValue) -> u8 {
         }
         PrimeValue::ZSet(_) => RDB_TYPE_ZSET_2,
         PrimeValue::Stream(_) => RDB_TYPE_STREAM_LISTPACKS_3,
+        PrimeValue::Sbf(_) => RDB_TYPE_SBF,
     }
 }
 
@@ -451,6 +458,7 @@ fn save_value(out: &mut Vec<u8>, pv: &PrimeValue) {
         PrimeValue::Hash(h) => save_hash(out, h, rdb_object_type(pv)),
         PrimeValue::ZSet(z) => save_zset(out, z),
         PrimeValue::Stream(s) => save_stream(out, s),
+        PrimeValue::Sbf(s) => save_string(out, &s.serialize()),
     }
 }
 
@@ -1071,6 +1079,13 @@ fn load_value(r: &mut Reader, typ: u8, now_ms: u64) -> Result<RestoreOutcome, Re
             Ok(RestoreOutcome::Value(PrimeValue::Stream(load_stream(
                 r, typ,
             )?)))
+        }
+        RDB_TYPE_SBF => {
+            let blob = r.read_string()?;
+            match SBF::deserialize(&blob) {
+                Ok(sbf) => Ok(RestoreOutcome::Value(PrimeValue::Sbf(sbf))),
+                Err(_) => Err(RestoreError::BadDataFormat),
+            }
         }
         _ => Err(RestoreError::BadDataFormat),
     }
