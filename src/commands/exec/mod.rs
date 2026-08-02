@@ -175,6 +175,12 @@ pub const ALL_COMMANDS: &[Command] = &[
     zsets::CMD_BZPOPMIN,
     zsets::CMD_BZPOPMAX,
     zsets::CMD_ZRANGEBYLEX,
+    zsets::CMD_ZREVRANGEBYLEX,
+    zsets::CMD_ZREVRANGE,
+    zsets::CMD_ZLEXCOUNT,
+    zsets::CMD_ZREMRANGEBYLEX,
+    zsets::CMD_ZRANDMEMBER,
+    zsets::CMD_ZSCAN,
     // geos
     geos::CMD_GEOADD,
     geos::CMD_GEODIST,

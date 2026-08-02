@@ -4,7 +4,7 @@ Goal: 100% parity with DragonflyDB — every command in the reference
 `dragonfly/src/server/*.cc` registries ported to `src/commands/exec/*.rs`,
 with reference tests (`*_test.cc`) ported to Rust unit tests.
 
-Command counts: reference **289**, ported **164**, missing **125**.
+Command counts: reference **289**, ported **170**, missing **119**.
 
 Legend:
 - [x] ported
@@ -42,11 +42,11 @@ Legend:
 
 ## Zset family (`zset_family.cc`) — 35 cmds
 - [x] BZMPOP, BZPOPMAX, BZPOPMIN, ZADD, ZCARD, ZCOUNT, ZDIFF, ZDIFFSTORE,
-  ZINCRBY, ZINTER, ZINTERCARD, ZINTERSTORE, ZMSCORE, ZMPOP, ZPOPMAX, ZPOPMIN,
-  ZRANGE, ZRANGEBYLEX, ZRANGEBYSCORE, ZRANGESTORE, ZRANK, ZREM,
-  ZREMRANGEBYRANK, ZREMRANGEBYSCORE, ZREVRANGEBYSCORE, ZREVRANK, ZSCORE,
-  ZUNION, ZUNIONSTORE
-- [ ] ZLEXCOUNT, ZRANDMEMBER, ZREMRANGEBYLEX, ZREVRANGE, ZREVRANGEBYLEX, ZSCAN
+  ZINCRBY, ZINTER, ZINTERCARD, ZINTERSTORE, ZLEXCOUNT, ZMSCORE, ZMPOP, ZPOPMAX,
+  ZPOPMIN, ZRANDMEMBER, ZRANGE, ZRANGEBYLEX, ZRANGEBYSCORE, ZRANGESTORE, ZRANK,
+  ZREM, ZREMRANGEBYLEX, ZREMRANGEBYRANK, ZREMRANGEBYSCORE, ZREVRANGE,
+  ZREVRANGEBYLEX, ZREVRANGEBYSCORE, ZREVRANK, ZSCAN, ZSCORE, ZUNION, ZUNIONSTORE
+- [ ] (none — family complete)
 
 ## Stream family (`stream_family.cc`) — 15 cmds
 - [x] XACK, XADD, XAUTOCLAIM, XCLAIM, XDEL, XGROUP, XINFO, XLEN, XPENDING,

@@ -272,6 +272,14 @@ fn rank_common(ctx: &mut OpContext, rev: bool) -> CmdResult {
 // ZRANGE / ZRANGEBYSCORE / ZREVRANGEBYSCORE / ZCOUNT / ZREMRANGEBYRANK / ZREMRANGEBYSCORE
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum RangeType {
+    #[default]
+    Index,
+    Score,
+    Lex,
+}
+
 #[derive(Default)]
 struct RangeOpts {
     byscore: bool,
@@ -279,9 +287,15 @@ struct RangeOpts {
     rev: bool,
     withscores: bool,
     limit: Option<(usize, usize)>,
+    /// A negative LIMIT offset makes the whole range empty (reference behavior).
+    empty_offset: bool,
 }
 
-fn parse_range_opts(args: &[Vec<u8>], start: usize) -> Result<RangeOpts, RespError> {
+/// Parse ZRANGE-style options. `fixed` is the preset interval type of the legacy
+/// handlers (ZRANGEBYSCORE/ZREVRANGEBYSCORE/ZRANGEBYLEX/ZREVRANGEBYLEX); a BY*
+/// option that flips it is rejected with the reference error. The unified ZRANGE
+/// passes `None` and only enforces the BYSCORE/BYLEX mutual exclusion.
+fn parse_range_opts(args: &[Vec<u8>], start: usize, fixed: Option<RangeType>) -> Result<RangeOpts, RespError> {
     let mut o = RangeOpts::default();
     let mut i = start;
     while i < args.len() {
@@ -296,7 +310,15 @@ fn parse_range_opts(args: &[Vec<u8>], start: usize) -> Result<RangeOpts, RespErr
                 }
                 let off = parse_i64(&args[i + 1]).ok_or_else(RespError::integer)?;
                 let cnt = parse_i64(&args[i + 2]).ok_or_else(RespError::integer)?;
-                o.limit = Some((off.max(0) as usize, cnt.max(0) as usize));
+                if off < 0 {
+                    o.empty_offset = true;
+                }
+                // A negative count acts as an unlimited cap (UINT32_MAX upstream).
+                o.limit = if off >= 0 {
+                    Some((off as usize, if cnt < 0 { usize::MAX } else { cnt as usize }))
+                } else {
+                    None
+                };
                 i += 2;
             }
             _ => return Err(RespError::syntax()),
@@ -304,9 +326,29 @@ fn parse_range_opts(args: &[Vec<u8>], start: usize) -> Result<RangeOpts, RespErr
         i += 1;
     }
     if o.byscore && o.bylex {
-        return Err(RespError::syntax());
+        return Err(RespError::new("ERR BYSCORE and BYLEX options are not compatible"));
+    }
+    if let Some(f) = fixed {
+        let flipped = match f {
+            RangeType::Score => o.bylex,
+            RangeType::Lex => o.byscore,
+            RangeType::Index => false,
+        };
+        if flipped {
+            return Err(RespError::new("ERR BYSCORE and BYLEX options are not compatible"));
+        }
     }
     Ok(o)
+}
+
+/// Lexicographic lower-bound check; an empty bound means -inf (unbounded low).
+fn lex_ge(m: &[u8], lo: &[u8], incl: bool) -> bool {
+    lo.is_empty() || (if incl { m >= lo } else { m > lo })
+}
+
+/// Lexicographic upper-bound check; an empty bound means +inf (unbounded high).
+fn lex_le(m: &[u8], hi: &[u8], incl: bool) -> bool {
+    hi.is_empty() || (if incl { m <= hi } else { m < hi })
 }
 
 fn parse_score_bound(s: &[u8]) -> Result<(f64, bool), RespError> {
@@ -331,9 +373,11 @@ fn score_in_range(score: f64, bound: f64, exclusive: bool, is_lower: bool) -> bo
 /// `key min max [BYSCORE|BYLEX] [REV] [LIMIT offset count]` argument layout,
 /// where `key_idx` is the index of the key argument. A missing key yields an
 /// empty range; a wrong-type key is an error.
-fn zrange_items(ctx: &mut OpContext, key_idx: usize) -> Result<Vec<(CompactString, f64)>, RespError> {
+fn zrange_items_with(ctx: &mut OpContext, key_idx: usize, opts: &RangeOpts) -> Result<Vec<(CompactString, f64)>, RespError> {
+    if opts.empty_offset {
+        return Ok(vec![]);
+    }
     let key = &ctx.args[key_idx];
-    let opts = parse_range_opts(ctx.args, key_idx + 3)?;
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::ZSet(z)) => {
             let items = if opts.byscore {
@@ -344,12 +388,9 @@ fn zrange_items(ctx: &mut OpContext, key_idx: usize) -> Result<Vec<(CompactStrin
                     score_in_range(score, lo.0, lo.1, true) && score_in_range(score, hi.0, hi.1, false)
                 }, opts.rev, opts.limit)
             } else if opts.bylex {
-                let min = ctx.args[key_idx + 1].as_slice();
-                let max = ctx.args[key_idx + 2].as_slice();
-                let (lo, lo_incl, hi, hi_incl) = parse_lex_range(min, max)?;
+                let (lo, lo_incl, hi, hi_incl) = parse_lex_range(&ctx.args[key_idx + 1], &ctx.args[key_idx + 2])?;
                 z.range_by_member_filtered(|m| {
-                    (if lo.is_empty() { true } else if lo_incl { m.as_bytes() >= lo.as_slice() } else { m.as_bytes() > lo.as_slice() })
-                        && (if hi.is_empty() { true } else if hi_incl { m.as_bytes() <= hi.as_slice() } else { m.as_bytes() < hi.as_slice() })
+                    lex_ge(m.as_bytes(), &lo, lo_incl) && lex_le(m.as_bytes(), &hi, hi_incl)
                 }, opts.rev, opts.limit)
             } else {
                 let start = parse_i64(&ctx.args[key_idx + 1]).ok_or_else(RespError::integer)?;
@@ -375,13 +416,32 @@ fn zrange_items(ctx: &mut OpContext, key_idx: usize) -> Result<Vec<(CompactStrin
     }
 }
 
+fn zrange_items(ctx: &mut OpContext, key_idx: usize) -> Result<Vec<(CompactString, f64)>, RespError> {
+    let opts = parse_range_opts(ctx.args, key_idx + 3, None)?;
+    zrange_items_with(ctx, key_idx, &opts)
+}
+
 fn exec_zrange(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
-    let opts = match parse_range_opts(ctx.args, key_idx + 3) {
+    let opts = match parse_range_opts(ctx.args, key_idx + 3, None) {
         Ok(o) => o,
         Err(e) => return CmdResult::Err(e),
     };
-    let items = match zrange_items(ctx, key_idx) {
+    let items = match zrange_items_with(ctx, key_idx, &opts) {
+        Ok(items) => items,
+        Err(e) => return CmdResult::Err(e),
+    };
+    CmdResult::Ok(build_range_output(items, opts.withscores))
+}
+
+fn exec_zrevrange(ctx: &mut OpContext) -> CmdResult {
+    let key_idx = ctx.owned_keys[0];
+    let mut opts = match parse_range_opts(ctx.args, key_idx + 3, None) {
+        Ok(o) => o,
+        Err(e) => return CmdResult::Err(e),
+    };
+    opts.rev = true;
+    let items = match zrange_items_with(ctx, key_idx, &opts) {
         Ok(items) => items,
         Err(e) => return CmdResult::Err(e),
     };
@@ -1202,29 +1262,12 @@ fn exec_zrevrangebyscore(ctx: &mut OpContext) -> CmdResult {
 fn zrange_by_score_common(ctx: &mut OpContext, rev: bool) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let (mut with_scores, mut limit) = (false, None);
-    let mut i = key_idx + 3;
-    while i < ctx.args.len() {
-        match ctx.args[i].to_ascii_uppercase().as_slice() {
-            b"WITHSCORES" => with_scores = true,
-            b"LIMIT" => {
-                if i + 2 >= ctx.args.len() {
-                    return CmdResult::Err(RespError::syntax());
-                }
-                let off = match parse_i64(&ctx.args[i + 1]) {
-                    Some(v) => v,
-                    None => return CmdResult::Err(RespError::integer()),
-                };
-                let cnt = match parse_i64(&ctx.args[i + 2]) {
-                    Some(v) => v,
-                    None => return CmdResult::Err(RespError::integer()),
-                };
-                limit = Some((off.max(0) as usize, cnt.max(0) as usize));
-                i += 2;
-            }
-            _ => return CmdResult::Err(RespError::syntax()),
-        }
-        i += 1;
+    let opts = match parse_range_opts(ctx.args, key_idx + 3, Some(RangeType::Score)) {
+        Ok(o) => o,
+        Err(e) => return CmdResult::Err(e),
+    };
+    if opts.empty_offset {
+        return CmdResult::Ok(RespValue::Array(vec![]));
     }
     let min = match parse_score_bound(&ctx.args[key_idx + 1]) {
         Ok(v) => v,
@@ -1239,10 +1282,10 @@ fn zrange_by_score_common(ctx: &mut OpContext, rev: bool) -> CmdResult {
         Some(PrimeValue::ZSet(z)) => {
             let items = z.range_by_score_filtered(
                 |score| score_in_range(score, lo.0, lo.1, true) && score_in_range(score, hi.0, hi.1, false),
-                rev,
-                limit,
+                opts.rev || rev,
+                opts.limit,
             );
-            CmdResult::Ok(build_range_output(items, with_scores))
+            CmdResult::Ok(build_range_output(items, opts.withscores))
         }
         Some(_) => CmdResult::Err(RespError::wrong_type()),
         None => CmdResult::Ok(RespValue::Array(vec![])),
@@ -1750,29 +1793,33 @@ fn merge_bzpop(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64
 }
 
 fn exec_zrangebylex(ctx: &mut OpContext) -> CmdResult {
+    lex_range_common(ctx, false)
+}
+
+fn exec_zrevrangebylex(ctx: &mut OpContext) -> CmdResult {
+    lex_range_common(ctx, true)
+}
+
+/// ZRANGEBYLEX/ZREVRANGEBYLEX: fixed LEX interval type, optionally reversed.
+fn lex_range_common(ctx: &mut OpContext, rev: bool) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let opts = match parse_range_opts(ctx.args, key_idx + 3) {
+    let opts = match parse_range_opts(ctx.args, key_idx + 3, Some(RangeType::Lex)) {
         Ok(o) => o,
         Err(e) => return CmdResult::Err(e),
     };
-    let min = ctx.args[key_idx + 1].as_slice();
-    let max = ctx.args[key_idx + 2].as_slice();
-    let (lo, lo_incl, hi, hi_incl) = match parse_lex_range(min, max) {
+    if opts.empty_offset {
+        return CmdResult::Ok(RespValue::Array(vec![]));
+    }
+    let (lo, lo_incl, hi, hi_incl) = match parse_lex_range(&ctx.args[key_idx + 1], &ctx.args[key_idx + 2]) {
         Ok(x) => x,
         Err(e) => return CmdResult::Err(e),
     };
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::ZSet(z)) => {
-            let lo_unbound = min == b"-";
-            let hi_unbound = max == b"+";
             let items = z.range_by_member_filtered(
-                |m| {
-                    let below_ok = if lo_unbound { true } else if lo_incl { m.as_bytes() >= lo.as_slice() } else { m.as_bytes() > lo.as_slice() };
-                    let above_ok = if hi_unbound { true } else if hi_incl { m.as_bytes() <= hi.as_slice() } else { m.as_bytes() < hi.as_slice() };
-                    below_ok && above_ok
-                },
-                opts.rev,
+                |m| lex_ge(m.as_bytes(), &lo, lo_incl) && lex_le(m.as_bytes(), &hi, hi_incl),
+                opts.rev || rev,
                 opts.limit,
             );
             CmdResult::Ok(build_range_output(items, opts.withscores))
@@ -1780,6 +1827,230 @@ fn exec_zrangebylex(ctx: &mut OpContext) -> CmdResult {
         Some(_) => CmdResult::Err(RespError::wrong_type()),
         None => CmdResult::Ok(RespValue::Array(vec![])),
     }
+}
+
+fn exec_zlexcount(ctx: &mut OpContext) -> CmdResult {
+    let key_idx = ctx.owned_keys[0];
+    let key = &ctx.args[key_idx];
+    let (lo, lo_incl, hi, hi_incl) = match parse_lex_range(&ctx.args[key_idx + 1], &ctx.args[key_idx + 2]) {
+        Ok(x) => x,
+        Err(e) => return CmdResult::Err(e),
+    };
+    match ctx.db.find(key, ctx.now_ms) {
+        Some(PrimeValue::ZSet(z)) => {
+            let count = z
+                .range_by_member_filtered(
+                    |m| lex_ge(m.as_bytes(), &lo, lo_incl) && lex_le(m.as_bytes(), &hi, hi_incl),
+                    false,
+                    None,
+                )
+                .len();
+            CmdResult::Ok(integer(count as i64))
+        }
+        Some(_) => CmdResult::Err(RespError::wrong_type()),
+        None => CmdResult::Ok(integer(0)),
+    }
+}
+
+fn exec_zremrangebylex(ctx: &mut OpContext) -> CmdResult {
+    let key_idx = ctx.owned_keys[0];
+    let key = &ctx.args[key_idx];
+    let (lo, lo_incl, hi, hi_incl) = match parse_lex_range(&ctx.args[key_idx + 1], &ctx.args[key_idx + 2]) {
+        Ok(x) => x,
+        Err(e) => return CmdResult::Err(e),
+    };
+    let z = match zset_mut(ctx, key) {
+        Ok(z) => z,
+        Err(e) => {
+            if e.message.starts_with("WRONGTYPE") {
+                return CmdResult::Err(e);
+            }
+            return CmdResult::Ok(integer(0));
+        }
+    };
+    let to_remove: Vec<CompactString> = z
+        .iter()
+        .filter(|(m, _)| lex_ge(m.as_bytes(), &lo, lo_incl) && lex_le(m.as_bytes(), &hi, hi_incl))
+        .map(|(m, _)| m)
+        .collect();
+    let mut removed = 0i64;
+    for m in to_remove {
+        z.delete(&m);
+        removed += 1;
+    }
+    if z.is_empty() {
+        ctx.db.remove(key);
+    }
+    CmdResult::Ok(integer(removed))
+}
+
+// ---------------------------------------------------------------------------
+// ZRANDMEMBER / ZSCAN
+// ---------------------------------------------------------------------------
+
+/// SplitMix64: deterministic pseudo-random source for ZRANDMEMBER (seeded from
+/// the key, mirroring the hash family's sampling approach).
+struct ZRandRng(u64);
+
+impl ZRandRng {
+    fn new(key: &[u8]) -> Self {
+        ZRandRng(shard_hash(key))
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+}
+
+/// `n` distinct members chosen uniformly (partial Fisher-Yates over ranks).
+fn zrand_unique(z: &ZSet, n: usize, rng: &mut ZRandRng) -> Vec<(CompactString, f64)> {
+    let len = z.len();
+    if len == 0 || n == 0 {
+        return vec![];
+    }
+    let n = n.min(len);
+    let mut all: Vec<usize> = (0..len).collect();
+    for i in 0..n {
+        let j = i + (rng.next() as usize) % (len - i);
+        all.swap(i, j);
+    }
+    all.truncate(n);
+    all.into_iter().map(|rank| z.by_rank(rank).expect("valid rank")).collect()
+}
+
+/// ZRANDMEMBER key [count [WITHSCORES]]
+fn exec_zrandmember(ctx: &mut OpContext) -> CmdResult {
+    let key_idx = ctx.owned_keys[0];
+    if ctx.args.len() > key_idx + 3 {
+        return CmdResult::Err(RespError::new("ERR wrong number of arguments for 'zrandmember' command"));
+    }
+    let key = &ctx.args[key_idx];
+    let with_count = ctx.args.len() > key_idx + 1;
+    let mut count = 1i64;
+    let mut with_scores = false;
+    let mut i = key_idx + 1;
+    if i < ctx.args.len() {
+        match parse_i64(&ctx.args[i]) {
+            Some(v) => count = v,
+            None => return CmdResult::Err(RespError::integer()),
+        }
+        i += 1;
+    }
+    if i < ctx.args.len() {
+        if ctx.args[i].eq_ignore_ascii_case(b"WITHSCORES") {
+            with_scores = true;
+        } else {
+            let opt = String::from_utf8_lossy(&ctx.args[i]).into_owned();
+            return CmdResult::Err(RespError::new(format!("ERR Unsupported option:{opt}")));
+        }
+    }
+    match ctx.db.find(key, ctx.now_ms) {
+        Some(PrimeValue::ZSet(z)) => {
+            let len = z.len();
+            let mut rng = ZRandRng::new(key);
+            let picked = if count >= 0 {
+                zrand_unique(z, count as usize, &mut rng)
+            } else {
+                let n = (-count) as usize;
+                (0..n)
+                    .map(|_| z.by_rank((rng.next() as usize) % len).expect("non-empty zset"))
+                    .collect()
+            };
+            CmdResult::Ok(zrandmember_reply(picked, with_scores))
+        }
+        Some(_) => CmdResult::Err(RespError::wrong_type()),
+        None => CmdResult::Ok(if with_count { RespValue::Array(vec![]) } else { RespValue::Nil }),
+    }
+}
+
+/// `[member, score, ...]` flat shape for with_scores (RESP2 SendScoredArray).
+fn zrandmember_reply(picked: Vec<(CompactString, f64)>, with_scores: bool) -> RespValue {
+    if with_scores {
+        let mut out = Vec::with_capacity(picked.len() * 2);
+        for (m, s) in picked {
+            out.push(RespValue::Bulk(m.as_bytes().to_vec()));
+            out.push(bulk(format_double(s).into_bytes()));
+        }
+        RespValue::Array(out)
+    } else {
+        RespValue::Array(picked.into_iter().map(|(m, _)| RespValue::Bulk(m.as_bytes().to_vec())).collect())
+    }
+}
+
+/// ZSCAN key cursor [MATCH pattern] [COUNT count]
+///
+/// Members iterate in ascending (score, member) order, the cursor doubling as a
+/// position marker (like SSCAN). `count` budgets flat entries (member, score),
+/// matching the reference OpScan loop.
+fn exec_zscan(ctx: &mut OpContext) -> CmdResult {
+    let key_idx = ctx.owned_keys[0];
+    let key = &ctx.args[key_idx];
+    let cursor = match parse_u64(&ctx.args[key_idx + 1]) {
+        Some(c) => c,
+        None => return CmdResult::Err(RespError::new("ERR invalid cursor")),
+    };
+    let opts = &ctx.args[key_idx + 2..];
+    if opts.len() > 4 {
+        return CmdResult::Err(RespError::syntax());
+    }
+    let mut pattern: Option<&[u8]> = None;
+    let mut count: usize = 10;
+    let mut i = 0;
+    while i < opts.len() {
+        if opts[i].eq_ignore_ascii_case(b"MATCH") {
+            if i + 1 >= opts.len() {
+                return CmdResult::Err(RespError::syntax());
+            }
+            pattern = Some(&opts[i + 1]);
+            i += 2;
+        } else if opts[i].eq_ignore_ascii_case(b"COUNT") {
+            if i + 1 >= opts.len() {
+                return CmdResult::Err(RespError::syntax());
+            }
+            match parse_u64(&opts[i + 1]) {
+                Some(v) if v >= 1 => count = v as usize,
+                _ => return CmdResult::Err(RespError::syntax()),
+            }
+            i += 2;
+        } else {
+            return CmdResult::Err(RespError::syntax());
+        }
+    }
+    match ctx.db.find(key, ctx.now_ms) {
+        Some(PrimeValue::ZSet(z)) => {
+            if z.is_empty() {
+                return CmdResult::Ok(zscan_reply(0, vec![]));
+            }
+            let members: Vec<(CompactString, f64)> = z.iter().collect();
+            let start = (cursor as usize).min(members.len());
+            let mut out: Vec<RespValue> = Vec::new();
+            let mut pos = start;
+            while pos < members.len() && out.len() + 2 <= count {
+                let (m, s) = &members[pos];
+                pos += 1;
+                if pattern.is_none_or(|p| glob_match(p, m.as_bytes())) {
+                    out.push(RespValue::Bulk(m.as_bytes().to_vec()));
+                    out.push(bulk(format_double(*s).into_bytes()));
+                }
+            }
+            let next = if pos >= members.len() { 0u64 } else { pos as u64 };
+            CmdResult::Ok(zscan_reply(next, out))
+        }
+        Some(_) => CmdResult::Err(RespError::wrong_type()),
+        None => CmdResult::Ok(zscan_reply(0, vec![])),
+    }
+}
+
+/// `[cursor, [member, score, ...]]` reply shape for ZSCAN.
+fn zscan_reply(cursor: u64, pairs: Vec<RespValue>) -> RespValue {
+    RespValue::Array(vec![
+        RespValue::Bulk(itoa(cursor as i64)),
+        RespValue::Array(pairs),
+    ])
 }
 
 pub static CMD_ZADD: Command = Command {
@@ -2014,6 +2285,54 @@ pub static CMD_ZRANGEBYLEX: Command = Command {
     exec: exec_zrangebylex,
     merge: None,
 };
+pub static CMD_ZREVRANGEBYLEX: Command = Command {
+    name: "ZREVRANGEBYLEX",
+    arity: -4,
+    flags: FLAG_READONLY,
+    key_range: KeyRange::ONE,
+    exec: exec_zrevrangebylex,
+    merge: None,
+};
+pub static CMD_ZREVRANGE: Command = Command {
+    name: "ZREVRANGE",
+    arity: -4,
+    flags: FLAG_READONLY,
+    key_range: KeyRange::ONE,
+    exec: exec_zrevrange,
+    merge: None,
+};
+pub static CMD_ZLEXCOUNT: Command = Command {
+    name: "ZLEXCOUNT",
+    arity: 4,
+    flags: FLAG_READONLY | FLAG_FAST,
+    key_range: KeyRange::ONE,
+    exec: exec_zlexcount,
+    merge: None,
+};
+pub static CMD_ZREMRANGEBYLEX: Command = Command {
+    name: "ZREMRANGEBYLEX",
+    arity: 4,
+    flags: FLAG_WRITE,
+    key_range: KeyRange::ONE,
+    exec: exec_zremrangebylex,
+    merge: None,
+};
+pub static CMD_ZRANDMEMBER: Command = Command {
+    name: "ZRANDMEMBER",
+    arity: -2,
+    flags: FLAG_READONLY,
+    key_range: KeyRange::ONE,
+    exec: exec_zrandmember,
+    merge: None,
+};
+pub static CMD_ZSCAN: Command = Command {
+    name: "ZSCAN",
+    arity: -3,
+    flags: FLAG_READONLY,
+    key_range: KeyRange::ONE,
+    exec: exec_zscan,
+    merge: None,
+};
 
 #[cfg(test)]
 mod tests {
@@ -2031,6 +2350,12 @@ mod tests {
                 b"ZRANGE" => (exec_zrange, 1, vec![1]),
                 b"ZRANGESTORE" => (exec_zrangestore, 1, vec![1, 2]),
                 b"ZINTERCARD" => (exec_zintercard, 2, vec![2, 3, 4]),
+                b"ZREVRANGE" => (exec_zrevrange, 1, vec![1]),
+                b"ZREVRANGEBYLEX" => (exec_zrevrangebylex, 1, vec![1]),
+                b"ZLEXCOUNT" => (exec_zlexcount, 1, vec![1]),
+                b"ZREMRANGEBYLEX" => (exec_zremrangebylex, 1, vec![1]),
+                b"ZRANDMEMBER" => (exec_zrandmember, 1, vec![1]),
+                b"ZSCAN" => (exec_zscan, 1, vec![1]),
                 _ => panic!("unhandled command {:?}", argv[0]),
             };
         let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx, now_ms };
@@ -2866,5 +3191,199 @@ mod tests {
         let r = merge_bzpop(&[part], &argv, &[1usize], 0);
         assert_eq!(triple(&r), ("z".to_string(), "a".to_string(), "1".to_string()));
         assert_eq!(range(&mut db, "z"), ["b"]);
+    }
+
+    #[test]
+    fn zrevrange_legacy() {
+        let mut db = DbSlice::new(0);
+        add(&mut db, "z", &[("1", "a"), ("2", "b"), ("3", "c")]);
+        // Descending rank order within the range (index 0 is the highest score).
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "z", "0", "-1"]))), ["c", "b", "a"]);
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "z", "0", "1"]))), ["c", "b"]);
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "z", "2", "2"]))), ["a"]);
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "z", "-1", "-1"]))), ["a"]);
+        // WITHSCORES flattens member/score pairs.
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "z", "0", "-1", "WITHSCORES"]))), ["c", "3", "b", "2", "a", "1"]);
+        // LIMIT applies after reversing.
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "z", "0", "-1", "LIMIT", "1", "1"]))), ["b"]);
+        // Missing key and empty range.
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "nope", "0", "-1"]))), Vec::<String>::new());
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "z", "5", "9"]))), Vec::<String>::new());
+        // A negative LIMIT offset empties the whole reply.
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "z", "0", "-1", "LIMIT", "-1", "1"]))), Vec::<String>::new());
+        // Wrong type.
+        db.insert(CompactString::from_bytes(b"s"), PrimeValue::Str(CompactString::from("x")));
+        assert!(err(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "s", "0", "-1"]))).contains("WRONGTYPE"));
+    }
+
+    #[test]
+    fn zrevrangebylex_legacy() {
+        let mut db = DbSlice::new(0);
+        add(&mut db, "z", &[("1", "a"), ("2", "b"), ("3", "c"), ("4", "d")]);
+        // Descending lex order within the range.
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGEBYLEX", "z", "-", "+"]))), ["d", "c", "b", "a"]);
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGEBYLEX", "z", "[b", "+"]))), ["d", "c", "b"]);
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGEBYLEX", "z", "(b", "[d"]))), ["d", "c"]);
+        // REV keeps the legacy direction (it only re-asserts the flag upstream).
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGEBYLEX", "z", "[b", "+", "REV"]))), ["d", "c", "b"]);
+        // WITHSCORES + LIMIT.
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGEBYLEX", "z", "-", "+", "WITHSCORES", "LIMIT", "0", "2"]))), ["d", "4", "c", "3"]);
+        // Negative LIMIT offset empties the reply.
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGEBYLEX", "z", "-", "+", "LIMIT", "-1", "1"]))), Vec::<String>::new());
+        // The fixed LEX interval type rejects a BYSCORE flip.
+        assert_eq!(err(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGEBYLEX", "z", "1", "2", "BYSCORE"]))), "ERR BYSCORE and BYLEX options are not compatible");
+        // Invalid lex bounds.
+        assert_eq!(err(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGEBYLEX", "z", "a", "b"]))), "ERR min or max not valid string range item");
+        // Missing key yields an empty array.
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGEBYLEX", "nope", "-", "+"]))), Vec::<String>::new());
+    }
+
+    #[test]
+    fn zlexcount_and_zremrangebylex() {
+        let mut db = DbSlice::new(0);
+        add(&mut db, "z", &[("1", "a"), ("2", "b"), ("3", "c"), ("4", "d")]);
+        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZLEXCOUNT", "z", "-", "+"]))), 4);
+        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZLEXCOUNT", "z", "[b", "[d"]))), 3);
+        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZLEXCOUNT", "z", "(b", "[c"]))), 1);
+        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZLEXCOUNT", "z", "(b", "(d"]))), 1);
+        // Missing key counts 0.
+        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZLEXCOUNT", "nope", "-", "+"]))), 0);
+        // Invalid bound errors.
+        assert_eq!(err(dispatch_at(&mut db, 0, &b_args(&["ZLEXCOUNT", "z", "x", "+"]))), "ERR min or max not valid string range item");
+        // Remove by lex: (a .. [c removes b and c.
+        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZREMRANGEBYLEX", "z", "(a", "[c"]))), 2);
+        assert_eq!(range(&mut db, "z"), ["a", "d"]);
+        // Removing everything deletes the key.
+        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZREMRANGEBYLEX", "z", "-", "+"]))), 2);
+        assert!(db.find(b"z", 0).is_none());
+        // Missing key removes 0.
+        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZREMRANGEBYLEX", "nope", "-", "+"]))), 0);
+    }
+
+    #[test]
+    fn zrandmember_basic() {
+        let mut db = DbSlice::new(0);
+        add(&mut db, "z", &[("1", "a"), ("2", "b"), ("3", "c"), ("4", "d")]);
+        let members = ["a", "b", "c", "d"];
+
+        // No count: a single member.
+        let r = dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z"]));
+        assert_eq!(flat(r).len(), 1);
+        assert!(members.contains(&flat(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z"])))[0].as_str()));
+
+        // count 0 yields an empty array.
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "0"]))), Vec::<String>::new());
+
+        // Positive count returns distinct members.
+        let picked = flat(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "2"])));
+        assert_eq!(picked.len(), 2);
+        let set: HashSet<&String> = picked.iter().collect();
+        assert_eq!(set.len(), 2);
+        assert!(picked.iter().all(|m| members.contains(&m.as_str())));
+
+        // Negative count returns exactly |count| draws (repetition allowed).
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "-3"]))).len(), 3);
+
+        // WITHSCORES flattens member/score pairs with matching scores.
+        let r = flat(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "2", "WITHSCORES"])));
+        assert_eq!(r.len(), 4);
+        for pair in r.chunks(2) {
+            let score = pair[1].parse::<f64>().unwrap();
+            let expected = match pair[0].as_str() {
+                "a" => 1.0,
+                "b" => 2.0,
+                "c" => 3.0,
+                "d" => 4.0,
+                o => panic!("unexpected member {o}"),
+            };
+            assert_eq!(score, expected);
+        }
+
+        // Missing key: null without count, empty array with count.
+        match dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "nope"])).into_resp_value() {
+            RespValue::Nil => {}
+            o => panic!("expected null, got {o:?}"),
+        }
+        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "nope", "2"]))), Vec::<String>::new());
+
+        // Deterministic for a fixed key (seeded from the key).
+        let first = flat(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "2", "WITHSCORES"])));
+        let second = flat(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "2", "WITHSCORES"])));
+        assert_eq!(first, second);
+
+        // Unsupported trailing option.
+        assert_eq!(err(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "1", "FOO"]))), "ERR Unsupported option:FOO");
+        // Non-integer count.
+        assert!(err(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "abc"]))).contains("not an integer"));
+        // More than 3 extra args.
+        assert_eq!(err(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "1", "WITHSCORES", "x"]))), "ERR wrong number of arguments for 'zrandmember' command");
+        // Wrong type.
+        db.insert(CompactString::from_bytes(b"s"), PrimeValue::Str(CompactString::from("x")));
+        assert!(err(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "s"]))).contains("WRONGTYPE"));
+    }
+
+    /// `[cursor, [member, score, ...]]` reply shape for ZSCAN.
+    fn scan_flat(r: CmdResult) -> (u64, Vec<String>) {
+        match r.into_resp_value() {
+            RespValue::Array(v) if v.len() == 2 => {
+                let cursor = match &v[0] {
+                    RespValue::Bulk(b) => parse_u64(b).unwrap(),
+                    o => panic!("expected cursor bulk, got {o:?}"),
+                };
+                let members = match &v[1] {
+                    RespValue::Array(items) => items
+                        .iter()
+                        .map(|x| match x {
+                            RespValue::Bulk(b) => String::from_utf8_lossy(b).into_owned(),
+                            o => panic!("unexpected element {o:?}"),
+                        })
+                        .collect(),
+                    o => panic!("expected array, got {o:?}"),
+                };
+                (cursor, members)
+            }
+            o => panic!("expected scan reply, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn zscan_basic() {
+        let mut db = DbSlice::new(0);
+        add(&mut db, "z", &[("1", "a"), ("2", "b"), ("3", "c"), ("4", "d")]);
+        // Full scan returns every member with its score.
+        let (cur, members) = scan_flat(dispatch_at(&mut db, 0, &b_args(&["ZSCAN", "z", "0"])));
+        assert_eq!(cur, 0);
+        assert_eq!(members, ["a", "1", "b", "2", "c", "3", "d", "4"]);
+
+        // MATCH filters members but still emits the matching scores.
+        let (cur, members) = scan_flat(dispatch_at(&mut db, 0, &b_args(&["ZSCAN", "z", "0", "MATCH", "a*"])));
+        assert_eq!(cur, 0);
+        assert_eq!(members, ["a", "1"]);
+
+        // Iterating with COUNT 2 pages through all elements and terminates at 0.
+        let mut cur = 0u64;
+        let mut seen = Vec::new();
+        loop {
+            let (c, page) = scan_flat(dispatch_at(&mut db, 0, &b_args(&["ZSCAN", "z", &cur.to_string(), "COUNT", "2"])));
+            seen.extend(page);
+            cur = c;
+            if c == 0 {
+                break;
+            }
+        }
+        assert_eq!(seen, ["a", "1", "b", "2", "c", "3", "d", "4"]);
+
+        // Missing key yields a zero cursor.
+        let (cur, members) = scan_flat(dispatch_at(&mut db, 0, &b_args(&["ZSCAN", "nope", "0"])));
+        assert_eq!(cur, 0);
+        assert!(members.is_empty());
+
+        // Invalid cursor.
+        assert!(err(dispatch_at(&mut db, 0, &b_args(&["ZSCAN", "z", "abc"]))).contains("invalid cursor"));
+        // Invalid COUNT.
+        assert!(err(dispatch_at(&mut db, 0, &b_args(&["ZSCAN", "z", "0", "COUNT", "0"]))).contains("syntax error"));
+        assert!(err(dispatch_at(&mut db, 0, &b_args(&["ZSCAN", "z", "0", "COUNT", "x"]))).contains("syntax error"));
+        // Unknown option.
+        assert!(err(dispatch_at(&mut db, 0, &b_args(&["ZSCAN", "z", "0", "FOO", "bar"]))).contains("syntax error"));
     }
 }

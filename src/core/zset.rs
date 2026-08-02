@@ -142,7 +142,9 @@ impl ZSet {
             member: member.clone(),
             score,
             next: vec![None; new_level],
-            backward: update[0].into(),
+            // The first node has no backward node; the header must never appear
+            // as a member (ZRevIter walks the backward chain).
+            backward: if update[0] == self.header { None } else { Some(update[0]) },
         };
         self.nodes.push(node);
         for i in 0..new_level {
