@@ -6,7 +6,10 @@ use crate::core::compact::CompactString;
 use crate::core::zset::ZSet;
 use crate::core::PrimeValue;
 use crate::error::{CmdResult, RespError, RespValue};
-use crate::util::{format_double, itoa, parse_double, parse_i64, parse_u64, redis_range, shard_hash};
+use crate::util::{
+    format_double, itoa, parse_double, parse_i64, parse_list_timeout, parse_u64, redis_range,
+    shard_hash,
+};
 
 fn zset_mut<'a>(ctx: &'a mut OpContext, key: &[u8]) -> Result<&'a mut ZSet, RespError> {
     match ctx.db.find_mut(key, ctx.now_ms) {
@@ -1390,6 +1393,362 @@ fn exec_zpopmax(ctx: &mut OpContext) -> CmdResult {
     exec_zpopminmax(ctx, true)
 }
 
+// ---------------------------------------------------------------------------
+// ZMPOP numkeys key... MIN|MAX [COUNT n] / BZMPOP timeout numkeys key... MIN|MAX [COUNT n]
+// ---------------------------------------------------------------------------
+
+/// How a wrong-type key is treated while scanning for the first non-empty zset.
+/// ZMPOP/BZMPOP skip it (`GetFirstNonEmptyKeyFound` only reports zsets) while
+/// BZPOPMIN/BZPOPMAX abort with WRONGTYPE (`FindFirstReadOnly`).
+#[derive(Clone, Copy)]
+enum Wrong {
+    Skip,
+    Error,
+}
+
+fn parse_zmpop_numkeys(args: &[Vec<u8>], numkeys_idx: usize) -> Result<usize, RespError> {
+    let Some(n) = parse_i64(&args[numkeys_idx]) else {
+        return Err(RespError::integer());
+    };
+    if n < 1 {
+        return Err(RespError::new("ERR at least 1 input key is needed"));
+    }
+    Ok(n as usize)
+}
+
+/// Parse `MIN|MAX [COUNT n]` after the `numkeys` keys. Returns `(is_max, count)`;
+/// errors mirror the `CmdArgParser` in `ZMPopGeneric`.
+fn parse_zmpop_tail(args: &[Vec<u8>], numkeys_idx: usize, numkeys: usize) -> Result<(bool, usize), RespError> {
+    let dir_idx = numkeys_idx + 1 + numkeys;
+    let Some(dir_arg) = args.get(dir_idx) else {
+        return Err(RespError::syntax());
+    };
+    let is_max = if dir_arg.eq_ignore_ascii_case(b"MAX") {
+        true
+    } else if dir_arg.eq_ignore_ascii_case(b"MIN") {
+        false
+    } else {
+        return Err(RespError::syntax());
+    };
+    let mut i = dir_idx + 1;
+    let mut count = 1usize;
+    if i < args.len() {
+        if !args[i].eq_ignore_ascii_case(b"COUNT") {
+            return Err(RespError::syntax());
+        }
+        let Some(count_arg) = args.get(i + 1) else {
+            return Err(RespError::syntax());
+        };
+        let c = match parse_i64(count_arg) {
+            Some(v) => v,
+            None => return Err(RespError::integer()),
+        };
+        if c < 0 {
+            return Err(RespError::integer());
+        }
+        count = c as usize;
+        i += 2;
+    }
+    if i != args.len() {
+        return Err(RespError::syntax());
+    }
+    Ok((is_max, count))
+}
+
+/// Split `z` into the `count` lowest (`is_max` false) or highest members and the
+/// remainder, without mutating the set. Members are returned in pop order.
+fn peek_pop(z: &ZSet, is_max: bool, count: usize) -> (Vec<(CompactString, f64)>, Vec<(CompactString, f64)>) {
+    let total = z.len();
+    let take = count.min(total);
+    let mut popped = Vec::with_capacity(take);
+    if is_max {
+        for i in 0..take {
+            if let Some(p) = z.by_rank(total - 1 - i) {
+                popped.push(p);
+            }
+        }
+    } else {
+        for i in 0..take {
+            if let Some(p) = z.by_rank(i) {
+                popped.push(p);
+            }
+        }
+    }
+    let remaining: Vec<(CompactString, f64)> = if is_max {
+        (0..total - take).filter_map(|i| z.by_rank(i)).collect()
+    } else {
+        (take..total).filter_map(|i| z.by_rank(i)).collect()
+    };
+    (popped, remaining)
+}
+
+/// Pop up to `count` min/max members in place from the first non-empty zset
+/// among `ctx.owned_keys` (command order), removing the key once emptied.
+/// Returns `(key_idx, flat [member, score, ...])` or `None` when nothing popped.
+fn pop_inplace_first(
+    ctx: &mut OpContext,
+    is_max: bool,
+    count: usize,
+    wrong: Wrong,
+) -> Result<Option<(usize, Vec<RespValue>)>, RespError> {
+    for &ki in ctx.owned_keys {
+        let key = &ctx.args[ki];
+        let z = match ctx.db.find_mut(key, ctx.now_ms) {
+            Some(PrimeValue::ZSet(z)) if !z.is_empty() => z,
+            Some(PrimeValue::ZSet(_)) => continue,
+            Some(_) => match wrong {
+                Wrong::Skip => continue,
+                Wrong::Error => return Err(RespError::wrong_type()),
+            },
+            None => continue,
+        };
+        let mut pairs = Vec::new();
+        for _ in 0..count {
+            let item = if is_max { z.pop_max() } else { z.pop_min() };
+            match item {
+                Some((m, s)) => {
+                    pairs.push(RespValue::Bulk(m.as_bytes().to_vec()));
+                    pairs.push(bulk(format_double(s).into_bytes()));
+                }
+                None => break,
+            }
+        }
+        if z.is_empty() {
+            ctx.db.remove(key);
+        }
+        return Ok(Some((ki, pairs)));
+    }
+    Ok(None)
+}
+
+/// Peek at the first non-empty zset among `ctx.owned_keys` without mutating:
+/// returns `(key_idx, flat popped pairs, flat remaining pairs)`. Multi-shard
+/// executors use this and let the merge reshape the reply and persist the
+/// remainder (the reference pops only the winning key in a second hop).
+fn peek_first(
+    ctx: &mut OpContext,
+    is_max: bool,
+    count: usize,
+    wrong: Wrong,
+) -> Result<Option<(usize, Vec<RespValue>, Vec<RespValue>)>, RespError> {
+    for &ki in ctx.owned_keys {
+        let key = &ctx.args[ki];
+        let z = match ctx.db.find(key, ctx.now_ms) {
+            Some(PrimeValue::ZSet(z)) if !z.is_empty() => z,
+            Some(PrimeValue::ZSet(_)) => continue,
+            Some(_) => match wrong {
+                Wrong::Skip => continue,
+                Wrong::Error => return Err(RespError::wrong_type()),
+            },
+            None => continue,
+        };
+        let (popped, remaining) = peek_pop(z, is_max, count);
+        let mut pairs = Vec::with_capacity(popped.len() * 2);
+        for (m, s) in popped {
+            pairs.push(RespValue::Bulk(m.as_bytes().to_vec()));
+            pairs.push(bulk(format_double(s).into_bytes()));
+        }
+        let mut rem = Vec::with_capacity(remaining.len() * 2);
+        for (m, s) in remaining {
+            rem.push(RespValue::Bulk(m.as_bytes().to_vec()));
+            rem.push(bulk(format_double(s).into_bytes()));
+        }
+        return Ok(Some((ki, pairs, rem)));
+    }
+    Ok(None)
+}
+
+/// `[key, [[member, score], ...]]` as `SendLabeledScoredArray` produces.
+fn labeled_scored_array(key: &[u8], flat_pairs: &[RespValue]) -> RespValue {
+    let pairs: Vec<RespValue> = flat_pairs.chunks_exact(2).map(|c| RespValue::Array(c.to_vec())).collect();
+    RespValue::Array(vec![RespValue::Bulk(key.to_vec()), RespValue::Array(pairs)])
+}
+
+/// Rebuild a zset value from a flat `[member, score, ...]` partial; `None`
+/// (empty remainder) deletes the key.
+fn zset_from_flat(flat: &[RespValue]) -> Option<PrimeValue> {
+    let mut z = ZSet::new();
+    let mut any = false;
+    for chunk in flat.chunks_exact(2) {
+        if let [RespValue::Bulk(m), RespValue::Bulk(s)] = chunk
+            && let Some(score) = parse_double(s)
+        {
+            z.insert(CompactString::from_bytes(m), score);
+            any = true;
+        }
+    }
+    if any { Some(PrimeValue::ZSet(z)) } else { None }
+}
+
+fn exec_zmpop(ctx: &mut OpContext, blocking: bool) -> CmdResult {
+    let numkeys_idx = if blocking { 2 } else { 1 };
+    if blocking {
+        let parsed = parse_list_timeout(&ctx.args[1]);
+        if let Err(e) = parsed {
+            return CmdResult::Err(RespError::new(e));
+        }
+    }
+    let numkeys = match parse_zmpop_numkeys(ctx.args, numkeys_idx) {
+        Ok(n) => n,
+        Err(e) => return CmdResult::Err(e),
+    };
+    let (is_max, count) = match parse_zmpop_tail(ctx.args, numkeys_idx, numkeys) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Err(e),
+    };
+    let none = if blocking { CmdResult::Blocked } else { CmdResult::Ok(RespValue::Nil) };
+    if ctx.owned_keys.len() == numkeys {
+        // All keys on this shard: pop in place and reply directly.
+        let found = match pop_inplace_first(ctx, is_max, count, Wrong::Skip) {
+            Ok(f) => f,
+            Err(e) => return CmdResult::Err(e),
+        };
+        let Some((ki, pairs)) = found else { return none };
+        return CmdResult::Ok(labeled_scored_array(&ctx.args[ki], &pairs));
+    }
+    // Multi-shard: report the candidate `[key_idx, pairs, remaining]`; the merge
+    // reshapes the reply and persists the remainder via a deferred store.
+    let found = match peek_first(ctx, is_max, count, Wrong::Skip) {
+        Ok(f) => f,
+        Err(e) => return CmdResult::Err(e),
+    };
+    let Some((ki, pairs, rem)) = found else { return none };
+    CmdResult::Ok(RespValue::Array(vec![
+        integer(ki as i64),
+        RespValue::Array(pairs),
+        RespValue::Array(rem),
+    ]))
+}
+
+fn exec_zmpop_cmd(ctx: &mut OpContext) -> CmdResult {
+    exec_zmpop(ctx, false)
+}
+fn exec_bzmpop_cmd(ctx: &mut OpContext) -> CmdResult {
+    exec_zmpop(ctx, true)
+}
+
+/// Shared merge for ZMPOP/BZMPOP: pick the lowest-index data report, reply with
+/// `[key, [[member, score], ...]]`, and store the remaining members (deleting
+/// the key when the zset was emptied). A lone part is a single-shard run that
+/// already produced the final reply.
+fn merge_zmpop(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64) -> CmdResult {
+    if parts.len() == 1 {
+        return parts[0].result.clone();
+    }
+    let mut best: Option<(usize, Vec<RespValue>, Vec<RespValue>)> = None;
+    for p in parts {
+        match &p.result {
+            CmdResult::Ok(RespValue::Array(rep)) if rep.len() == 3 => {
+                if let (RespValue::Integer(ki), RespValue::Array(pairs), RespValue::Array(rem)) =
+                    (&rep[0], &rep[1], &rep[2])
+                {
+                    let ki = *ki as usize;
+                    let better = match &best {
+                        Some((b, _, _)) => ki < *b,
+                        None => true,
+                    };
+                    if better {
+                        best = Some((ki, pairs.clone(), rem.clone()));
+                    }
+                }
+            }
+            CmdResult::Ok(RespValue::Nil) => {}
+            CmdResult::Err(e) => return CmdResult::Err(e.clone()),
+            _ => {}
+        }
+    }
+    match best {
+        Some((ki, pairs, rem)) => {
+            let reply = labeled_scored_array(&args[ki], &pairs);
+            CmdResult::deferred_store(args[ki].clone(), zset_from_flat(&rem), reply)
+        }
+        None => CmdResult::Ok(RespValue::Nil),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BZPOPMIN / BZPOPMAX key... timeout
+// ---------------------------------------------------------------------------
+
+fn exec_bzpop(ctx: &mut OpContext, is_max: bool) -> CmdResult {
+    let Some(timeout_arg) = ctx.args.last() else {
+        return CmdResult::err("ERR wrong number of arguments for 'bzpopmin' command");
+    };
+    if let Err(e) = parse_list_timeout(timeout_arg) {
+        return CmdResult::Err(RespError::new(e));
+    }
+    let key_count = ctx.args.len().saturating_sub(2);
+    if ctx.owned_keys.len() == key_count {
+        // Single shard: pop in place and reply `[key, member, score]`.
+        let found = match pop_inplace_first(ctx, is_max, 1, Wrong::Error) {
+            Ok(f) => f,
+            Err(e) => return CmdResult::Err(e),
+        };
+        let Some((ki, pairs)) = found else { return CmdResult::Blocked };
+        return CmdResult::Ok(bzpop_reply(&ctx.args[ki], &pairs));
+    }
+    // Multi-shard: report the candidate for the merge.
+    let found = match peek_first(ctx, is_max, 1, Wrong::Error) {
+        Ok(f) => f,
+        Err(e) => return CmdResult::Err(e),
+    };
+    let Some((ki, pairs, rem)) = found else { return CmdResult::Blocked };
+    CmdResult::Ok(RespValue::Array(vec![
+        integer(ki as i64),
+        RespValue::Array(pairs),
+        RespValue::Array(rem),
+    ]))
+}
+
+fn bzpop_reply(key: &[u8], flat_pairs: &[RespValue]) -> RespValue {
+    let m = flat_pairs.first().cloned().unwrap_or(RespValue::Nil);
+    let s = flat_pairs.get(1).cloned().unwrap_or(RespValue::Nil);
+    RespValue::Array(vec![RespValue::Bulk(key.to_vec()), m, s])
+}
+
+fn exec_bzpopmin(ctx: &mut OpContext) -> CmdResult {
+    exec_bzpop(ctx, false)
+}
+fn exec_bzpopmax(ctx: &mut OpContext) -> CmdResult {
+    exec_bzpop(ctx, true)
+}
+
+/// Shared merge for BZPOPMIN/BZPOPMAX: lowest-index data report wins, reply
+/// `[key, member, score]`, persist the remainder.
+fn merge_bzpop(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64) -> CmdResult {
+    if parts.len() == 1 {
+        return parts[0].result.clone();
+    }
+    let mut best: Option<(usize, Vec<RespValue>, Vec<RespValue>)> = None;
+    for p in parts {
+        match &p.result {
+            CmdResult::Ok(RespValue::Array(rep)) if rep.len() == 3 => {
+                if let (RespValue::Integer(ki), RespValue::Array(pairs), RespValue::Array(rem)) =
+                    (&rep[0], &rep[1], &rep[2])
+                {
+                    let ki = *ki as usize;
+                    let better = match &best {
+                        Some((b, _, _)) => ki < *b,
+                        None => true,
+                    };
+                    if better {
+                        best = Some((ki, pairs.clone(), rem.clone()));
+                    }
+                }
+            }
+            CmdResult::Err(e) => return CmdResult::Err(e.clone()),
+            _ => {}
+        }
+    }
+    match best {
+        Some((ki, pairs, rem)) => {
+            let reply = bzpop_reply(&args[ki], &pairs);
+            CmdResult::deferred_store(args[ki].clone(), zset_from_flat(&rem), reply)
+        }
+        None => CmdResult::Blocked,
+    }
+}
+
 fn exec_zrangebylex(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
@@ -1614,6 +1973,38 @@ pub static CMD_ZPOPMAX: Command = Command {
     key_range: KeyRange::ONE,
     exec: exec_zpopmax,
     merge: None,
+};
+pub static CMD_ZMPOP: Command = Command {
+    name: "ZMPOP",
+    arity: -4,
+    flags: FLAG_WRITE | FLAG_MULTI_KEY,
+    key_range: KeyRange { first: 2, last: 0, step: 1 },
+    exec: exec_zmpop_cmd,
+    merge: Some(merge_zmpop),
+};
+pub static CMD_BZMPOP: Command = Command {
+    name: "BZMPOP",
+    arity: -5,
+    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY,
+    key_range: KeyRange { first: 3, last: 0, step: 1 },
+    exec: exec_bzmpop_cmd,
+    merge: Some(merge_zmpop),
+};
+pub static CMD_BZPOPMIN: Command = Command {
+    name: "BZPOPMIN",
+    arity: -3,
+    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY,
+    key_range: KeyRange::ALL_BUT_LAST,
+    exec: exec_bzpopmin,
+    merge: Some(merge_bzpop),
+};
+pub static CMD_BZPOPMAX: Command = Command {
+    name: "BZPOPMAX",
+    arity: -3,
+    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY,
+    key_range: KeyRange::ALL_BUT_LAST,
+    exec: exec_bzpopmax,
+    merge: Some(merge_bzpop),
 };
 pub static CMD_ZRANGEBYLEX: Command = Command {
     name: "ZRANGEBYLEX",
@@ -1942,6 +2333,66 @@ mod tests {
         }
     }
 
+    /// Dispatch a pop-family command (ZMPOP/BZMPOP/BZPOPMIN/BZPOPMAX) with
+    /// `owned` as the owned key indices, applying deferred stores so merged
+    /// multi-shard results are visible to later commands.
+    fn pop_at(db: &mut DbSlice, argv: &[Vec<u8>], owned: Vec<usize>) -> CmdResult {
+        let (exec, first_key_idx): (fn(&mut OpContext) -> CmdResult, usize) =
+            match argv[0].to_ascii_uppercase().as_slice() {
+                b"ZMPOP" => (exec_zmpop_cmd, 2),
+                b"BZMPOP" => (exec_bzmpop_cmd, 3),
+                b"BZPOPMIN" => (exec_bzpopmin, 1),
+                b"BZPOPMAX" => (exec_bzpopmax, 1),
+                _ => panic!("unhandled command {:?}", argv[0]),
+            };
+        let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx, now_ms: 0 };
+        let r = (exec)(&mut ctx);
+        match r {
+            CmdResult::DeferredStore { key, value, reply } => {
+                apply_store(db, key, value);
+                CmdResult::Ok(reply)
+            }
+            other => other,
+        }
+    }
+
+    fn str_of_bulk(v: &RespValue) -> String {
+        match v {
+            RespValue::Bulk(b) => String::from_utf8_lossy(b).into_owned(),
+            o => panic!("expected bulk, got {o:?}"),
+        }
+    }
+
+    /// `None` for a nil reply, else `(key, popped pairs)` for the
+    /// `[key, [[member, score], ...]]` shape.
+    fn labeled(r: CmdResult) -> Option<(String, Vec<(String, String)>)> {
+        match r.into_resp_value() {
+            RespValue::Nil => None,
+            RespValue::Array(v) => {
+                let key = str_of_bulk(&v[0]);
+                let pairs = match &v[1] {
+                    RespValue::Array(pairs) => pairs
+                        .iter()
+                        .map(|p| match p {
+                            RespValue::Array(pair) => (str_of_bulk(&pair[0]), str_of_bulk(&pair[1])),
+                            o => panic!("expected pair array, got {o:?}"),
+                        })
+                        .collect(),
+                    o => panic!("expected pairs array, got {o:?}"),
+                };
+                Some((key, pairs))
+            }
+            o => panic!("expected array or nil, got {o:?}"),
+        }
+    }
+
+    fn triple(r: &CmdResult) -> (String, String, String) {
+        match r.clone().into_resp_value() {
+            RespValue::Array(v) => (str_of_bulk(&v[0]), str_of_bulk(&v[1]), str_of_bulk(&v[2])),
+            o => panic!("expected [key, member, score], got {o:?}"),
+        }
+    }
+
     #[test]
     fn zunion_basic() {
         let mut db = DbSlice::new(0);
@@ -2203,5 +2654,217 @@ mod tests {
         let store_keys = [1usize, 3, 4];
         assert!(err(merge_zinterstore(&parts, &store_args, &store_keys, 0)).contains("WRONGTYPE"));
         assert!(err(merge_zdiffstore(&parts, &store_args, &store_keys, 0)).contains("WRONGTYPE"));
+    }
+
+    #[test]
+    fn zmpop_basic() {
+        let mut db = DbSlice::new(0);
+        add(&mut db, "a", &[("1", "a1"), ("2", "a2")]);
+        // MIN pops the lowest member.
+        let (key, pairs) = labeled(pop_at(&mut db, &b_args(&["ZMPOP", "1", "a", "MIN"]), vec![2])).unwrap();
+        assert_eq!(key, "a");
+        assert_eq!(pairs, [("a1".into(), "1".into())]);
+        assert_eq!(range(&mut db, "a"), ["a2"]);
+        // COUNT > 1; MAX pops from the top.
+        add(&mut db, "b", &[("1", "b1"), ("2", "b2"), ("3", "b3")]);
+        let (key, pairs) =
+            labeled(pop_at(&mut db, &b_args(&["ZMPOP", "1", "b", "MAX", "COUNT", "2"]), vec![2])).unwrap();
+        assert_eq!(key, "b");
+        assert_eq!(pairs, [("b3".into(), "3".into()), ("b2".into(), "2".into())]);
+        assert_eq!(range(&mut db, "b"), ["b1"]);
+        // No zset at all -> nil.
+        let r = pop_at(&mut db, &b_args(&["ZMPOP", "1", "none", "MIN"]), vec![1]);
+        assert!(matches!(r.into_resp_value(), RespValue::Nil));
+        // The first non-empty key in command order wins.
+        add(&mut db, "x", &[("1", "x1")]);
+        let (key, pairs) =
+            labeled(pop_at(&mut db, &b_args(&["ZMPOP", "3", "none", "a", "x", "MAX"]), vec![2, 3, 4])).unwrap();
+        assert_eq!(key, "a");
+        assert_eq!(pairs, [("a2".into(), "2".into())]);
+        // COUNT 0 returns the key with an empty array, leaving the zset intact.
+        add(&mut db, "k", &[("5", "m1")]);
+        let (key, pairs) =
+            labeled(pop_at(&mut db, &b_args(&["ZMPOP", "1", "k", "MIN", "COUNT", "0"]), vec![2])).unwrap();
+        assert_eq!(key, "k");
+        assert!(pairs.is_empty());
+        assert_eq!(range(&mut db, "k"), ["m1"]);
+        // Wrong-type keys are skipped, not errors (dragonfly GetFirstNonEmptyKeyFound).
+        db.insert(CompactString::from_bytes(b"s"), PrimeValue::Str(CompactString::from("x")));
+        let r = pop_at(&mut db, &b_args(&["ZMPOP", "1", "s", "MIN"]), vec![2]);
+        assert!(matches!(r.into_resp_value(), RespValue::Nil));
+    }
+
+    #[test]
+    fn zmpop_errors() {
+        let mut db = DbSlice::new(0);
+        add(&mut db, "a", &[("1", "a1")]);
+        // Missing MIN/MAX.
+        assert!(err(pop_at(&mut db, &b_args(&["ZMPOP", "1", "a"]), vec![1])).contains("syntax error"));
+        // Numkeys not an integer.
+        assert!(err(pop_at(&mut db, &b_args(&["ZMPOP", "x", "a", "MIN"]), vec![])).contains("not an integer"));
+        // Zero keys.
+        assert!(err(pop_at(&mut db, &b_args(&["ZMPOP", "0", "MIN"]), vec![])).contains("at least 1 input key is needed"));
+        // Wrong number of keys.
+        assert!(err(pop_at(&mut db, &b_args(&["ZMPOP", "1", "a", "b", "MAX"]), vec![1])).contains("syntax error"));
+        // COUNT without a number.
+        assert!(err(pop_at(&mut db, &b_args(&["ZMPOP", "1", "a", "MIN", "COUNT"]), vec![1])).contains("syntax error"));
+        // COUNT not an integer.
+        assert!(err(pop_at(&mut db, &b_args(&["ZMPOP", "1", "a", "MIN", "COUNT", "boo"]), vec![1])).contains("not an integer"));
+        // Trailing arguments.
+        assert!(err(pop_at(&mut db, &b_args(&["ZMPOP", "1", "a", "MIN", "COUNT", "2", "foo"]), vec![1])).contains("syntax error"));
+    }
+
+    #[test]
+    fn bzmpop_basic() {
+        let mut db = DbSlice::new(0);
+        add(&mut db, "a", &[("1", "a1"), ("2", "a2")]);
+        // Ready data pops immediately, reply shaped like ZMPOP.
+        let (key, pairs) = labeled(pop_at(&mut db, &b_args(&["BZMPOP", "0", "1", "a", "MIN"]), vec![3])).unwrap();
+        assert_eq!(key, "a");
+        assert_eq!(pairs, [("a1".to_string(), "1".to_string())]);
+        assert_eq!(range(&mut db, "a"), ["a2"]);
+        // Nothing to pop -> Blocked.
+        let r = pop_at(&mut db, &b_args(&["BZMPOP", "0", "1", "none", "MIN"]), vec![3]);
+        assert!(matches!(r, CmdResult::Blocked));
+        // Wrong-type keys block rather than error (key_checker -> kNotReady).
+        db.insert(CompactString::from_bytes(b"s"), PrimeValue::Str(CompactString::from("x")));
+        let r = pop_at(&mut db, &b_args(&["BZMPOP", "0", "1", "s", "MIN"]), vec![3]);
+        assert!(matches!(r, CmdResult::Blocked));
+        // Timeout validation.
+        assert!(err(pop_at(&mut db, &b_args(&["BZMPOP", "-1", "1", "a", "MIN"]), vec![3])).contains("timeout is negative"));
+        assert!(err(pop_at(&mut db, &b_args(&["BZMPOP", "abc", "1", "a", "MIN"]), vec![3])).contains("timeout is not a float"));
+    }
+
+    #[test]
+    fn bzpop_basic() {
+        let mut db = DbSlice::new(0);
+        add(&mut db, "z", &[("1", "a"), ("2", "b")]);
+        // Pops the min member: [key, member, score].
+        let r = pop_at(&mut db, &b_args(&["BZPOPMIN", "z", "0"]), vec![1]);
+        assert_eq!(triple(&r), ("z".into(), "a".into(), "1".into()));
+        assert_eq!(range(&mut db, "z"), ["b"]);
+        // MAX pops the top member.
+        let r = pop_at(&mut db, &b_args(&["BZPOPMAX", "z", "0"]), vec![1]);
+        assert_eq!(triple(&r), ("z".to_string(), "b".to_string(), "2".to_string()));
+        assert!(range(&mut db, "z").is_empty());
+        // No data -> Blocked.
+        let r = pop_at(&mut db, &b_args(&["BZPOPMIN", "none", "0"]), vec![1]);
+        assert!(matches!(r, CmdResult::Blocked));
+        // Wrong type -> WRONGTYPE (FindFirstReadOnly aborts).
+        db.insert(CompactString::from_bytes(b"s"), PrimeValue::Str(CompactString::from("x")));
+        assert!(err(pop_at(&mut db, &b_args(&["BZPOPMIN", "s", "0"]), vec![1])).contains("WRONGTYPE"));
+        // Timeout validation.
+        assert!(err(pop_at(&mut db, &b_args(&["BZPOPMIN", "z", "-1"]), vec![1])).contains("timeout is negative"));
+        assert!(err(pop_at(&mut db, &b_args(&["BZPOPMIN", "z", "abc"]), vec![1])).contains("timeout is not a float"));
+    }
+
+    #[test]
+    fn zmpop_multishard_merge() {
+        let args = b_args(&["ZMPOP", "3", "e", "x", "y", "MIN"]);
+        let keys = [1usize, 2, 3];
+        // Shard 0 owns "e" (empty), shard 1 owns "x" and "y" (data).
+        let parts = [
+            ShardPart { shard: 0, owned_key_idxs: vec![1], result: CmdResult::Ok(RespValue::Nil) },
+            ShardPart { shard: 1, owned_key_idxs: vec![2, 3], result: CmdResult::Ok(RespValue::Array(vec![
+                integer(3),
+                RespValue::Array(vec![bulk(b"x1"), bulk(b"1")]),
+                RespValue::Array(vec![bulk(b"x2"), bulk(b"2")]),
+            ])) },
+        ];
+        match merge_zmpop(&parts, &args, &keys, 0) {
+            CmdResult::DeferredStore { key, value, reply } => {
+                assert_eq!(key, b"x");
+                let (k, pairs) = labeled(CmdResult::Ok(reply)).unwrap();
+                assert_eq!(k, "x");
+                assert_eq!(pairs, [("x1".to_string(), "1".to_string())]);
+                match value {
+                    Some(PrimeValue::ZSet(z)) => {
+                        assert_eq!(z.len(), 1);
+                        assert_eq!(z.score(b"x2"), Some(2.0));
+                    }
+                    o => panic!("expected zset, got {o:?}"),
+                }
+            }
+            o => panic!("expected DeferredStore, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn zmpop_multishard_picks_lowest_key() {
+        let args = b_args(&["BZMPOP", "0", "3", "x", "y", "z", "MAX"]);
+        let keys = [1usize, 2, 3];
+        let parts = [
+            ShardPart { shard: 0, owned_key_idxs: vec![1], result: CmdResult::Ok(RespValue::Array(vec![
+                integer(3),
+                RespValue::Array(vec![bulk(b"x1"), bulk(b"1")]),
+                RespValue::Array(vec![]),
+            ])) },
+            ShardPart { shard: 1, owned_key_idxs: vec![2, 3], result: CmdResult::Ok(RespValue::Array(vec![
+                integer(4),
+                RespValue::Array(vec![bulk(b"y1"), bulk(b"2")]),
+                RespValue::Array(vec![]),
+            ])) },
+        ];
+        // "x" (index 1) wins; y's peek is read-only so only x is stored (deleted).
+        match merge_zmpop(&parts, &args, &keys, 0) {
+            CmdResult::DeferredStore { key, value, reply } => {
+                assert_eq!(key, b"x");
+                assert!(value.is_none());
+                let (k, pairs) = labeled(CmdResult::Ok(reply)).unwrap();
+                assert_eq!(k, "x");
+                assert_eq!(pairs, [("x1".into(), "1".into())]);
+            }
+            o => panic!("expected DeferredStore, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_bzpop_multishard() {
+        let args = b_args(&["BZPOPMIN", "x", "y", "1"]);
+        let keys = [1usize, 2];
+        let parts = [
+            ShardPart { shard: 0, owned_key_idxs: vec![1], result: CmdResult::Blocked },
+            ShardPart { shard: 1, owned_key_idxs: vec![2], result: CmdResult::Ok(RespValue::Array(vec![
+                integer(2),
+                RespValue::Array(vec![bulk(b"y1"), bulk(b"9")]),
+                RespValue::Array(vec![bulk(b"y2"), bulk(b"8")]),
+            ])) },
+        ];
+        match merge_bzpop(&parts, &args, &keys, 0) {
+            CmdResult::DeferredStore { key, value, reply } => {
+                assert_eq!(key, b"y");
+                assert_eq!(triple(&CmdResult::Ok(reply)), ("y".into(), "y1".into(), "9".into()));
+                match value {
+                    Some(PrimeValue::ZSet(z)) => {
+                        assert_eq!(z.len(), 1);
+                        assert_eq!(z.score(b"y2"), Some(8.0));
+                    }
+                    o => panic!("expected zset, got {o:?}"),
+                }
+            }
+            o => panic!("expected DeferredStore, got {o:?}"),
+        }
+
+        // A wrong-type part aborts the whole pop.
+        let parts = [
+            ShardPart { shard: 0, owned_key_idxs: vec![1], result: CmdResult::Err(RespError::wrong_type()) },
+            ShardPart { shard: 1, owned_key_idxs: vec![2], result: CmdResult::Blocked },
+        ];
+        assert!(err(merge_bzpop(&parts, &args, &keys, 0)).contains("WRONGTYPE"));
+    }
+
+    #[test]
+    fn bzpop_single_part_passthrough() {
+        // Blocking commands always run via the coordinator, so a single-shard
+        // run executes in place and the merge passes its final reply through.
+        let mut db = DbSlice::new(0);
+        add(&mut db, "z", &[("1", "a"), ("2", "b")]);
+        let argv = b_args(&["BZPOPMIN", "z", "0"]);
+        let mut ctx = OpContext { db: &mut db, args: &argv, owned_keys: &[1usize], first_key_idx: 1, now_ms: 0 };
+        let exec_r = exec_bzpopmin(&mut ctx);
+        let part = ShardPart { shard: 0, owned_key_idxs: vec![1], result: exec_r };
+        let r = merge_bzpop(&[part], &argv, &[1usize], 0);
+        assert_eq!(triple(&r), ("z".to_string(), "a".to_string(), "1".to_string()));
+        assert_eq!(range(&mut db, "z"), ["b"]);
     }
 }

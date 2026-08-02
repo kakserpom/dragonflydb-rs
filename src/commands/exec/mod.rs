@@ -170,6 +170,10 @@ pub const ALL_COMMANDS: &[Command] = &[
     zsets::CMD_ZREMRANGEBYSCORE,
     zsets::CMD_ZPOPMIN,
     zsets::CMD_ZPOPMAX,
+    zsets::CMD_ZMPOP,
+    zsets::CMD_BZMPOP,
+    zsets::CMD_BZPOPMIN,
+    zsets::CMD_BZPOPMAX,
     zsets::CMD_ZRANGEBYLEX,
     // geos
     geos::CMD_GEOADD,
