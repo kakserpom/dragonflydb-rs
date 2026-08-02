@@ -1,5 +1,6 @@
 pub mod bitops;
 pub mod bloom;
+pub mod cms;
 pub mod geos;
 pub mod hashes;
 pub mod hlls;
@@ -61,6 +62,13 @@ pub const ALL_COMMANDS: &[Command] = &[
     bloom::CMD_BF_INFO,
     bloom::CMD_BF_SCANDUMP,
     bloom::CMD_BF_LOADCHUNK,
+    // count-min sketches
+    cms::CMD_CMS_INITBYDIM,
+    cms::CMD_CMS_INITBYPROB,
+    cms::CMD_CMS_INCRBY,
+    cms::CMD_CMS_QUERY,
+    cms::CMD_CMS_INFO,
+    cms::CMD_CMS_MERGE,
     // keys
     keys::CMD_DEL,
     keys::CMD_EXISTS,

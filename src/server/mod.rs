@@ -156,7 +156,13 @@ impl ServerEnv {
     /// SORT's runtime STORE destination) and numkeys-prefixed keys (LMPOP)
     /// by scanning the argument list.
     pub fn extract_keys(&self, cmd: &'static Command, args: &[Vec<u8>]) -> Vec<usize> {
-        if cmd.name == "LMPOP" || cmd.name == "BLMPOP" {
+        if cmd.name == "CMS.MERGE" {
+            // `CMS.MERGE <dest> <numkeys> <key>... [WEIGHTS w...]`: the
+            // destination (args[1]) plus the numkeys-prefixed sources.
+            let mut keys = extract_numkeys_keys(args, 2);
+            keys.insert(0, 1);
+            keys
+        } else if cmd.name == "LMPOP" || cmd.name == "BLMPOP" {
             // `LMPOP <numkeys> <key>...` / `BLMPOP <timeout> <numkeys> <key>...`
             let numkeys_idx = if cmd.name == "LMPOP" { 1 } else { 2 };
             extract_numkeys_keys(args, numkeys_idx)

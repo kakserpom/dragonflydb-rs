@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use hashbrown::HashMap;
 
 use crate::core::bloom::SBF;
+use crate::core::cms::Cms;
 use crate::core::compact::CompactString;
 use crate::core::crc64;
 use crate::core::hash::Hash;
@@ -68,6 +69,11 @@ pub const RDB_TYPE_SET_WITH_EXPIRY: u8 = 32;
 /// SCANDUMP blob (`SBF::serialize`); not part of the reference RDB type table
 /// (the reference does not persist SBF values in RDB).
 pub const RDB_TYPE_SBF: u8 = 40;
+
+/// Port-local RDB type for the count-min sketch. The payload is the CMS blob
+/// (`Cms::serialize`); not part of the reference RDB type table (the reference
+/// does not persist CMS values in RDB).
+pub const RDB_TYPE_CMS: u8 = 41;
 
 const QUICKLIST_NODE_CONTAINER_PACKED: usize = 2;
 
@@ -213,6 +219,7 @@ fn rdb_object_type(pv: &PrimeValue) -> u8 {
         PrimeValue::ZSet(_) => RDB_TYPE_ZSET_2,
         PrimeValue::Stream(_) => RDB_TYPE_STREAM_LISTPACKS_3,
         PrimeValue::Sbf(_) => RDB_TYPE_SBF,
+        PrimeValue::Cms(_) => RDB_TYPE_CMS,
     }
 }
 
@@ -459,6 +466,7 @@ fn save_value(out: &mut Vec<u8>, pv: &PrimeValue) {
         PrimeValue::ZSet(z) => save_zset(out, z),
         PrimeValue::Stream(s) => save_stream(out, s),
         PrimeValue::Sbf(s) => save_string(out, &s.serialize()),
+        PrimeValue::Cms(c) => save_string(out, &c.serialize()),
     }
 }
 
@@ -1085,6 +1093,13 @@ fn load_value(r: &mut Reader, typ: u8, now_ms: u64) -> Result<RestoreOutcome, Re
             match SBF::deserialize(&blob) {
                 Ok(sbf) => Ok(RestoreOutcome::Value(PrimeValue::Sbf(sbf))),
                 Err(_) => Err(RestoreError::BadDataFormat),
+            }
+        }
+        RDB_TYPE_CMS => {
+            let blob = r.read_string()?;
+            match Cms::deserialize(&blob) {
+                Some(cms) => Ok(RestoreOutcome::Value(PrimeValue::Cms(cms))),
+                None => Err(RestoreError::BadDataFormat),
             }
         }
         _ => Err(RestoreError::BadDataFormat),
@@ -2044,5 +2059,35 @@ mod tests {
             let re2 = dump_value(&v2);
             assert_eq!(re, re2);
         }
+    }
+
+    #[test]
+    fn module_types_dump_restore_round_trip() {
+        use crate::core::bloom::SBF;
+        use crate::core::cms::Cms;
+
+        let mut sbf = SBF::new(32, 0.01, 2.0);
+        sbf.add(b"a");
+        sbf.add(b"b");
+        let mut cms = Cms::new(100, 5);
+        cms.incr_by(b"foo", 5);
+        cms.incr_by(b"bar", 3);
+
+        for pv in [PrimeValue::Sbf(sbf), PrimeValue::Cms(cms)] {
+            let dump = dump_value(&pv);
+            match restore_value(&dump, now_ms()) {
+                Ok(RestoreOutcome::Value(v)) => {
+                    assert_eq!(v.type_name(), pv.type_name());
+                    assert_eq!(dump_value(&v), dump);
+                }
+                other => panic!("expected Value, got {:?}", other),
+            }
+        }
+
+        // Truncated / garbage payloads are rejected as BadDataFormat.
+        let cms = Cms::new(100, 5);
+        let mut bad = dump_value(&PrimeValue::Cms(cms));
+        bad.truncate(bad.len() - 1);
+        assert!(matches!(restore_value(&bad, now_ms()), Err(RestoreError::BadDataFormat)));
     }
 }
