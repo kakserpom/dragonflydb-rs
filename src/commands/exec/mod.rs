@@ -1,5 +1,6 @@
 pub mod bitops;
 pub mod hashes;
+pub mod hlls;
 pub mod keys;
 pub mod lists;
 pub mod server;
@@ -45,6 +46,10 @@ pub const ALL_COMMANDS: &[Command] = &[
     bitops::CMD_BITOP,
     bitops::CMD_GETBIT,
     bitops::CMD_SETBIT,
+    // hyperloglog
+    hlls::CMD_PFADD,
+    hlls::CMD_PFCOUNT,
+    hlls::CMD_PFMERGE,
     // keys
     keys::CMD_DEL,
     keys::CMD_EXISTS,

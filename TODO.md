@@ -53,7 +53,7 @@ Legend:
   XRANGE, XREAD, XREADGROUP, XREVRANGE, XSETID, XTRIM
 
 ## HyperLogLog (`hll_family.cc`) — 3 cmds
-- [ ] PFADD, PFCOUNT, PFMERGE
+- [x] PFADD, PFCOUNT, PFMERGE
 
 ## Geo (`geo_family.cc`) — 7 cmds
 - [ ] GEOADD, GEODIST, GEOHASH, GEOPOS, GEORADIUS, GEORADIUSBYMEMBER, GEOSEARCH
