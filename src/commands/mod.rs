@@ -17,6 +17,10 @@ pub const FLAG_GLOBAL: u32 = 1 << 7;
 pub const FLAG_ADMIN: u32 = 1 << 8;
 pub const FLAG_MOVABLEKEYS: u32 = 1 << 9;
 
+/// Sentinel for `KeyRange::last`: keys run through the second-to-last argument
+/// (used by BLPOP/BRPOP whose trailing argument is the float timeout).
+pub const LAST_BUT_ONE: usize = usize::MAX;
+
 /// Key extraction spec, using Redis's (firstkey, lastkey, step) convention where
 /// last == 0 means "through the last argument".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,13 +36,21 @@ impl KeyRange {
     pub const ALL: KeyRange = KeyRange { first: 1, last: 0, step: 1 };
     pub const PAIRS: KeyRange = KeyRange { first: 1, last: 0, step: 2 };
     pub const TWO: KeyRange = KeyRange { first: 1, last: 2, step: 1 };
+    /// `<key>... <timeout>`: every argument except the last one (BLPOP/BRPOP).
+    pub const ALL_BUT_LAST: KeyRange = KeyRange { first: 1, last: LAST_BUT_ONE, step: 1 };
 
     /// Return indices into args that are keys.
     pub fn keys(&self, argc: usize) -> Vec<usize> {
         if self.first == 0 || argc <= self.first {
             return Vec::new();
         }
-        let last = if self.last == 0 { argc - 1 } else { self.last.min(argc - 1) };
+        let last = if self.last == 0 {
+            argc - 1
+        } else if self.last == LAST_BUT_ONE {
+            argc.saturating_sub(2)
+        } else {
+            self.last.min(argc - 1)
+        };
         let mut out = Vec::new();
         let mut i = self.first;
         while i <= last {

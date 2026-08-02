@@ -134,6 +134,9 @@ pub struct CoordMsg {
     pub first_key_idx: usize,
     /// The connection's selected DB index.
     pub db_idx: usize,
+    /// True when the command runs inside a MULTI block: a blocking command must
+    /// not wait, so the coordinator replies nil instead of re-queueing it.
+    pub no_block: bool,
 }
 
 /// Shared handles owned by the IO thread.
@@ -150,9 +153,14 @@ impl ServerEnv {
     }
 
     /// Key indices for a command. Handles movable keys (XREAD/XREADGROUP,
-    /// SORT's runtime STORE destination) by scanning the argument list.
+    /// SORT's runtime STORE destination) and numkeys-prefixed keys (LMPOP)
+    /// by scanning the argument list.
     pub fn extract_keys(&self, cmd: &'static Command, args: &[Vec<u8>]) -> Vec<usize> {
-        if cmd.flags & crate::commands::FLAG_MOVABLEKEYS != 0 {
+        if cmd.name == "LMPOP" || cmd.name == "BLMPOP" {
+            // `LMPOP <numkeys> <key>...` / `BLMPOP <timeout> <numkeys> <key>...`
+            let numkeys_idx = if cmd.name == "LMPOP" { 1 } else { 2 };
+            extract_numkeys_keys(args, numkeys_idx)
+        } else if cmd.flags & crate::commands::FLAG_MOVABLEKEYS != 0 {
             if cmd.name == "SORT" || cmd.name == "SORT_RO" {
                 extract_sort_keys(args)
             } else if cmd.name == "GEORADIUS" || cmd.name == "GEORADIUSBYMEMBER" {
@@ -214,6 +222,53 @@ pub fn extract_movable_keys(args: &[Vec<u8>]) -> Vec<usize> {
         }
     }
     vec![]
+}
+
+/// Key indices for numkeys-prefixed commands (LMPOP/BLMPOP): the `numkeys`
+/// argument at `numkeys_idx` names how many of the following args are keys.
+/// Malformed counts yield an empty range so the executor reports the error.
+pub fn extract_numkeys_keys(args: &[Vec<u8>], numkeys_idx: usize) -> Vec<usize> {
+    let Some(n) = args.get(numkeys_idx).and_then(|a| crate::util::parse_i64(a)) else {
+        return vec![];
+    };
+    if n < 1 {
+        return vec![];
+    }
+    let n = n as usize;
+    let start = numkeys_idx + 1;
+    (start..start + n.min(args.len().saturating_sub(start))).collect()
+}
+
+/// Blocking timeout in milliseconds for a command that returned `Blocked`,
+/// or `None` when it has no waitable timeout (immediate retry). A `Some(0)`
+/// means "wait forever". The reference parses the timeout as float seconds
+/// (already validated by the executor) and scales it by 1000, with `u32::MAX`
+/// the maximum millisecond counter.
+pub fn blocking_timeout_ms(cmd: &Command, args: &[Vec<u8>]) -> Option<u64> {
+    match cmd.name {
+        "XREAD" | "XREADGROUP" => parse_block_ms(args),
+        "BLPOP" | "BRPOP" => args
+            .last()
+            .and_then(|a| crate::util::parse_list_timeout(a).ok())
+            .map(secs_to_ms),
+        "BRPOPLPUSH" => args
+            .get(3)
+            .and_then(|a| crate::util::parse_list_timeout(a).ok())
+            .map(secs_to_ms),
+        "BLMOVE" => args
+            .get(5)
+            .and_then(|a| crate::util::parse_list_timeout(a).ok())
+            .map(secs_to_ms),
+        "BLMPOP" => args
+            .get(1)
+            .and_then(|a| crate::util::parse_list_timeout(a).ok())
+            .map(secs_to_ms),
+        _ => None,
+    }
+}
+
+fn secs_to_ms(secs: f64) -> u64 {
+    ((secs * 1000.0) as u64).min(u32::MAX as u64)
 }
 
 /// Group key indices by shard.

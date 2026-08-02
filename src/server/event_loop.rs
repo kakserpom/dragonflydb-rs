@@ -669,7 +669,16 @@ impl IoLoop {
         first_key_idx: usize,
     ) {
         let db_idx = self.conns.get(&conn_id).map(|c| c.db_idx).unwrap_or(0);
-        let msg = CoordMsg { conn_id, seq, args, keys, shards, first_key_idx, db_idx };
+        let msg = CoordMsg {
+            conn_id,
+            seq,
+            args,
+            keys,
+            shards,
+            first_key_idx,
+            db_idx,
+            no_block: self.in_multi(conn_id),
+        };
         let _ = self.env.coord_tx.send(msg);
     }
 

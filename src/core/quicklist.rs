@@ -310,6 +310,19 @@ impl QuickList {
         removed
     }
 
+    /// Insert `elem` before (or after) the first element equal to `pivot`.
+    /// Returns false when no matching pivot was found.
+    pub fn insert_relative(&mut self, pivot: &[u8], elem: ListItem, after: bool) -> bool {
+        let items: Vec<ListItem> = self.iter().cloned().collect();
+        let Some(pos) = items.iter().position(|it| it.as_bytes() == pivot) else {
+            return false;
+        };
+        let mut items = items;
+        items.insert(if after { pos + 1 } else { pos }, elem);
+        *self = Self::from_items(items);
+        true
+    }
+
     /// Insert at logical position `index` (0-based, may be == len for append).
     pub fn insert(&mut self, index: i64, item: ListItem) {
         let len = self.count as i64;

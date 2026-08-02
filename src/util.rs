@@ -120,6 +120,29 @@ pub fn parse_double(s: &[u8]) -> Option<f64> {
     Some(f)
 }
 
+/// Parse a list blocking-command timeout, replicating the reference `Timeout`
+/// rule in `list_family.cc` (`Validated<float, NotNan<kTimeoutNotFloatErr>,
+/// NonNegative<kTimeoutNegativeErr>, WithinTimeoutLimit>` with
+/// `kMaxBlockingTimeoutSec = u32::MAX / 1000`). Returns the error string with
+/// the "ERR " prefix, ready for a reply.
+pub fn parse_list_timeout(arg: &[u8]) -> Result<f64, String> {
+    let s = std::str::from_utf8(arg).unwrap_or("");
+    let v: f64 = s
+        .trim()
+        .parse()
+        .map_err(|_| "ERR timeout is not a float or out of range".to_string())?;
+    if v.is_nan() {
+        return Err("ERR timeout is not a float or out of range".into());
+    }
+    if v < 0.0 {
+        return Err("ERR timeout is negative".into());
+    }
+    if v > 4294967.296 {
+        return Err("ERR timeout is out of range".into());
+    }
+    Ok(v)
+}
+
 /// Format a double the way Redis does (shortest repr, "inf" for infinite).
 pub fn format_double(f: f64) -> String {
     if f.is_nan() {

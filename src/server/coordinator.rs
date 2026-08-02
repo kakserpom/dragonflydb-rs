@@ -7,8 +7,8 @@ use crate::commands::exec::server::now_ms;
 use crate::commands::ShardPart;
 use crate::error::{CmdResult, RespValue};
 use crate::server::{
-    command_for, encode_result, keys_per_shard, parse_block_ms, shard_for_key, CoordMsg, Reply,
-    ReplyBus, ShardMsg,
+    blocking_timeout_ms, command_for, encode_result, keys_per_shard, shard_for_key, CoordMsg,
+    Reply, ReplyBus, ShardMsg,
 };
 
 /// A blocking command (XREAD/XREADGROUP) waiting for data or a timeout. The
@@ -65,11 +65,25 @@ impl Coordinator {
     fn handle(&mut self, msg: CoordMsg) {
         match self.execute_tx(&msg) {
             CmdResult::Blocked => {
-                let deadline_ms = match parse_block_ms(&msg.args) {
-                    Some(0) => None, // wait forever
-                    Some(ms) => Some(now_ms().saturating_add(ms)),
-                    None => Some(now_ms()),
-                };
+                if msg.no_block {
+                    // Inside MULTI a blocking command never waits: it returns
+                    // nil immediately (mirrors `RunCbOnFirstNonEmptyBlocking`'s
+                    // `IsMulti` -> TIMED_OUT path).
+                    let bytes = encode_result(CmdResult::Ok(RespValue::Nil));
+                    self.reply(msg.conn_id, msg.seq, bytes);
+                    return;
+                }
+                let cmd = command_for(&msg.args);
+                let deadline_ms = cmd
+                    .and_then(|c| blocking_timeout_ms(c, &msg.args))
+                    .map(|ms| {
+                        if ms == 0 {
+                            None // wait forever
+                        } else {
+                            Some(now_ms().saturating_add(ms))
+                        }
+                    })
+                    .unwrap_or(Some(now_ms()));
                 self.pending.push_back(PendingTx { msg, deadline_ms });
             }
             other => self.reply_result(msg.conn_id, msg.seq, other),
