@@ -4,7 +4,7 @@ Goal: 100% parity with DragonflyDB — every command in the reference
 `dragonfly/src/server/*.cc` registries ported to `src/commands/exec/*.rs`,
 with reference tests (`*_test.cc`) ported to Rust unit tests.
 
-Command counts: reference **289**, ported **143**, missing **146**.
+Command counts: reference **289**, ported **155**, missing **134**.
 
 Legend:
 - [x] ported
@@ -55,8 +55,9 @@ Legend:
 ## HyperLogLog (`hll_family.cc`) — 3 cmds
 - [x] PFADD, PFCOUNT, PFMERGE
 
-## Geo (`geo_family.cc`) — 7 cmds
-- [ ] GEOADD, GEODIST, GEOHASH, GEOPOS, GEORADIUS, GEORADIUSBYMEMBER, GEOSEARCH
+## Geo (`geo_family.cc`) — 9 cmds
+- [x] GEOADD, GEODIST, GEOHASH, GEOPOS, GEORADIUS, GEORADIUS_RO, GEORADIUSBYMEMBER,
+  GEORADIUSBYMEMBER_RO, GEOSEARCH, GEOSEARCHSTORE
 
 ## Server / admin (`server_family.cc` + `main_service.cc`)
 - [x] AUTH, CLIENT, COMMAND, CONFIG, DBSIZE, FLUSHALL, FLUSHDB, HELLO, INFO,
@@ -92,7 +93,7 @@ function + thin exec wrapper).
 ## Priority order
 1. Core data types: bitops, keys/generic, string, list, hash, set, zset, stream
    (biggest day-to-day surface, fits existing architecture).
-2. HLL, GEO (self-contained, well-specified).
+2. GEO (self-contained, well-specified).
 3. Scripting (EVAL/FUNCTION/MULTI) + pub/sub (need connection/runtime hooks).
 4. Server/admin + SORT.
 5. Probabilistic structures (BF/CF/CMS/TOPK) and JSON (large; need new value

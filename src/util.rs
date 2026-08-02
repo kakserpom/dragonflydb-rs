@@ -128,12 +128,12 @@ pub fn format_double(f: f64) -> String {
     if f.is_infinite() {
         return if f > 0.0 { "inf".into() } else { "-inf".into() };
     }
-    // Redis uses %.17g with special handling; Rust's shortest round-trip repr is close enough.
-    let mut s = format!("{}", f);
-    if !s.contains('.') && !s.contains('e') && !s.contains('E') {
-        s.push_str(".0");
+    if f == 0.0 {
+        return "0".into();
     }
-    s
+    // Reference reply_builder.cc FormatDouble: DoubleToStringConverter(UNIQUE_ZERO|EMIT_POSITIVE_EXPONENT_SIGN, ...).ToShortest().
+    // Rust's shortest round-trip repr matches for the ranges that matter; no forced ".0" suffix.
+    format!("{}", f)
 }
 
 #[cfg(test)]
@@ -168,6 +168,19 @@ mod tests {
         assert_eq!(parse_u64(b"-123"), None);
         assert_eq!(parse_u64(b"1a"), None);
         assert_eq!(parse_u64(b""), None);
+    }
+
+    #[test]
+    fn format_double_works() {
+        assert_eq!(format_double(5.0), "5");
+        assert_eq!(format_double(1.5), "1.5");
+        assert_eq!(format_double(3673983950397063.0), "3673983950397063");
+        assert_eq!(format_double(0.0), "0");
+        assert_eq!(format_double(-0.0), "0");
+        assert_eq!(format_double(-3.25), "-3.25");
+        assert_eq!(format_double(f64::INFINITY), "inf");
+        assert_eq!(format_double(f64::NEG_INFINITY), "-inf");
+        assert_eq!(format_double(f64::NAN), "nan");
     }
 
     #[test]

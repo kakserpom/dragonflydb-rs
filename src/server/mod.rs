@@ -137,6 +137,8 @@ impl ServerEnv {
         if cmd.flags & crate::commands::FLAG_MOVABLEKEYS != 0 {
             if cmd.name == "SORT" || cmd.name == "SORT_RO" {
                 extract_sort_keys(args)
+            } else if cmd.name == "GEORADIUS" || cmd.name == "GEORADIUSBYMEMBER" {
+                extract_geo_radius_keys(args)
             } else {
                 extract_movable_keys(args)
             }
@@ -163,6 +165,20 @@ pub fn extract_sort_keys(args: &[Vec<u8>]) -> Vec<usize> {
             }
             b"BY" | b"GET" => i += 2,
             _ => i += 1, // ALPHA / ASC / DESC and anything malformed (exec errors)
+        }
+    }
+    keys
+}
+
+/// Key indices for GEORADIUS / GEORADIUSBYMEMBER: the source key plus the
+/// STORE/STOREDIST destination as the last argument (mirrors `STORE_LAST_KEY`
+/// in `transaction.cc`: the penultimate arg must be STORE/STOREDIST).
+pub fn extract_geo_radius_keys(args: &[Vec<u8>]) -> Vec<usize> {
+    let mut keys = vec![1];
+    if args.len() >= 3 {
+        let opt = &args[args.len() - 2];
+        if opt.eq_ignore_ascii_case(b"STORE") || opt.eq_ignore_ascii_case(b"STOREDIST") {
+            keys.push(args.len() - 1);
         }
     }
     keys

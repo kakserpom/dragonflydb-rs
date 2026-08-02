@@ -1,4 +1,5 @@
 pub mod bitops;
+pub mod geos;
 pub mod hashes;
 pub mod hlls;
 pub mod keys;
@@ -153,6 +154,17 @@ pub const ALL_COMMANDS: &[Command] = &[
     zsets::CMD_ZPOPMIN,
     zsets::CMD_ZPOPMAX,
     zsets::CMD_ZRANGEBYLEX,
+    // geos
+    geos::CMD_GEOADD,
+    geos::CMD_GEODIST,
+    geos::CMD_GEOHASH,
+    geos::CMD_GEOPOS,
+    geos::CMD_GEOSEARCH,
+    geos::CMD_GEOSEARCHSTORE,
+    geos::CMD_GEORADIUS,
+    geos::CMD_GEORADIUS_RO,
+    geos::CMD_GEORADIUSBYMEMBER,
+    geos::CMD_GEORADIUSBYMEMBER_RO,
     // streams
     streams::CMD_XADD,
     streams::CMD_XLEN,

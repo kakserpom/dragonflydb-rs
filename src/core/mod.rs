@@ -1,6 +1,7 @@
 pub mod compact;
 pub mod crc64;
 pub mod db;
+pub mod geohash;
 pub mod hash;
 pub mod hll;
 pub mod intset;
