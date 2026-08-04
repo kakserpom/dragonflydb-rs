@@ -4,7 +4,7 @@ Goal: 100% parity with DragonflyDB — every command in the reference
 `dragonfly/src/server/*.cc` registries ported to `src/commands/exec/*.rs`,
 with reference tests (`*_test.cc`) ported to Rust unit tests.
 
-Command counts: reference **289**, ported **203**, missing **86**.
+Command counts: reference **289**, ported **227**, missing **62**.
 
 Legend:
 - [x] ported
@@ -79,11 +79,14 @@ Legend:
   TOPK.RESERVE
 
 ## JSON module (`json_family.cc`) — 24 cmds
-- [ ] JSON.ARRAPPEND, JSON.ARRINDEX, JSON.ARRINSERT, JSON.ARRLEN, JSON.ARRPOP,
+- [x] JSON.ARRAPPEND, JSON.ARRINDEX, JSON.ARRINSERT, JSON.ARRLEN, JSON.ARRPOP,
   JSON.ARRTRIM, JSON.CLEAR, JSON.DEBUG, JSON.DEL, JSON.FORGET, JSON.GET,
   JSON.MERGE, JSON.MGET, JSON.MSET, JSON.NUMINCRBY, JSON.NUMMULTBY, JSON.OBJKEYS,
   JSON.OBJLEN, JSON.RESP, JSON.SET, JSON.STRAPPEND, JSON.STRLEN, JSON.TOGGLE,
   JSON.TYPE
+  (built on `src/core/json.rs` JSON model, `src/core/jsonpath.rs` JSONPath v2
+  engine and `PrimeValue::Json` storage; RESP2-only replies, legacy + enhanced
+  paths)
 
 ## Test porting backlog
 Reference C++ tests in `dragonfly/src/server/*_test.cc` should be ported to
@@ -99,3 +102,4 @@ function + thin exec wrapper).
 4. Server/admin + SORT.
 5. Probabilistic structures (BF/CF/CMS/TOPK) and JSON (large; need new value
    types in `src/core/value.rs`).
+   - Done: BF/CF/CMS/TOPK and JSON families are ported.
