@@ -7,6 +7,7 @@ use crate::commands::exec::server;
 use crate::commands::{Command, FLAG_BLOCKING, FLAG_GLOBAL, FLAG_LOCAL};
 use crate::error::RespValue;
 use crate::protocol::resp::RespParser;
+use crate::server::pubsub::{self, ChannelStore, SubscribeInfo};
 use crate::server::{
     command_for, encode_value, keys_per_shard, CoordMsg, Reply, ServerEnv, ShardMsg, SingleOp,
     WatchState,
@@ -68,6 +69,8 @@ struct Conn {
     /// watched key is observed modified, making the next EXEC abort even if a
     /// later WATCH re-registers keys. Cleared by EXEC/DISCARD/RESET/UNWATCH.
     watched_dirty: bool,
+    /// Pub/sub channels and patterns this connection is subscribed to.
+    sub: SubscribeInfo,
 }
 
 /// A single-threaded kqueue-based IO event loop. Owns all client sockets, the
@@ -81,6 +84,8 @@ pub struct IoLoop {
     conns: HashMap<u64, Conn>,
     fd_to_id: HashMap<RawFd, u64>,
     next_conn_id: u64,
+    /// Subscriber index shared by all connections.
+    pubsub: ChannelStore,
 }
 
 impl IoLoop {
@@ -103,6 +108,7 @@ impl IoLoop {
             conns: HashMap::new(),
             fd_to_id: HashMap::new(),
             next_conn_id: 1,
+            pubsub: ChannelStore::new(),
         })
     }
 
@@ -197,6 +203,7 @@ impl IoLoop {
                 multi: MultiState::default(),
                 watched: Vec::new(),
                 watched_dirty: false,
+                sub: SubscribeInfo::default(),
             },
         );
         self.fd_to_id.insert(fd, conn_id);
@@ -207,6 +214,7 @@ impl IoLoop {
     fn close_conn(&mut self, conn_id: u64) {
         if let Some(conn) = self.conns.remove(&conn_id) {
             self.fd_to_id.remove(&conn.fd);
+            self.pubsub.remove_conn(conn_id);
             unsafe { libc::close(conn.fd) };
         }
     }
@@ -286,6 +294,12 @@ impl IoLoop {
             "RESET" => return self.local_reset(conn_id, seq),
             "WATCH" => return self.local_watch(conn_id, seq, &args),
             "UNWATCH" => return self.local_unwatch(conn_id, seq),
+            "SUBSCRIBE" => return self.local_subscribe(conn_id, seq, &args),
+            "UNSUBSCRIBE" => return self.local_unsubscribe(conn_id, seq, &args),
+            "PSUBSCRIBE" => return self.local_psubscribe(conn_id, seq, &args),
+            "PUNSUBSCRIBE" => return self.local_punsubscribe(conn_id, seq, &args),
+            "SSUBSCRIBE" => return self.local_ssubscribe(conn_id, seq, &args),
+            "SUNSUBSCRIBE" => return self.local_sunsubscribe(conn_id, seq, &args),
             _ => {}
         }
         if cmd.has_flag(FLAG_LOCAL) {
@@ -356,6 +370,14 @@ impl IoLoop {
     }
 
     fn handle_local(&mut self, conn_id: u64, cmd: &Command, args: &[Vec<u8>]) -> RespValue {
+        // Single-reply pub/sub commands reach this path both from `dispatch`
+        // (FLAG_LOCAL) and from `run_queued` when executed inside EXEC.
+        match cmd.name {
+            "PUBLISH" => return self.local_publish(args),
+            "SPUBLISH" => return self.local_spublish(args),
+            "PUBSUB" => return self.local_pubsub(args),
+            _ => {}
+        }
         if cmd.name == "SELECT" {
             let v = server::local_select(args);
             if matches!(&v, RespValue::Simple(_))
@@ -367,6 +389,19 @@ impl IoLoop {
                 conn.db_idx = db as usize;
             }
             return v;
+        }
+        // While subscribed in RESP2, PING echoes the message inside a
+        // `["pong", msg]` array instead of a plain bulk reply
+        // (`GenericFamily::Ping`).
+        if cmd.name == "PING"
+            && self
+                .conns
+                .get(&conn_id)
+                .map(|c| !c.sub.is_empty())
+                .unwrap_or(false)
+        {
+            let msg = args.get(1).map_or(&b""[..], |a| a.as_slice());
+            return pubsub::ping_pubsub(msg);
         }
         self.run_local(cmd, args)
     }
@@ -574,8 +609,201 @@ impl IoLoop {
             conn.watched.clear();
             conn.watched_dirty = false;
             conn.db_idx = 0;
+            conn.sub = SubscribeInfo::default();
         }
+        self.pubsub.remove_conn(conn_id);
         self.deliver(conn_id, seq, encode_value(&RespValue::Simple("RESET".into())));
+    }
+
+    // ------------------------------------------------------------------
+    // Pub/sub
+    // ------------------------------------------------------------------
+
+    /// SUBSCRIBE ch...: register each channel and reply with one
+    /// `[subscribe, ch, count]` array per channel. Each channel gets its own
+    /// top-level reply, mirroring upstream's pipeline-breaking behavior.
+    fn local_subscribe(&mut self, conn_id: u64, seq: u64, args: &[Vec<u8>]) {
+        for (seq, ch) in (seq..).zip(args[1..].iter()) {
+            self.pubsub.subscribe(ch, conn_id);
+            if let Some(conn) = self.conns.get_mut(&conn_id) {
+                conn.sub.channels.insert(ch.to_vec());
+            }
+            let count = self
+                .conns
+                .get(&conn_id)
+                .map(|c| c.sub.count())
+                .unwrap_or(0);
+            let reply = encode_value(&pubsub::sub_change("subscribe", Some(ch), count));
+            self.deliver(conn_id, seq, reply);
+        }
+    }
+
+    /// UNSUBSCRIBE [ch...]: the no-arg form unsubscribes from every channel the
+    /// connection owns; with nothing subscribed it still emits
+    /// `[unsubscribe, nil, 0]`.
+    fn local_unsubscribe(&mut self, conn_id: u64, seq: u64, args: &[Vec<u8>]) {
+        let channels: Vec<Vec<u8>> = if args.len() > 1 {
+            args[1..].to_vec()
+        } else {
+            self.conns
+                .get(&conn_id)
+                .map(|c| c.sub.channels.iter().cloned().collect())
+                .unwrap_or_default()
+        };
+        if channels.is_empty() {
+            let reply = encode_value(&pubsub::sub_change("unsubscribe", None, 0));
+            self.deliver(conn_id, seq, reply);
+            return;
+        }
+        for (seq, ch) in (seq..).zip(channels) {
+            self.pubsub.unsubscribe(&ch, conn_id);
+            if let Some(conn) = self.conns.get_mut(&conn_id) {
+                conn.sub.channels.remove(&ch);
+            }
+            let count = self
+                .conns
+                .get(&conn_id)
+                .map(|c| c.sub.count())
+                .unwrap_or(0);
+            let reply = encode_value(&pubsub::sub_change("unsubscribe", Some(&ch), count));
+            self.deliver(conn_id, seq, reply);
+        }
+    }
+
+    fn local_psubscribe(&mut self, conn_id: u64, seq: u64, args: &[Vec<u8>]) {
+        for (seq, pat) in (seq..).zip(args[1..].iter()) {
+            self.pubsub.psubscribe(pat, conn_id);
+            if let Some(conn) = self.conns.get_mut(&conn_id) {
+                conn.sub.patterns.insert(pat.to_vec());
+            }
+            let count = self
+                .conns
+                .get(&conn_id)
+                .map(|c| c.sub.count())
+                .unwrap_or(0);
+            let reply = encode_value(&pubsub::sub_change("psubscribe", Some(pat), count));
+            self.deliver(conn_id, seq, reply);
+        }
+    }
+
+    fn local_punsubscribe(&mut self, conn_id: u64, seq: u64, args: &[Vec<u8>]) {
+        let patterns: Vec<Vec<u8>> = if args.len() > 1 {
+            args[1..].to_vec()
+        } else {
+            self.conns
+                .get(&conn_id)
+                .map(|c| c.sub.patterns.iter().cloned().collect())
+                .unwrap_or_default()
+        };
+        if patterns.is_empty() {
+            let reply = encode_value(&pubsub::sub_change("punsubscribe", None, 0));
+            self.deliver(conn_id, seq, reply);
+            return;
+        }
+        for (seq, pat) in (seq..).zip(patterns) {
+            self.pubsub.punsubscribe(&pat, conn_id);
+            if let Some(conn) = self.conns.get_mut(&conn_id) {
+                conn.sub.patterns.remove(&pat);
+            }
+            let count = self
+                .conns
+                .get(&conn_id)
+                .map(|c| c.sub.count())
+                .unwrap_or(0);
+            let reply = encode_value(&pubsub::sub_change("punsubscribe", Some(&pat), count));
+            self.deliver(conn_id, seq, reply);
+        }
+    }
+
+    /// Shard pub/sub (SSUBSCRIBE/SUNSUBSCRIBE/SPUBLISH). In non-cluster mode
+    /// these behave like their regular counterparts with "ssubscribe" /
+    /// "sunsubscribe" / "smessage" reply types (upstream only gates them on
+    /// `IsClusterEnabled()`).
+    fn local_ssubscribe(&mut self, conn_id: u64, seq: u64, args: &[Vec<u8>]) {
+        for (seq, ch) in (seq..).zip(args[1..].iter()) {
+            self.pubsub.ssubscribe(ch, conn_id);
+            if let Some(conn) = self.conns.get_mut(&conn_id) {
+                conn.sub.sharded.insert(ch.to_vec());
+            }
+            let count = self
+                .conns
+                .get(&conn_id)
+                .map(|c| c.sub.count())
+                .unwrap_or(0);
+            let reply = encode_value(&pubsub::sub_change("ssubscribe", Some(ch), count));
+            self.deliver(conn_id, seq, reply);
+        }
+    }
+
+    fn local_sunsubscribe(&mut self, conn_id: u64, seq: u64, args: &[Vec<u8>]) {
+        let channels: Vec<Vec<u8>> = if args.len() > 1 {
+            args[1..].to_vec()
+        } else {
+            self.conns
+                .get(&conn_id)
+                .map(|c| c.sub.sharded.iter().cloned().collect())
+                .unwrap_or_default()
+        };
+        if channels.is_empty() {
+            let reply = encode_value(&pubsub::sub_change("sunsubscribe", None, 0));
+            self.deliver(conn_id, seq, reply);
+            return;
+        }
+        for (seq, ch) in (seq..).zip(channels) {
+            self.pubsub.sunsubscribe(&ch, conn_id);
+            if let Some(conn) = self.conns.get_mut(&conn_id) {
+                conn.sub.sharded.remove(&ch);
+            }
+            let count = self
+                .conns
+                .get(&conn_id)
+                .map(|c| c.sub.count())
+                .unwrap_or(0);
+            let reply = encode_value(&pubsub::sub_change("sunsubscribe", Some(&ch), count));
+            self.deliver(conn_id, seq, reply);
+        }
+    }
+
+    /// PUBLISH ch msg: append a `["message", ch, msg]` frame to every
+    /// subscriber's output (patterns emit `["pmessage", pat, ch, msg]`) and
+    /// return the number of subscriber connections that were notified.
+    fn local_publish(&mut self, args: &[Vec<u8>]) -> RespValue {
+        let channel = args[1].clone();
+        let message = args[2].clone();
+        let targets = self.pubsub.subscribers(&channel);
+        for (target, pattern) in &targets {
+            let frame =
+                encode_value(&pubsub::push_message(pattern.as_deref(), &channel, &message, false));
+            if let Some(conn) = self.conns.get_mut(target) {
+                conn.out.extend_from_slice(&frame);
+            }
+        }
+        RespValue::Integer(targets.len() as i64)
+    }
+
+    /// SPUBLISH ch msg: like PUBLISH but only notifies shard-channel
+    /// subscribers, emitting `["smessage", ch, msg]` frames. In non-cluster
+    /// mode the command is fully supported (upstream only gates it on
+    /// `IsClusterEnabled()`).
+    fn local_spublish(&mut self, args: &[Vec<u8>]) -> RespValue {
+        let channel = args[1].clone();
+        let message = args[2].clone();
+        let targets = self.pubsub.sharded_subscribers(&channel);
+        for &target in &targets {
+            let frame = encode_value(&pubsub::push_message(None, &channel, &message, true));
+            if let Some(conn) = self.conns.get_mut(&target) {
+                conn.out.extend_from_slice(&frame);
+            }
+        }
+        RespValue::Integer(targets.len() as i64)
+    }
+
+    /// PUBSUB introspection (CHANNELS/NUMSUB/NUMPAT/SHARD*/HELP).
+    fn local_pubsub(&mut self, args: &[Vec<u8>]) -> RespValue {
+        match pubsub::pubsub_command(args, &self.pubsub) {
+            Ok(v) => v,
+            Err(e) => RespValue::Error(e),
+        }
     }
 
     /// Blocking read of every watched key's state across its shards, under the
@@ -617,7 +845,18 @@ impl IoLoop {
     fn queue_cmd(&mut self, conn_id: u64, seq: u64, cmd: &Command, args: Vec<Vec<u8>>) {
         // These are forbidden inside a transaction and poison it
         // (upstream `VerifyCommandState`).
-        if matches!(cmd.name, "WATCH" | "FLUSHALL" | "FLUSHDB") {
+        if matches!(
+            cmd.name,
+            "WATCH"
+                | "FLUSHALL"
+                | "FLUSHDB"
+                | "SUBSCRIBE"
+                | "UNSUBSCRIBE"
+                | "PSUBSCRIBE"
+                | "PUNSUBSCRIBE"
+                | "SSUBSCRIBE"
+                | "SUNSUBSCRIBE"
+        ) {
             let msg = format!("ERR '{}' not allowed inside a transaction", cmd.name);
             if let Some(conn) = self.conns.get_mut(&conn_id) {
                 conn.multi.phase = MultiPhase::Error;

@@ -303,4 +303,13 @@ pub const ALL_COMMANDS: &[Command] = &[
     server::CMD_DEBUG,
     server::CMD_SAVE,
     server::CMD_BGSAVE,
+    server::CMD_PUBLISH,
+    server::CMD_SUBSCRIBE,
+    server::CMD_UNSUBSCRIBE,
+    server::CMD_PSUBSCRIBE,
+    server::CMD_PUNSUBSCRIBE,
+    server::CMD_PUBSUB,
+    server::CMD_SPUBLISH,
+    server::CMD_SSUBSCRIBE,
+    server::CMD_SUNSUBSCRIBE,
 ];

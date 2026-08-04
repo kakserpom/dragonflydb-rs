@@ -1,5 +1,6 @@
 pub mod coordinator;
 pub mod event_loop;
+pub mod pubsub;
 pub mod shard;
 
 /// Number of logical databases (matches upstream `FLAGS_dbnum` default).

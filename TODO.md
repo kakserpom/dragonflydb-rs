@@ -4,7 +4,7 @@ Goal: 100% parity with DragonflyDB — every command in the reference
 `dragonfly/src/server/*.cc` registries ported to `src/commands/exec/*.rs`,
 with reference tests (`*_test.cc`) ported to Rust unit tests.
 
-Command counts: reference **289**, ported **235**, missing **54**.
+Command counts: reference **289**, ported **241**, missing **48**.
 
 Legend:
 - [x] ported
@@ -61,13 +61,12 @@ Legend:
 
 ## Server / admin (`server_family.cc` + `main_service.cc`)
 - [x] AUTH, BGSAVE, CLIENT, COMMAND, CONFIG, DBSIZE, DEBUG, DISCARD, EXEC,
-  FLUSHALL, FLUSHDB, HELLO, INFO, LASTSAVE, LATENCY, MEMORY, MULTI, PING, QUIT,
-  RESET, ROLE, SAVE, SLOWLOG, UNWATCH, WATCH
+  FLUSHALL, FLUSHDB, HELLO, INFO, LASTSAVE, LATENCY, MEMORY, MULTI, PING,
+  PSUBSCRIBE, PUBLISH, PUBSUB, PUNSUBSCRIBE, QUIT, RESET, ROLE, SAVE, SLOWLOG,
+  SPUBLISH, SSUBSCRIBE, SUBSCRIBE, SUNSUBSCRIBE, UNSUBSCRIBE, UNWATCH, WATCH
 - [ ] ADDREPLICAOF, DFLY, EVAL, EVALSHA, FUNCTION,
-  MODULE, MONITOR, PSUBSCRIBE, PUBLISH, PUBSUB,
-  PUNSUBSCRIBE, REPLCONF, REPLICAOF, REPLTAKEOVER, SCRIPT, SHRINK,
-  SHUTDOWN, SLAVEOF, SPUBLISH, SSUBSCRIBE, SUBSCRIBE, SUNSUBSCRIBE,
-  UNSUBSCRIBE, WAIT
+  MODULE, MONITOR, REPLCONF, REPLICAOF, REPLTAKEOVER, SCRIPT, SHRINK,
+  SHUTDOWN, SLAVEOF, WAIT
 
 ## Module / probabilistic (`bloom_family.cc`, `cms_family.cc`, `cuckoo_filter_family.cc`, `topk_family.cc`)
 - [x] BF.ADD, BF.EXISTS, BF.INFO, BF.LOADCHUNK, BF.MADD, BF.MEXISTS, BF.RESERVE,

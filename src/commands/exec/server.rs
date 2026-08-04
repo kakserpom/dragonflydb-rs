@@ -710,6 +710,78 @@ pub static CMD_BGSAVE: Command = Command {
     exec: exec_bgsave,
     merge: Some(merge_bgsave),
 };
+pub static CMD_PUBLISH: Command = Command {
+    name: "PUBLISH",
+    arity: 3,
+    flags: FLAG_FAST | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_SUBSCRIBE: Command = Command {
+    name: "SUBSCRIBE",
+    arity: -2,
+    flags: FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_UNSUBSCRIBE: Command = Command {
+    name: "UNSUBSCRIBE",
+    arity: -1,
+    flags: FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_PSUBSCRIBE: Command = Command {
+    name: "PSUBSCRIBE",
+    arity: -2,
+    flags: FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_PUNSUBSCRIBE: Command = Command {
+    name: "PUNSUBSCRIBE",
+    arity: -1,
+    flags: FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_PUBSUB: Command = Command {
+    name: "PUBSUB",
+    arity: -2,
+    flags: FLAG_FAST | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_SPUBLISH: Command = Command {
+    name: "SPUBLISH",
+    arity: 3,
+    flags: FLAG_FAST | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_SSUBSCRIBE: Command = Command {
+    name: "SSUBSCRIBE",
+    arity: -2,
+    flags: FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_SUNSUBSCRIBE: Command = Command {
+    name: "SUNSUBSCRIBE",
+    arity: -1,
+    flags: FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
 
 #[cfg(test)]
 mod tests {
