@@ -4,7 +4,7 @@ Goal: 100% parity with DragonflyDB — every command in the reference
 `dragonfly/src/server/*.cc` registries ported to `src/commands/exec/*.rs`,
 with reference tests (`*_test.cc`) ported to Rust unit tests.
 
-Command counts: reference **289**, ported **227**, missing **62**.
+Command counts: reference **289**, ported **235**, missing **54**.
 
 Legend:
 - [x] ported
@@ -60,12 +60,13 @@ Legend:
   GEORADIUSBYMEMBER_RO, GEOSEARCH, GEOSEARCHSTORE
 
 ## Server / admin (`server_family.cc` + `main_service.cc`)
-- [x] AUTH, CLIENT, COMMAND, CONFIG, DBSIZE, DISCARD, EXEC, FLUSHALL, FLUSHDB,
-  HELLO, INFO, MULTI, PING, QUIT, RESET, UNWATCH, WATCH
-- [ ] ADDREPLICAOF, BGSAVE, DEBUG, DFLY, EVAL, EVALSHA, FUNCTION,
-  LASTSAVE, LATENCY, MEMORY, MODULE, MONITOR, PSUBSCRIBE, PUBLISH, PUBSUB,
-  PUNSUBSCRIBE, REPLCONF, REPLICAOF, REPLTAKEOVER, ROLE, SAVE, SCRIPT, SHRINK,
-  SHUTDOWN, SLAVEOF, SLOWLOG, SPUBLISH, SSUBSCRIBE, SUBSCRIBE, SUNSUBSCRIBE,
+- [x] AUTH, BGSAVE, CLIENT, COMMAND, CONFIG, DBSIZE, DEBUG, DISCARD, EXEC,
+  FLUSHALL, FLUSHDB, HELLO, INFO, LASTSAVE, LATENCY, MEMORY, MULTI, PING, QUIT,
+  RESET, ROLE, SAVE, SLOWLOG, UNWATCH, WATCH
+- [ ] ADDREPLICAOF, DFLY, EVAL, EVALSHA, FUNCTION,
+  MODULE, MONITOR, PSUBSCRIBE, PUBLISH, PUBSUB,
+  PUNSUBSCRIBE, REPLCONF, REPLICAOF, REPLTAKEOVER, SCRIPT, SHRINK,
+  SHUTDOWN, SLAVEOF, SPUBLISH, SSUBSCRIBE, SUBSCRIBE, SUNSUBSCRIBE,
   UNSUBSCRIBE, WAIT
 
 ## Module / probabilistic (`bloom_family.cc`, `cms_family.cc`, `cuckoo_filter_family.cc`, `topk_family.cc`)

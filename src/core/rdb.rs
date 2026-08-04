@@ -33,6 +33,7 @@ use crate::core::set::Set;
 use crate::core::stream::{Consumer, ConsumerGroup, PendingEntry, Stream, StreamEntry, StreamId};
 use crate::core::value::PrimeValue;
 use crate::core::zset::ZSet;
+use crate::core::DbSlice;
 
 /// RDB version accepted by RESTORE (`RDB_VERSION` in `rdb.h`).
 pub const RDB_VERSION: u64 = 12;
@@ -502,6 +503,96 @@ pub fn dump_value(pv: &PrimeValue) -> Vec<u8> {
     out.extend_from_slice(&RDB_SER_VERSION.to_le_bytes());
     let crc = crc64::crc64(&out);
     out.extend_from_slice(&crc.to_le_bytes());
+    out
+}
+
+/// Serialize a whole DB to a standalone RDB snapshot, mirroring
+/// `RdbSerializer::SaveSnapshot` (`rdb_save.cc`): `REDIS0012` magic, SELECTDB
+/// 0, RESIZEDB with key/expiry counts, then per key: optional EXPIRETIME_MS
+/// opcode (u64 LE milliseconds), the RDB type byte, the key, the value, and a
+/// trailing EOF opcode plus LE CRC64 over all preceding bytes. Keys are emitted
+/// in sorted order so the output is deterministic.
+pub fn save_db(slice: &DbSlice) -> Vec<u8> {
+    const MAGIC: &[u8] = b"REDIS";
+    const VERSION: &[u8] = b"0012";
+    const OPCODE_SELECTDB: u8 = 0xfe;
+    const OPCODE_RESIZEDB: u8 = 0xfb;
+    const OPCODE_EXPIRETIME_MS: u8 = 0xfc;
+    const OPCODE_EOF: u8 = 0xff;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(VERSION);
+
+    out.push(OPCODE_SELECTDB);
+    write_len(&mut out, 0);
+
+    let mut keys: Vec<_> = slice.iter().collect();
+    keys.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
+    let expires = keys
+        .iter()
+        .filter(|(k, _)| slice.expire_at(k.as_bytes()).is_some())
+        .count();
+    out.push(OPCODE_RESIZEDB);
+    write_len(&mut out, keys.len() as u64);
+    write_len(&mut out, expires as u64);
+
+    for (key, value) in keys {
+        if let Some(at) = slice.expire_at(key.as_bytes()) {
+            out.push(OPCODE_EXPIRETIME_MS);
+            out.extend_from_slice(&at.to_le_bytes());
+        }
+        out.push(rdb_object_type(value));
+        save_string(&mut out, key.as_bytes());
+        save_value(&mut out, value);
+    }
+
+    out.push(OPCODE_EOF);
+    let crc = crc64::crc64(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out
+}
+
+/// Decode a `save_db` snapshot back into `(key, value)` pairs, verifying the
+/// file layout (magic, SELECTDB, RESIZEDB, optional expiries, EOF and CRC64)
+/// round-trips to the same contents. Test-only: used by rdb and command tests.
+#[cfg(test)]
+pub(crate) fn decode_snapshot(data: &[u8], now_ms: u64) -> Vec<(Vec<u8>, PrimeValue)> {
+    assert!(data.starts_with(b"REDIS0012"));
+    let crc = u64::from_le_bytes(data[data.len() - 8..].try_into().unwrap());
+    assert_eq!(crc64::crc64(&data[..data.len() - 8]), crc);
+
+    let mut r = Reader::new(&data[9..data.len() - 8]);
+    assert_eq!(r.read_u8().unwrap(), 0xfe); // SELECTDB
+    assert_eq!(r.read_len().unwrap(), (0, false));
+    assert_eq!(r.read_u8().unwrap(), 0xfb); // RESIZEDB
+    let (num_keys, _) = r.read_len().unwrap();
+    let (num_expires, _) = r.read_len().unwrap();
+
+    let mut out = Vec::new();
+    let mut seen_expires = 0usize;
+    for _ in 0..num_keys {
+        let mut r2 = r;
+        // The leading byte is either the EXPIRETIME_MS opcode or the type.
+        let first = r2.read_u8().unwrap();
+        let typ = if first == 0xfc {
+            seen_expires += 1;
+            r2.read_exact(8).unwrap();
+            r2.read_u8().unwrap()
+        } else {
+            first
+        };
+        let key = r2.read_string().unwrap();
+        let val = match load_value(&mut r2, typ, now_ms).unwrap() {
+            RestoreOutcome::Value(v) => v,
+            RestoreOutcome::Expired => panic!("unexpected expired value"),
+        };
+        out.push((key, val));
+        r = r2;
+    }
+    assert_eq!(seen_expires, num_expires as usize);
+    assert_eq!(r.read_u8().unwrap(), 0xff); // EOF
+    assert!(r.read_u8().is_err()); // checksum consumed separately
     out
 }
 
@@ -2153,5 +2244,41 @@ mod tests {
         let mut bad = dump_value(&PrimeValue::Cms(cms));
         bad.truncate(bad.len() - 1);
         assert!(matches!(restore_value(&bad, now_ms()), Err(RestoreError::BadDataFormat)));
+    }
+
+    #[test]
+    fn snapshot_roundtrip() {
+        let mut slice = DbSlice::new(0);
+        slice.insert(cs("name"), PrimeValue::Str(cs("dragonfly")));
+        slice.insert(cs("count"), PrimeValue::Str(cs("19")));
+        let mut h = Hash::new();
+        h.set(cs("f1"), cs("v1"));
+        h.set(cs("f2"), cs("v2"));
+        slice.insert(cs("hash"), PrimeValue::Hash(h));
+        slice.set_expiry(b"count", 4_000_000_000_000, now_ms());
+
+        let data = save_db(&slice);
+        assert!(data.len() > 9 + 8);
+        let decoded = decode_snapshot(&data, now_ms());
+        assert_eq!(decoded.len(), 3);
+
+        // Key order is deterministic (sorted).
+        let keys: Vec<&[u8]> = decoded.iter().map(|(k, _)| k.as_slice()).collect();
+        assert_eq!(
+            keys,
+            vec![b"count".as_slice(), b"hash".as_slice(), b"name".as_slice()]
+        );
+
+        assert!(matches!(&decoded[0].1, PrimeValue::Str(s) if s.as_bytes() == b"19"));
+        assert!(matches!(&decoded[1].1, PrimeValue::Hash(_)));
+        assert!(matches!(&decoded[2].1, PrimeValue::Str(s) if s.as_bytes() == b"dragonfly"));
+
+        // An empty DB still produces a structurally valid snapshot.
+        let empty = save_db(&DbSlice::new(0));
+        let decoded = decode_snapshot(&empty, now_ms());
+        assert!(decoded.is_empty());
+
+        // Deterministic output for the same DB contents.
+        assert_eq!(save_db(&slice), data);
     }
 }

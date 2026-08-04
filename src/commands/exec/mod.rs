@@ -295,4 +295,12 @@ pub const ALL_COMMANDS: &[Command] = &[
     server::CMD_RESET,
     server::CMD_WATCH,
     server::CMD_UNWATCH,
+    server::CMD_ROLE,
+    server::CMD_LASTSAVE,
+    server::CMD_LATENCY,
+    server::CMD_SLOWLOG,
+    server::CMD_MEMORY,
+    server::CMD_DEBUG,
+    server::CMD_SAVE,
+    server::CMD_BGSAVE,
 ];

@@ -642,6 +642,10 @@ impl IoLoop {
             "CONFIG" => server::local_config(args),
             "CLIENT" => server::local_client(args),
             "TIME" => server::local_time(args),
+            "ROLE" => server::local_role(args),
+            "LASTSAVE" => server::local_lastsave(args),
+            "LATENCY" => server::local_latency(args),
+            "SLOWLOG" => server::local_slowlog(args),
             _ => RespValue::Error("ERR internal: unhandled local command".into()),
         }
     }
