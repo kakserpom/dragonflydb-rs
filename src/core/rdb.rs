@@ -20,6 +20,7 @@ use hashbrown::HashMap;
 use crate::core::bloom::SBF;
 use crate::core::cms::Cms;
 use crate::core::cuckoo::CuckooFilter;
+use crate::core::json::Json;
 use crate::core::topk::Topk;
 use crate::core::compact::CompactString;
 use crate::core::crc64;
@@ -85,6 +86,11 @@ pub const RDB_TYPE_CUCKOO: u8 = 42;
 /// Port-local RDB type for the top-K sketch. The payload is the TOPK blob
 /// (`Topk::serialize`); not part of the reference RDB type table.
 pub const RDB_TYPE_TOPK: u8 = 43;
+
+/// Port-local RDB type for a JSON document. The payload is the compact JSON
+/// dump (`Json::dump`); not part of the reference RDB type table (the reference
+/// serializes JSON through the module RDB interface).
+pub const RDB_TYPE_JSON: u8 = 44;
 
 const QUICKLIST_NODE_CONTAINER_PACKED: usize = 2;
 
@@ -233,6 +239,7 @@ fn rdb_object_type(pv: &PrimeValue) -> u8 {
         PrimeValue::Cms(_) => RDB_TYPE_CMS,
         PrimeValue::Cuckoo(_) => RDB_TYPE_CUCKOO,
         PrimeValue::Topk(_) => RDB_TYPE_TOPK,
+        PrimeValue::Json(_) => RDB_TYPE_JSON,
     }
 }
 
@@ -482,6 +489,7 @@ fn save_value(out: &mut Vec<u8>, pv: &PrimeValue) {
         PrimeValue::Cms(c) => save_string(out, &c.serialize()),
         PrimeValue::Cuckoo(c) => save_string(out, &c.serialize()),
         PrimeValue::Topk(t) => save_string(out, &t.serialize()),
+        PrimeValue::Json(j) => save_string(out, j.dump().as_bytes()),
     }
 }
 
@@ -1129,6 +1137,13 @@ fn load_value(r: &mut Reader, typ: u8, now_ms: u64) -> Result<RestoreOutcome, Re
             match Topk::deserialize(&blob) {
                 Some(tk) => Ok(RestoreOutcome::Value(PrimeValue::Topk(tk))),
                 None => Err(RestoreError::BadDataFormat),
+            }
+        }
+        RDB_TYPE_JSON => {
+            let blob = r.read_string()?;
+            match Json::parse(&blob) {
+                Ok(j) => Ok(RestoreOutcome::Value(PrimeValue::Json(j))),
+                Err(_) => Err(RestoreError::BadDataFormat),
             }
         }
         _ => Err(RestoreError::BadDataFormat),

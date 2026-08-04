@@ -1,20 +1,22 @@
 pub mod bloom;
 pub mod cms;
-pub mod cuckoo;
-pub mod topk;
 pub mod compact;
 pub mod crc64;
+pub mod cuckoo;
 pub mod db;
 pub mod geohash;
 pub mod hash;
 pub mod hll;
 pub mod intset;
+pub mod json;
+pub mod jsonpath;
 pub mod listpack;
 pub mod lzf;
 pub mod quicklist;
 pub mod rdb;
 pub mod set;
 pub mod stream;
+pub mod topk;
 pub mod value;
 pub mod zset;
 

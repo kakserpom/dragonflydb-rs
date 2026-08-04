@@ -15,6 +15,11 @@ path = "src/main.rs"
 hashbrown = "0.17"
 libc = "0.2"
 mimalloc = "0.1"
+simd-json = { version = "0.17", default-features = false, features = [
+  "runtime-detection",
+  "swar-number-parsing",
+  "value-no-dup-keys",
+] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [profile.release]

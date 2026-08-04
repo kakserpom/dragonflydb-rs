@@ -3,6 +3,7 @@ use crate::core::cms::Cms;
 use crate::core::compact::CompactString;
 use crate::core::cuckoo::CuckooFilter;
 use crate::core::hash::Hash;
+use crate::core::json::Json;
 use crate::core::quicklist::QuickList;
 use crate::core::set::Set;
 use crate::core::stream::Stream;
@@ -22,6 +23,7 @@ pub enum ObjType {
     Cms,
     Cuckoo,
     Topk,
+    Json,
 }
 
 /// A value stored in the prime table: the Rust analogue of Dragonfly's
@@ -38,6 +40,7 @@ pub enum PrimeValue {
     Cms(Cms),
     Cuckoo(CuckooFilter),
     Topk(Topk),
+    Json(Json),
 }
 
 impl PrimeValue {
@@ -53,6 +56,7 @@ impl PrimeValue {
             PrimeValue::Cms(_) => ObjType::Cms,
             PrimeValue::Cuckoo(_) => ObjType::Cuckoo,
             PrimeValue::Topk(_) => ObjType::Topk,
+            PrimeValue::Json(_) => ObjType::Json,
         }
     }
 
@@ -68,6 +72,7 @@ impl PrimeValue {
             ObjType::Cms => "CMSk-TYPE",
             ObjType::Cuckoo => "MBbloomCF",
             ObjType::Topk => "TopK-TYPE",
+            ObjType::Json => "ReJSON-RL",
         }
     }
 
@@ -97,6 +102,7 @@ impl PrimeValue {
             PrimeValue::Cms(c) => c.malloc_used(),
             PrimeValue::Cuckoo(c) => c.malloc_used(),
             PrimeValue::Topk(t) => t.malloc_used(),
+            PrimeValue::Json(j) => j.memory_usage(),
             _ => 0,
         }
     }
@@ -104,8 +110,8 @@ impl PrimeValue {
 
 impl ObjType {
     /// Parse a TYPE argument (case-insensitive). Returns `None` for unknown
-    /// names. Pseudo-types ("key", "ReJSON-RL", ...) are valid for SCAN but
-    /// never match a stored value; they are handled by the caller.
+    /// names. Pseudo-types ("key", ...) are valid for SCAN but never match a
+    /// stored value; they are handled by the caller.
     pub fn from_name(s: &[u8]) -> Option<ObjType> {
         match s.to_ascii_lowercase().as_slice() {
             b"string" => Some(ObjType::Str),
@@ -118,6 +124,7 @@ impl ObjType {
             b"cmsk-type" => Some(ObjType::Cms),
             b"mbbloomcf" => Some(ObjType::Cuckoo),
             b"topk-type" => Some(ObjType::Topk),
+            b"rejson-rl" => Some(ObjType::Json),
             _ => None,
         }
     }

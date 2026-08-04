@@ -2,16 +2,17 @@ pub mod bitops;
 pub mod bloom;
 pub mod cms;
 pub mod cuckoo;
-pub mod topk;
 pub mod geos;
 pub mod hashes;
 pub mod hlls;
+pub mod json;
 pub mod keys;
 pub mod lists;
 pub mod server;
 pub mod sets;
 pub mod streams;
 pub mod strings;
+pub mod topk;
 pub mod zsets;
 
 use crate::commands::Command;
@@ -233,6 +234,31 @@ pub const ALL_COMMANDS: &[Command] = &[
     geos::CMD_GEORADIUS_RO,
     geos::CMD_GEORADIUSBYMEMBER,
     geos::CMD_GEORADIUSBYMEMBER_RO,
+    // json
+    json::CMD_JSON_GET,
+    json::CMD_JSON_MGET,
+    json::CMD_JSON_TYPE,
+    json::CMD_JSON_STRLEN,
+    json::CMD_JSON_OBJLEN,
+    json::CMD_JSON_ARRLEN,
+    json::CMD_JSON_TOGGLE,
+    json::CMD_JSON_NUMINCRBY,
+    json::CMD_JSON_NUMMULTBY,
+    json::CMD_JSON_DEL,
+    json::CMD_JSON_FORGET,
+    json::CMD_JSON_OBJKEYS,
+    json::CMD_JSON_STRAPPEND,
+    json::CMD_JSON_CLEAR,
+    json::CMD_JSON_ARRPOP,
+    json::CMD_JSON_ARRTRIM,
+    json::CMD_JSON_ARRINSERT,
+    json::CMD_JSON_ARRAPPEND,
+    json::CMD_JSON_ARRINDEX,
+    json::CMD_JSON_DEBUG,
+    json::CMD_JSON_RESP,
+    json::CMD_JSON_SET,
+    json::CMD_JSON_MSET,
+    json::CMD_JSON_MERGE,
     // streams
     streams::CMD_XADD,
     streams::CMD_XLEN,
