@@ -1172,6 +1172,22 @@ pub static CMD_EVALSHA: Command = Command {
     exec: local_stub,
     merge: None,
 };
+pub static CMD_EVAL_RO: Command = Command {
+    name: "EVAL_RO",
+    arity: -3,
+    flags: FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_EVALSHA_RO: Command = Command {
+    name: "EVALSHA_RO",
+    arity: -3,
+    flags: FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
 pub static CMD_DFLY: Command = Command {
     name: "DFLY",
     arity: -2,

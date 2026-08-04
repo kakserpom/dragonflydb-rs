@@ -327,5 +327,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     server::CMD_SHRINK,
     server::CMD_EVAL,
     server::CMD_EVALSHA,
+    server::CMD_EVAL_RO,
+    server::CMD_EVALSHA_RO,
     server::CMD_DFLY,
 ];

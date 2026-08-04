@@ -1027,7 +1027,7 @@ impl IoLoop {
             "MODULE" => server::local_module(args),
             "FUNCTION" => server::local_function(args),
             "SCRIPT" => server::local_script(args),
-            "EVAL" | "EVALSHA" => server::local_lua(args),
+            "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" => server::local_lua(args),
             "DFLY" => server::local_dfly(args),
             _ => RespValue::Error("ERR internal: unhandled local command".into()),
         }

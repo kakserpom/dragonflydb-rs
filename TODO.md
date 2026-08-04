@@ -4,7 +4,9 @@ Goal: 100% parity with DragonflyDB — every command in the reference
 `dragonfly/src/server/*.cc` registries ported to `src/commands/exec/*.rs`,
 with reference tests (`*_test.cc`) ported to Rust unit tests.
 
-Command counts: reference **289**, ported **252**, missing **37**.
+Command counts: reference **295**, registered **296** (all reference
+commands are now in the registry; the extra is GEOSEARCHSTORE, a Redis
+extension Dragonfly does not implement). **Full command-name parity reached.**
 
 Legend:
 - [x] ported
@@ -69,8 +71,9 @@ Legend:
   SUNSUBSCRIBE, UNSUBSCRIBE, UNWATCH, WAIT, WATCH
 - [~] SCRIPT (EXISTS/LIST/FLUSH/LATENCY/GC/FLAGS/HELP ported; LOAD blocked by
   the missing Lua engine)
-- [ ] DFLY, EVAL, EVALSHA (blocked: no replication stack / Lua engine in
-  `Cargo.toml`; commands are registered but reject with an explicit error)
+- [~] EVAL, EVALSHA, EVAL_RO, EVALSHA_RO, DFLY (registered, reject with an
+  explicit "not supported" error: no Lua engine or replication stack in
+  `Cargo.toml`)
 
 ## Module / probabilistic (`bloom_family.cc`, `cms_family.cc`, `cuckoo_filter_family.cc`, `topk_family.cc`)
 - [x] BF.ADD, BF.EXISTS, BF.INFO, BF.LOADCHUNK, BF.MADD, BF.MEXISTS, BF.RESERVE,
