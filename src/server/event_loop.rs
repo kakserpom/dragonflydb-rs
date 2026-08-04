@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::sync::mpsc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::commands::exec::server;
-use crate::commands::{Command, FLAG_BLOCKING, FLAG_GLOBAL, FLAG_LOCAL};
+use crate::commands::{Command, FLAG_ADMIN, FLAG_BLOCKING, FLAG_GLOBAL, FLAG_LOCAL};
 use crate::error::RespValue;
 use crate::protocol::resp::RespParser;
 use crate::server::pubsub::{self, ChannelStore, SubscribeInfo};
@@ -17,6 +18,36 @@ const EV_READ: i16 = libc::EVFILT_READ;
 const EV_WRITE: i16 = libc::EVFILT_WRITE;
 const EV_ADD_ENABLE: u16 = libc::EV_ADD | libc::EV_ENABLE;
 const EV_DELETE: u16 = libc::EV_DELETE;
+
+/// `gettimeofday`-style `sec.usec` timestamp used in MONITOR lines.
+fn monitor_timestamp() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}.{:06}", now.as_secs(), now.subsec_micros())
+}
+
+/// Escape a command argument for MONITOR output the way upstream's
+/// `CmdEntryToMonitorFormat` does: backslash and quote are backslash-escaped,
+/// control characters use their C short forms, and every other non-printable
+/// byte is emitted as `\xNN`.
+fn monitor_escape(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len());
+    for &b in bytes {
+        match b {
+            b'\\' => s.push_str("\\\\"),
+            b'"' => s.push_str("\\\""),
+            b'\n' => s.push_str("\\n"),
+            b'\r' => s.push_str("\\r"),
+            b'\t' => s.push_str("\\t"),
+            7 => s.push_str("\\a"),
+            8 => s.push_str("\\b"),
+            0..=31 | 127..=255 => s.push_str(&format!("\\x{:02x}", b)),
+            _ => s.push(b as char),
+        }
+    }
+    s
+}
 
 /// Phases of a connection-scoped MULTI/EXEC block (mirrors
 /// `ConnectionState::ExecInfo::ExecState`). `Collect` accepts queued commands;
@@ -71,6 +102,13 @@ struct Conn {
     watched_dirty: bool,
     /// Pub/sub channels and patterns this connection is subscribed to.
     sub: SubscribeInfo,
+    /// Peer address rendered as `ip:port`, shown in MONITOR output.
+    remote: String,
+    /// Whether this connection is registered as a MONITOR. Monitor
+    /// connections reject every command except RESET/QUIT.
+    monitor: bool,
+    /// Set by QUIT: close the socket once pending output has flushed.
+    closing: bool,
 }
 
 /// A single-threaded kqueue-based IO event loop. Owns all client sockets, the
@@ -86,6 +124,10 @@ pub struct IoLoop {
     next_conn_id: u64,
     /// Subscriber index shared by all connections.
     pubsub: ChannelStore,
+    /// Connection ids currently in MONITOR mode (fed by the broadcast below).
+    monitors: Vec<u64>,
+    /// Set by SHUTDOWN; the run loop stops once pending replies are flushed.
+    shutting_down: bool,
 }
 
 impl IoLoop {
@@ -109,6 +151,8 @@ impl IoLoop {
             fd_to_id: HashMap::new(),
             next_conn_id: 1,
             pubsub: ChannelStore::new(),
+            monitors: Vec::new(),
+            shutting_down: false,
         })
     }
 
@@ -147,7 +191,11 @@ impl IoLoop {
             }
             self.drain_bus();
             self.flush_all();
+            if self.shutting_down {
+                break;
+            }
         }
+        Ok(())
     }
 
     fn handle_event(&mut self, ev: libc::kevent) {
@@ -175,9 +223,13 @@ impl IoLoop {
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
+                    let remote = stream
+                        .peer_addr()
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|_| "0.0.0.0:0".into());
                     let _ = stream.set_nonblocking(true);
                     let fd = stream.into_raw_fd();
-                    self.register_conn(fd);
+                    self.register_conn(fd, remote);
                 }
                 Err(e) if is_again(&e) => break,
                 Err(_) => break,
@@ -185,7 +237,7 @@ impl IoLoop {
         }
     }
 
-    fn register_conn(&mut self, fd: RawFd) {
+    fn register_conn(&mut self, fd: RawFd, remote: String) {
         let conn_id = self.next_conn_id;
         self.next_conn_id += 1;
         self.conns.insert(
@@ -204,6 +256,9 @@ impl IoLoop {
                 watched: Vec::new(),
                 watched_dirty: false,
                 sub: SubscribeInfo::default(),
+                remote,
+                monitor: false,
+                closing: false,
             },
         );
         self.fd_to_id.insert(fd, conn_id);
@@ -215,6 +270,7 @@ impl IoLoop {
         if let Some(conn) = self.conns.remove(&conn_id) {
             self.fd_to_id.remove(&conn.fd);
             self.pubsub.remove_conn(conn_id);
+            self.monitors.retain(|&c| c != conn_id);
             unsafe { libc::close(conn.fd) };
         }
     }
@@ -280,11 +336,37 @@ impl IoLoop {
             return;
         }
 
+        // A MONITOR connection may only run RESET or QUIT
+        // (`main_service.cc:1413-1414`).
+        if self
+            .conns
+            .get(&conn_id)
+            .map(|c| c.monitor)
+            .unwrap_or(false)
+            && !matches!(cmd.name, "RESET" | "QUIT")
+        {
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error(
+                    "Replica can't interact with the keyspace".into(),
+                )),
+            );
+            return;
+        }
+
         // Inside an open MULTI block everything except the exec-group commands
         // and RESET is queued (upstream `StoreInMultiBlock`).
         if self.in_multi(conn_id) && !matches!(cmd.name, "MULTI" | "EXEC" | "DISCARD" | "RESET") {
             self.queue_cmd(conn_id, seq, cmd, args);
             return;
+        }
+
+        // Feed live MONITOR connections; admin commands and EXEC are excluded
+        // (`command_registry.cc` CAN_MONITOR). Queued MULTI commands are logged
+        // when EXEC runs them (see `run_queued`).
+        if !cmd.has_flag(FLAG_ADMIN) && cmd.name != "EXEC" {
+            self.broadcast_monitor(conn_id, &args);
         }
 
         match cmd.name {
@@ -300,9 +382,19 @@ impl IoLoop {
             "PUNSUBSCRIBE" => return self.local_punsubscribe(conn_id, seq, &args),
             "SSUBSCRIBE" => return self.local_ssubscribe(conn_id, seq, &args),
             "SUNSUBSCRIBE" => return self.local_sunsubscribe(conn_id, seq, &args),
+            "QUIT" => return self.local_quit(conn_id, seq),
             _ => {}
         }
         if cmd.has_flag(FLAG_LOCAL) {
+            // REPLCONF ACK is answered with silence: the reply is dropped but
+            // the seq still advances so later replies drain in order.
+            if cmd.name == "REPLCONF" {
+                match server::local_replconf(&args) {
+                    Some(v) => self.deliver(conn_id, seq, encode_value(&v)),
+                    None => self.deliver(conn_id, seq, Vec::new()),
+                }
+                return;
+            }
             let v = self.handle_local(conn_id, cmd, &args);
             self.deliver(conn_id, seq, encode_value(&v));
             return;
@@ -347,7 +439,18 @@ impl IoLoop {
             self.local_unwatch(conn_id, seq);
             return;
         }
+        // Commands executed through EXEC are monitored as they run.
+        if !cmd.has_flag(FLAG_ADMIN) && cmd.name != "EXEC" {
+            self.broadcast_monitor(conn_id, args);
+        }
         if cmd.has_flag(FLAG_LOCAL) {
+            if cmd.name == "REPLCONF" {
+                match server::local_replconf(args) {
+                    Some(v) => self.deliver(conn_id, seq, encode_value(&v)),
+                    None => self.deliver(conn_id, seq, Vec::new()),
+                }
+                return;
+            }
             let v = self.handle_local(conn_id, cmd, args);
             self.deliver(conn_id, seq, encode_value(&v));
             return;
@@ -376,6 +479,27 @@ impl IoLoop {
             "PUBLISH" => return self.local_publish(args),
             "SPUBLISH" => return self.local_spublish(args),
             "PUBSUB" => return self.local_pubsub(args),
+            "MONITOR" => {
+                // Register the connection and reply +OK (`ChangeMonitor(true)`).
+                if let Some(conn) = self.conns.get_mut(&conn_id) {
+                    conn.monitor = true;
+                }
+                if !self.monitors.contains(&conn_id) {
+                    self.monitors.push(conn_id);
+                }
+                return RespValue::Simple("OK".into());
+            }
+            "SHUTDOWN" => {
+                // Grammar validation happens first; a valid SHUTDOWN stops the
+                // run loop once this +OK reply has been flushed.
+                return match server::local_shutdown(args) {
+                    Ok(()) => {
+                        self.shutting_down = true;
+                        RespValue::Simple("OK".into())
+                    }
+                    Err(e) => e,
+                };
+            }
             _ => {}
         }
         if cmd.name == "SELECT" {
@@ -610,9 +734,20 @@ impl IoLoop {
             conn.watched_dirty = false;
             conn.db_idx = 0;
             conn.sub = SubscribeInfo::default();
+            conn.monitor = false;
         }
         self.pubsub.remove_conn(conn_id);
+        self.monitors.retain(|&c| c != conn_id);
         self.deliver(conn_id, seq, encode_value(&RespValue::Simple("RESET".into())));
+    }
+
+    /// QUIT: reply `+OK`, then close once the reply is flushed (upstream
+    /// `Service::Quit`).
+    fn local_quit(&mut self, conn_id: u64, seq: u64) {
+        self.deliver(conn_id, seq, encode_value(&RespValue::Simple("OK".into())));
+        if let Some(conn) = self.conns.get_mut(&conn_id) {
+            conn.closing = true;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -885,7 +1020,51 @@ impl IoLoop {
             "LASTSAVE" => server::local_lastsave(args),
             "LATENCY" => server::local_latency(args),
             "SLOWLOG" => server::local_slowlog(args),
+            "WAIT" => server::local_wait(args),
+            "REPLICAOF" | "SLAVEOF" => server::local_replicaof(args),
+            "ADDREPLICAOF" => server::local_addreplicaof(args),
+            "REPLTAKEOVER" => server::local_repltakeover(args),
+            "MODULE" => server::local_module(args),
+            "FUNCTION" => server::local_function(args),
+            "SCRIPT" => server::local_script(args),
+            "EVAL" | "EVALSHA" => server::local_lua(args),
+            "DFLY" => server::local_dfly(args),
             _ => RespValue::Error("ERR internal: unhandled local command".into()),
+        }
+    }
+
+    /// Feed a command to the live MONITOR connections as one
+    /// `"<ts> [<db> <src>] \"CMD\" \"arg\" ..."` bulk line per command,
+    /// mirroring upstream `DispatchMonitor` (`main_service.cc`). Admin
+    /// commands never reach here (they are excluded by `dispatch`), and the
+    /// issuing connection is skipped so a monitor never echoes its own
+    /// RESET/QUIT.
+    fn broadcast_monitor(&mut self, conn_id: u64, args: &[Vec<u8>]) {
+        if self.monitors.is_empty() {
+            return;
+        }
+        let ts = monitor_timestamp();
+        let db = self.conns.get(&conn_id).map(|c| c.db_idx).unwrap_or(0);
+        let src = self
+            .conns
+            .get(&conn_id)
+            .map(|c| c.remote.clone())
+            .unwrap_or_default();
+        let mut line = format!("{ts} [{db} {src}] ");
+        for (i, a) in args.iter().enumerate() {
+            if i > 0 {
+                line.push(' ');
+            }
+            line.push('"');
+            line.push_str(&monitor_escape(a));
+            line.push('"');
+        }
+        let frame = encode_value(&RespValue::Bulk(line.into_bytes()));
+        let targets: Vec<u64> = self.monitors.iter().copied().filter(|&m| m != conn_id).collect();
+        for mon in targets {
+            if let Some(c) = self.conns.get_mut(&mon) {
+                c.out.extend_from_slice(&frame);
+            }
         }
     }
 
@@ -967,11 +1146,15 @@ impl IoLoop {
         let ids: Vec<u64> = self
             .conns
             .values()
-            .filter(|c| !c.out.is_empty())
+            .filter(|c| !c.out.is_empty() || c.closing)
             .map(|c| c.conn_id)
             .collect();
         for id in ids {
             self.flush_conn(id);
+            // QUIT closes the socket right after its +OK has been written.
+            if self.conns.get(&id).map(|c| c.closing && c.out.is_empty()).unwrap_or(false) {
+                self.close_conn(id);
+            }
         }
     }
 

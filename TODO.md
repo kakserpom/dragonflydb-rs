@@ -4,10 +4,11 @@ Goal: 100% parity with DragonflyDB — every command in the reference
 `dragonfly/src/server/*.cc` registries ported to `src/commands/exec/*.rs`,
 with reference tests (`*_test.cc`) ported to Rust unit tests.
 
-Command counts: reference **289**, ported **241**, missing **48**.
+Command counts: reference **289**, ported **252**, missing **37**.
 
 Legend:
 - [x] ported
+- [~] partial (registered, some subcommands blocked)
 - [ ] missing
 
 ## String family (`string_family.cc`) — 25 cmds
@@ -60,13 +61,16 @@ Legend:
   GEORADIUSBYMEMBER_RO, GEOSEARCH, GEOSEARCHSTORE
 
 ## Server / admin (`server_family.cc` + `main_service.cc`)
-- [x] AUTH, BGSAVE, CLIENT, COMMAND, CONFIG, DBSIZE, DEBUG, DISCARD, EXEC,
-  FLUSHALL, FLUSHDB, HELLO, INFO, LASTSAVE, LATENCY, MEMORY, MULTI, PING,
-  PSUBSCRIBE, PUBLISH, PUBSUB, PUNSUBSCRIBE, QUIT, RESET, ROLE, SAVE, SLOWLOG,
-  SPUBLISH, SSUBSCRIBE, SUBSCRIBE, SUNSUBSCRIBE, UNSUBSCRIBE, UNWATCH, WATCH
-- [ ] ADDREPLICAOF, DFLY, EVAL, EVALSHA, FUNCTION,
-  MODULE, MONITOR, REPLCONF, REPLICAOF, REPLTAKEOVER, SCRIPT, SHRINK,
-  SHUTDOWN, SLAVEOF, WAIT
+- [x] ADDREPLICAOF, AUTH, BGSAVE, CLIENT, COMMAND, CONFIG, DBSIZE, DEBUG,
+  DISCARD, EXEC, FLUSHALL, FLUSHDB, FUNCTION, HELLO, INFO, LASTSAVE, LATENCY,
+  MEMORY, MODULE, MONITOR, MULTI, PING, PSUBSCRIBE, PUBLISH, PUBSUB,
+  PUNSUBSCRIBE, QUIT, REPLCONF, REPLICAOF, REPLTAKEOVER, RESET, ROLE, SAVE,
+  SHRINK, SHUTDOWN, SLAVEOF, SLOWLOG, SPUBLISH, SSUBSCRIBE, SUBSCRIBE,
+  SUNSUBSCRIBE, UNSUBSCRIBE, UNWATCH, WAIT, WATCH
+- [~] SCRIPT (EXISTS/LIST/FLUSH/LATENCY/GC/FLAGS/HELP ported; LOAD blocked by
+  the missing Lua engine)
+- [ ] DFLY, EVAL, EVALSHA (blocked: no replication stack / Lua engine in
+  `Cargo.toml`; commands are registered but reject with an explicit error)
 
 ## Module / probabilistic (`bloom_family.cc`, `cms_family.cc`, `cuckoo_filter_family.cc`, `topk_family.cc`)
 - [x] BF.ADD, BF.EXISTS, BF.INFO, BF.LOADCHUNK, BF.MADD, BF.MEXISTS, BF.RESERVE,

@@ -405,6 +405,28 @@ fn encoding_name(t: ObjType) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// SHRINK (keyed shard command; the key lives at argument index 1)
+// ---------------------------------------------------------------------------
+
+/// SHRINK key: the reference compacts the bucket array of a DenseSet-encoded
+/// SET/HASH and reports the freed bytes. The port's set/hash storage exposes
+/// no bucket array to compact, so valid SET/HASH keys take the reference's
+/// "nothing to shrink" fast path (reply 0), missing keys reply nil, and any
+/// other type is WRONGTYPE.
+fn exec_shrink(ctx: &mut OpContext) -> CmdResult {
+    let key = ctx.args[1].as_slice();
+    match ctx.db.find(key, ctx.now_ms) {
+        None => CmdResult::Ok(RespValue::Nil),
+        Some(value) => match value.obj_type() {
+            ObjType::Set | ObjType::Hash => CmdResult::Ok(RespValue::Integer(0)),
+            _ => CmdResult::Err(RespError::new(
+                "WRONGTYPE Key is not a set or hash with DenseSet encoding",
+            )),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SAVE / BGSAVE (global commands; each shard snapshots itself)
 // ---------------------------------------------------------------------------
 
@@ -462,6 +484,254 @@ fn snapshot_path(shard_id: usize, basename: Option<&[u8]>) -> PathBuf {
         Some(dir) => PathBuf::from(dir).join(name),
         None => PathBuf::from(name),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Replication / shutdown / admin (connection-thread commands)
+// ---------------------------------------------------------------------------
+
+/// WAIT numreplicas timeout: this standalone port never has connected
+/// replicas, so the reply is always `:0` immediately (the reference's
+/// `replicas.empty()` fast path). Both arguments must be non-negative
+/// integers; anything else is the reference `FInt<0, max>` parse error.
+pub fn local_wait(args: &[Vec<u8>]) -> RespValue {
+    for a in &args[1..] {
+        match crate::util::parse_i64(a) {
+            Some(n) if n >= 0 => {}
+            _ => {
+                return RespValue::Error(
+                    "ERR value is not an integer or out of range".into(),
+                )
+            }
+        }
+    }
+    RespValue::Integer(0)
+}
+
+/// Parse SHUTDOWN options ([SAVE|SAFE][NOSAVE][NOW][FORCE][ABORT]) following
+/// the reference grammar: SAVE/SAFE are synonyms, SAVE+NOSAVE together are a
+/// syntax error, ABORT is unsupported, and anything else fails the grammar.
+/// `Ok` means the server may shut down.
+pub fn local_shutdown(args: &[Vec<u8>]) -> Result<(), RespValue> {
+    let (mut save, mut no_save) = (false, false);
+    for opt in &args[1..] {
+        match opt.to_ascii_uppercase().as_slice() {
+            b"SAVE" | b"SAFE" => save = true,
+            b"NOSAVE" => no_save = true,
+            b"NOW" | b"FORCE" => {}
+            b"ABORT" => {
+                return Err(RespValue::Error(
+                    "ERR SHUTDOWN ABORT is not supported".into(),
+                ))
+            }
+            _ => return Err(RespValue::Error("ERR syntax error".into())),
+        }
+    }
+    if save && no_save {
+        return Err(RespValue::Error("ERR syntax error".into()));
+    }
+    Ok(())
+}
+
+/// REPLCONF option value...: validate the option/value pairs the reference
+/// accepts and reply OK. A single `REPLCONF ACK <n>` is answered with silence
+/// (this port has no replication flow, matching the reference's no-flow path),
+/// represented by `None`. Odd argument counts and unknown options are syntax
+/// errors; LISTENING-PORT / CLIENT-VERSION values must be 32-bit integers.
+pub fn local_replconf(args: &[Vec<u8>]) -> Option<RespValue> {
+    let rest = &args[1..];
+    if rest.len() % 2 == 1 {
+        return Some(RespValue::Error("ERR syntax error".into()));
+    }
+    let single = rest.len() == 2;
+    for pair in rest.chunks(2) {
+        match pair[0].to_ascii_uppercase().as_slice() {
+            b"CAPA" | b"IP-ADDRESS" => {}
+            b"LISTENING-PORT" | b"CLIENT-ID" | b"CLIENT-VERSION" => {
+                if !is_u32(&pair[1]) {
+                    return Some(RespValue::Error(
+                        "ERR value is not an integer or out of range".into(),
+                    ));
+                }
+            }
+            b"ACK" if single => return None,
+            _ => return Some(RespValue::Error("ERR syntax error".into())),
+        }
+    }
+    Some(RespValue::Simple("OK".into()))
+}
+
+/// REPLICAOF/SLAVEOF. `NO ONE` clears replication and always succeeds on this
+/// always-master standalone port (reference `ReplicaOfNoOne`). A `host port`
+/// pair would start replication in the reference; there is no replication
+/// stack here, so after the port-range validation it is rejected explicitly.
+pub fn local_replicaof(args: &[Vec<u8>]) -> RespValue {
+    let no = args.get(1).map(|a| a.eq_ignore_ascii_case(b"NO")).unwrap_or(false);
+    if no {
+        if args.get(2).map(|a| a.eq_ignore_ascii_case(b"ONE")).unwrap_or(false) {
+            return RespValue::Simple("OK".into());
+        }
+        // "NO" without "ONE": the reference's ExpectTag fails.
+        return RespValue::Error("ERR syntax error".into());
+    }
+    if args.len() == 3 {
+        let port_ok = std::str::from_utf8(&args[2])
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .map(|p| p > 0)
+            .unwrap_or(false);
+        if !port_ok {
+            return RespValue::Error("ERR port is out of range".into());
+        }
+        return RespValue::Error("ERR replication is not supported".into());
+    }
+    RespValue::Error("ERR syntax error".into())
+}
+
+/// ADDREPLICAOF always errors on this port: the reference rejects the command
+/// whenever the server is already a master (note the "OFF" typo upstream).
+pub fn local_addreplicaof(_args: &[Vec<u8>]) -> RespValue {
+    RespValue::Error(
+        "ERR Calling ADDREPLICAOFF allowed only after server is already a replica".into(),
+    )
+}
+
+/// REPLTAKEOVER seconds [SAVE]. On a master the reference validates the
+/// arguments and returns OK (idempotency semantics); parse/option errors keep
+/// the reference order so "Unsupported option" wins over the integer error.
+pub fn local_repltakeover(args: &[Vec<u8>]) -> RespValue {
+    let timeout = crate::util::parse_i64(&args[1]);
+    let mut rest = &args[2..];
+    if rest.first().map(|a| a.eq_ignore_ascii_case(b"SAVE")).unwrap_or(false) {
+        rest = &rest[1..];
+    }
+    if let Some(extra) = rest.first() {
+        return RespValue::Error(format!(
+            "ERR Unsupported option:{}",
+            String::from_utf8_lossy(extra)
+        ));
+    }
+    let Some(n) = timeout else {
+        return RespValue::Error(
+            "ERR value is not an integer or out of range".into(),
+        );
+    };
+    if n < 0 {
+        return RespValue::Error("ERR timeout is negative".into());
+    }
+    RespValue::Simple("OK".into())
+}
+
+/// MODULE LIST replies with the two statically loaded modules (ReJSON v20808,
+/// search v21015); the reference errors on any other subcommand.
+pub fn local_module(args: &[Vec<u8>]) -> RespValue {
+    let sub = args.get(1).map(|a| a.to_ascii_uppercase()).unwrap_or_default();
+    if sub.as_slice() != b"LIST" {
+        return RespValue::Error("ERR syntax error".into());
+    }
+    RespValue::Array(vec![
+        RespValue::Array(vec![
+            RespValue::Simple("name".into()),
+            RespValue::Simple("ReJSON".into()),
+            RespValue::Simple("ver".into()),
+            RespValue::Integer(20808),
+        ]),
+        RespValue::Array(vec![
+            RespValue::Simple("name".into()),
+            RespValue::Simple("search".into()),
+            RespValue::Simple("ver".into()),
+            RespValue::Integer(21015),
+        ]),
+    ])
+}
+
+/// FUNCTION: only `FLUSH` is implemented in the reference (a decorator for
+/// tests); anything else is an unknown-subcommand error.
+pub fn local_function(args: &[Vec<u8>]) -> RespValue {
+    let sub = args.get(1).map(|a| a.to_ascii_uppercase()).unwrap_or_default();
+    if sub.as_slice() == b"FLUSH" {
+        return RespValue::Simple("OK".into());
+    }
+    RespValue::Error(unknown_subcmd(&sub, "FUNCTION"))
+}
+
+/// SCRIPT introspection without a Lua interpreter. EXISTS always reports 0,
+/// LIST/LATENCY are empty, FLUSH/GC reply OK, and LOAD errors because there is
+/// no script engine to compile against (a documented deviation).
+pub fn local_script(args: &[Vec<u8>]) -> RespValue {
+    let sub = args.get(1).map(|a| a.to_ascii_uppercase()).unwrap_or_default();
+    match sub.as_slice() {
+        b"HELP" => RespValue::Array(vec![
+            RespValue::Simple("SCRIPT <subcommand> [<arg> [value] [opt] ...]".into()),
+            RespValue::Simple("Subcommands are:".into()),
+            RespValue::Simple("EXISTS <sha1> [<sha1> ...]".into()),
+            RespValue::Simple(
+                "   Return information about the existence of the scripts in the script cache.".into(),
+            ),
+            RespValue::Simple("FLUSH".into()),
+            RespValue::Simple("   Flush the Lua scripts cache. Very dangerous on replicas.".into()),
+            RespValue::Simple("LOAD <script>".into()),
+            RespValue::Simple("   Load a script into the scripts cache without executing it.".into()),
+            RespValue::Simple("FLAGS <sha> [flags ...]".into()),
+            RespValue::Simple(
+                "   Set specific flags for script. Can be called before the sript is loaded.".into(),
+            ),
+            RespValue::Simple("   The following flags are possible: ".into()),
+            RespValue::Simple(
+                "      - Use 'allow-undeclared-keys' to allow accessing undeclared keys".into(),
+            ),
+            RespValue::Simple(
+                "      - Use 'disable-atomicity' to allow running scripts non-atomically".into(),
+            ),
+            RespValue::Simple("      - Use 'legacy-float' to return floats as integers".into()),
+            RespValue::Simple("LIST".into()),
+            RespValue::Simple("   Lists loaded scripts.".into()),
+            RespValue::Simple("LATENCY".into()),
+            RespValue::Simple(
+                "   Prints latency histograms in usec for every called function.".into(),
+            ),
+            RespValue::Simple("GC".into()),
+            RespValue::Simple(
+                "   Invokes garbage collection on all unused interpreter instances.".into(),
+            ),
+            RespValue::Simple("HELP".into()),
+            RespValue::Simple("   Prints this help.".into()),
+        ]),
+        b"EXISTS" if args.len() >= 3 => {
+            RespValue::Array(vec![RespValue::Integer(0); args.len() - 2])
+        }
+        b"FLUSH" | b"GC" => RespValue::Simple("OK".into()),
+        b"LIST" | b"LATENCY" => RespValue::Array(vec![]),
+        b"LOAD" => RespValue::Error("ERR Lua scripting is not supported".into()),
+        b"FLAGS" if args.len() >= 3 => {
+            // Reference requires a 40-char SHA; without a script cache there is
+            // nothing else to record.
+            if args[2].len() != 40 {
+                return RespValue::Error("ERR syntax error".into());
+            }
+            RespValue::Simple("OK".into())
+        }
+        other => RespValue::Error(unknown_subcmd(other, "SCRIPT")),
+    }
+}
+
+/// EVAL/EVALSHA require a Lua interpreter, which this port does not embed
+/// (only hashbrown/libc/mimalloc/simd-json/xxhash dependencies). Registration
+/// keeps the command name known; execution is rejected explicitly.
+pub fn local_lua(_args: &[Vec<u8>]) -> RespValue {
+    RespValue::Error("ERR Lua scripting is not supported".into())
+}
+
+/// DFLY is the replication control protocol (`dflycmd.cc`); the port has no
+/// replication stack, so it is rejected explicitly.
+pub fn local_dfly(_args: &[Vec<u8>]) -> RespValue {
+    RespValue::Error("ERR DFLY replication control is not supported".into())
+}
+
+fn is_u32(s: &[u8]) -> bool {
+    std::str::from_utf8(s)
+        .map(|s| s.parse::<u32>().is_ok())
+        .unwrap_or(false)
 }
 
 fn save_help(is_bgsave: bool) -> RespValue {
@@ -782,6 +1052,134 @@ pub static CMD_SUNSUBSCRIBE: Command = Command {
     exec: local_stub,
     merge: None,
 };
+pub static CMD_QUIT: Command = Command {
+    name: "QUIT",
+    arity: 1,
+    flags: FLAG_FAST | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_MONITOR: Command = Command {
+    name: "MONITOR",
+    arity: 1,
+    flags: FLAG_ADMIN | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_SHUTDOWN: Command = Command {
+    name: "SHUTDOWN",
+    arity: -1,
+    flags: FLAG_ADMIN | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_WAIT: Command = Command {
+    name: "WAIT",
+    arity: 3,
+    flags: FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_REPLCONF: Command = Command {
+    name: "REPLCONF",
+    arity: -1,
+    flags: FLAG_ADMIN | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_REPLICAOF: Command = Command {
+    name: "REPLICAOF",
+    arity: -3,
+    flags: FLAG_ADMIN | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_SLAVEOF: Command = Command {
+    name: "SLAVEOF",
+    arity: 3,
+    flags: FLAG_ADMIN | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_ADDREPLICAOF: Command = Command {
+    name: "ADDREPLICAOF",
+    arity: 5,
+    flags: FLAG_ADMIN | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_REPLTAKEOVER: Command = Command {
+    name: "REPLTAKEOVER",
+    arity: -2,
+    flags: FLAG_ADMIN | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_MODULE: Command = Command {
+    name: "MODULE",
+    arity: 2,
+    flags: FLAG_ADMIN | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_FUNCTION: Command = Command {
+    name: "FUNCTION",
+    arity: 2,
+    flags: FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_SCRIPT: Command = Command {
+    name: "SCRIPT",
+    arity: -2,
+    flags: FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_SHRINK: Command = Command {
+    name: "SHRINK",
+    arity: 2,
+    flags: FLAG_READONLY | FLAG_FAST,
+    key_range: KeyRange::ONE,
+    exec: exec_shrink,
+    merge: None,
+};
+pub static CMD_EVAL: Command = Command {
+    name: "EVAL",
+    arity: -3,
+    flags: FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_EVALSHA: Command = Command {
+    name: "EVALSHA",
+    arity: -3,
+    flags: FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_DFLY: Command = Command {
+    name: "DFLY",
+    arity: -2,
+    flags: FLAG_ADMIN | FLAG_LOCAL,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
 
 #[cfg(test)]
 mod tests {
@@ -1027,6 +1425,183 @@ mod tests {
         assert_eq!(
             s(&mut d, &["BGSAVE", "SCHEDULE"]),
             "Background saving started"
+        );
+    }
+
+    #[test]
+    fn wait_reply() {
+        // No connected replicas on this port: always `:0`, but arguments are
+        // still validated as non-negative integers.
+        assert_eq!(render(&local_wait(&b_args(&["WAIT", "0", "0"]))), "0");
+        assert_eq!(render(&local_wait(&b_args(&["WAIT", "2", "1000"]))), "0");
+        assert_eq!(
+            render(&local_wait(&b_args(&["WAIT", "-1", "1000"]))),
+            "ERR value is not an integer or out of range"
+        );
+        assert_eq!(
+            render(&local_wait(&b_args(&["WAIT", "x", "1000"]))),
+            "ERR value is not an integer or out of range"
+        );
+    }
+
+    #[test]
+    fn shutdown_grammar() {
+        assert_eq!(render(&shutdown(&["SHUTDOWN"])), "OK");
+        assert_eq!(render(&shutdown(&["SHUTDOWN", "NOSAVE"])), "OK");
+        assert_eq!(render(&shutdown(&["SHUTDOWN", "SAVE"])), "OK");
+        assert_eq!(render(&shutdown(&["SHUTDOWN", "SAFE", "FORCE", "NOW"])), "OK");
+        assert_eq!(
+            render(&shutdown(&["SHUTDOWN", "SAVE", "NOSAVE"])),
+            "ERR syntax error"
+        );
+        assert_eq!(
+            render(&shutdown(&["SHUTDOWN", "ABORT"])),
+            "ERR SHUTDOWN ABORT is not supported"
+        );
+        assert_eq!(render(&shutdown(&["SHUTDOWN", "BOGUS"])), "ERR syntax error");
+    }
+
+    fn shutdown(a: &[&str]) -> RespValue {
+        match local_shutdown(&b_args(a)) {
+            Ok(()) => RespValue::Simple("OK".into()),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn replconf_options() {
+        let c = |a: &[&str]| -> String {
+            match local_replconf(&b_args(a)) {
+                Some(v) => render(&v),
+                None => "<silence>".into(),
+            }
+        };
+        assert_eq!(c(&["REPLCONF", "LISTENING-PORT", "6379"]), "OK");
+        assert_eq!(
+            c(&["REPLCONF", "LISTENING-PORT", "abc"]),
+            "ERR value is not an integer or out of range"
+        );
+        assert_eq!(c(&["REPLCONF", "CAPA", "eof", "CAPA", "psync2"]), "OK");
+        assert_eq!(
+            c(&["REPLCONF", "CLIENT-ID", "42", "CLIENT-VERSION", "1"]),
+            "OK"
+        );
+        assert_eq!(c(&["REPLCONF", "ACK", "1"]), "<silence>");
+        assert_eq!(c(&["REPLCONF", "ACK"]), "ERR syntax error");
+        assert_eq!(c(&["REPLCONF", "IP-ADDRESS", "1.2.3.4", "CAPA", "eof"]), "OK");
+        assert_eq!(c(&["REPLCONF", "BOGUS", "x"]), "ERR syntax error");
+        assert_eq!(
+            c(&["REPLCONF", "LISTENING-PORT", "6379", "ACK", "1"]),
+            "ERR syntax error"
+        );
+    }
+
+    #[test]
+    fn replicaof_reply() {
+        let r = |a: &[&str]| render(&local_replicaof(&b_args(a)));
+        assert_eq!(r(&["REPLICAOF", "NO", "ONE"]), "OK");
+        assert_eq!(r(&["SLAVEOF", "NO", "ONE"]), "OK");
+        assert_eq!(
+            r(&["REPLICAOF", "localhost", "7000"]),
+            "ERR replication is not supported"
+        );
+        assert_eq!(
+            r(&["REPLICAOF", "localhost", "99999"]),
+            "ERR port is out of range"
+        );
+        assert_eq!(
+            r(&["REPLICAOF", "localhost", "-1"]),
+            "ERR port is out of range"
+        );
+        assert_eq!(r(&["REPLICAOF", "NO", "TWO"]), "ERR syntax error");
+        assert_eq!(r(&["REPLICAOF"]), "ERR syntax error");
+    }
+
+    #[test]
+    fn addreplicaof_reply() {
+        assert_eq!(
+            render(&local_addreplicaof(&b_args(&["ADDREPLICAOF", "h", "1", "2", "3"]))),
+            "ERR Calling ADDREPLICAOFF allowed only after server is already a replica"
+        );
+    }
+
+    #[test]
+    fn repltakeover_reply() {
+        let r = |a: &[&str]| render(&local_repltakeover(&b_args(a)));
+        assert_eq!(r(&["REPLTAKEOVER", "1"]), "OK");
+        assert_eq!(r(&["REPLTAKEOVER", "1", "SAVE"]), "OK");
+        assert_eq!(
+            r(&["REPLTAKEOVER", "1", "NOSAVE"]),
+            "ERR Unsupported option:NOSAVE"
+        );
+        assert_eq!(
+            r(&["REPLTAKEOVER", "x"]),
+            "ERR value is not an integer or out of range"
+        );
+        assert_eq!(
+            r(&["REPLTAKEOVER", "-1"]),
+            "ERR timeout is negative"
+        );
+    }
+
+    #[test]
+    fn module_list() {
+        let v = local_module(&b_args(&["MODULE", "LIST"]));
+        match v {
+            RespValue::Array(mods) if mods.len() == 2 => {
+                let m0 = render(&mods[0]);
+                assert!(m0.contains("ReJSON") && m0.contains("20808"));
+                let m1 = render(&mods[1]);
+                assert!(m1.contains("search") && m1.contains("21015"));
+            }
+            other => panic!("unexpected MODULE LIST: {:?}", other),
+        }
+        assert_eq!(
+            render(&local_module(&b_args(&["MODULE", "LOAD", "foo"]))),
+            "ERR syntax error"
+        );
+    }
+
+    #[test]
+    fn function_reply() {
+        assert_eq!(render(&local_function(&b_args(&["FUNCTION", "FLUSH"]))), "OK");
+        assert_eq!(
+            render(&local_function(&b_args(&["FUNCTION", "LOAD", "x"]))),
+            "ERR Unknown subcommand or wrong number of arguments for 'LOAD'. Try FUNCTION HELP."
+        );
+    }
+
+    #[test]
+    fn script_reply() {
+        let r = |a: &[&str]| render(&local_script(&b_args(a)));
+        assert_eq!(r(&["SCRIPT", "FLUSH"]), "OK");
+        assert_eq!(r(&["SCRIPT", "GC"]), "OK");
+        assert_eq!(r(&["SCRIPT", "EXISTS", "a", "b"]), "[0, 0]");
+        assert_eq!(r(&["SCRIPT", "LIST"]), "[]");
+        assert_eq!(r(&["SCRIPT", "FLAGS", "0123456789012345678901234567890123456789"]), "OK");
+        assert_eq!(r(&["SCRIPT", "FLAGS", "short"]), "ERR syntax error");
+        assert_eq!(
+            r(&["SCRIPT", "LOAD", "return 1"]),
+            "ERR Lua scripting is not supported"
+        );
+        assert!(
+            r(&["SCRIPT", "HELP"]).contains("SCRIPT <subcommand>")
+        );
+    }
+
+    #[test]
+    fn shrink_reply() {
+        let mut d = db();
+        assert_eq!(s(&mut d, &["SADD", "set", "a"]), "1");
+        assert_eq!(s(&mut d, &["HSET", "h", "f", "1"]), "1");
+        assert_eq!(s(&mut d, &["SET", "str", "v"]), "OK");
+        // Set/hash: DenseSet encoding has no bucket array to compact here.
+        assert_eq!(s(&mut d, &["SHRINK", "set"]), "0");
+        assert_eq!(s(&mut d, &["SHRINK", "h"]), "0");
+        assert_eq!(s(&mut d, &["SHRINK", "nosuch"]), "(nil)");
+        assert_eq!(
+            s(&mut d, &["SHRINK", "str"]),
+            "WRONGTYPE Key is not a set or hash with DenseSet encoding"
         );
     }
 }
