@@ -609,31 +609,38 @@ pub fn local_replconf(args: &[Vec<u8>]) -> Option<RespValue> {
     Some(RespValue::Simple("OK".into()))
 }
 
-/// REPLICAOF/SLAVEOF. `NO ONE` clears replication and always succeeds on this
-/// always-master standalone port (reference `ReplicaOfNoOne`). A `host port`
-/// pair would start replication in the reference; there is no replication
-/// stack here, so after the port-range validation it is rejected explicitly.
-#[must_use]
-pub fn local_replicaof(args: &[Vec<u8>]) -> RespValue {
+/// The action a `REPLICAOF`/`SLAVEOF` request asks for (`GetReplicaOfCommand`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplicaOf {
+    /// `REPLICAOF NO ONE`: stop replicating and resume master mode.
+    NoOne,
+    /// `REPLICAOF <host> <port>`: start replicating from a master.
+    Start { host: String, port: u16 },
+}
+
+/// Parse a REPLICAOF/SLAVEOF argument list. The reference's
+/// `ParseReplicaOf` accepts `NO ONE`, a `host port` pair, or `""` as the host
+/// (an empty host restarts the replica in place).
+pub fn parse_replicaof(args: &[Vec<u8>]) -> Result<ReplicaOf, RespValue> {
     let no = args.get(1).is_some_and(|a| a.eq_ignore_ascii_case(b"NO"));
     if no {
         if args.get(2).is_some_and(|a| a.eq_ignore_ascii_case(b"ONE")) {
-            return RespValue::Simple("OK".into());
+            return Ok(ReplicaOf::NoOne);
         }
         // "NO" without "ONE": the reference's ExpectTag fails.
-        return RespValue::Error("ERR syntax error".into());
+        return Err(RespValue::Error("ERR syntax error".into()));
     }
     if args.len() == 3 {
-        let port_ok = std::str::from_utf8(&args[2])
+        let host = String::from_utf8_lossy(&args[1]).into_owned();
+        let port = std::str::from_utf8(&args[2])
             .ok()
-            .and_then(|s| s.parse::<u16>().ok())
-            .is_some_and(|p| p > 0);
-        if !port_ok {
-            return RespValue::Error("ERR port is out of range".into());
-        }
-        return RespValue::Error("ERR replication is not supported".into());
+            .and_then(|s| s.parse::<u16>().ok());
+        return match port {
+            Some(p) if p > 0 => Ok(ReplicaOf::Start { host, port: p }),
+            _ => Err(RespValue::Error("ERR port is out of range".into())),
+        };
     }
-    RespValue::Error("ERR syntax error".into())
+    Err(RespValue::Error("ERR syntax error".into()))
 }
 
 /// ADDREPLICAOF always errors on this port: the reference rejects the command
@@ -1551,13 +1558,14 @@ mod tests {
 
     #[test]
     fn replicaof_reply() {
-        let r = |a: &[&str]| render(&local_replicaof(&b_args(a)));
+        let r = |a: &[&str]| match parse_replicaof(&b_args(a)) {
+            Ok(ReplicaOf::NoOne) => "OK".to_string(),
+            Ok(ReplicaOf::Start { host, port }) => format!("OK {host}:{port}"),
+            Err(e) => render(&e),
+        };
         assert_eq!(r(&["REPLICAOF", "NO", "ONE"]), "OK");
         assert_eq!(r(&["SLAVEOF", "NO", "ONE"]), "OK");
-        assert_eq!(
-            r(&["REPLICAOF", "localhost", "7000"]),
-            "ERR replication is not supported"
-        );
+        assert_eq!(r(&["REPLICAOF", "localhost", "7000"]), "OK localhost:7000");
         assert_eq!(
             r(&["REPLICAOF", "localhost", "99999"]),
             "ERR port is out of range"

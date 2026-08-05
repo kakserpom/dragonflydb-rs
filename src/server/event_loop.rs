@@ -1,16 +1,22 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use std::fmt::Write as _;
 
 use crate::commands::exec::server;
-use crate::commands::{Command, FLAG_ADMIN, FLAG_BLOCKING, FLAG_GLOBAL, FLAG_LOCAL};
+use crate::commands::{
+    Command, FLAG_ADMIN, FLAG_BLOCKING, FLAG_GLOBAL, FLAG_LOCAL, FLAG_WRITE,
+};
 use crate::error::RespValue;
 use crate::protocol::resp::RespParser;
 use crate::server::pubsub::{self, ChannelStore, SubscribeInfo};
+use crate::server::replica::{self, ReplicaPhase, ReplicaStatus};
+use crate::server::replication::{self, ReplicationManager, ReplChunk, SyncState};
 use crate::server::{
     CoordMsg, GcRequest, Reply, ServerEnv, ShardMsg, SingleOp, WatchState, command_for,
     encode_value, extract_keys, is_eval_cmd, is_function_cmd, keys_per_shard, local_function,
@@ -110,15 +116,32 @@ struct Conn {
     /// Whether this connection is registered as a MONITOR. Monitor
     /// connections reject every command except RESET/QUIT.
     monitor: bool,
+    /// This connection's role in a replication session, if any.
+    repl: Option<ConnRepl>,
     /// Set by QUIT: close the socket once pending output has flushed.
     closing: bool,
 }
 
+/// The role a connection plays inside a replica session. The control connection
+/// carries `REPLCONF`/`DFLY`; each flow connection carries the RDB stream and
+/// the stable-sync journal for one shard.
+#[derive(Debug, Clone, Copy)]
+enum ConnRepl {
+    /// The session's control connection (`REPLCONF CAPA dragonfly`).
+    Control { sync_id: u32 },
+    /// A `DFLY FLOW` connection for one shard of the session.
+    Flow { sync_id: u32, flow_id: usize },
+}
+
 /// A single-threaded kqueue-based IO event loop. Owns all client sockets, the
-/// reply bus receiver, and the shared `ServerEnv` handle.
+/// reply bus receiver, the shared `ServerEnv` handle, and the master-side
+/// replication state.
 pub struct IoLoop {
     env: ServerEnv,
     reply_bus_rx: mpsc::Receiver<Reply>,
+    /// Stable-sync journal chunks from the shard threads, routed to their
+    /// flow connections.
+    repl_rx: mpsc::Receiver<ReplChunk>,
     listener: TcpListener,
     wake_r: RawFd,
     kq: RawFd,
@@ -129,14 +152,23 @@ pub struct IoLoop {
     pubsub: ChannelStore,
     /// Connection ids currently in MONITOR mode (fed by the broadcast below).
     monitors: Vec<u64>,
+    /// Replica sessions (`dflycmd.cc` `replica_infos_`).
+    repl: ReplicationManager,
     /// Set by SHUTDOWN; the run loop stops once pending replies are flushed.
     shutting_down: bool,
+    /// Replica-side state: the status shared with the replica thread (surfaced
+    /// through ROLE), the stop flag for `REPLICAOF NO ONE`, and the running
+    /// replica thread, if any.
+    replica_status: Arc<Mutex<ReplicaStatus>>,
+    replica_stop: Arc<AtomicBool>,
+    replica_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl IoLoop {
     pub fn new(
         env: ServerEnv,
         reply_bus_rx: mpsc::Receiver<Reply>,
+        repl_rx: mpsc::Receiver<ReplChunk>,
         listener: TcpListener,
         wake_r: RawFd,
     ) -> std::io::Result<Self> {
@@ -147,6 +179,7 @@ impl IoLoop {
         Ok(IoLoop {
             env,
             reply_bus_rx,
+            repl_rx,
             listener,
             wake_r,
             kq,
@@ -155,7 +188,11 @@ impl IoLoop {
             next_conn_id: 1,
             pubsub: ChannelStore::new(),
             monitors: Vec::new(),
+            repl: ReplicationManager::new(),
             shutting_down: false,
+            replica_status: Arc::new(Mutex::new(ReplicaStatus::default())),
+            replica_stop: Arc::new(AtomicBool::new(false)),
+            replica_handle: None,
         })
     }
 
@@ -193,6 +230,7 @@ impl IoLoop {
                 self.handle_event(*ev);
             }
             self.drain_bus();
+            self.drain_repl();
             self.flush_all();
             if self.shutting_down {
                 break;
@@ -260,6 +298,7 @@ impl IoLoop {
                 sub: SubscribeInfo::default(),
                 remote,
                 monitor: false,
+                repl: None,
                 closing: false,
             },
         );
@@ -269,6 +308,15 @@ impl IoLoop {
     }
 
     fn close_conn(&mut self, conn_id: u64) {
+        // A closed flow/control connection tears down the whole replica session
+        // (`DflyCmd::StopReplication`); the shard consumers are unregistered.
+        if let Some(role) = self.conns.get(&conn_id).and_then(|c| c.repl) {
+            let sync_id = match role {
+                ConnRepl::Control { sync_id } => sync_id,
+                ConnRepl::Flow { sync_id, .. } => sync_id,
+            };
+            self.stop_replication(sync_id);
+        }
         if let Some(conn) = self.conns.remove(&conn_id) {
             self.fd_to_id.remove(&conn.fd);
             self.pubsub.remove_conn(conn_id);
@@ -343,6 +391,20 @@ impl IoLoop {
             return;
         }
 
+        // A replica rejects writes from client connections (the replica's own
+        // journal application bypasses `dispatch` entirely). Matches
+        // `main_service.cc` `IsWriteCmd && !is_master && !is_replicating`.
+        if self.is_replica() && cmd.has_flag(FLAG_WRITE) {
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error(
+                    "READONLY You can't write against a read only replica.".into(),
+                )),
+            );
+            return;
+        }
+
         // A MONITOR connection may only run RESET or QUIT
         // (`main_service.cc:1413-1414`).
         if self.conns.get(&conn_id).is_some_and(|c| c.monitor)
@@ -392,10 +454,14 @@ impl IoLoop {
             // REPLCONF ACK is answered with silence: the reply is dropped but
             // the seq still advances so later replies drain in order.
             if cmd.name == "REPLCONF" {
-                match server::local_replconf(&args) {
+                match self.replconf(conn_id, &args) {
                     Some(v) => self.deliver(conn_id, seq, encode_value(&v)),
                     None => self.deliver(conn_id, seq, Vec::new()),
                 }
+                return;
+            }
+            if cmd.name == "DFLY" {
+                self.dfly(conn_id, seq, &args);
                 return;
             }
             let v = self.handle_local(conn_id, cmd, &args);
@@ -468,10 +534,14 @@ impl IoLoop {
         }
         if cmd.has_flag(FLAG_LOCAL) {
             if cmd.name == "REPLCONF" {
-                match server::local_replconf(args) {
+                match self.replconf(conn_id, args) {
                     Some(v) => self.deliver(conn_id, seq, encode_value(&v)),
                     None => self.deliver(conn_id, seq, Vec::new()),
                 }
+                return;
+            }
+            if cmd.name == "DFLY" {
+                self.dfly(conn_id, seq, args);
                 return;
             }
             let v = self.handle_local(conn_id, cmd, args);
@@ -498,6 +568,20 @@ impl IoLoop {
         // Single-reply pub/sub commands reach this path both from `dispatch`
         // (FLAG_LOCAL) and from `run_queued` when executed inside EXEC.
         match cmd.name {
+            "ROLE" => return replica::role_reply(&self.replica_status.lock().unwrap()),
+            "REPLICAOF" | "SLAVEOF" => {
+                return match server::parse_replicaof(args) {
+                    Ok(server::ReplicaOf::NoOne) => {
+                        self.stop_replica();
+                        RespValue::Simple("OK".into())
+                    }
+                    Ok(server::ReplicaOf::Start { host, port }) => {
+                        self.start_replica(&host, port);
+                        RespValue::Simple("OK".into())
+                    }
+                    Err(e) => e,
+                };
+            }
             "PUBLISH" => return self.local_publish(args),
             "SPUBLISH" => return self.local_spublish(args),
             "PUBSUB" => return self.local_pubsub(args),
@@ -1046,19 +1130,407 @@ impl IoLoop {
             "CONFIG" => server::local_config(args),
             "CLIENT" => server::local_client(args),
             "TIME" => server::local_time(args),
-            "ROLE" => server::local_role(args),
             "LASTSAVE" => server::local_lastsave(args),
             "LATENCY" => server::local_latency(args),
             "SLOWLOG" => server::local_slowlog(args),
             "WAIT" => server::local_wait(args),
-            "REPLICAOF" | "SLAVEOF" => server::local_replicaof(args),
             "ADDREPLICAOF" => server::local_addreplicaof(args),
             "REPLTAKEOVER" => server::local_repltakeover(args),
             "MODULE" => server::local_module(args),
             "FUNCTION" => self.local_function(args),
             "SCRIPT" => self.local_script(args),
-            "DFLY" => server::local_dfly(args),
             _ => RespValue::Error("ERR internal: unhandled local command".into()),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Replication (replica side)
+    // ------------------------------------------------------------------
+
+    /// Whether this server currently plays the replica role (any phase other
+    /// than Master), which gates writes from client connections.
+    fn is_replica(&self) -> bool {
+        let status = self.replica_status.lock().unwrap();
+        status.phase != ReplicaPhase::Master
+    }
+
+    /// `REPLICAOF <host> <port>`: stop any previous session, then start a new
+    /// replica thread (the reply is `+OK` immediately; the handshake happens
+    /// asynchronously). Mirrors `ServerFamily::ReplicaOf`.
+    fn start_replica(&mut self, host: &str, port: u16) {
+        self.stop_replica();
+        self.replica_stop.store(false, Ordering::Relaxed);
+        let cfg = replica::ReplicaConfig {
+            host: host.to_string(),
+            port,
+            listen_port: self.env.listen_port,
+            num_shards: self.env.num_shards,
+            shard_txs: self.env.shard_txs.clone(),
+            status: self.replica_status.clone(),
+            stop: self.replica_stop.clone(),
+            lsn_cells: Arc::new(
+                (0..self.env.num_shards)
+                    .map(|_| Arc::new(AtomicU64::new(0)))
+                    .collect(),
+            ),
+        };
+        {
+            let mut status = self.replica_status.lock().unwrap();
+            status.master_host = host.to_string();
+            status.master_port = port;
+            status.error = None;
+        }
+        let handle = std::thread::Builder::new()
+            .name("replica".into())
+            .spawn(move || replica::run(cfg))
+            .expect("failed to spawn replica thread");
+        self.replica_handle = Some(handle);
+    }
+
+    /// `REPLICAOF NO ONE`: stop the replica thread and reset to master mode.
+    fn stop_replica(&mut self) {
+        self.replica_stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.replica_handle.take() {
+            let _ = handle.join();
+        }
+        let mut status = self.replica_status.lock().unwrap();
+        *status = ReplicaStatus::default();
+    }
+
+    // ------------------------------------------------------------------
+    // Replication (master side)
+    // ------------------------------------------------------------------
+
+    /// REPLCONF handling. `REPLCONF CAPA dragonfly` (a single pair) opens a
+    /// replica session and replies with the `[replid, "SYNC<n>", flow_count,
+    /// version, lineage]` handshake (`server_family.cc`). A single
+    /// `REPLCONF ACK <lsn>` on a flow connection records the acknowledged LSN
+    /// and is answered with silence; everything else defers to
+    /// `local_replconf`.
+    fn replconf(&mut self, conn_id: u64, args: &[Vec<u8>]) -> Option<RespValue> {
+        let rest = &args[1..];
+        if rest.len() == 2 {
+            if rest[0].eq_ignore_ascii_case(b"CAPA") && rest[1].eq_ignore_ascii_case(b"dragonfly") {
+                let (address, port) = {
+                    let remote = self
+                        .conns
+                        .get(&conn_id)
+                        .map_or_else(|| "0.0.0.0:0".to_string(), |c| c.remote.clone());
+                    match remote.rsplit_once(':') {
+                        Some((a, p)) => (a.to_string(), p.parse::<u32>().unwrap_or(0)),
+                        None => (remote, 0),
+                    }
+                };
+                let sync_id = self.repl.create_sync_session(address, port, self.env.num_shards);
+                if let Some(conn) = self.conns.get_mut(&conn_id) {
+                    conn.repl = Some(ConnRepl::Control { sync_id });
+                }
+                return Some(replication::capa_dragonfly_reply(
+                    &self.repl,
+                    sync_id,
+                    self.env.num_shards,
+                ));
+            }
+            if rest[0].eq_ignore_ascii_case(b"ACK") {
+                if let Some(ConnRepl::Flow { sync_id, flow_id }) =
+                    self.conns.get(&conn_id).and_then(|c| c.repl)
+                {
+                    if let Some(n) = std::str::from_utf8(&rest[1])
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        if let Some(replica) = self.repl.get_mut(sync_id)
+                            && let Some(flow) = replica.flows.get_mut(flow_id)
+                        {
+                            flow.last_acked_lsn = n;
+                        }
+                    }
+                }
+                return None;
+            }
+        }
+        server::local_replconf(args)
+    }
+
+    /// `DFLY` subcommand dispatch (`dflycmd.cc` `DflyCmd`).
+    fn dfly(&mut self, conn_id: u64, seq: u64, args: &[Vec<u8>]) {
+        let sub = args
+            .get(1)
+            .map(|a| a.to_ascii_uppercase())
+            .unwrap_or_default();
+        match sub.as_slice() {
+            b"FLOW" => self.dfly_flow(conn_id, seq, args),
+            b"SYNC" => self.dfly_sync(conn_id, seq, args),
+            b"STARTSTABLE" => self.dfly_startstable(conn_id, seq, args),
+            _ => self.deliver(conn_id, seq, encode_value(&server::local_dfly(args))),
+        }
+    }
+
+    /// `DFLY FLOW <master_id> <sync_id> <flow_id> [<lsn>]` or the failover form
+    /// `<last_master_id> <lsn-vec>`. Registers the flow connection, enables the
+    /// flow's shard journal, and negotiates FULL vs PARTIAL sync against the
+    /// journal ring; replies `[FULL|PARTIAL, eof_token]`.
+    fn dfly_flow(&mut self, conn_id: u64, seq: u64, args: &[Vec<u8>]) {
+        if args.len() < 5 {
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error(
+                    "ERR wrong number of arguments for 'DFLY FLOW' command".into(),
+                )),
+            );
+            return;
+        }
+        if String::from_utf8_lossy(&args[2]) != self.repl.master_replid {
+            self.deliver(conn_id, seq, encode_value(&RespValue::Error("bad master id".into())));
+            return;
+        }
+        let Some(sync_id) =
+            ReplicationManager::parse_sync_id(&String::from_utf8_lossy(&args[3]))
+        else {
+            self.deliver(conn_id, seq, encode_value(&RespValue::Error("bad sync id".into())));
+            return;
+        };
+        let Some(flow_id) = std::str::from_utf8(&args[4])
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        else {
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error(
+                    "ERR value is not an integer or out of range".into(),
+                )),
+            );
+            return;
+        };
+        if flow_id >= self.env.num_shards {
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error(
+                    "ERR value is not an integer or out of range".into(),
+                )),
+            );
+            return;
+        }
+        let Some(replica) = self.repl.get(sync_id) else {
+            self.deliver(conn_id, seq, encode_value(&RespValue::Error("bad sync id".into())));
+            return;
+        };
+        if replica.state != SyncState::Preparation {
+            self.deliver(conn_id, seq, encode_value(&RespValue::Error("invalid state".into())));
+            return;
+        }
+
+        // The trailing LSN forms: `[<lsn>]` or `<last_master_id> <lsn-vec>`
+        // (the lsn-vec has one entry per shard; only the failover/cascaded
+        // partial-sync path, which v1 does not negotiate).
+        let mut flow_lsn = None;
+        match args.len() {
+            6 => flow_lsn = parse_u64(&args[5]),
+            7 => {
+                if let Some(lsns) = parse_lsn_vec(&args[6])
+                    && lsns.len() == self.env.num_shards
+                {
+                    flow_lsn = lsns.get(flow_id).copied();
+                }
+            }
+            _ => {}
+        }
+
+        // `journal::IsLSNInPartialSyncBuffer` decides the sync type.
+        let mut sync_type = "FULL";
+        if let Some(lsn) = flow_lsn {
+            let (tx, rx) = mpsc::channel();
+            let asked = self.env.shard_txs[flow_id]
+                .send(ShardMsg::IsLsnInBuffer { lsn, result_tx: tx })
+                .is_ok()
+                && rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false);
+            if asked {
+                sync_type = "PARTIAL";
+            }
+        }
+
+        let eof_token = replication::random_hex(40);
+        {
+            let replica = self.repl.get_mut(sync_id).unwrap();
+            let flow = &mut replica.flows[flow_id];
+            flow.conn_id = conn_id;
+            flow.eof_token.clone_from(&eof_token);
+            if sync_type == "PARTIAL" {
+                flow.start_partial_sync_at = flow_lsn;
+            }
+        }
+        // `journal::StartInThread`: the flow's shard starts recording writes.
+        let _ = self.env.shard_txs[flow_id].send(ShardMsg::EnableJournal { enabled: true });
+        if let Some(conn) = self.conns.get_mut(&conn_id) {
+            conn.repl = Some(ConnRepl::Flow { sync_id, flow_id });
+        }
+        let reply = RespValue::Array(vec![
+            RespValue::Simple(sync_type.into()),
+            RespValue::Simple(eof_token.into()),
+        ]);
+        self.deliver(conn_id, seq, encode_value(&reply));
+    }
+
+    /// `DFLY SYNC <sync_id>`: build and stream every shard's full-sync RDB
+    /// snapshot, then move the session to FULL_SYNC. Partial-sync sessions
+    /// reject SYNC (the replica must not send it after a PARTIAL reply).
+    fn dfly_sync(&mut self, conn_id: u64, seq: u64, args: &[Vec<u8>]) {
+        let Some(sync_id) = args
+            .get(2)
+            .and_then(|a| ReplicationManager::parse_sync_id(&String::from_utf8_lossy(a)))
+        else {
+            self.deliver(conn_id, seq, encode_value(&RespValue::Error("bad sync id".into())));
+            return;
+        };
+        let Some(replica) = self.repl.get(sync_id) else {
+            self.deliver(conn_id, seq, encode_value(&RespValue::Error("bad sync id".into())));
+            return;
+        };
+        if replica.state != SyncState::Preparation {
+            self.deliver(conn_id, seq, encode_value(&RespValue::Error("invalid state".into())));
+            return;
+        }
+        if replica.flows.iter().any(|f| f.start_partial_sync_at.is_some()) {
+            self.deliver(conn_id, seq, encode_value(&RespValue::Error("invalid state".into())));
+            return;
+        }
+
+        let mut streams = Vec::with_capacity(self.env.num_shards);
+        for shard in 0..self.env.num_shards {
+            let (tx, rx) = mpsc::channel();
+            let _ = self.env.shard_txs[shard].send(ShardMsg::FullSyncSnapshot { result_tx: tx });
+            match rx.recv_timeout(Duration::from_secs(120)) {
+                Ok(data) => streams.push(data),
+                Err(_) => {
+                    self.deliver(
+                        conn_id,
+                        seq,
+                        encode_value(&RespValue::Error("invalid state".into())),
+                    );
+                    return;
+                }
+            }
+        }
+
+        let replica = self.repl.get_mut(sync_id).unwrap();
+        for (flow, data) in replica.flows.iter_mut().zip(streams.into_iter()) {
+            flow.full_sync_stream = Some(data.stream);
+            flow.start_lsn = data.journal_lsn;
+        }
+        // The RDB stream is written to each flow socket right away, mirroring
+        // the reference streaming it asynchronously during FULL_SYNC.
+        let flow_conns: Vec<(u64, Vec<u8>)> = replica
+            .flows
+            .iter()
+            .map(|f| (f.conn_id, f.full_sync_stream.clone().unwrap_or_default()))
+            .collect();
+        for (fid, bytes) in flow_conns {
+            if let Some(conn) = self.conns.get_mut(&fid) {
+                conn.out.extend_from_slice(&bytes);
+            }
+        }
+        replica.state = SyncState::FullSync;
+        self.deliver(conn_id, seq, encode_value(&RespValue::Simple("OK".into())));
+    }
+
+    /// `DFLY STARTSTABLE <sync_id>`: start the stable-sync streamers on every
+    /// shard (ring catch-up then live consumer), write the eof tokens that
+    /// close the full-sync RDB streams, and move the session to STABLE_SYNC.
+    fn dfly_startstable(&mut self, conn_id: u64, seq: u64, args: &[Vec<u8>]) {
+        let Some(sync_id) = args
+            .get(2)
+            .and_then(|a| ReplicationManager::parse_sync_id(&String::from_utf8_lossy(a)))
+        else {
+            self.deliver(conn_id, seq, encode_value(&RespValue::Error("bad sync id".into())));
+            return;
+        };
+        let Some(replica) = self.repl.get(sync_id) else {
+            self.deliver(conn_id, seq, encode_value(&RespValue::Error("bad sync id".into())));
+            return;
+        };
+        let state = replica.state;
+        if state != SyncState::FullSync && state != SyncState::Preparation {
+            self.deliver(conn_id, seq, encode_value(&RespValue::Error("invalid state".into())));
+            return;
+        }
+        if replica.flows.iter().any(|f| f.conn_id == 0) {
+            // `AllFlowsConnected`: a flow disconnected before STARTSTABLE.
+            self.deliver(conn_id, seq, encode_value(&RespValue::Error("invalid state".into())));
+            return;
+        }
+
+        for shard in 0..self.env.num_shards {
+            let from_lsn = {
+                let flow = &self.repl.get(sync_id).unwrap().flows[shard];
+                flow.start_partial_sync_at.unwrap_or(flow.start_lsn)
+            };
+            let (tx, rx) = mpsc::channel();
+            let _ = self.env.shard_txs[shard].send(ShardMsg::StartStableSync {
+                sync_id,
+                flow_id: shard,
+                from_lsn,
+                repl_tx: self.env.repl_tx.clone(),
+                result_tx: tx,
+            });
+            if rx.recv_timeout(Duration::from_secs(120))
+                .map_or(true, |r| r.is_err())
+            {
+                self.deliver(conn_id, seq, encode_value(&RespValue::Error("invalid state".into())));
+                return;
+            }
+        }
+
+        let replica = self.repl.get_mut(sync_id).unwrap();
+        replica.state = SyncState::StableSync;
+        // The eof token closes each flow's RDB stream; stable-sync journal
+        // bytes follow it on the socket (they are drained after this reply).
+        let tokens: Vec<(u64, String)> = replica
+            .flows
+            .iter()
+            .map(|f| (f.conn_id, f.eof_token.clone()))
+            .collect();
+        for (fid, token) in tokens {
+            if let Some(conn) = self.conns.get_mut(&fid) {
+                conn.out.extend_from_slice(token.as_bytes());
+            }
+        }
+        self.deliver(conn_id, seq, encode_value(&RespValue::Simple("OK".into())));
+    }
+
+    /// `DflyCmd::StopReplication`: unregister every flow's journal consumer and
+    /// drop the session. Triggered when a flow or control connection closes.
+    fn stop_replication(&mut self, sync_id: u32) {
+        let Some(replica) = self.repl.get(sync_id) else {
+            return;
+        };
+        let flows: Vec<usize> = replica.flows.iter().map(|f| f.flow_id).collect();
+        for flow_id in flows {
+            let _ = self
+                .env
+                .shard_txs[flow_id]
+                .send(ShardMsg::StopReplication { sync_id, flow_id });
+        }
+        if let Some(replica) = self.repl.get_mut(sync_id) {
+            replica.state = SyncState::Cancelled;
+        }
+        self.repl.replicas.remove(&sync_id);
+    }
+
+    fn drain_repl(&mut self) {
+        while let Ok(chunk) = self.repl_rx.try_recv() {
+            let conn_id = self
+                .repl
+                .get(chunk.sync_id)
+                .and_then(|r| r.flows.get(chunk.flow_id))
+                .map(|f| f.conn_id);
+            if let Some(conn_id) = conn_id
+                && let Some(conn) = self.conns.get_mut(&conn_id)
+            {
+                conn.out.extend_from_slice(&chunk.bytes);
+            }
         }
     }
 
@@ -1117,6 +1589,7 @@ impl IoLoop {
             args,
             owned_key_idxs: owned,
             db_idx,
+            owns_all_keys: true,
             reply: self.env.reply_bus_tx.clone(),
         };
         let _ = self.env.shard_txs[shard].send(ShardMsg::Single(op));
@@ -1309,4 +1782,20 @@ fn set_nonblocking(fd: RawFd) {
 fn is_again(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::EAGAIN))
         || matches!(e.raw_os_error(), Some(libc::EWOULDBLOCK))
+}
+
+fn parse_u64(bytes: &[u8]) -> Option<u64> {
+    std::str::from_utf8(bytes).ok()?.parse().ok()
+}
+
+/// `DFLY FLOW`'s trailing `last_journal_LSNs` argument: a space-separated list
+/// of LSNs, one per shard (`ParseLsnVec`).
+fn parse_lsn_vec(bytes: &[u8]) -> Option<Vec<u64>> {
+    let s = std::str::from_utf8(bytes).ok()?;
+    if s.trim().is_empty() {
+        return Some(vec![]);
+    }
+    s.split_ascii_whitespace()
+        .map(|tok| tok.parse::<u64>().ok())
+        .collect()
 }

@@ -40,6 +40,20 @@ pub const RDB_VERSION: u64 = 12;
 /// Serialization version written by DUMP (`RDB_SER_VERSION` in `rdb.h`).
 pub const RDB_SER_VERSION: u16 = 9;
 
+pub(crate) const RDB_OPCODE_AUX: u8 = 0xfa;
+pub(crate) const RDB_OPCODE_RESIZEDB: u8 = 0xfb;
+pub(crate) const RDB_OPCODE_EXPIRETIME_MS: u8 = 0xfc;
+pub(crate) const RDB_OPCODE_SELECTDB: u8 = 0xfe;
+pub(crate) const RDB_OPCODE_EOF: u8 = 0xff;
+/// `RDB_OPCODE_FULLSYNC_END` (rdb_extensions.h): marks the end of a full-sync
+/// RDB stream. Followed by 8 zero bytes so opcode readers never run dry.
+pub(crate) const RDB_OPCODE_FULLSYNC_END: u8 = 200;
+/// `RDB_OPCODE_JOURNAL_BLOB`: a raw journal record wrapped inside the RDB
+/// stream: opcode + `SaveLen(1)` + the serialized entry.
+pub(crate) const RDB_OPCODE_JOURNAL_BLOB: u8 = 210;
+/// `RDB_OPCODE_JOURNAL_OFFSET`: u64 LE, the shard LSN at the full-sync cut.
+pub(crate) const RDB_OPCODE_JOURNAL_OFFSET: u8 = 211;
+
 const RDB_14BITLEN: u8 = 1;
 const RDB_32BITLEN: u8 = 0x80;
 const RDB_64BITLEN: u8 = 0x81;
@@ -106,7 +120,7 @@ const K_STREAM_NODE_MAX_ENTRIES: i64 = 100;
 const K_MEMBER_EXPIRY_BASE: u64 = 1_675_209_600;
 
 /// Encode a length with `WritePackedUInt` semantics (6/14/32/64-bit).
-fn write_len(out: &mut Vec<u8>, len: u64) {
+pub(crate) fn write_len(out: &mut Vec<u8>, len: u64) {
     if len < 1 << 6 {
         out.push(len as u8);
     } else if len < 1 << 14 {
@@ -173,7 +187,7 @@ fn save_binary_double(out: &mut Vec<u8>, val: f64) {
 
 /// `SaveString`: integer encoding for short canonical ints, LZF compression in
 /// `SINGLE_ENTRY` mode when it saves enough bytes, otherwise length + verbatim.
-fn save_string(out: &mut Vec<u8>, s: &[u8]) {
+pub(crate) fn save_string(out: &mut Vec<u8>, s: &[u8]) {
     if s.len() <= 11
         && let Some(enc) = try_integer_encoding(s)
     {
@@ -514,44 +528,93 @@ pub fn dump_value(pv: &PrimeValue) -> Vec<u8> {
 /// in sorted order so the output is deterministic.
 #[must_use]
 pub fn save_db(slice: &DbSlice) -> Vec<u8> {
-    const MAGIC: &[u8] = b"REDIS";
-    const VERSION: &[u8] = b"0012";
-    const OPCODE_SELECTDB: u8 = 0xfe;
-    const OPCODE_RESIZEDB: u8 = 0xfb;
-    const OPCODE_EXPIRETIME_MS: u8 = 0xfc;
-    const OPCODE_EOF: u8 = 0xff;
-
     let mut out = Vec::new();
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(VERSION);
+    out.extend_from_slice(b"REDIS");
+    out.extend_from_slice(b"0012");
 
-    out.push(OPCODE_SELECTDB);
+    out.push(RDB_OPCODE_SELECTDB);
     write_len(&mut out, 0);
+    serialize_db(&mut out, slice);
 
+    out.push(RDB_OPCODE_EOF);
+    let crc = crc64::crc64(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out
+}
+
+/// Append a DB's contents to a stream: `RESIZEDB` header followed by every key
+/// (sorted, deterministic), each with an optional `EXPIRETIME_MS` prefix, the
+/// RDB type byte, the key and the value (`RdbSerializer::SaveEntry`).
+fn serialize_db(out: &mut Vec<u8>, slice: &DbSlice) {
     let mut keys: Vec<_> = slice.iter().collect();
     keys.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
     let expires = keys
         .iter()
         .filter(|(k, _)| slice.expire_at(k.as_bytes()).is_some())
         .count();
-    out.push(OPCODE_RESIZEDB);
-    write_len(&mut out, keys.len() as u64);
-    write_len(&mut out, expires as u64);
+    out.push(RDB_OPCODE_RESIZEDB);
+    write_len(out, keys.len() as u64);
+    write_len(out, expires as u64);
 
     for (key, value) in keys {
         if let Some(at) = slice.expire_at(key.as_bytes()) {
-            out.push(OPCODE_EXPIRETIME_MS);
+            out.push(RDB_OPCODE_EXPIRETIME_MS);
             out.extend_from_slice(&at.to_le_bytes());
         }
         out.push(rdb_object_type(value));
-        save_string(&mut out, key.as_bytes());
-        save_value(&mut out, value);
+        save_string(out, key.as_bytes());
+        save_value(out, value);
+    }
+}
+
+/// Build one shard's full-sync stream, mirroring the reference layout
+/// (`StartFullSyncInThread` → `SaveHeader` + `SaveBody` + `FinalizeJournalStream`
+/// + `SaveEpilog`): `REDIS0009` magic, AUX fields, every DB, the full-sync cut
+/// marker, the journal offset, then EOF with a zero checksum (replication
+/// streams disable checksums). The replica stores `journal_lsn` as the first
+/// LSN it still needs from stable sync.
+#[must_use]
+pub fn save_shard_full_sync(dbs: &[DbSlice], journal_lsn: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(format!("REDIS{:04}", RDB_SER_VERSION).as_bytes());
+    save_aux(&mut out, "redis-ver", "6.2.11");
+    save_aux(&mut out, "df-ver", "1.0.0");
+    save_aux(&mut out, "redis-bits", "64");
+    let ctime = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        .to_string();
+    save_aux(&mut out, "ctime", &ctime);
+    save_aux(&mut out, "used-mem", "0");
+    save_aux(&mut out, "aof-preamble", "0");
+
+    for (dbid, db) in dbs.iter().enumerate() {
+        out.push(RDB_OPCODE_SELECTDB);
+        write_len(&mut out, dbid as u64);
+        serialize_db(&mut out, db);
     }
 
-    out.push(OPCODE_EOF);
-    let crc = crc64::crc64(&out);
-    out.extend_from_slice(&crc.to_le_bytes());
+    // `SendFullSyncCut`: marks the boundary between the baseline snapshot and
+    // the journal records that follow in stable sync.
+    out.push(RDB_OPCODE_FULLSYNC_END);
+    out.extend_from_slice(&[0u8; 8]);
+
+    // `FinalizeJournalStream`: the LSN of the next journal record the replica
+    // needs. Written after the cut, before the RDB EOF.
+    out.push(RDB_OPCODE_JOURNAL_OFFSET);
+    out.extend_from_slice(&journal_lsn.to_le_bytes());
+
+    // `SendEofAndChecksum` with checksums disabled for replication streams.
+    out.push(RDB_OPCODE_EOF);
+    out.extend_from_slice(&[0u8; 8]);
     out
+}
+
+/// `RDB_OPCODE_AUX` + `SaveString(key)` + `SaveString(val)`.
+fn save_aux(out: &mut Vec<u8>, key: &str, val: &str) {
+    out.push(RDB_OPCODE_AUX);
+    save_string(out, key.as_bytes());
+    save_string(out, val.as_bytes());
 }
 
 /// Decode a `save_db` snapshot back into `(key, value)` pairs, verifying the
@@ -618,32 +681,14 @@ pub enum RestoreOutcome {
     Expired,
 }
 
-/// A bounds-checked cursor over the value bytes of a DUMP payload.
-struct Reader<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
+/// A byte source the RDB decoders read from. Slice-backed for RESTORE payloads,
+/// stream-backed (a socket) for full-sync loading on a replica.
+pub(crate) trait Rd {
+    fn read_u8(&mut self) -> Result<u8, RestoreError>;
 
-impl<'a> Reader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Reader { data, pos: 0 }
-    }
-
-    fn read_u8(&mut self) -> Result<u8, RestoreError> {
-        let b = *self.data.get(self.pos).ok_or(RestoreError::BadDataFormat)?;
-        self.pos += 1;
-        Ok(b)
-    }
-
-    fn read_exact(&mut self, n: usize) -> Result<&'a [u8], RestoreError> {
-        let end = self.pos.checked_add(n).ok_or(RestoreError::BadDataFormat)?;
-        let s = self
-            .data
-            .get(self.pos..end)
-            .ok_or(RestoreError::BadDataFormat)?;
-        self.pos = end;
-        Ok(s)
-    }
+    /// Read exactly `n` bytes. Slice sources return a copy; stream sources
+    /// block until `n` bytes arrive or the connection closes.
+    fn read_exact(&mut self, n: usize) -> Result<Vec<u8>, RestoreError>;
 
     /// `rdbLoadLen` semantics: returns `(value, is_encoded)` where
     /// `is_encoded` is set for `RDB_ENCVAL` (0xc0..0xff) markers. 32/64-bit
@@ -682,7 +727,7 @@ impl<'a> Reader<'a> {
     fn read_string(&mut self) -> Result<Vec<u8>, RestoreError> {
         let (len, encoded) = self.read_len()?;
         if !encoded {
-            return Ok(self.read_exact(len as usize)?.to_vec());
+            return self.read_exact(len as usize);
         }
         match len as u8 {
             RDB_ENC_INT8 => {
@@ -706,7 +751,7 @@ impl<'a> Reader<'a> {
                     return Err(RestoreError::BadDataFormat);
                 }
                 let comp = self.read_exact(clen as usize)?;
-                lzf::decompress(comp, ulen as usize).ok_or(RestoreError::BadDataFormat)
+                lzf::decompress(&comp, ulen as usize).ok_or(RestoreError::BadDataFormat)
             }
             _ => Err(RestoreError::BadDataFormat),
         }
@@ -724,6 +769,36 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// A bounds-checked cursor over the value bytes of a DUMP payload.
+struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Reader { data, pos: 0 }
+    }
+}
+
+impl<'a> Rd for Reader<'a> {
+    fn read_u8(&mut self) -> Result<u8, RestoreError> {
+        let b = *self.data.get(self.pos).ok_or(RestoreError::BadDataFormat)?;
+        self.pos += 1;
+        Ok(b)
+    }
+
+    fn read_exact(&mut self, n: usize) -> Result<Vec<u8>, RestoreError> {
+        let end = self.pos.checked_add(n).ok_or(RestoreError::BadDataFormat)?;
+        let s = self
+            .data
+            .get(self.pos..end)
+            .ok_or(RestoreError::BadDataFormat)?;
+        self.pos = end;
+        Ok(s.to_vec())
+    }
+}
+
 /// `MemberTimeSeconds` (`common.h`): the reference's relative member-seconds
 /// clock.
 fn member_time_seconds(now_ms: u64) -> i64 {
@@ -738,7 +813,7 @@ fn entry_to_bytes(lp: &[u8], pos: usize) -> Result<Vec<u8>, RestoreError> {
     }
 }
 
-fn load_set(r: &mut Reader, with_expiry: bool, now_ms: u64) -> Result<Option<Set>, RestoreError> {
+fn load_set(r: &mut impl Rd, with_expiry: bool, now_ms: u64) -> Result<Option<Set>, RestoreError> {
     let len = r.read_len()?.0;
     let mut s = Set::new();
     let mut values_expired = false;
@@ -769,7 +844,7 @@ fn load_set(r: &mut Reader, with_expiry: bool, now_ms: u64) -> Result<Option<Set
     Ok(Some(s))
 }
 
-fn load_intset(r: &mut Reader) -> Result<Set, RestoreError> {
+fn load_intset(r: &mut impl Rd) -> Result<Set, RestoreError> {
     let blob = r.read_string()?;
     let mut s = Set::new();
     for v in intset::values(&blob).ok_or(RestoreError::BadDataFormat)? {
@@ -778,7 +853,7 @@ fn load_intset(r: &mut Reader) -> Result<Set, RestoreError> {
     Ok(s)
 }
 
-fn load_lp_set(r: &mut Reader) -> Result<Set, RestoreError> {
+fn load_lp_set(r: &mut impl Rd) -> Result<Set, RestoreError> {
     let lp = r.read_string()?;
     if !listpack::validate_deep(&lp) {
         return Err(RestoreError::BadDataFormat);
@@ -795,7 +870,7 @@ fn load_lp_set(r: &mut Reader) -> Result<Set, RestoreError> {
     Ok(s)
 }
 
-fn load_hash(r: &mut Reader, with_expiry: bool, now_ms: u64) -> Result<Option<Hash>, RestoreError> {
+fn load_hash(r: &mut impl Rd, with_expiry: bool, now_ms: u64) -> Result<Option<Hash>, RestoreError> {
     let len = r.read_len()?.0;
     let mut h = Hash::new();
     let mut values_expired = false;
@@ -824,7 +899,7 @@ fn load_hash(r: &mut Reader, with_expiry: bool, now_ms: u64) -> Result<Option<Ha
     Ok(Some(h))
 }
 
-fn load_hash_listpack(r: &mut Reader) -> Result<Hash, RestoreError> {
+fn load_hash_listpack(r: &mut impl Rd) -> Result<Hash, RestoreError> {
     let lp = r.read_string()?;
     if !listpack::validate_deep(&lp) {
         return Err(RestoreError::BadDataFormat);
@@ -843,7 +918,7 @@ fn load_hash_listpack(r: &mut Reader) -> Result<Hash, RestoreError> {
     Ok(h)
 }
 
-fn load_zset(r: &mut Reader) -> Result<ZSet, RestoreError> {
+fn load_zset(r: &mut impl Rd) -> Result<ZSet, RestoreError> {
     let len = r.read_len()?.0;
     let mut z = ZSet::new();
     for _ in 0..len {
@@ -857,7 +932,7 @@ fn load_zset(r: &mut Reader) -> Result<ZSet, RestoreError> {
     Ok(z)
 }
 
-fn load_zset_listpack(r: &mut Reader) -> Result<ZSet, RestoreError> {
+fn load_zset_listpack(r: &mut impl Rd) -> Result<ZSet, RestoreError> {
     let lp = r.read_string()?;
     if !listpack::validate_deep(&lp) {
         return Err(RestoreError::BadDataFormat);
@@ -882,7 +957,7 @@ fn load_zset_listpack(r: &mut Reader) -> Result<ZSet, RestoreError> {
     Ok(z)
 }
 
-fn load_old_list(r: &mut Reader) -> Result<QuickList, RestoreError> {
+fn load_old_list(r: &mut impl Rd) -> Result<QuickList, RestoreError> {
     let len = r.read_len()?.0;
     let mut ql = QuickList::new();
     for _ in 0..len {
@@ -891,7 +966,7 @@ fn load_old_list(r: &mut Reader) -> Result<QuickList, RestoreError> {
     Ok(ql)
 }
 
-fn load_quicklist(r: &mut Reader) -> Result<QuickList, RestoreError> {
+fn load_quicklist(r: &mut impl Rd) -> Result<QuickList, RestoreError> {
     let len = r.read_len()?.0;
     let mut ql = QuickList::new();
     for _ in 0..len {
@@ -1036,7 +1111,7 @@ fn parse_stream_node(
     Ok(())
 }
 
-fn load_stream(r: &mut Reader, typ: u8) -> Result<Stream, RestoreError> {
+fn load_stream(r: &mut impl Rd, typ: u8) -> Result<Stream, RestoreError> {
     let listpacks = r.read_len()?.0;
     let mut entries: BTreeMap<StreamId, StreamEntry> = BTreeMap::new();
     for _ in 0..listpacks {
@@ -1091,7 +1166,7 @@ fn load_stream(r: &mut Reader, typ: u8) -> Result<Stream, RestoreError> {
         let mut pel: BTreeMap<StreamId, PendingEntry> = BTreeMap::new();
         for _ in 0..pel_size {
             let raw = r.read_exact(16)?;
-            let eid = decode_stream_id(raw);
+            let eid = decode_stream_id(&raw);
             let delivery_time = r.read_u64_le()?;
             let delivery_count = r.read_len()?.0;
             pel.insert(
@@ -1117,7 +1192,7 @@ fn load_stream(r: &mut Reader, typ: u8) -> Result<Stream, RestoreError> {
             let cpel_size = r.read_len()?.0;
             for _ in 0..cpel_size {
                 let raw = r.read_exact(16)?;
-                let eid = decode_stream_id(raw);
+                let eid = decode_stream_id(&raw);
                 match pel.get_mut(&eid) {
                     Some(pe) => pe.consumer = cname.clone(),
                     None => {
@@ -1164,7 +1239,11 @@ fn load_stream(r: &mut Reader, typ: u8) -> Result<Stream, RestoreError> {
     Ok(s)
 }
 
-fn load_value(r: &mut Reader, typ: u8, now_ms: u64) -> Result<RestoreOutcome, RestoreError> {
+pub(crate) fn load_value(
+    r: &mut impl Rd,
+    typ: u8,
+    now_ms: u64,
+) -> Result<RestoreOutcome, RestoreError> {
     match typ {
         RDB_TYPE_STRING => {
             let s = r.read_string()?;

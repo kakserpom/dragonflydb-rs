@@ -194,14 +194,21 @@ impl Coordinator {
         let mut ack_rxs = Vec::new();
         for &s in &msg.shards {
             let (ack_tx, ack_rx) = mpsc::channel();
+            let owned_for_s = owned_for(&owned, s);
+            // A shard that owns all the command's keys journals the full
+            // command tail; a partial owner journals reduced args (or nothing,
+            // for `FLAG_NO_REDUCED` commands). Global commands own no keys but
+            // still journal the full tail.
+            let owns_all_keys = owned_for_s.len() == msg.keys.len();
             let ok = self.shard_txs[s].send(ShardMsg::TxLock {
                 tx_id,
                 conn_id: msg.conn_id,
                 seq: msg.seq,
                 args: msg.args.clone(),
-                owned_key_idxs: owned_for(&owned, s),
+                owned_key_idxs: owned_for_s,
                 first_key_idx: msg.first_key_idx,
                 db_idx: msg.db_idx,
+                owns_all_keys,
                 ack: ack_tx,
             });
             if ok.is_ok() {
@@ -378,6 +385,7 @@ impl Coordinator {
                     owned_key_idxs: owned_for(&per, s),
                     first_key_idx: 0,
                     db_idx: msg.db_idx,
+                    owns_all_keys: false,
                     ack: ack_tx,
                 })
                 .is_ok()
@@ -549,6 +557,7 @@ impl Coordinator {
                     owned_key_idxs: owned_for(&per, s),
                     first_key_idx: 0,
                     db_idx: msg.db_idx,
+                    owns_all_keys: false,
                     ack: ack_tx,
                 })
                 .is_ok()
@@ -628,6 +637,7 @@ impl Coordinator {
         owned: Vec<usize>,
         first_key_idx: usize,
         db_idx: usize,
+        owns_all_keys: bool,
     ) -> CmdResult {
         let (result_tx, result_rx) = mpsc::channel();
         if self.shard_txs[shard]
@@ -636,6 +646,7 @@ impl Coordinator {
                 owned_key_idxs: owned,
                 first_key_idx,
                 db_idx,
+                owns_all_keys,
                 result_tx,
             })
             .is_err()
@@ -876,6 +887,7 @@ impl ScriptDispatchCtx<'_> {
                     args: cmd.args,
                     owned: per[0].1.clone(),
                     first_key_idx: exec.key_range.first,
+                    owns_all_keys: true,
                 });
                 hop_positions.push(pos);
                 if batches[shard].len() >= MAX_SQUASH_SIZE {
@@ -987,9 +999,14 @@ impl ScriptDispatchCtx<'_> {
         let first_key_idx = cmd.key_range.first;
         let mut parts = Vec::new();
         if keys.is_empty() {
-            let result =
-                self.coord
-                    .script_op(0, args.to_owned(), vec![], first_key_idx, self.ctx.db_idx);
+            let result = self.coord.script_op(
+                0,
+                args.to_owned(),
+                vec![],
+                first_key_idx,
+                self.ctx.db_idx,
+                true,
+            );
             parts.push(ShardPart {
                 shard: 0,
                 owned_key_idxs: vec![],
@@ -997,12 +1014,16 @@ impl ScriptDispatchCtx<'_> {
             });
         } else {
             for (s, owned) in keys_per_shard(args, &keys, self.ctx.num_shards) {
+                // A subcommand whose keys all live on one shard journals the
+                // full tail; split keys journal reduced args per shard.
+                let owns_all_keys = owned.len() == keys.len();
                 let result = self.coord.script_op(
                     s,
                     args.to_owned(),
                     owned.clone(),
                     first_key_idx,
                     self.ctx.db_idx,
+                    owns_all_keys,
                 );
                 parts.push(ShardPart {
                     shard: s,
@@ -1072,6 +1093,7 @@ fn run_squash_hop(
                         owned_key_idxs: e.owned.clone(),
                         first_key_idx: e.first_key_idx,
                         db_idx,
+                        owns_all_keys: e.owns_all_keys,
                     })
                     .collect(),
                 result_tx,
@@ -1115,4 +1137,5 @@ struct BatchEntry {
     args: Vec<Vec<u8>>,
     owned: Vec<usize>,
     first_key_idx: usize,
+    owns_all_keys: bool,
 }

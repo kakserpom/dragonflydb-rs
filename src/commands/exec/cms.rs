@@ -7,8 +7,8 @@
 //! into a `DeferredStore`.
 
 use crate::commands::{
-    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE, KeyRange,
-    OpContext, ShardPart, integer, ok,
+    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_NO_REDUCED, FLAG_READONLY, FLAG_WRITE,
+    KeyRange, OpContext, ShardPart, integer, ok,
 };
 use crate::core::PrimeValue;
 use crate::core::cms::Cms;
@@ -482,7 +482,7 @@ pub static CMD_CMS_INFO: Command = Command {
 pub static CMD_CMS_MERGE: Command = Command {
     name: "CMS.MERGE",
     arity: -4,
-    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY,
+    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY | FLAG_NO_REDUCED,
     key_range: KeyRange {
         first: 1,
         last: 0,

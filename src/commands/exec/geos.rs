@@ -12,8 +12,8 @@
 // ---------------------------------------------------------------------------
 
 use crate::commands::{
-    Command, FLAG_DENYOOM, FLAG_MOVABLEKEYS, FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext,
-    ShardPart, bulk, integer,
+    Command, FLAG_DENYOOM, FLAG_MOVABLEKEYS, FLAG_NO_REDUCED, FLAG_READONLY, FLAG_WRITE, KeyRange,
+    OpContext, ShardPart, bulk, integer,
 };
 use crate::core::PrimeValue;
 use crate::core::compact::CompactString;
@@ -988,7 +988,7 @@ pub static CMD_GEOSEARCH: Command = Command {
 pub static CMD_GEOSEARCHSTORE: Command = Command {
     name: "GEOSEARCHSTORE",
     arity: -4,
-    flags: FLAG_WRITE,
+    flags: FLAG_WRITE | FLAG_NO_REDUCED,
     key_range: KeyRange::TWO,
     exec: exec_geosearchstore,
     merge: Some(merge_geosearchstore),
@@ -997,7 +997,7 @@ pub static CMD_GEOSEARCHSTORE: Command = Command {
 pub static CMD_GEORADIUS: Command = Command {
     name: "GEORADIUS",
     arity: -6,
-    flags: FLAG_WRITE | FLAG_MOVABLEKEYS,
+    flags: FLAG_WRITE | FLAG_MOVABLEKEYS | FLAG_NO_REDUCED,
     key_range: KeyRange::ONE,
     exec: exec_georadius,
     merge: Some(merge_geo_radius),
@@ -1015,7 +1015,7 @@ pub static CMD_GEORADIUS_RO: Command = Command {
 pub static CMD_GEORADIUSBYMEMBER: Command = Command {
     name: "GEORADIUSBYMEMBER",
     arity: -5,
-    flags: FLAG_WRITE | FLAG_MOVABLEKEYS,
+    flags: FLAG_WRITE | FLAG_MOVABLEKEYS | FLAG_NO_REDUCED,
     key_range: KeyRange::ONE,
     exec: exec_georadiusbymember,
     merge: Some(merge_geo_radius),

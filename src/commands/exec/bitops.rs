@@ -1,6 +1,6 @@
 use crate::commands::{
-    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE, KeyRange,
-    OpContext, ShardPart, integer,
+    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_NO_REDUCED, FLAG_READONLY, FLAG_WRITE,
+    KeyRange, OpContext, ShardPart, integer,
 };
 use crate::core::PrimeValue;
 use crate::core::compact::CompactString;
@@ -1023,7 +1023,7 @@ pub static CMD_BITFIELD_RO: Command = Command {
 pub static CMD_BITOP: Command = Command {
     name: "BITOP",
     arity: -4,
-    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY,
+    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY | FLAG_NO_REDUCED,
     key_range: KeyRange {
         first: 2,
         last: 0,

@@ -1,6 +1,7 @@
 use crate::commands::{
     Command, FLAG_BLOCKING, FLAG_DENYOOM, FLAG_FAST, FLAG_MOVABLEKEYS, FLAG_MULTI_KEY,
-    FLAG_NOSCRIPT, FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext, ShardPart, integer, ok,
+    FLAG_NO_AUTOJOURNAL, FLAG_NOSCRIPT, FLAG_NO_REDUCED, FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext, ShardPart,
+    integer, ok,
 };
 use crate::core::PrimeValue;
 use crate::core::quicklist::{ListItem, QuickList};
@@ -39,11 +40,13 @@ fn push(ctx: &mut OpContext, front: bool, only_if_exists: bool) -> CmdResult {
                 return CmdResult::Ok(integer(0));
             }
         };
-        for item in items.into_iter().rev() {
+        // `LPUSH a b c` must yield `[c, b, a]`: each value pushes onto the head,
+        // so values iterate in the order given.
+        for item in items {
             if front {
-                ql.push_back(item);
-            } else {
                 ql.push_front(item);
+            } else {
+                ql.push_back(item);
             }
         }
         return CmdResult::Ok(integer(ql.len() as i64));
@@ -52,12 +55,11 @@ fn push(ctx: &mut OpContext, front: bool, only_if_exists: bool) -> CmdResult {
         Ok(l) => l,
         Err(e) => return CmdResult::Err(e),
     };
-    // iterate args in reverse so the first provided value ends up at the head
-    for item in items.into_iter().rev() {
+    for item in items {
         if front {
-            ql.push_back(item);
-        } else {
             ql.push_front(item);
+        } else {
+            ql.push_back(item);
         }
     }
     let len = ql.len() as i64;
@@ -1225,7 +1227,7 @@ pub static CMD_LINSERT: Command = Command {
 pub static CMD_LMOVE: Command = Command {
     name: "LMOVE",
     arity: 5,
-    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY,
+    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY | FLAG_NO_REDUCED,
     key_range: KeyRange::TWO,
     exec: exec_lmove,
     merge: Some(merge_move),
@@ -1233,7 +1235,7 @@ pub static CMD_LMOVE: Command = Command {
 pub static CMD_RPOPLPUSH: Command = Command {
     name: "RPOPLPUSH",
     arity: 3,
-    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY,
+    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY | FLAG_NO_REDUCED,
     key_range: KeyRange::TWO,
     exec: exec_rpoplpush,
     merge: Some(merge_move),
@@ -1249,7 +1251,7 @@ pub static CMD_LMPOP: Command = Command {
 pub static CMD_BLPOP: Command = Command {
     name: "BLPOP",
     arity: -3,
-    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_NOSCRIPT,
+    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_NOSCRIPT | FLAG_NO_AUTOJOURNAL,
     key_range: KeyRange::ALL_BUT_LAST,
     exec: exec_blpop,
     merge: Some(merge_bpop),
@@ -1257,7 +1259,7 @@ pub static CMD_BLPOP: Command = Command {
 pub static CMD_BRPOP: Command = Command {
     name: "BRPOP",
     arity: -3,
-    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_NOSCRIPT,
+    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_NOSCRIPT | FLAG_NO_AUTOJOURNAL,
     key_range: KeyRange::ALL_BUT_LAST,
     exec: exec_brpop,
     merge: Some(merge_bpop),
@@ -1265,7 +1267,7 @@ pub static CMD_BRPOP: Command = Command {
 pub static CMD_BLMOVE: Command = Command {
     name: "BLMOVE",
     arity: 6,
-    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_BLOCKING | FLAG_MULTI_KEY,
+    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_NO_AUTOJOURNAL,
     key_range: KeyRange::TWO,
     exec: exec_blmove,
     merge: Some(merge_move_blocking),
@@ -1273,7 +1275,7 @@ pub static CMD_BLMOVE: Command = Command {
 pub static CMD_BRPOPLPUSH: Command = Command {
     name: "BRPOPLPUSH",
     arity: 4,
-    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_NOSCRIPT,
+    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_NOSCRIPT | FLAG_NO_AUTOJOURNAL,
     key_range: KeyRange::TWO,
     exec: exec_blmove,
     merge: Some(merge_move_blocking),
@@ -1281,7 +1283,7 @@ pub static CMD_BRPOPLPUSH: Command = Command {
 pub static CMD_BLMPOP: Command = Command {
     name: "BLMPOP",
     arity: -5,
-    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_MOVABLEKEYS,
+    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_MOVABLEKEYS | FLAG_NO_AUTOJOURNAL,
     key_range: KeyRange::NONE,
     exec: exec_blmpop,
     merge: Some(merge_blmpop),

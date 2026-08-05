@@ -2,8 +2,8 @@ use hashbrown::HashSet;
 
 use crate::commands::exec::keys::glob_match;
 use crate::commands::{
-    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE, KeyRange,
-    OpContext, ShardPart, integer,
+    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_NO_AUTOJOURNAL, FLAG_NO_REDUCED,
+    FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext, ShardPart, integer,
 };
 use crate::core::PrimeValue;
 use crate::core::compact::CompactString;
@@ -1084,7 +1084,7 @@ pub static CMD_SCARD: Command = Command {
 pub static CMD_SPOP: Command = Command {
     name: "SPOP",
     arity: -2,
-    flags: FLAG_WRITE | FLAG_FAST,
+    flags: FLAG_WRITE | FLAG_FAST | FLAG_NO_AUTOJOURNAL,
     key_range: KeyRange::ONE,
     exec: exec_spop,
     merge: None,
@@ -1132,7 +1132,7 @@ pub static CMD_SDIFF: Command = Command {
 pub static CMD_SINTERSTORE: Command = Command {
     name: "SINTERSTORE",
     arity: -3,
-    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY,
+    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY | FLAG_NO_REDUCED,
     key_range: KeyRange::ALL,
     exec: exec_sinterstore,
     merge: Some(merge_sinterstore),
@@ -1140,7 +1140,7 @@ pub static CMD_SINTERSTORE: Command = Command {
 pub static CMD_SUNIONSTORE: Command = Command {
     name: "SUNIONSTORE",
     arity: -3,
-    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY,
+    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY | FLAG_NO_REDUCED,
     key_range: KeyRange::ALL,
     exec: exec_sunionstore,
     merge: Some(merge_sunionstore),
@@ -1148,7 +1148,7 @@ pub static CMD_SUNIONSTORE: Command = Command {
 pub static CMD_SDIFFSTORE: Command = Command {
     name: "SDIFFSTORE",
     arity: -3,
-    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY,
+    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY | FLAG_NO_REDUCED,
     key_range: KeyRange::ALL,
     exec: exec_sdiffstore,
     merge: Some(merge_sdiffstore),

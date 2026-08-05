@@ -1,6 +1,9 @@
 pub mod coordinator;
 pub mod event_loop;
+pub mod journal;
 pub mod pubsub;
+pub mod replica;
+pub mod replication;
 pub mod shard;
 
 /// Number of logical databases (matches upstream `FLAGS_dbnum` default).
@@ -499,6 +502,9 @@ pub struct SingleOp {
     /// The connection's selected DB index.
     pub db_idx: usize,
     pub reply: ReplyBus,
+    /// True when the shard owns every key of the command (always, for single
+    /// ops). Journals the full command tail instead of reduced per-shard args.
+    pub owns_all_keys: bool,
 }
 
 /// Messages to a shard thread.
@@ -513,6 +519,7 @@ pub enum ShardMsg {
         owned_key_idxs: Vec<usize>,
         first_key_idx: usize,
         db_idx: usize,
+        owns_all_keys: bool,
         ack: mpsc::Sender<()>,
     },
     TxExec {
@@ -555,6 +562,7 @@ pub enum ShardMsg {
         /// The subcommand's `KeyRange::first` for the `OpContext`.
         first_key_idx: usize,
         db_idx: usize,
+        owns_all_keys: bool,
         result_tx: mpsc::Sender<crate::error::CmdResult>,
     },
     /// A squashed batch of `redis.acall`/`redis.apcall` subcommands that all
@@ -564,6 +572,63 @@ pub enum ShardMsg {
     ScriptBatch {
         cmds: Vec<ScriptBatchEntry>,
         result_tx: mpsc::Sender<Vec<crate::error::CmdResult>>,
+    },
+    /// Create or drop the per-shard replication journal (`journal_slice.cc`).
+    /// The master enables it once a replica's `DFLY FLOW` arrives; while
+    /// enabled, every write on the shard is recorded with a monotonically
+    /// increasing shard-local LSN.
+    EnableJournal {
+        enabled: bool,
+    },
+    /// Build this shard's full-sync RDB stream (`StartFullSyncInThread`). The
+    /// snapshot is cut at the current journal LSN; records issued after it are
+    /// replayed from the ring when stable sync starts (`StartStableSync`).
+    FullSyncSnapshot {
+        result_tx: mpsc::Sender<crate::server::replication::FullSyncData>,
+    },
+    /// Catch a flow up from the journal ring and register its stable-sync
+    /// consumer (`JournalStreamer::Start`). `from_lsn` is the full-sync cut LSN
+    /// (or the negotiated partial-sync LSN). Newly recorded entries are
+    /// forwarded to the flow through `repl_tx`.
+    StartStableSync {
+        sync_id: u32,
+        flow_id: usize,
+        from_lsn: u64,
+        repl_tx: mpsc::Sender<crate::server::replication::ReplChunk>,
+        result_tx: mpsc::Sender<Result<(), String>>,
+    },
+    /// Drop a flow's stable-sync journal consumer (its connection closed).
+    StopReplication {
+        sync_id: u32,
+        flow_id: usize,
+    },
+    /// Whether an LSN is still readable from the journal ring
+    /// (`journal::IsLSNInBuffer`), deciding FULL vs PARTIAL sync in `DFLY FLOW`.
+    IsLsnInBuffer {
+        lsn: u64,
+        result_tx: mpsc::Sender<bool>,
+    },
+    /// Apply a journal record on a replica: run `args` against `db_idx` without
+    /// re-journaling, then ack. Mirrors the reference replica's per-shard
+    /// command apply (`replica.cc::ExecuteTx` single-shard path).
+    ReplicaOp {
+        args: Vec<Vec<u8>>,
+        db_idx: usize,
+        ack: mpsc::Sender<()>,
+    },
+    /// Load one RDB value into `db_idx` during a full sync (replica side of
+    /// `FullSyncDflyFb`). Keys from the snapshot are overwritten by later
+    /// journal records, matching reference behavior.
+    ReplicaLoadValue {
+        db_idx: usize,
+        key: Vec<u8>,
+        value: crate::core::PrimeValue,
+        expire_at: Option<u64>,
+    },
+    /// Drain every DB on every shard before a full sync (reference
+    /// `replica.cc::FlushAll`); acks when done.
+    ReplicaFlushAll {
+        ack: mpsc::Sender<()>,
     },
 }
 
@@ -576,6 +641,7 @@ pub struct ScriptBatchEntry {
     /// The subcommand's `KeyRange::first` for the `OpContext`.
     pub first_key_idx: usize,
     pub db_idx: usize,
+    pub owns_all_keys: bool,
 }
 
 /// Messages to the transaction coordinator.
@@ -611,9 +677,15 @@ pub struct ServerEnv {
     pub coord_tx: mpsc::Sender<CoordMsg>,
     pub gc_tx: mpsc::Sender<GcRequest>,
     pub reply_bus_tx: ReplyBus,
+    /// Stable-sync journal records routed from shard threads to their flow
+    /// connections; drained by the IO thread alongside the reply bus.
+    pub repl_tx: mpsc::Sender<crate::server::replication::ReplChunk>,
     /// Shared script cache: SCRIPT subcommands (IO thread) and EVAL
     /// (coordinator) both read/write it.
     pub script_mgr: std::sync::Arc<std::sync::Mutex<crate::commands::lua::ScriptMgr>>,
+    /// The port this server listens on, reported to a master as
+    /// `REPLCONF listening-port` when running as a replica.
+    pub listen_port: u16,
 }
 
 impl ServerEnv {

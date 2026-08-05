@@ -103,6 +103,9 @@ fn main() {
     set_nonblocking(pipefds[1]);
     let reply_bus = ReplyBus::new(reply_tx, pipefds[1]);
 
+    // Stable-sync journal records from shards to their flow connections.
+    let (repl_tx, repl_rx) = mpsc::channel::<dragonflydb::server::replication::ReplChunk>();
+
     // Shard threads.
     let mut shard_txs = Vec::with_capacity(num_shards);
     for s in 0..num_shards {
@@ -151,12 +154,14 @@ fn main() {
         coord_tx,
         gc_tx,
         reply_bus_tx: reply_bus,
+        repl_tx,
         script_mgr,
+        listen_port: port,
     };
 
     println!("dragonflydb-rs listening on 0.0.0.0:{port} with {num_shards} shards");
 
-    let mut loop_ = match IoLoop::new(env, reply_rx, listener, pipefds[0]) {
+    let mut loop_ = match IoLoop::new(env, reply_rx, repl_rx, listener, pipefds[0]) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("failed to create event loop: {e}");

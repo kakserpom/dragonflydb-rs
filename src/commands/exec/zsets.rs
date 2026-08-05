@@ -2,8 +2,9 @@ use hashbrown::{HashMap, HashSet};
 
 use crate::commands::exec::keys::glob_match;
 use crate::commands::{
-    Command, FLAG_BLOCKING, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_NOSCRIPT, FLAG_READONLY,
-    FLAG_WRITE, KeyRange, OpContext, ShardPart, bulk, integer,
+    Command, FLAG_BLOCKING, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_NO_AUTOJOURNAL,
+    FLAG_NO_REDUCED, FLAG_NOSCRIPT, FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext, ShardPart,
+    bulk, integer,
 };
 use crate::core::PrimeValue;
 use crate::core::compact::CompactString;
@@ -2322,7 +2323,7 @@ pub static CMD_ZUNION: Command = Command {
 pub static CMD_ZUNIONSTORE: Command = Command {
     name: "ZUNIONSTORE",
     arity: -4,
-    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY,
+    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY | FLAG_NO_REDUCED,
     key_range: KeyRange {
         first: 1,
         last: 0,
@@ -2346,7 +2347,7 @@ pub static CMD_ZINTER: Command = Command {
 pub static CMD_ZINTERSTORE: Command = Command {
     name: "ZINTERSTORE",
     arity: -4,
-    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY,
+    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY | FLAG_NO_REDUCED,
     key_range: KeyRange {
         first: 1,
         last: 0,
@@ -2370,7 +2371,7 @@ pub static CMD_ZDIFF: Command = Command {
 pub static CMD_ZDIFFSTORE: Command = Command {
     name: "ZDIFFSTORE",
     arity: -4,
-    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY,
+    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY | FLAG_NO_REDUCED,
     key_range: KeyRange {
         first: 1,
         last: 0,
@@ -2450,7 +2451,7 @@ pub static CMD_ZMPOP: Command = Command {
 pub static CMD_BZMPOP: Command = Command {
     name: "BZMPOP",
     arity: -5,
-    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY,
+    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_NO_AUTOJOURNAL,
     key_range: KeyRange {
         first: 3,
         last: 0,
@@ -2462,7 +2463,7 @@ pub static CMD_BZMPOP: Command = Command {
 pub static CMD_BZPOPMIN: Command = Command {
     name: "BZPOPMIN",
     arity: -3,
-    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_NOSCRIPT,
+    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_NOSCRIPT | FLAG_NO_AUTOJOURNAL,
     key_range: KeyRange::ALL_BUT_LAST,
     exec: exec_bzpopmin,
     merge: Some(merge_bzpop),
@@ -2470,7 +2471,7 @@ pub static CMD_BZPOPMIN: Command = Command {
 pub static CMD_BZPOPMAX: Command = Command {
     name: "BZPOPMAX",
     arity: -3,
-    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_NOSCRIPT,
+    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_NOSCRIPT | FLAG_NO_AUTOJOURNAL,
     key_range: KeyRange::ALL_BUT_LAST,
     exec: exec_bzpopmax,
     merge: Some(merge_bzpop),

@@ -93,13 +93,20 @@ Legend:
   rewriting statement-context `redis.call`/`redis.pcall` into `acall`/`apcall`
   for atomic scripts, applied at SCRIPT LOAD and first EVAL while keeping the
   SHA over the original body)
-- [~] DFLY (registered, rejects: no replication stack in `Cargo.toml`)
+- [x] DFLY (FLOW, SYNC, STARTSTABLE, SHELLO, SYNCID behind the master-side
+  `ReplicationManager` in `src/server/replication.rs`; see Replication section)
 - [x] Lua extension libraries loaded at interpreter bootstrap (`LoadLibrary`
   order): `cjson` (2.1devel), `struct` (v1.7), `cmsgpack`, `bit` (BitOp
   1.0.3) — pure-Rust ports in `src/commands/lua_libs.rs` mirroring Dragonfly's
   vendored C sources, including the Dragonfly deltas (always-global `cjson`,
   integer-returning `decode`, `int64_t` msgpack sizes) and the C error strings
-  (raised as plain Lua strings so `__redis__err__handler` can format them)
+  (raised as plain Lua strings so `__redis__err__handler` can format them).
+  Parity audit complete (29 `lua_libs` tests): cjson array detection counts
+  only `LUA_TNUMBER` keys (string keys force objects), config defaults/bounds
+  match `json_enum_option`/`json_integer_option` (precision cap 14), cmsgpack
+  `table_is_an_array` is exactly `max == count` (empty `{}` packs as `\x90`,
+  sparse as a map), struct `c0` coerces the previous result via
+  `lua_isnumber` (numeric strings accepted)
 
 ### Scripting deviations
 - Scripts run on a single coordinator-side interpreter (taken from the sandbox
@@ -128,6 +135,30 @@ Legend:
   exact `redis.register_function can only be called on FUNCTION LOAD command`;
   library and function names are validated (`[A-Za-z0-9_.-]`, like
   `functionVerifyName`).
+
+## Replication (`replication.cc`/`replica.cc`/`dflycmd.cc`/`journal_slice.cc`)
+- [x] Master side: `ReplicationManager` (`src/server/replication.rs`) with
+  `DFLY FLOW`/`SYNC`/`STARTSTABLE`/`SHELLO`/`SYNCID` — replica sessions, flow
+  registration with LSN continuity checks, per-shard full-sync RDB streamers
+  (`save_shard_full_sync`: `REDIS0009` + AUX + per-db `SELECTDB` + `FULLSYNC_END`
+  + `JOURNAL_OFFSET` + EOF) and stable-sync streamers replaying the per-shard
+  journal from a consumer callback.
+- [x] Per-shard journal (`src/server/journal.rs`): circular LSN ring with
+  eviction and consumer registry, Dragonfly wire format (opcodes `SELECT=6`,
+  `EXPIRED=9`, `COMMAND=10`, `PING=13`, `LSN=15`; fresh writer per record so
+  COMMAND always carries its own SELECT prefix). Multi-key stores journal
+  `FLAG_NO_REDUCED` via coordinator deferred stores (DEL/SET/RESTORE); reduced
+  `ShardArgs` records are replay-safe for every other write command.
+- [x] Replica side (`src/server/replica.rs`): dedicated threads per flow,
+  `PING`/`REPLCONF`/`DFLY` handshake, full-sync `load_rdb` restore through the
+  shard message queue, per-record journal apply (single-shard ops acked via
+  `ShardMsg::ReplicaOp`, global FLUSHDB/FLUSHALL through a `GlobalBarrier` with
+  abort polling), periodic `REPLCONF ACK <lsn>` threads, partial reconnect from
+  the last applied LSN (`DFLY FLOW ... <lsn>`).
+- [x] Read-only gating on the replica (`-READONLY You can't write against a read
+  only replica.`), `ROLE`/`REPLICAOF NO ONE` detach, and a two-instance
+  integration test (`tests/replication.rs`) covering full sync, stable sync,
+  multi-key/global commands, TTL/expiry propagation, and the read-only gate.
 
 ## Module / probabilistic (`bloom_family.cc`, `cms_family.cc`, `cuckoo_filter_family.cc`, `topk_family.cc`)
 - [x] BF.ADD, BF.EXISTS, BF.INFO, BF.LOADCHUNK, BF.MADD, BF.MEXISTS, BF.RESERVE,

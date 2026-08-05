@@ -2,7 +2,7 @@ use std::ops::Bound;
 
 use crate::commands::{
     Command, FLAG_BLOCKING, FLAG_DENYOOM, FLAG_FAST, FLAG_MOVABLEKEYS, FLAG_MULTI_KEY,
-    FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext, ShardPart, bulk, integer,
+    FLAG_NO_AUTOJOURNAL, FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext, ShardPart, bulk, integer,
 };
 use crate::core::PrimeValue;
 use crate::core::compact::CompactString;
@@ -1582,7 +1582,7 @@ pub static CMD_XGROUP: Command = Command {
 pub static CMD_XREADGROUP: Command = Command {
     name: "XREADGROUP",
     arity: -7,
-    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_MOVABLEKEYS,
+    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_MOVABLEKEYS | FLAG_NO_AUTOJOURNAL,
     key_range: KeyRange::NONE,
     exec: exec_xreadgroup,
     merge: Some(merge_xread),

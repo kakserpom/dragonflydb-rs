@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::commands::{
-    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_GLOBAL, FLAG_MOVABLEKEYS, FLAG_MULTI_KEY, FLAG_READONLY,
-    FLAG_WRITE, KeyRange, OpContext, ShardPart, integer, ok,
+    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_GLOBAL, FLAG_MOVABLEKEYS, FLAG_MULTI_KEY, FLAG_NO_REDUCED,
+    FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext, ShardPart, integer, ok,
 };
 use crate::core::PrimeValue;
 use crate::core::compact::CompactString;
@@ -1830,10 +1830,15 @@ pub static CMD_MOVE: Command = Command {
     exec: exec_move,
     merge: Some(merge_sum),
 };
+// RENAME/RENAMENX/COPY are `FLAG_NO_REDUCED` like the other multi-key stores:
+// when their keys span shards the coordinator journals the mutation as
+// DEL/SET/RESTORE deferred-store records, and never as a reduced command (the
+// reduced `[CMD, key]` form is not replay-safe, since these executors read the
+// destination key unconditionally).
 pub static CMD_RENAME: Command = Command {
     name: "RENAME",
     arity: 3,
-    flags: FLAG_WRITE,
+    flags: FLAG_WRITE | FLAG_NO_REDUCED,
     key_range: KeyRange::TWO,
     exec: exec_rename,
     merge: Some(merge_rename),
@@ -1841,7 +1846,7 @@ pub static CMD_RENAME: Command = Command {
 pub static CMD_RENAMENX: Command = Command {
     name: "RENAMENX",
     arity: 3,
-    flags: FLAG_WRITE,
+    flags: FLAG_WRITE | FLAG_NO_REDUCED,
     key_range: KeyRange::TWO,
     exec: exec_renamenx,
     merge: Some(merge_rename),
@@ -1849,7 +1854,7 @@ pub static CMD_RENAMENX: Command = Command {
 pub static CMD_COPY: Command = Command {
     name: "COPY",
     arity: -3,
-    flags: FLAG_WRITE,
+    flags: FLAG_WRITE | FLAG_NO_REDUCED,
     key_range: KeyRange::TWO,
     exec: exec_copy,
     merge: Some(merge_copy),

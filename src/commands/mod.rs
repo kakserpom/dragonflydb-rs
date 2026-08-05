@@ -19,6 +19,15 @@ pub const FLAG_GLOBAL: u32 = 1 << 7;
 pub const FLAG_ADMIN: u32 = 1 << 8;
 pub const FLAG_MOVABLEKEYS: u32 = 1 << 9;
 pub const FLAG_NOSCRIPT: u32 = 1 << 10;
+/// Never auto-journaled: the command is nondeterministic (SPOP) or its replay
+/// would block/duplicate work on the replica (blocking writes). Such commands
+/// journal an explicit deterministic rewrite instead (SPOP -> SREM/DEL).
+pub const FLAG_NO_AUTOJOURNAL: u32 = 1 << 11;
+/// Not journaled when the shard owns only some of the command's keys (the
+/// reduced per-shard args would re-run a partial command on the replica and
+/// produce a different result). The coordinator journals these commands'
+/// destination writes separately (`ShardMsg::StoreValue`).
+pub const FLAG_NO_REDUCED: u32 = 1 << 12;
 
 /// Sentinel for `KeyRange::last`: keys run through the second-to-last argument
 /// (used by BLPOP/BRPOP whose trailing argument is the float timeout).
