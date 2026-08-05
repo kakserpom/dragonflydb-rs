@@ -122,7 +122,9 @@ pub fn local_script(mgr: &mut ScriptMgr, args: &[Vec<u8>]) -> RespValue {
                 Err(e) => return RespValue::Error(format!("ERR {e}")),
             };
             if !mgr.exists(&sha) {
-                mgr.store(sha.clone(), body.clone(), params);
+                // The `lua_auto_async` rewrite applies at load time (`Insert`).
+                let body = mgr.auto_async_body(body, &params);
+                mgr.store(sha.clone(), body, params);
             }
             RespValue::Bulk(sha.into_bytes())
         }

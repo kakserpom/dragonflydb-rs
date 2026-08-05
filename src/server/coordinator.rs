@@ -10,7 +10,7 @@ use crate::commands::exec::server::now_ms;
 use crate::commands::lua::{
     FUNCTION_KILLED_ERR, SandboxedInterpreter, ScriptDispatch, ScriptMgr, sha1_hex,
 };
-use crate::commands::{FLAG_GLOBAL, FLAG_NOSCRIPT, FLAG_WRITE, ShardPart};
+use crate::commands::{Command, FLAG_GLOBAL, FLAG_NOSCRIPT, FLAG_WRITE, ShardPart};
 use crate::error::{CmdResult, RespValue};
 use crate::server::{
     CoordMsg, Reply, ReplyBus, ShardMsg, blocking_timeout_ms, command_for, encode_result,
@@ -274,7 +274,7 @@ impl Coordinator {
         let keys: Vec<Vec<u8>> = key_idxs.iter().map(|&i| args[i].clone()).collect();
         let argv: Vec<Vec<u8>> = args[3 + numkeys..].to_vec();
 
-        let (sha, body) = if is_evalsha {
+        let (sha, mut body) = if is_evalsha {
             let sha = String::from_utf8_lossy(&args[1]).to_ascii_lowercase();
             if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return CmdResult::err("NOSCRIPT No matching script. Please use EVAL.");
@@ -302,6 +302,17 @@ impl Coordinator {
                 Err(e) => return CmdResult::err(format!("ERR {e}")),
             },
         };
+        // `lua_auto_async`: rewrite statement-context `redis.call`/`redis.pcall`
+        // into `acall`/`apcall` for atomic bodies before the first compile
+        // (`ScriptMgr::Insert`). The SHA stays computed over the original body,
+        // and cached bodies (EVALSHA) are already rewritten.
+        if !is_evalsha {
+            body = self
+                .script_mgr
+                .lock()
+                .unwrap()
+                .auto_async_body(&body, &params);
+        }
         if !is_evalsha && !self.script_mgr.lock().unwrap().exists(&sha) {
             // Compile before caching (`Insert` short-circuits when the function
             // is already compiled); a compile error must not leave a cache
@@ -377,12 +388,20 @@ impl Coordinator {
             read_only,
             num_shards: self.num_shards,
             db_idx: msg.db_idx,
+            async_cmds: Vec::new(),
+            async_bytes: 0,
         };
         // `CallSHA` records the script's run duration in usec for SCRIPT LATENCY.
         let started = Instant::now();
         let result = {
             let mut dctx = ScriptDispatchCtx { coord: self, ctx };
-            sandbox.run(&sha, &mut dctx, params.float_as_int)
+            let run = sandbox.run(&sha, &mut dctx, params.float_as_int);
+            // Force-flush pending `redis.acall` commands; a flush error
+            // overrides the script's own result (`FlushEvalAsyncCmds(true)`).
+            match dctx.flush() {
+                Ok(()) => run,
+                Err(e) => Err(e),
+            }
         };
         let elapsed_usec = started.elapsed().as_micros() as u64;
         self.script_mgr
@@ -511,10 +530,18 @@ impl Coordinator {
             read_only,
             num_shards: self.num_shards,
             db_idx: msg.db_idx,
+            async_cmds: Vec::new(),
+            async_bytes: 0,
         };
         let result = {
             let mut dctx = ScriptDispatchCtx { coord: self, ctx };
-            sandbox.run_function(&name, &keys, &argv, &mut dctx, params.float_as_int)
+            let run = sandbox.run_function(&name, &keys, &argv, &mut dctx, params.float_as_int);
+            // Force-flush pending `redis.acall` commands; a flush error
+            // overrides the function's own result (`FlushEvalAsyncCmds(true)`).
+            match dctx.flush() {
+                Ok(()) => run,
+                Err(e) => Err(e),
+            }
         };
         self.script_mgr.lock().unwrap().clear_running();
         self.sandbox = Some(sandbox);
@@ -628,7 +655,24 @@ struct ScriptCtx {
     num_shards: usize,
     /// The DB all subcommands run in (the connection's selected DB).
     db_idx: usize,
+    /// Pending `redis.acall`/`redis.apcall` commands batched for one flush
+    /// (`ConnectionState::ScriptInfo::async_cmds`).
+    async_cmds: Vec<AsyncCmd>,
+    /// Heap bytes held by `async_cmds`, the `--multi_eval_squash_buffer` budget.
+    async_bytes: usize,
 }
+
+/// A single pending async subcommand.
+struct AsyncCmd {
+    args: Vec<Vec<u8>>,
+    /// `acall` (true): the command's runtime error aborts the run; `apcall`
+    /// (false) suppresses per-command errors (`ReplyMode::ONLY_ERR` vs `NONE`).
+    abort_on_error: bool,
+}
+
+/// `--multi_eval_squash_buffer`: max bytes of queued async commands before the
+/// batch is flushed mid-script.
+const ASYNC_FLUSH_LIMIT: usize = 8096;
 
 /// Routes a script subcommand to the shards owning its keys while the script's
 /// tx holds the declared-key locks.
@@ -644,21 +688,104 @@ impl ScriptDispatch for ScriptDispatchCtx<'_> {
         if self.coord.kill.load(Ordering::Relaxed) {
             return Err(FUNCTION_KILLED_ERR.to_string());
         }
-        let cmd = command_for(&args).ok_or_else(|| {
+        // A synchronous call flushes the pending async batch first; a flush
+        // error aborts this call too (`requested_abort` in TryEnqueueEvalAsyncCmd).
+        self.flush_pending(true)?;
+        let cmd = self.verify_script_cmd(&args)?;
+        Ok(self.execute_script_cmd(cmd, &args).into_resp_value())
+    }
+
+    fn dispatch_async(&mut self, args: Vec<Vec<u8>>, abort_on_error: bool) -> Result<(), String> {
+        if command_for(&args).is_none() {
+            if abort_on_error {
+                // acall: an unknown command is fatal (`early_async_error`). The
+                // pending batch is still flushed first, so its errors win.
+                self.flush_pending(true)?;
+                return Err(format!(
+                    "ERR unknown command '{}'",
+                    String::from_utf8_lossy(&args[0])
+                ));
+            }
+            // apcall: drop the unknown command silently, but keep the budget.
+            return self.flush_pending(false);
+        }
+        // Full verification (NOSCRIPT, write-in-read-only, undeclared keys) is
+        // deferred to the flush, mirroring `VerifyCommandState` in
+        // `FlushEvalAsyncCmds` — so `pcall(redis.acall, ...)` cannot catch an
+        // error that only surfaces at the flush boundary.
+        let bytes: usize = args.iter().map(Vec::len).sum::<usize>() + 64;
+        self.ctx.async_cmds.push(AsyncCmd {
+            args,
+            abort_on_error,
+        });
+        self.ctx.async_bytes += bytes;
+        self.flush_pending(false)
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        self.flush_pending(true)
+    }
+}
+
+impl ScriptDispatchCtx<'_> {
+    /// Execute the pending async batch as one phase (`FlushEvalAsyncCmds`).
+    /// `force=false` only flushes when the byte budget is exhausted. Every
+    /// command is verified before any runs; a failing `acall` command aborts
+    /// the remaining batch (`error_abort`) and surfaces its error.
+    fn flush_pending(&mut self, force: bool) -> Result<(), String> {
+        if self.ctx.async_cmds.is_empty() {
+            return Ok(());
+        }
+        if !force && self.ctx.async_bytes < ASYNC_FLUSH_LIMIT {
+            return Ok(());
+        }
+        if self.coord.kill.load(Ordering::Relaxed) {
+            return Err(FUNCTION_KILLED_ERR.to_string());
+        }
+        for cmd in &self.ctx.async_cmds {
+            if let Err(e) = self.verify_script_cmd(&cmd.args) {
+                // The reference clears the batch on a verification error.
+                self.ctx.async_cmds.clear();
+                self.ctx.async_bytes = 0;
+                return Err(e);
+            }
+        }
+        let mut fatal: Option<String> = None;
+        for cmd in std::mem::take(&mut self.ctx.async_cmds) {
+            let exec = command_for(&cmd.args).expect("verified command");
+            let result = self.execute_script_cmd(exec, &cmd.args);
+            if result.is_err() {
+                if cmd.abort_on_error
+                    && let CmdResult::Err(e) = result
+                {
+                    fatal = Some(e.message);
+                }
+                break;
+            }
+        }
+        self.ctx.async_bytes = 0;
+        match fatal {
+            Some(msg) => Err(msg),
+            None => Ok(()),
+        }
+    }
+
+    /// Validate a script subcommand before it touches a shard: known command,
+    /// not NOSCRIPT/GLOBAL, no writes in read-only scripts, declared keys.
+    fn verify_script_cmd(&self, args: &[Vec<u8>]) -> Result<&'static Command, String> {
+        let cmd = command_for(args).ok_or_else(|| {
             format!(
                 "ERR unknown command '{}'",
                 String::from_utf8_lossy(&args[0])
             )
         })?;
-        // Blocking commands and shard-spanning commands cannot run inside the
-        // script's lock (`VerifyCommandState` NOSCRIPT / GLOBAL_TRANS checks).
         if cmd.has_flag(FLAG_NOSCRIPT) || cmd.has_flag(FLAG_GLOBAL) {
             return Err("This Redis command is not allowed from script".to_string());
         }
         if self.ctx.read_only && cmd.has_flag(FLAG_WRITE) {
             return Err("Write commands are not allowed from read-only scripts".to_string());
         }
-        let keys = extract_keys(cmd, &args);
+        let keys = extract_keys(cmd, args);
         if !self.ctx.undeclared_keys {
             for &ki in &keys {
                 if !self.ctx.declared.contains(&args[ki]) {
@@ -669,23 +796,29 @@ impl ScriptDispatch for ScriptDispatchCtx<'_> {
                 }
             }
         }
+        Ok(cmd)
+    }
 
+    /// Execute one (already verified) subcommand against the shards owning its
+    /// keys, merging partial results and resolving deferred stores.
+    fn execute_script_cmd(&mut self, cmd: &'static Command, args: &[Vec<u8>]) -> CmdResult {
+        let keys = extract_keys(cmd, args);
         let first_key_idx = cmd.key_range.first;
         let mut parts = Vec::new();
         if keys.is_empty() {
             let result =
                 self.coord
-                    .script_op(0, args.clone(), vec![], first_key_idx, self.ctx.db_idx);
+                    .script_op(0, args.to_owned(), vec![], first_key_idx, self.ctx.db_idx);
             parts.push(ShardPart {
                 shard: 0,
                 owned_key_idxs: vec![],
                 result,
             });
         } else {
-            for (s, owned) in keys_per_shard(&args, &keys, self.ctx.num_shards) {
+            for (s, owned) in keys_per_shard(args, &keys, self.ctx.num_shards) {
                 let result = self.coord.script_op(
                     s,
-                    args.clone(),
+                    args.to_owned(),
                     owned.clone(),
                     first_key_idx,
                     self.ctx.db_idx,
@@ -699,13 +832,13 @@ impl ScriptDispatch for ScriptDispatchCtx<'_> {
         }
         let merged = if parts.len() > 1 {
             match cmd.merge {
-                Some(m) => m(&parts, &args, &keys, now_ms()),
+                Some(m) => m(&parts, args, &keys, now_ms()),
                 None => parts[0].result.clone(),
             }
         } else {
             parts[0].result.clone()
         };
-        let result = match merged {
+        match merged {
             CmdResult::DeferredStore { key, value, reply } => {
                 self.coord
                     .perform_deferred_store(&key, value, None, false, self.ctx.db_idx);
@@ -725,7 +858,6 @@ impl ScriptDispatch for ScriptDispatchCtx<'_> {
             }
             CmdResult::Blocked => CmdResult::Ok(RespValue::Nil),
             other => other,
-        };
-        Ok(result.into_resp_value())
+        }
     }
 }

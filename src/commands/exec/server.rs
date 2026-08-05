@@ -1772,6 +1772,51 @@ mod tests {
     }
 
     #[test]
+    fn script_load_auto_async_rewrite() {
+        use crate::commands::lua::ScriptMgr;
+        use crate::server::local_script;
+        let mut mgr = ScriptMgr::new();
+        mgr.lua_auto_async = true;
+        let r = |m: &mut ScriptMgr, a: &[&str]| render(&local_script(m, &b_args(a)));
+        let bodies = |m: &ScriptMgr| {
+            let mut map = std::collections::HashMap::new();
+            for (sha, body) in m.get_all() {
+                map.insert(sha, String::from_utf8(body).unwrap());
+            }
+            map
+        };
+
+        // Atomic script: standalone `redis.call` is rewritten at LOAD time.
+        let body = "redis.call('set', KEYS[1], '1')";
+        let sha = r(&mut mgr, &["SCRIPT", "LOAD", body]);
+        assert_eq!(sha.len(), 40);
+        assert_eq!(
+            bodies(&mgr).get(&sha).unwrap(),
+            "redis.acall('set', KEYS[1], '1')"
+        );
+        // A second LOAD of the same body is a no-op (sha already cached).
+        assert_eq!(r(&mut mgr, &["SCRIPT", "LOAD", body]), sha);
+
+        // A used return value is never rewritten.
+        let used = "local v = redis.call('get', KEYS[1])\nreturn v";
+        let sha_used = r(&mut mgr, &["SCRIPT", "LOAD", used]);
+        assert_eq!(bodies(&mgr).get(&sha_used).unwrap(), used);
+
+        // disable-atomicity suppresses the rewrite even with the flag on.
+        let non_atomic = "--!df flags=disable-atomicity\nredis.call('set', KEYS[1], '1')";
+        let sha_na = r(&mut mgr, &["SCRIPT", "LOAD", non_atomic]);
+        assert_eq!(bodies(&mgr).get(&sha_na).unwrap(), non_atomic);
+
+        // The flag defaults off: no rewrite.
+        let mut mgr2 = ScriptMgr::new();
+        assert_eq!(
+            render(&local_script(&mut mgr2, &b_args(&["SCRIPT", "LOAD", body]))),
+            sha
+        );
+        assert_eq!(bodies(&mgr2).get(&sha).unwrap(), body);
+    }
+
+    #[test]
     fn shrink_reply() {
         let mut d = db();
         assert_eq!(s(&mut d, &["SADD", "set", "a"]), "1");

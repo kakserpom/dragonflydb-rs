@@ -84,15 +84,28 @@ Legend:
   transaction locking, cross-shard `redis.call`/`redis.pcall` dispatch, script
   error wrapping `ERR Error running script (call to <sha>): ...`, NOSCRIPT and
   read-only write rejection)
+- [x] `redis.acall`/`redis.apcall` (async command batching flushed as one
+  squashed phase on sync calls / budget overflow / end of run, with the
+  `--multi_eval_squash_buffer` 8096-byte budget and the reference's
+  `error_abort` + `ONLY_ERR` semantics: acall aborts on runtime errors, apcall
+  suppresses them)
+- [x] `--lua_auto_async` (load-time `DetectPossibleAsyncCalls` byte scanner
+  rewriting statement-context `redis.call`/`redis.pcall` into `acall`/`apcall`
+  for atomic scripts, applied at SCRIPT LOAD and first EVAL while keeping the
+  SHA over the original body)
 - [~] DFLY (registered, rejects: no replication stack in `Cargo.toml`)
 
 ### Scripting deviations
 - Scripts run on a single coordinator-side interpreter (taken from the sandbox
   pool), not one per shard; EVAL is serialized by the coordinator and holds
-  the script's locks for its whole body (no `lua_auto_async` squash).
-- No `redis.acall`/`redis.apcall` (no async path); `SCRIPT LATENCY` aggregates
-  per-SHA usec runs on the coordinator into a single summary per script (the
-  reference merges per-shard `base::Histogram` dumps).
+  the script's locks for its whole body.
+- `SCRIPT LATENCY` aggregates per-SHA usec runs on the coordinator into a
+  single summary per script (the reference merges per-shard
+  `base::Histogram` dumps).
+- The async batch is squashed sequentially through the shards rather than
+  through a real `MultiCommandSquasher` single-hop; the byte budget uses an
+  approximate per-command heap cost (arg bytes + 64), so the mid-script flush
+  point may differ slightly from the reference.
 - Function library callbacks live in a `__dfly_functions__` table in the Lua
   registry (hidden from scripts, which would otherwise bypass FCALL's locking
   and flag enforcement) and are recreated on first FCALL or when a library's

@@ -17,6 +17,7 @@ fn main() {
     let mut num_shards = std::thread::available_parallelism()
         .map_or(4, std::num::NonZero::get)
         .max(1);
+    let mut lua_auto_async = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -34,6 +35,8 @@ fn main() {
                 }
                 num_shards = args[i].parse().expect("invalid --num-shards value");
             }
+            "--lua_auto_async" => lua_auto_async = true,
+            "--lua_auto_async=false" => lua_auto_async = false,
             "--help" | "-h" => {
                 usage();
                 return;
@@ -75,7 +78,9 @@ fn main() {
 
     // Transaction coordinator thread.
     let (coord_tx, coord_rx) = mpsc::channel();
-    let script_mgr = Arc::new(std::sync::Mutex::new(ScriptMgr::new()));
+    let mut mgr = ScriptMgr::new();
+    mgr.lua_auto_async = lua_auto_async;
+    let script_mgr = Arc::new(std::sync::Mutex::new(mgr));
     coordinator::spawn(
         num_shards,
         coord_rx,
@@ -116,7 +121,9 @@ fn main() {
 }
 
 fn usage() {
-    eprintln!("usage: dragonflydb [--port PORT] [--num-shards N] [--help]");
+    eprintln!(
+        "usage: dragonflydb [--port PORT] [--num-shards N] [--lua_auto_async[=false]] [--help]"
+    );
 }
 
 fn set_nonblocking(fd: RawFd) {

@@ -234,6 +234,10 @@ pub struct ScriptMgr {
     /// Per-SHA script run durations (`SCRIPT LATENCY`, like the reference's
     /// `ServerState::call_latency_histos_`).
     latency: HashMap<String, LatencyStats>,
+    /// `--lua_auto_async`: rewrite statement-context `redis.call`/`redis.pcall`
+    /// into `redis.acall`/`redis.apcall` at load time (`FLAGS_lua_auto_async`).
+    /// Defaults off; applies only to atomic scripts.
+    pub lua_auto_async: bool,
 }
 
 /// Aggregated script run time in microseconds, keyed by script SHA.
@@ -361,6 +365,18 @@ impl ScriptMgr {
             params.undeclared_keys = true;
         }
         Ok(params)
+    }
+
+    /// The body to compile and cache for a script, applying the `lua_auto_async`
+    /// rewrite for atomic scripts exactly like `Insert` in `script_mgr.cc`.
+    /// The SHA stays computed over the original body (the 'a' insertions are
+    /// transparent to callers).
+    #[must_use]
+    pub fn auto_async_body(&self, body: &[u8], params: &ScriptParams) -> Vec<u8> {
+        if !self.lua_auto_async || !params.atomic {
+            return body.to_vec();
+        }
+        detect_possible_async_calls(body).unwrap_or_else(|| body.to_vec())
     }
 
     /// Insert a library into the FUNCTION registry, replacing any existing one
@@ -567,6 +583,149 @@ fn trim_ascii_start(mut b: &[u8]) -> &[u8] {
         b = rest;
     }
     b
+}
+
+// ---------------------------------------------------------------------------
+// lua_auto_async: `redis.call` -> `redis.acall` rewrite
+// ---------------------------------------------------------------------------
+
+/// Continuation operators: a line ending with one likely continues into the
+/// next, so the following `redis.call` is part of an expression
+/// (`kContOperators` in `DetectPossibleAsyncCalls`).
+const CONT_OPERATORS: &[&[u8]] = &[
+    b"+", b"-", b"*", b"/", b"%", b"^", b"#", b"&", b"~", b"|", b"<<", b">>", b"//", b"==", b"~=",
+    b"<=", b">=", b"<", b">", b"=", b"(", b"{", b"[", b"::", b":", b",", b".", b"..",
+];
+
+/// Continuation tokens: a line ending with one likely continues into the next
+/// (`kContTokens`).
+const CONT_TOKENS: &[&[u8]] = &[
+    b"and", b"else", b"elseif", b"for", b"goto", b"if", b"in", b"local", b"not", b"or", b"repeat",
+    b"return", b"until", b"while",
+];
+
+/// Rewrite `redis.call`/`redis.pcall` calls whose return value is discarded
+/// (standalone statements) into `redis.acall`/`redis.apcall` — a byte-level
+/// port of `Interpreter::DetectPossibleAsyncCalls`. Returns `None` when nothing
+/// qualifies, or when the body contains a `--[[` block comment (which the
+/// reference does not parse and bails on).
+///
+/// A call is a target when, reading the reference regex
+/// `(?:(\\S+)(\\s*--.*?)*\\s*\n|(then)|(do)|(^))\\s*redis\\.(p*call)`:
+/// * it is the first thing in the script (`^`),
+/// * it is preceded on the same line by `then` or `do` (a block's first
+///   statement, where the return value is certainly unused), or
+/// * it starts a line whose previous line's last word is not a continuation
+///   operator/token (so it is not a multi-line expression).
+#[must_use]
+pub fn detect_possible_async_calls(body: &[u8]) -> Option<Vec<u8>> {
+    // Block comments are not handled by the reference; bail like it does.
+    if body.windows(4).any(|w| w == b"--[[") {
+        return None;
+    }
+    let mut targets: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i + 6 <= body.len() {
+        if &body[i..i + 6] != b"redis." {
+            i += 1;
+            continue;
+        }
+        // `redis\.(p*call)`: any run of `p` then `call`.
+        let mut call_start = i + 6;
+        while call_start < body.len() && body[call_start] == b'p' {
+            call_start += 1;
+        }
+        if call_start + 4 > body.len() || &body[call_start..call_start + 4] != b"call" {
+            i += 1;
+            continue;
+        }
+        if is_async_target(body, i) {
+            // The reference inserts 'a' at the start of the `(p*call)` group
+            // (`it->position(it->size() - 1)`), i.e. before any `p`s.
+            targets.push(i + 6);
+        }
+        i = call_start;
+    }
+    if targets.is_empty() {
+        return None;
+    }
+    let mut out = body.to_vec();
+    // Insert 'a' before 'call'/'pcall', reverse order to preserve positions.
+    for pos in targets.into_iter().rev() {
+        out.insert(pos, b'a');
+    }
+    Some(out)
+}
+
+/// Whether the `redis.` at `redis_pos` is a rewrite target.
+fn is_async_target(body: &[u8], redis_pos: usize) -> bool {
+    let line_start = body[..redis_pos]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |p| p + 1);
+    let at_line_start = body[line_start..redis_pos]
+        .iter()
+        .all(|&b| b.is_ascii_whitespace());
+
+    // Reference alternative A: a previous line exists and its last word is a
+    // valid group-1 match. The operator/token skip applies here.
+    if at_line_start && line_start > 0 {
+        if let Some(last) = prev_line_last_word(&body[..line_start - 1]) {
+            // The reference checks the word's final two bytes, its final byte,
+            // and the whole word (`last_n` + `kContTokens.count`).
+            if last.len() >= 2 && CONT_OPERATORS.contains(&&last[last.len() - 2..]) {
+                return false;
+            }
+            if CONT_OPERATORS.contains(&&last[last.len() - 1..]) {
+                return false;
+            }
+            if CONT_TOKENS.contains(&last) {
+                return false;
+            }
+            return true;
+        }
+        // No group-1 word (empty or comment-only previous line): the `then`/`do`
+        // alternatives cannot fire for a line-start call either (the word would
+        // have matched group A and been skipped above).
+        return false;
+    }
+
+    // Reference alternative D: the call is the first thing in the script.
+    if body[..redis_pos].iter().all(|&b| b.is_ascii_whitespace()) {
+        return true;
+    }
+
+    // Reference alternatives B/C: `then` or `do` immediately before the call
+    // (whitespace may span the call, so this covers `do\n redis.call` too).
+    let prefix = &body[..redis_pos];
+    let mut end = prefix.len();
+    while end > 0 && prefix[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    prefix[..end].ends_with(b"then") || prefix[..end].ends_with(b"do")
+}
+
+/// The group-1 word the reference regex captures for a line: the leftmost
+/// `\S+` run followed only by whitespace and `--` comments up to the newline.
+/// A pure-comment line therefore yields its comment text (matching the regex's
+/// behavior when no earlier run qualifies).
+fn prev_line_last_word(line: &[u8]) -> Option<&[u8]> {
+    let mut i = 0;
+    while i < line.len() {
+        if line[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < line.len() && !line[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let rest = trim_ascii_start(&line[i..]);
+        if rest.is_empty() || rest.starts_with(b"--") {
+            return Some(&line[start..i]);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,9 +1248,41 @@ impl SandboxedInterpreter {
                     }
                 }
             })?;
+            // `redis.acall`/`redis.apcall`: enqueue for batched execution and
+            // return nil, like the reference's `RedisACallCommand`. acall
+            // raises abort errors, apcall suppresses per-command errors (the
+            // dispatch decides which are fatal).
+            let acall = scope.create_function_mut(move |lua, args: MultiValue| {
+                let Ok(cmd_args) = prepare_args(&args) else {
+                    raise_string_error(lua, ARG_TYPE_ERR.into())
+                };
+                let dispatched = {
+                    let mut d = dispatch.borrow_mut();
+                    d.dispatch_async(cmd_args, true)
+                };
+                match dispatched {
+                    Ok(()) => Ok(Value::Nil),
+                    Err(msg) => raise_string_error(lua, msg),
+                }
+            })?;
+            let apcall = scope.create_function_mut(move |lua, args: MultiValue| {
+                let Ok(cmd_args) = prepare_args(&args) else {
+                    raise_string_error(lua, ARG_TYPE_ERR.into())
+                };
+                let dispatched = {
+                    let mut d = dispatch.borrow_mut();
+                    d.dispatch_async(cmd_args, false)
+                };
+                match dispatched {
+                    Ok(()) => Ok(Value::Nil),
+                    Err(msg) => raise_string_error(lua, msg),
+                }
+            })?;
             let redis: Table = lua.globals().get("redis")?;
             redis.set("call", call)?;
             redis.set("pcall", pcall)?;
+            redis.set("acall", acall)?;
+            redis.set("apcall", apcall)?;
             let runner: Function = lua.globals().get("__dfly__run")?;
             let v: Value = runner.call(sha)?;
             serialize_value(v, float_as_int, 0)
@@ -1128,7 +1319,9 @@ impl SandboxedInterpreter {
             let redis: Table = lua.globals().get("redis")?;
             redis.set("register_function", register)?;
             redis.set("call", no_call.clone())?;
-            redis.set("pcall", no_call)?;
+            redis.set("pcall", no_call.clone())?;
+            redis.set("acall", no_call.clone())?;
+            redis.set("apcall", no_call)?;
             let res = lua
                 .load(body)
                 .set_name("@user_function")
@@ -1194,9 +1387,39 @@ impl SandboxedInterpreter {
                     }
                 }
             })?;
+            // `redis.acall`/`redis.apcall`: enqueue for batched execution and
+            // return nil, like the reference's `RedisACallCommand`.
+            let acall = scope.create_function_mut(move |lua, args: MultiValue| {
+                let Ok(cmd_args) = prepare_args(&args) else {
+                    raise_string_error(lua, ARG_TYPE_ERR.into())
+                };
+                let dispatched = {
+                    let mut d = dispatch.borrow_mut();
+                    d.dispatch_async(cmd_args, true)
+                };
+                match dispatched {
+                    Ok(()) => Ok(Value::Nil),
+                    Err(msg) => raise_string_error(lua, msg),
+                }
+            })?;
+            let apcall = scope.create_function_mut(move |lua, args: MultiValue| {
+                let Ok(cmd_args) = prepare_args(&args) else {
+                    raise_string_error(lua, ARG_TYPE_ERR.into())
+                };
+                let dispatched = {
+                    let mut d = dispatch.borrow_mut();
+                    d.dispatch_async(cmd_args, false)
+                };
+                match dispatched {
+                    Ok(()) => Ok(Value::Nil),
+                    Err(msg) => raise_string_error(lua, msg),
+                }
+            })?;
             let redis: Table = lua.globals().get("redis")?;
             redis.set("call", call)?;
             redis.set("pcall", pcall)?;
+            redis.set("acall", acall)?;
+            redis.set("apcall", apcall)?;
             let funcs: Table = lua.named_registry_value(DFLY_FUNCTIONS)?;
             let f: Function = funcs.get(name)?;
             let keys_t = lua.create_table()?;
@@ -1294,6 +1517,23 @@ fn single_field_table(lua: &Lua, field: &str, args: &MultiValue) -> mlua::Result
 /// `pcall`.
 pub trait ScriptDispatch {
     fn dispatch(&mut self, args: Vec<Vec<u8>>) -> Result<RespValue, String>;
+
+    /// Enqueue a subcommand for batched execution (`redis.acall`/`redis.apcall`),
+    /// mirroring `TryEnqueueEvalAsyncCmd`. `abort_on_error` (acall) makes an
+    /// unknown command fatal; apcall drops it silently. `Err` is only for
+    /// errors that must abort the script (an unknown command under acall, or a
+    /// flush error) — plain command errors are deferred to the flush.
+    fn dispatch_async(&mut self, args: Vec<Vec<u8>>, abort_on_error: bool) -> Result<(), String> {
+        let _ = (args, abort_on_error);
+        Ok(())
+    }
+
+    /// Execute the pending async batch (`FlushEvalAsyncCmds`). Called after the
+    /// script body finishes, and by `dispatch` when a synchronous call flushes
+    /// the buffer. `Err` aborts the run.
+    fn flush(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Convert `redis.call` args to command argument bytes
@@ -1436,6 +1676,17 @@ mod tests {
         }
     }
 
+    struct Failing;
+
+    impl ScriptDispatch for Failing {
+        fn dispatch(&mut self, _: Vec<Vec<u8>>) -> Result<RespValue, String> {
+            Ok(RespValue::Nil)
+        }
+        fn dispatch_async(&mut self, _: Vec<Vec<u8>>, _: bool) -> Result<(), String> {
+            Err("ERR boom".into())
+        }
+    }
+
     #[test]
     fn sha1_known_vectors() {
         assert_eq!(sha1_hex(b""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
@@ -1487,6 +1738,172 @@ mod tests {
         assert!(!p.atomic && p.undeclared_keys);
         assert_eq!(p.apply_flags("no-writes"), Ok(()));
         assert_eq!(p.apply_flags("bogus"), Err("Invalid flag: bogus".into()));
+    }
+
+    #[test]
+    fn detect_async_calls() {
+        let rw = |s: &str| {
+            detect_possible_async_calls(s.as_bytes()).map(|b| String::from_utf8(b).unwrap())
+        };
+
+        // A standalone statement at the start of the script.
+        assert_eq!(
+            rw("redis.call('set', KEYS[1], '1')"),
+            Some("redis.acall('set', KEYS[1], '1')".into())
+        );
+        // Statement start after an ordinary previous line.
+        assert_eq!(
+            rw("local x = 1\nredis.call('set', KEYS[1], '1')"),
+            Some("local x = 1\nredis.acall('set', KEYS[1], '1')".into())
+        );
+        // Previous line is a plain comment: the call is a target.
+        assert_eq!(
+            rw("-- hello\nredis.call('set', KEYS[1], '1')"),
+            Some("-- hello\nredis.acall('set', KEYS[1], '1')".into())
+        );
+        // First statement of a `then`/`do` block (same or next line).
+        assert_eq!(
+            rw("if x then redis.call('set', KEYS[1], '1') end"),
+            Some("if x then redis.acall('set', KEYS[1], '1') end".into())
+        );
+        assert_eq!(
+            rw("do redis.call('set', KEYS[1], '1') end"),
+            Some("do redis.acall('set', KEYS[1], '1') end".into())
+        );
+        assert_eq!(
+            rw("while true do\nredis.call('set', KEYS[1], '1')"),
+            Some("while true do\nredis.acall('set', KEYS[1], '1')".into())
+        );
+        // pcall rewrites to apcall, inserting before the `p`.
+        assert_eq!(
+            rw("redis.pcall('set', KEYS[1], '1')"),
+            Some("redis.apcall('set', KEYS[1], '1')".into())
+        );
+
+        // The return value is used: never rewritten.
+        assert_eq!(rw("local x = redis.call('get', KEYS[1])"), None);
+        assert_eq!(rw("print(redis.call('get', KEYS[1]))"), None);
+        // Multi-line expression: previous line ends with a continuation op.
+        assert_eq!(rw("local x = f(\nredis.call('get', KEYS[1])"), None);
+        assert_eq!(rw("local x = 1 +\nredis.call('get', KEYS[1])"), None);
+        assert_eq!(rw("local x = 1 ,\nredis.call('get', KEYS[1])"), None);
+        // Continuation token: previous line ends with `return`.
+        assert_eq!(rw("return\nredis.call('get', KEYS[1])"), None);
+        // Block comments make the scanner bail entirely.
+        assert_eq!(rw("--[[ c\nredis.call('set', KEYS[1], '1')]]"), None);
+        // Only standalone calls are rewritten in a mixed body.
+        assert_eq!(
+            rw("redis.call('set', KEYS[1], '1')\nlocal v = redis.call('get', KEYS[1])"),
+            Some("redis.acall('set', KEYS[1], '1')\nlocal v = redis.call('get', KEYS[1])".into())
+        );
+        // `then`/`do` on their own line are ordinary words (not continuation
+        // tokens), so a following call is still a target.
+        assert_eq!(
+            rw("if x then\nredis.call('set', KEYS[1], '1')"),
+            Some("if x then\nredis.acall('set', KEYS[1], '1')".into())
+        );
+        // No calls at all.
+        assert_eq!(rw("return 1"), None);
+    }
+
+    #[test]
+    fn auto_async_body_gating() {
+        let mut mgr = ScriptMgr::new();
+        let body = b"redis.call('set', KEYS[1], '1')";
+        // The flag defaults off.
+        assert!(!mgr.lua_auto_async);
+        assert_eq!(mgr.auto_async_body(body, &ScriptParams::default()), body);
+        mgr.lua_auto_async = true;
+        // Non-atomic scripts are never rewritten.
+        let non_atomic = ScriptParams {
+            atomic: false,
+            ..Default::default()
+        };
+        assert_eq!(mgr.auto_async_body(body, &non_atomic), body);
+        // Atomic + flag: rewritten, and idempotent on the rewritten result.
+        let rewritten = mgr.auto_async_body(body, &ScriptParams::default());
+        assert_eq!(
+            String::from_utf8(rewritten.clone()).unwrap(),
+            "redis.acall('set', KEYS[1], '1')"
+        );
+        assert_eq!(
+            mgr.auto_async_body(&rewritten, &ScriptParams::default()),
+            rewritten
+        );
+    }
+
+    struct RecordingDispatch {
+        calls: Vec<(Vec<Vec<u8>>, bool)>,
+    }
+
+    impl ScriptDispatch for RecordingDispatch {
+        fn dispatch(&mut self, _: Vec<Vec<u8>>) -> Result<RespValue, String> {
+            Ok(RespValue::Integer(1))
+        }
+        fn dispatch_async(
+            &mut self,
+            args: Vec<Vec<u8>>,
+            abort_on_error: bool,
+        ) -> Result<(), String> {
+            self.calls.push((args, abort_on_error));
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<(), String> {
+            self.calls.push((vec![b"__flush__".to_vec()], false));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn async_call_wiring() {
+        let interp = SandboxedInterpreter::new().unwrap();
+        let sha = "aaaa";
+        let mut d = RecordingDispatch { calls: Vec::new() };
+        let call_before: Vec<Vec<u8>> = vec![b"SET".to_vec(), b"k".to_vec(), b"1".to_vec()];
+        let get: Vec<Vec<u8>> = vec![b"GET".to_vec(), b"k".to_vec()];
+
+        // acall routes with abort_on_error=true and evaluates to nil.
+        interp
+            .define(
+                sha,
+                b"redis.acall('SET', KEYS[1], '1')\nreturn redis.acall('GET', KEYS[1])",
+            )
+            .unwrap();
+        interp.set_global_array("KEYS", &[b"k".to_vec()]).unwrap();
+        let v = interp.run(sha, &mut d, false).unwrap();
+        assert_eq!(v, RespValue::Nil);
+        assert_eq!(d.calls.len(), 2);
+        assert_eq!(d.calls[0].0, call_before);
+        assert!(d.calls[0].1);
+        assert_eq!(d.calls[1].0, get);
+        assert!(d.calls[1].1);
+
+        // apcall routes with abort_on_error=false.
+        d.calls.clear();
+        interp
+            .define(sha, b"redis.apcall('GET', KEYS[1])\nreturn 1")
+            .unwrap();
+        assert_eq!(
+            interp.run(sha, &mut d, false).unwrap(),
+            RespValue::Integer(1)
+        );
+        assert_eq!(d.calls.len(), 1);
+        assert!(!d.calls[0].1);
+
+        // Both acall and apcall raise dispatch errors (flush failures set the
+        // reference's `requested_abort`, which raises regardless of mode); the
+        // two differ only in unknown-command handling and per-command runtime
+        // errors, both decided inside the dispatcher.
+        interp
+            .define(sha, b"redis.acall('SET', KEYS[1], '1')")
+            .unwrap();
+        let err = interp.run(sha, &mut Failing, false).unwrap_err();
+        assert!(err.contains("ERR boom"), "{err}");
+        interp
+            .define(sha, b"redis.apcall('SET', KEYS[1], '1')\nreturn 1")
+            .unwrap();
+        let err = interp.run(sha, &mut Failing, false).unwrap_err();
+        assert!(err.contains("ERR boom"), "{err}");
     }
 
     #[test]
