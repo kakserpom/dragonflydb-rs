@@ -6,6 +6,7 @@ pub mod cuckoo;
 pub mod db;
 pub mod geohash;
 pub mod hash;
+pub mod histogram;
 pub mod hll;
 pub mod intset;
 pub mod json;

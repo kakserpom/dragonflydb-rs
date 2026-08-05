@@ -99,9 +99,12 @@ Legend:
 - Scripts run on a single coordinator-side interpreter (taken from the sandbox
   pool), not one per shard; EVAL is serialized by the coordinator and holds
   the script's locks for its whole body.
-- `SCRIPT LATENCY` aggregates per-SHA usec runs on the coordinator into a
-  single summary per script (the reference merges per-shard
-  `base::Histogram` dumps).
+- `SCRIPT LATENCY` prints the reference's `base::Histogram::ToString()` text
+  dump per SHA (a 154-bucket fixed-boundary histogram, ported in
+  `src/core/histogram.rs`, sent as a bulk string — exactly
+  `SendVerbatimString`'s RESP2 encoding). The reference merges per-shard
+  histograms before printing; the coordinator records a single histogram per
+  SHA, so no merge is needed and the output format is identical.
 - The async batch is flushed as a `MultiCommandSquasher`-style squashed phase:
   per-shard accumulation runs in a single parallel hop per shard
   (`ShardMsg::ScriptBatch`) when a shard's batch reaches `max_squash_cmd_num`

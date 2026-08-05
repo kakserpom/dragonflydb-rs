@@ -15,6 +15,7 @@ use mlua::chunk::ChunkMode;
 use mlua::ffi;
 use mlua::{Function, HookTriggers, Lua, MultiValue, StdLib, Table, Value, VmState};
 
+use crate::core::histogram::Histogram;
 use crate::error::RespValue;
 use crate::util::{format_double, itoa};
 
@@ -238,20 +239,11 @@ pub struct ScriptMgr {
     kill: Arc<AtomicBool>,
     /// Per-SHA script run durations (`SCRIPT LATENCY`, like the reference's
     /// `ServerState::call_latency_histos_`).
-    latency: HashMap<String, LatencyStats>,
+    latency: HashMap<String, Histogram>,
     /// `--lua_auto_async`: rewrite statement-context `redis.call`/`redis.pcall`
     /// into `redis.acall`/`redis.apcall` at load time (`FLAGS_lua_auto_async`).
     /// Defaults off; applies only to atomic scripts.
     pub lua_auto_async: bool,
-}
-
-/// Aggregated script run time in microseconds, keyed by script SHA.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct LatencyStats {
-    pub count: u64,
-    pub total_usec: u64,
-    pub min_usec: u64,
-    pub max_usec: u64,
 }
 
 /// Script SHAs upstream force-flags (buggy clients, see `script_mgr.cc:284`).
@@ -479,24 +471,15 @@ impl ScriptMgr {
     /// Record a script run duration in microseconds (`CallSHA`'s
     /// `RecordCallLatency`).
     pub fn record_latency(&mut self, sha: &str, usec: u64) {
-        let e = self
-            .latency
+        self.latency
             .entry(sha.to_string())
-            .or_insert_with(|| LatencyStats {
-                count: 0,
-                total_usec: 0,
-                min_usec: usec,
-                max_usec: usec,
-            });
-        e.count += 1;
-        e.total_usec += usec;
-        e.min_usec = e.min_usec.min(usec);
-        e.max_usec = e.max_usec.max(usec);
+            .or_default()
+            .add(usec as f64);
     }
 
-    /// Per-SHA latency stats for `SCRIPT LATENCY`.
+    /// Per-SHA latency histograms for `SCRIPT LATENCY`.
     #[must_use]
-    pub fn latency(&self) -> &HashMap<String, LatencyStats> {
+    pub fn latency(&self) -> &HashMap<String, Histogram> {
         &self.latency
     }
 
@@ -2302,10 +2285,17 @@ mod tests {
         mgr.record_latency("sha2", 50);
         let s1 = &mgr.latency()["sha1"];
         assert_eq!(
-            (s1.count, s1.total_usec, s1.min_usec, s1.max_usec),
+            (
+                s1.count(),
+                s1.sum() as u64,
+                s1.min() as u64,
+                s1.max() as u64
+            ),
             (2, 400, 100, 300)
         );
-        assert_eq!(mgr.latency()["sha2"].count, 1);
+        assert_eq!(mgr.latency()["sha2"].count(), 1);
+        // The reference sends the merged histogram's text dump verbatim.
+        assert!(s1.to_string().starts_with("Count: 2 Average: 200.0000\n"));
     }
 
     #[test]
