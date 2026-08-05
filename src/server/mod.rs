@@ -12,7 +12,8 @@ use std::sync::mpsc;
 
 use crate::commands::exec::server::now_ms;
 use crate::commands::lua::{
-    FunctionLib, SandboxedInterpreter, ScriptMgr, compile_check, parse_function_header, sha1_hex,
+    FunctionLib, LatencyStats, SandboxedInterpreter, ScriptMgr, compile_check,
+    parse_function_header, sha1_hex,
 };
 use crate::commands::{Command, lookup};
 use crate::error::{CmdResult, ReplyBytes, RespValue};
@@ -89,7 +90,23 @@ pub fn local_script(mgr: &mut ScriptMgr, args: &[Vec<u8>]) -> RespValue {
                 })
                 .collect(),
         ),
-        b"LATENCY" => RespValue::Array(vec![]),
+        b"LATENCY" => {
+            // The reference merges per-shard histograms into a text dump per
+            // SHA; here the coordinator records a single aggregate per SHA.
+            let mut entries: Vec<(&String, &LatencyStats)> = mgr.latency().iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            RespValue::Array(
+                entries
+                    .into_iter()
+                    .map(|(sha, s)| {
+                        RespValue::Array(vec![
+                            RespValue::Bulk(sha.clone().into_bytes()),
+                            RespValue::Bulk(latency_summary(s).into_bytes()),
+                        ])
+                    })
+                    .collect(),
+            )
+        }
         b"LOAD" if args.len() == 3 => {
             let body = &args[2];
             if body.is_empty() {
@@ -135,6 +152,16 @@ fn unknown_function_subcmd(sub: &[u8]) -> String {
     format!(
         "ERR Unknown subcommand or wrong number of arguments for '{}'. Try FUNCTION HELP.",
         String::from_utf8_lossy(sub)
+    )
+}
+
+/// One-line latency summary for a script SHA (`SCRIPT LATENCY`). The reference
+/// dumps a `base::Histogram` text block, which has no direct Rust equivalent.
+fn latency_summary(s: &LatencyStats) -> String {
+    let avg = s.total_usec / s.count.max(1);
+    format!(
+        "count: {}  sum: {} usec  min: {} usec  max: {} usec  avg: {} usec",
+        s.count, s.total_usec, s.min_usec, s.max_usec, avg
     )
 }
 
@@ -209,9 +236,15 @@ pub fn local_function(mgr: &mut ScriptMgr, args: &[Vec<u8>]) -> RespValue {
         b"DUMP" => RespValue::Bulk(mgr.dump_libraries()),
         b"RESTORE" => function_restore(mgr, args),
         b"KILL" => {
-            // Functions run synchronously on the coordinator and cannot be
-            // interrupted from the IO thread, so KILL always reports idle.
-            RespValue::Error("ERR No scripts in execution right now.".into())
+            // Functions run synchronously on the coordinator; KILL sets a flag
+            // it polls between `redis.call` dispatches. A tight loop that never
+            // calls out is not interruptible.
+            if mgr.running().is_none() {
+                RespValue::Error("NOTBUSY No scripts in execution right now.".into())
+            } else {
+                mgr.request_kill();
+                RespValue::Simple("OK".into())
+            }
         }
         other => RespValue::Error(unknown_function_subcmd(other)),
     }

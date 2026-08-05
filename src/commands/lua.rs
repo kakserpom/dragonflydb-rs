@@ -8,6 +8,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::raw::c_char;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use mlua::chunk::ChunkMode;
 use mlua::ffi;
@@ -26,6 +28,9 @@ pub const READONLY_WRITE_ERR: &str = "Write commands are not allowed from read-o
 pub const NOSCRIPT_CMD_ERR: &str = "This Redis command is not allowed from script";
 /// Error raised when a `redis.call`/`redis.pcall` argument is not a string/integer.
 pub const ARG_TYPE_ERR: &str = "Lua redis() command arguments must be strings or integers";
+/// Error raised inside a function when `FUNCTION KILL` interrupts it. Redis
+/// reuses the SCRIPT KILL text for functions (the count hook is shared).
+pub const FUNCTION_KILLED_ERR: &str = "Script killed by user with SCRIPT KILL...";
 
 // ---------------------------------------------------------------------------
 // SHA-1
@@ -222,6 +227,22 @@ pub struct ScriptMgr {
     functions: HashMap<String, String>,
     /// The function running on the coordinator, if any.
     running: Option<RunningFunction>,
+    /// `FUNCTION KILL`: set by the IO thread, polled by the coordinator between
+    /// `redis.call` dispatches. `Arc` so the coordinator can read it without
+    /// holding the mgr mutex on every subcommand.
+    kill: Arc<AtomicBool>,
+    /// Per-SHA script run durations (`SCRIPT LATENCY`, like the reference's
+    /// `ServerState::call_latency_histos_`).
+    latency: HashMap<String, LatencyStats>,
+}
+
+/// Aggregated script run time in microseconds, keyed by script SHA.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LatencyStats {
+    pub count: u64,
+    pub total_usec: u64,
+    pub min_usec: u64,
+    pub max_usec: u64,
 }
 
 /// Script SHAs upstream force-flags (buggy clients, see `script_mgr.cc:284`).
@@ -412,6 +433,52 @@ impl ScriptMgr {
         self.running.as_ref()
     }
 
+    /// `FUNCTION KILL`: request the running function to abort. The coordinator
+    /// polls this between `redis.call` dispatches (a CPU-bound tight loop that
+    /// never calls out is not interruptible).
+    pub fn request_kill(&self) {
+        self.kill.store(true, Ordering::Relaxed);
+    }
+
+    pub fn clear_kill(&self) {
+        self.kill.store(false, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn kill_requested(&self) -> bool {
+        self.kill.load(Ordering::Relaxed)
+    }
+
+    /// A clone of the kill flag for the coordinator to poll lock-free.
+    #[must_use]
+    pub fn kill_flag(&self) -> Arc<AtomicBool> {
+        self.kill.clone()
+    }
+
+    /// Record a script run duration in microseconds (`CallSHA`'s
+    /// `RecordCallLatency`).
+    pub fn record_latency(&mut self, sha: &str, usec: u64) {
+        let e = self
+            .latency
+            .entry(sha.to_string())
+            .or_insert_with(|| LatencyStats {
+                count: 0,
+                total_usec: 0,
+                min_usec: usec,
+                max_usec: usec,
+            });
+        e.count += 1;
+        e.total_usec += usec;
+        e.min_usec = e.min_usec.min(usec);
+        e.max_usec = e.max_usec.max(usec);
+    }
+
+    /// Per-SHA latency stats for `SCRIPT LATENCY`.
+    #[must_use]
+    pub fn latency(&self) -> &HashMap<String, LatencyStats> {
+        &self.latency
+    }
+
     /// FUNCTION DUMP: an opaque binary snapshot of every loaded library. The
     /// restored payload is re-validated by `FUNCTION RESTORE`, so a valid dump
     /// is interchangeable with `FUNCTION LOAD` of its `library_code` values.
@@ -511,8 +578,9 @@ fn trim_ascii_start(mut b: &[u8]) -> &[u8] {
 const DFLY_FUNCTIONS: &str = "__dfly_functions__";
 
 /// `redis.register_function` error outside a `FUNCTION LOAD` body
-/// (`luaRegisterFunction` when `!lue->loading`).
-const REGISTER_FUNCTION_ERR: &str = "Function registration is not allowed during execution";
+/// (`luaRegisterFunction` when no `loadCtx` is present).
+const REGISTER_FUNCTION_ERR: &str =
+    "redis.register_function can only be called on FUNCTION LOAD command";
 
 /// Metadata parsed from a library's `#!lua name=<name> [flags=...]` header.
 #[derive(Debug)]
@@ -731,10 +799,14 @@ fn script_chunk(sha: &str, body: &[u8]) -> Vec<u8> {
 
 /// Compile-check `body` in a throwaway Lua state without executing it. SCRIPT
 /// LOAD uses this on the IO thread so a compile error never enters the cache
-/// (`ScriptMgr::Insert`); parsing is identical to the sandboxed state.
+/// (`ScriptMgr::Insert`). A full `SandboxedInterpreter` is built so parsing runs
+/// under the identical strict environment as EVAL (polyfills, protected globals,
+/// `redis.*` table), not a bare state.
 pub fn compile_check(body: &[u8]) -> Result<(), String> {
-    let lua = Lua::new();
-    lua.load(script_chunk("check", body))
+    let interp = SandboxedInterpreter::new()?;
+    interp
+        .lua
+        .load(script_chunk("check", body))
         .set_name("@user_script")
         .set_mode(ChunkMode::Text)
         .exec()
@@ -1648,7 +1720,7 @@ mod tests {
             .unwrap();
         let err = interp.run("aaaa", &mut Noop, false).unwrap_err();
         assert!(
-            err.contains("Function registration is not allowed during execution"),
+            err.contains("redis.register_function can only be called on FUNCTION LOAD command"),
             "{err}"
         );
         // After a load the blocker is restored, not the load-only collector.
@@ -1663,7 +1735,7 @@ mod tests {
             .unwrap();
         let err = interp.run("bbbb", &mut Noop, false).unwrap_err();
         assert!(
-            err.contains("Function registration is not allowed during execution"),
+            err.contains("redis.register_function can only be called on FUNCTION LOAD command"),
             "{err}"
         );
     }
@@ -1695,5 +1767,33 @@ mod tests {
         );
         assert!(ScriptMgr::restore_libraries(b"junk").is_err());
         assert!(ScriptMgr::restore_libraries(b"").is_err());
+    }
+
+    #[test]
+    fn latency_aggregates_per_sha() {
+        let mut mgr = ScriptMgr::new();
+        assert!(mgr.latency().is_empty());
+        mgr.record_latency("sha1", 100);
+        mgr.record_latency("sha1", 300);
+        mgr.record_latency("sha2", 50);
+        let s1 = &mgr.latency()["sha1"];
+        assert_eq!(
+            (s1.count, s1.total_usec, s1.min_usec, s1.max_usec),
+            (2, 400, 100, 300)
+        );
+        assert_eq!(mgr.latency()["sha2"].count, 1);
+    }
+
+    #[test]
+    fn kill_flag_shared_with_io_thread() {
+        let mgr = ScriptMgr::new();
+        let flag = mgr.kill_flag();
+        assert!(!mgr.kill_requested());
+        mgr.request_kill();
+        // The coordinator's clone observes the write without touching the mutex.
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(mgr.kill_requested());
+        mgr.clear_kill();
+        assert!(!mgr.kill_requested());
     }
 }

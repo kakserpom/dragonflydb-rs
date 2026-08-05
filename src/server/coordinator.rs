@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::commands::exec::server::now_ms;
-use crate::commands::lua::{SandboxedInterpreter, ScriptDispatch, ScriptMgr, sha1_hex};
+use crate::commands::lua::{
+    FUNCTION_KILLED_ERR, SandboxedInterpreter, ScriptDispatch, ScriptMgr, sha1_hex,
+};
 use crate::commands::{FLAG_GLOBAL, FLAG_NOSCRIPT, FLAG_WRITE, ShardPart};
 use crate::error::{CmdResult, RespValue};
 use crate::server::{
@@ -40,6 +43,7 @@ pub fn spawn(
                     None
                 }
             };
+            let kill = script_mgr.lock().unwrap().kill_flag();
             Coordinator {
                 num_shards,
                 rx,
@@ -47,6 +51,7 @@ pub fn spawn(
                 reply_bus,
                 script_mgr,
                 sandbox,
+                kill,
                 loaded_libs: HashMap::new(),
                 tx_counter: 0,
                 pending: VecDeque::new(),
@@ -65,6 +70,9 @@ struct Coordinator {
     /// The coordinator-owned Lua state. `Option` so it can be taken out while a
     /// script runs (the dispatch context borrows the whole `Coordinator`).
     sandbox: Option<SandboxedInterpreter>,
+    /// `FUNCTION KILL` flag shared with the IO thread; polled by the dispatch
+    /// path between `redis.call` subcommands.
+    kill: Arc<AtomicBool>,
     /// Libraries already loaded into `sandbox`, keyed by library name with the
     /// loaded sha and its function names (so `FUNCTION LOAD REPLACE` invalidates
     /// the cached callbacks and purges names the new version dropped).
@@ -251,6 +259,9 @@ impl Coordinator {
     /// shards, install KEYS/ARGV, and run the body with `redis.call` dispatching
     /// subcommands straight to shards (`CallFromScript`).
     fn execute_script(&mut self, msg: &CoordMsg, is_evalsha: bool, read_only: bool) -> CmdResult {
+        // A stale kill flag (set while a function ran) must not leak into an
+        // EVAL; FUNCTION KILL only targets the running function.
+        self.kill.store(false, Ordering::Relaxed);
         let args = &msg.args;
         let numkeys = match args.get(2).and_then(|a| crate::util::parse_i64(a)) {
             Some(n) if n >= 0 => n as usize,
@@ -367,10 +378,17 @@ impl Coordinator {
             num_shards: self.num_shards,
             db_idx: msg.db_idx,
         };
+        // `CallSHA` records the script's run duration in usec for SCRIPT LATENCY.
+        let started = Instant::now();
         let result = {
             let mut dctx = ScriptDispatchCtx { coord: self, ctx };
             sandbox.run(&sha, &mut dctx, params.float_as_int)
         };
+        let elapsed_usec = started.elapsed().as_micros() as u64;
+        self.script_mgr
+            .lock()
+            .unwrap()
+            .record_latency(&sha, elapsed_usec);
         self.sandbox = Some(sandbox);
         self.unlock_script(tx_id, &shards);
 
@@ -385,6 +403,8 @@ impl Coordinator {
     /// coordinator's interpreter if needed, lock the declared-key shards, and
     /// invoke the callback with `(keys, args)` tables like the EVAL path.
     fn execute_function(&mut self, msg: &CoordMsg, read_only: bool) -> CmdResult {
+        // Start clean; the flag is set (and honored) only while this run lives.
+        self.kill.store(false, Ordering::Relaxed);
         let args = &msg.args;
         let name = String::from_utf8_lossy(&args[1]).into_owned();
         let numkeys = match args.get(2).and_then(|a| crate::util::parse_i64(a)) {
@@ -619,6 +639,11 @@ struct ScriptDispatchCtx<'a> {
 
 impl ScriptDispatch for ScriptDispatchCtx<'_> {
     fn dispatch(&mut self, args: Vec<Vec<u8>>) -> Result<RespValue, String> {
+        // `FUNCTION KILL` from the IO thread: abort at the next dispatch
+        // boundary (mirrors the count hook Redis uses to raise this).
+        if self.coord.kill.load(Ordering::Relaxed) {
+            return Err(FUNCTION_KILLED_ERR.to_string());
+        }
         let cmd = command_for(&args).ok_or_else(|| {
             format!(
                 "ERR unknown command '{}'",

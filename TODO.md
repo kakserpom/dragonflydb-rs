@@ -90,20 +90,21 @@ Legend:
 - Scripts run on a single coordinator-side interpreter (taken from the sandbox
   pool), not one per shard; EVAL is serialized by the coordinator and holds
   the script's locks for its whole body (no `lua_auto_async` squash).
-- `SCRIPT LOAD` compiles with a throwaway unsandboxed `Lua` instance on the
-  IO thread (`compile_check`); the actual sandbox bootstrap applies at EVAL.
-- No `redis.acall`/`redis.apcall` (no async path); `SCRIPT LATENCY` returns an
-  empty array.
+- No `redis.acall`/`redis.apcall` (no async path); `SCRIPT LATENCY` aggregates
+  per-SHA usec runs on the coordinator into a single summary per script (the
+  reference merges per-shard `base::Histogram` dumps).
 - Function library callbacks live in a `__dfly_functions__` table in the Lua
   registry (hidden from scripts, which would otherwise bypass FCALL's locking
   and flag enforcement) and are recreated on first FCALL or when a library's
   sha changes, purging names the replacement dropped;
   `FUNCTION DUMP`/`RESTORE` use an opaque local binary format.
-- `redis.register_function` outside a `FUNCTION LOAD` body errors with
-  `Function registration is not allowed during execution`; library and
-  function names are validated (`[A-Za-z0-9_.-]`, like `functionVerifyName`).
-- `FUNCTION KILL` always reports idle (functions run synchronously on the
-  coordinator and cannot be interrupted from the IO thread).
+- `redis.register_function` outside a `FUNCTION LOAD` body errors with Redis's
+  exact `redis.register_function can only be called on FUNCTION LOAD command`;
+  library and function names are validated (`[A-Za-z0-9_.-]`, like
+  `functionVerifyName`).
+- `FUNCTION KILL` is soft: it sets a flag the coordinator polls between
+  `redis.call` dispatches (idle reply is Redis's `NOTBUSY`), so a CPU-bound
+  tight loop that never calls out cannot be interrupted.
 
 ## Module / probabilistic (`bloom_family.cc`, `cms_family.cc`, `cuckoo_filter_family.cc`, `topk_family.cc`)
 - [x] BF.ADD, BF.EXISTS, BF.INFO, BF.LOADCHUNK, BF.MADD, BF.MEXISTS, BF.RESERVE,

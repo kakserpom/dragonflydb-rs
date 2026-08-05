@@ -1628,7 +1628,7 @@ mod tests {
         assert_eq!(r(&mut mgr, &["FUNCTION", "FLUSH"]), "OK");
         assert_eq!(
             r(&mut mgr, &["FUNCTION", "KILL"]),
-            "ERR No scripts in execution right now."
+            "NOTBUSY No scripts in execution right now."
         );
         assert!(r(&mut mgr, &["FUNCTION", "HELP"]).contains("FUNCTION <subcommand>"));
         assert_eq!(r(&mut mgr, &["FUNCTION", "LIST"]), "[]");
@@ -1760,6 +1760,9 @@ mod tests {
         );
         assert_eq!(r(&mut mgr, &["SCRIPT", "LOAD", "return 1"]), sha);
         assert_eq!(r(&mut mgr, &["SCRIPT", "EXISTS", sha]), "[1]");
+        // LATENCY is empty until scripts have actually run through the
+        // coordinator (which records per-SHA usec stats).
+        assert_eq!(r(&mut mgr, &["SCRIPT", "LATENCY"]), "[]");
         assert_eq!(
             r(&mut mgr, &["SCRIPT", "FLAGS", sha, "bogus"]),
             "ERR Invalid config format: Invalid flag: bogus"
