@@ -70,8 +70,8 @@ struct Coordinator {
     /// The coordinator-owned Lua state. `Option` so it can be taken out while a
     /// script runs (the dispatch context borrows the whole `Coordinator`).
     sandbox: Option<SandboxedInterpreter>,
-    /// `FUNCTION KILL` flag shared with the IO thread; polled by the dispatch
-    /// path between `redis.call` subcommands.
+    /// `FUNCTION KILL` flag shared with the IO thread; polled by the
+    /// `LUA_MASKCOUNT` instruction hook and the dispatch path.
     kill: Arc<AtomicBool>,
     /// Libraries already loaded into `sandbox`, keyed by library name with the
     /// loaded sha and its function names (so `FUNCTION LOAD REPLACE` invalidates
@@ -393,9 +393,10 @@ impl Coordinator {
         };
         // `CallSHA` records the script's run duration in usec for SCRIPT LATENCY.
         let started = Instant::now();
+        let kill = Arc::clone(&self.kill);
         let result = {
             let mut dctx = ScriptDispatchCtx { coord: self, ctx };
-            let run = sandbox.run(&sha, &mut dctx, params.float_as_int);
+            let run = sandbox.run(&sha, &mut dctx, params.float_as_int, &kill);
             // Force-flush pending `redis.acall` commands; a flush error
             // overrides the script's own result (`FlushEvalAsyncCmds(true)`).
             match dctx.flush() {
@@ -534,8 +535,10 @@ impl Coordinator {
             async_bytes: 0,
         };
         let result = {
+            let kill = Arc::clone(&self.kill);
             let mut dctx = ScriptDispatchCtx { coord: self, ctx };
-            let run = sandbox.run_function(&name, &keys, &argv, &mut dctx, params.float_as_int);
+            let run =
+                sandbox.run_function(&name, &keys, &argv, &mut dctx, params.float_as_int, &kill);
             // Force-flush pending `redis.acall` commands; a flush error
             // overrides the function's own result (`FlushEvalAsyncCmds(true)`).
             match dctx.flush() {
@@ -724,7 +727,8 @@ struct ScriptDispatchCtx<'a> {
 impl ScriptDispatch for ScriptDispatchCtx<'_> {
     fn dispatch(&mut self, args: Vec<Vec<u8>>) -> Result<RespValue, String> {
         // `FUNCTION KILL` from the IO thread: abort at the next dispatch
-        // boundary (mirrors the count hook Redis uses to raise this).
+        // boundary (mirrors the count hook, which cannot fire while a
+        // subcommand is dispatched from Rust).
         if self.coord.kill.load(Ordering::Relaxed) {
             return Err(FUNCTION_KILLED_ERR.to_string());
         }

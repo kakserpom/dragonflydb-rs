@@ -239,8 +239,8 @@ pub fn local_function(mgr: &mut ScriptMgr, args: &[Vec<u8>]) -> RespValue {
         b"RESTORE" => function_restore(mgr, args),
         b"KILL" => {
             // Functions run synchronously on the coordinator; KILL sets a flag
-            // it polls between `redis.call` dispatches. A tight loop that never
-            // calls out is not interruptible.
+            // the `LUA_MASKCOUNT` instruction hook polls, so even a tight loop
+            // that never calls out is interrupted.
             if mgr.running().is_none() {
                 RespValue::Error("NOTBUSY No scripts in execution right now.".into())
             } else {

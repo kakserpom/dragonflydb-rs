@@ -119,9 +119,6 @@ Legend:
   exact `redis.register_function can only be called on FUNCTION LOAD command`;
   library and function names are validated (`[A-Za-z0-9_.-]`, like
   `functionVerifyName`).
-- `FUNCTION KILL` is soft: it sets a flag the coordinator polls between
-  `redis.call` dispatches (idle reply is Redis's `NOTBUSY`), so a CPU-bound
-  tight loop that never calls out cannot be interrupted.
 
 ## Module / probabilistic (`bloom_family.cc`, `cms_family.cc`, `cuckoo_filter_family.cc`, `topk_family.cc`)
 - [x] BF.ADD, BF.EXISTS, BF.INFO, BF.LOADCHUNK, BF.MADD, BF.MEXISTS, BF.RESERVE,

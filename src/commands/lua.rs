@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use mlua::chunk::ChunkMode;
 use mlua::ffi;
-use mlua::{Function, Lua, MultiValue, StdLib, Table, Value};
+use mlua::{Function, HookTriggers, Lua, MultiValue, StdLib, Table, Value, VmState};
 
 use crate::error::RespValue;
 use crate::util::{format_double, itoa};
@@ -31,6 +31,10 @@ pub const ARG_TYPE_ERR: &str = "Lua redis() command arguments must be strings or
 /// Error raised inside a function when `FUNCTION KILL` interrupts it. Redis
 /// reuses the SCRIPT KILL text for functions (the count hook is shared).
 pub const FUNCTION_KILLED_ERR: &str = "Script killed by user with SCRIPT KILL...";
+
+/// Redis's `LUA_MASKCOUNT` hook interval: the kill flag is polled after every
+/// 100k VM instructions, so a CPU-bound tight loop is interruptible.
+const KILL_HOOK_INTERVAL: u32 = 100_000;
 
 // ---------------------------------------------------------------------------
 // SHA-1
@@ -227,9 +231,10 @@ pub struct ScriptMgr {
     functions: HashMap<String, String>,
     /// The function running on the coordinator, if any.
     running: Option<RunningFunction>,
-    /// `FUNCTION KILL`: set by the IO thread, polled by the coordinator between
-    /// `redis.call` dispatches. `Arc` so the coordinator can read it without
-    /// holding the mgr mutex on every subcommand.
+    /// `FUNCTION KILL`: set by the IO thread, polled by the `LUA_MASKCOUNT`
+    /// instruction hook (every `KILL_HOOK_INTERVAL` VM instructions) and by the
+    /// dispatch path between `redis.call` subcommands. `Arc` so the coordinator
+    /// can read it without holding the mgr mutex on every subcommand.
     kill: Arc<AtomicBool>,
     /// Per-SHA script run durations (`SCRIPT LATENCY`, like the reference's
     /// `ServerState::call_latency_histos_`).
@@ -450,8 +455,8 @@ impl ScriptMgr {
     }
 
     /// `FUNCTION KILL`: request the running function to abort. The coordinator
-    /// polls this between `redis.call` dispatches (a CPU-bound tight loop that
-    /// never calls out is not interruptible).
+    /// polls this from the `LUA_MASKCOUNT` instruction hook (interrupting even a
+    /// CPU-bound tight loop) and between `redis.call` dispatches.
     pub fn request_kill(&self) {
         self.kill.store(true, Ordering::Relaxed);
     }
@@ -1217,6 +1222,7 @@ impl SandboxedInterpreter {
         sha: &str,
         dispatch: &mut D,
         float_as_int: bool,
+        kill: &Arc<AtomicBool>,
     ) -> Result<RespValue, String> {
         let lua = &self.lua;
         let cell = RefCell::new(&mut *dispatch);
@@ -1284,7 +1290,7 @@ impl SandboxedInterpreter {
             redis.set("acall", acall)?;
             redis.set("apcall", apcall)?;
             let runner: Function = lua.globals().get("__dfly__run")?;
-            let v: Value = runner.call(sha)?;
+            let v: Value = with_kill_hook(lua, kill, || runner.call(sha))?;
             serialize_value(v, float_as_int, 0)
         });
         result.map_err(|e| clean_script_error(&e.to_string()))
@@ -1358,6 +1364,7 @@ impl SandboxedInterpreter {
         argv: &[Vec<u8>],
         dispatch: &mut D,
         float_as_int: bool,
+        kill: &Arc<AtomicBool>,
     ) -> Result<RespValue, String> {
         let lua = &self.lua;
         let cell = RefCell::new(&mut *dispatch);
@@ -1430,7 +1437,7 @@ impl SandboxedInterpreter {
             for (i, a) in argv.iter().enumerate() {
                 args_t.raw_set(i + 1, lua.create_string(a)?)?;
             }
-            let v: Value = f.call((keys_t, args_t))?;
+            let v: Value = with_kill_hook(lua, kill, || f.call((keys_t, args_t)))?;
             serialize_value(v, float_as_int, 0)
         });
         result.map_err(|e| clean_script_error(&e.to_string()))
@@ -1470,6 +1477,44 @@ fn clean_script_error(msg: &str) -> String {
         .next()
         .unwrap_or(msg)
         .to_string()
+}
+
+/// Run `f` under Redis's `LUA_MASKCOUNT` kill hook: every `KILL_HOOK_INTERVAL`
+/// VM instructions the hook checks `kill` and, when set, raises
+/// `FUNCTION_KILLED_ERR` (aborting the running script exactly like `lua_error`
+/// from the reference's count hook). The hook is removed unconditionally
+/// afterwards.
+fn with_kill_hook<T>(
+    lua: &Lua,
+    kill: &Arc<AtomicBool>,
+    f: impl FnOnce() -> mlua::Result<T>,
+) -> mlua::Result<T> {
+    lua.set_hook(
+        HookTriggers::new().every_nth_instruction(KILL_HOOK_INTERVAL),
+        {
+            let kill = Arc::clone(kill);
+            move |lua, _| {
+                if kill.load(Ordering::Relaxed) {
+                    // The reference's `luaMaskCountHook` calls `lua_error` with
+                    // a plain string; returning a typed mlua error instead would
+                    // surface to the script's error handler as an
+                    // unconcatenatable userdata.
+                    lua.exec_raw_lua(|raw| unsafe {
+                        ffi::lua_pushlstring(
+                            raw.state(),
+                            FUNCTION_KILLED_ERR.as_ptr().cast::<c_char>(),
+                            FUNCTION_KILLED_ERR.len(),
+                        );
+                        ffi::lua_error(raw.state());
+                    });
+                }
+                Ok(VmState::Continue)
+            }
+        },
+    )?;
+    let result = f();
+    lua.remove_hook();
+    result
 }
 
 /// True when `v` is `_G`, `_G`'s metatable, or any table stored as a global
@@ -1676,6 +1721,10 @@ mod tests {
         }
     }
 
+    fn no_kill() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
     struct Failing;
 
     impl ScriptDispatch for Failing {
@@ -1870,7 +1919,7 @@ mod tests {
             )
             .unwrap();
         interp.set_global_array("KEYS", &[b"k".to_vec()]).unwrap();
-        let v = interp.run(sha, &mut d, false).unwrap();
+        let v = interp.run(sha, &mut d, false, &no_kill()).unwrap();
         assert_eq!(v, RespValue::Nil);
         assert_eq!(d.calls.len(), 2);
         assert_eq!(d.calls[0].0, call_before);
@@ -1884,7 +1933,7 @@ mod tests {
             .define(sha, b"redis.apcall('GET', KEYS[1])\nreturn 1")
             .unwrap();
         assert_eq!(
-            interp.run(sha, &mut d, false).unwrap(),
+            interp.run(sha, &mut d, false, &no_kill()).unwrap(),
             RespValue::Integer(1)
         );
         assert_eq!(d.calls.len(), 1);
@@ -1897,13 +1946,52 @@ mod tests {
         interp
             .define(sha, b"redis.acall('SET', KEYS[1], '1')")
             .unwrap();
-        let err = interp.run(sha, &mut Failing, false).unwrap_err();
+        let err = interp
+            .run(sha, &mut Failing, false, &no_kill())
+            .unwrap_err();
         assert!(err.contains("ERR boom"), "{err}");
         interp
             .define(sha, b"redis.apcall('SET', KEYS[1], '1')\nreturn 1")
             .unwrap();
-        let err = interp.run(sha, &mut Failing, false).unwrap_err();
+        let err = interp
+            .run(sha, &mut Failing, false, &no_kill())
+            .unwrap_err();
         assert!(err.contains("ERR boom"), "{err}");
+    }
+
+    #[test]
+    fn count_hook_kills_cpu_bound_loop() {
+        let interp = SandboxedInterpreter::new().unwrap();
+        interp.define("aaaa", b"while true do end").unwrap();
+        let kill = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&kill);
+        // `FUNCTION KILL` arrives from the IO thread while the loop runs.
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let err = interp.run("aaaa", &mut Noop, false, &kill).unwrap_err();
+        killer.join().unwrap();
+        assert!(err.contains("Script killed by user"), "{err}");
+    }
+
+    #[test]
+    fn count_hook_kills_cpu_bound_function() {
+        let interp = SandboxedInterpreter::new().unwrap();
+        interp
+            .load_function_lib(b"#!lua name=lib\nredis.register_function('spin', function() while true do end end)")
+            .unwrap();
+        let kill = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&kill);
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let err = interp
+            .run_function("spin", &[], &[], &mut Noop, false, &kill)
+            .unwrap_err();
+        killer.join().unwrap();
+        assert!(err.contains("Script killed by user"), "{err}");
     }
 
     #[test]
@@ -1911,7 +1999,7 @@ mod tests {
         let interp = SandboxedInterpreter::new().unwrap();
         let run = |body: &str| {
             interp.define("aaaa", body.as_bytes()).unwrap();
-            interp.run("aaaa", &mut Noop, false)
+            interp.run("aaaa", &mut Noop, false, &no_kill())
         };
         assert_eq!(run("return 1 + 2").unwrap(), RespValue::Integer(3));
         // Missing global read -> strict error.
@@ -1964,7 +2052,7 @@ mod tests {
         // Re-define of another script in the same state must not trip the strict chunk.
         interp.define("bbbb", b"return 42").unwrap();
         assert_eq!(
-            interp.run("bbbb", &mut Noop, false).unwrap(),
+            interp.run("bbbb", &mut Noop, false, &no_kill()).unwrap(),
             RespValue::Integer(42)
         );
     }
@@ -2033,20 +2121,27 @@ mod tests {
         // The callback receives the (keys, args) tables and redis.call works.
         assert_eq!(
             interp
-                .run_function("add", &[b"k".to_vec()], &[b"a".to_vec()], &mut Get, false)
+                .run_function(
+                    "add",
+                    &[b"k".to_vec()],
+                    &[b"a".to_vec()],
+                    &mut Get,
+                    false,
+                    &no_kill()
+                )
                 .unwrap(),
             RespValue::Bulk(b"v:a".to_vec())
         );
         assert_eq!(
             interp
-                .run_function("one", &[], &[], &mut Get, false)
+                .run_function("one", &[], &[], &mut Get, false, &no_kill())
                 .unwrap(),
             RespValue::Integer(1)
         );
         // Unknown function name.
         assert!(
             interp
-                .run_function("nope", &[], &[], &mut Get, false)
+                .run_function("nope", &[], &[], &mut Get, false, &no_kill())
                 .is_err()
         );
         // Reloading a library replaces the callback in place.
@@ -2054,7 +2149,7 @@ mod tests {
         interp.load_function_lib(code2).unwrap();
         assert_eq!(
             interp
-                .run_function("one", &[], &[], &mut Get, false)
+                .run_function("one", &[], &[], &mut Get, false, &no_kill())
                 .unwrap(),
             RespValue::Integer(2)
         );
@@ -2104,7 +2199,9 @@ mod tests {
         // The callback table lives in the Lua registry, not `_G`, so scripts
         // cannot read it (direct access would bypass FCALL's checks).
         interp.define("aaaa", b"return __dfly_functions__").unwrap();
-        let err = interp.run("aaaa", &mut Noop, false).unwrap_err();
+        let err = interp
+            .run("aaaa", &mut Noop, false, &no_kill())
+            .unwrap_err();
         assert!(
             err.contains("nonexistent global variable '__dfly_functions__'"),
             "{err}"
@@ -2116,13 +2213,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            interp.run_function("f", &[], &[], &mut Get, false).unwrap(),
+            interp
+                .run_function("f", &[], &[], &mut Get, false, &no_kill())
+                .unwrap(),
             RespValue::Integer(1)
         );
 
         // purge_functions drops the callback (used when a REPLACE drops a name).
         interp.purge_functions(&["f".to_string()]);
-        assert!(interp.run_function("f", &[], &[], &mut Get, false).is_err());
+        assert!(
+            interp
+                .run_function("f", &[], &[], &mut Get, false, &no_kill())
+                .is_err()
+        );
     }
 
     #[test]
@@ -2135,7 +2238,9 @@ mod tests {
                 b"return redis.register_function('x', function() end)",
             )
             .unwrap();
-        let err = interp.run("aaaa", &mut Noop, false).unwrap_err();
+        let err = interp
+            .run("aaaa", &mut Noop, false, &no_kill())
+            .unwrap_err();
         assert!(
             err.contains("redis.register_function can only be called on FUNCTION LOAD command"),
             "{err}"
@@ -2150,7 +2255,9 @@ mod tests {
                 b"return redis.register_function('y', function() end)",
             )
             .unwrap();
-        let err = interp.run("bbbb", &mut Noop, false).unwrap_err();
+        let err = interp
+            .run("bbbb", &mut Noop, false, &no_kill())
+            .unwrap_err();
         assert!(
             err.contains("redis.register_function can only be called on FUNCTION LOAD command"),
             "{err}"
