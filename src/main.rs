@@ -1,12 +1,12 @@
 use std::net::TcpListener;
 use std::os::fd::RawFd;
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 
 use dragonflydb::commands::lua::ScriptMgr;
 use dragonflydb::server::event_loop::IoLoop;
-use dragonflydb::server::{coordinator, shard};
 use dragonflydb::server::{Reply, ReplyBus, ServerEnv};
+use dragonflydb::server::{coordinator, shard};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -15,8 +15,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut port: u16 = 6379;
     let mut num_shards = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+        .map_or(4, std::num::NonZero::get)
         .max(1);
     let mut i = 0;
     while i < args.len() {
@@ -40,7 +39,7 @@ fn main() {
                 return;
             }
             other => {
-                eprintln!("unknown argument: {}", other);
+                eprintln!("unknown argument: {other}");
                 usage();
                 return;
             }
@@ -70,19 +69,25 @@ fn main() {
     let mut shard_txs = Vec::with_capacity(num_shards);
     for s in 0..num_shards {
         let (tx, rx) = mpsc::channel();
-        shard::spawn(s, rx);
+        let _ = shard::spawn(s, rx);
         shard_txs.push(tx);
     }
 
     // Transaction coordinator thread.
     let (coord_tx, coord_rx) = mpsc::channel();
     let script_mgr = Arc::new(std::sync::Mutex::new(ScriptMgr::new()));
-    coordinator::spawn(num_shards, coord_rx, shard_txs.clone(), reply_bus.clone(), script_mgr.clone());
+    coordinator::spawn(
+        num_shards,
+        coord_rx,
+        shard_txs.clone(),
+        reply_bus.clone(),
+        script_mgr.clone(),
+    );
 
     let listener = match TcpListener::bind(("0.0.0.0", port)) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("failed to bind 0.0.0.0:{}: {}", port, e);
+            eprintln!("failed to bind 0.0.0.0:{port}: {e}");
             std::process::exit(1);
         }
     };
@@ -95,17 +100,17 @@ fn main() {
         script_mgr,
     };
 
-    println!("dragonflydb-rs listening on 0.0.0.0:{} with {} shards", port, num_shards);
+    println!("dragonflydb-rs listening on 0.0.0.0:{port} with {num_shards} shards");
 
     let mut loop_ = match IoLoop::new(env, reply_rx, listener, pipefds[0]) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("failed to create event loop: {}", e);
+            eprintln!("failed to create event loop: {e}");
             std::process::exit(1);
         }
     };
     if let Err(e) = loop_.run() {
-        eprintln!("event loop error: {}", e);
+        eprintln!("event loop error: {e}");
         std::process::exit(1);
     }
 }

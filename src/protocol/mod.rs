@@ -1,3 +1,3 @@
 pub mod resp;
 
-pub use resp::{encode_reply, RespParser};
+pub use resp::{RespParser, encode_reply};

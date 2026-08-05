@@ -1,10 +1,9 @@
 use crate::commands::{
-    integer, ok, Command, OpContext, ShardPart, KeyRange, FLAG_BLOCKING, FLAG_DENYOOM, FLAG_FAST,
-    FLAG_MOVABLEKEYS, FLAG_MULTI_KEY, FLAG_NOSCRIPT, FLAG_READONLY, FLAG_WRITE,
+    Command, FLAG_BLOCKING, FLAG_DENYOOM, FLAG_FAST, FLAG_MOVABLEKEYS, FLAG_MULTI_KEY,
+    FLAG_NOSCRIPT, FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext, ShardPart, integer, ok,
 };
-use crate::core::compact::CompactString;
-use crate::core::quicklist::{ListItem, QuickList};
 use crate::core::PrimeValue;
+use crate::core::quicklist::{ListItem, QuickList};
 use crate::error::{CmdResult, DeferredStoreItem, RespError, RespValue};
 use crate::util::{parse_i64, parse_list_timeout};
 
@@ -18,7 +17,7 @@ fn list_mut<'a>(ctx: &'a mut OpContext, key: &[u8]) -> Result<&'a mut QuickList,
 
 fn ensure_list<'a>(ctx: &'a mut OpContext, key: &[u8]) -> Result<&'a mut QuickList, RespError> {
     if ctx.db.find(key, ctx.now_ms).is_none() {
-        ctx.db.insert(CompactString::from_bytes(key), PrimeValue::List(QuickList::new()));
+        ctx.db.insert(key, PrimeValue::List(QuickList::new()));
     }
     list_mut(ctx, key)
 }
@@ -26,7 +25,10 @@ fn ensure_list<'a>(ctx: &'a mut OpContext, key: &[u8]) -> Result<&'a mut QuickLi
 fn push(ctx: &mut OpContext, front: bool, only_if_exists: bool) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let items: Vec<ListItem> = ctx.args[key_idx + 1..].iter().map(|a| ListItem::from_bytes(a)).collect();
+    let items: Vec<ListItem> = ctx.args[key_idx + 1..]
+        .iter()
+        .map(|a| ListItem::from_bytes(a))
+        .collect();
     if only_if_exists {
         let ql = match list_mut(ctx, key) {
             Ok(l) => l,
@@ -80,12 +82,13 @@ fn pop(ctx: &mut OpContext, front: bool) -> CmdResult {
     let key = &ctx.args[key_idx];
     let with_count = ctx.args.len() > key_idx + 1;
     let count = if with_count {
-        let c = match parse_i64(&ctx.args[key_idx + 1]) {
-            Some(v) => v,
-            None => return CmdResult::Err(RespError::integer()),
+        let Some(c) = parse_i64(&ctx.args[key_idx + 1]) else {
+            return CmdResult::Err(RespError::integer());
         };
         if c < 0 {
-            return CmdResult::Err(RespError::new("ERR value is out of range, must be positive"));
+            return CmdResult::Err(RespError::new(
+                "ERR value is out of range, must be positive",
+            ));
         }
         c as usize
     } else {
@@ -96,7 +99,11 @@ fn pop(ctx: &mut OpContext, front: bool) -> CmdResult {
         Some(_) => return CmdResult::Err(RespError::wrong_type()),
         None => None,
     }) else {
-        return CmdResult::Ok(if with_count { RespValue::Array(vec![]) } else { RespValue::Nil });
+        return CmdResult::Ok(if with_count {
+            RespValue::Array(vec![])
+        } else {
+            RespValue::Nil
+        });
     };
     let mut out = Vec::new();
     for _ in 0..count {
@@ -135,13 +142,11 @@ fn exec_llen(ctx: &mut OpContext) -> CmdResult {
 fn exec_lrange(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let start = match parse_i64(&ctx.args[key_idx + 1]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(start) = parse_i64(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::integer());
     };
-    let stop = match parse_i64(&ctx.args[key_idx + 2]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(stop) = parse_i64(&ctx.args[key_idx + 2]) else {
+        return CmdResult::Err(RespError::integer());
     };
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::List(l)) => {
@@ -159,9 +164,8 @@ fn exec_lrange(ctx: &mut OpContext) -> CmdResult {
 fn exec_lindex(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let idx = match parse_i64(&ctx.args[key_idx + 1]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(idx) = parse_i64(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::integer());
     };
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::List(l)) => match l.get(idx) {
@@ -176,9 +180,8 @@ fn exec_lindex(ctx: &mut OpContext) -> CmdResult {
 fn exec_lset(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let idx = match parse_i64(&ctx.args[key_idx + 1]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(idx) = parse_i64(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::integer());
     };
     let value = &ctx.args[key_idx + 2];
     match ctx.db.find_mut(key, ctx.now_ms) {
@@ -194,9 +197,8 @@ fn exec_lset(ctx: &mut OpContext) -> CmdResult {
 fn exec_lrem(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let count = match parse_i64(&ctx.args[key_idx + 1]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(count) = parse_i64(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::integer());
     };
     let value = &ctx.args[key_idx + 2];
     match ctx.db.find_mut(key, ctx.now_ms) {
@@ -227,13 +229,11 @@ fn exec_lrem(ctx: &mut OpContext) -> CmdResult {
 fn exec_ltrim(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let start = match parse_i64(&ctx.args[key_idx + 1]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(start) = parse_i64(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::integer());
     };
-    let stop = match parse_i64(&ctx.args[key_idx + 2]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(stop) = parse_i64(&ctx.args[key_idx + 2]) else {
+        return CmdResult::Err(RespError::integer());
     };
     match ctx.db.find_mut(key, ctx.now_ms) {
         Some(PrimeValue::List(l)) => {
@@ -272,13 +272,14 @@ fn exec_lpos(ctx: &mut OpContext) -> CmdResult {
                     None => return CmdResult::Err(RespError::integer()),
                 };
                 if rank == 0 {
-                    return CmdResult::Err(RespError::new("ERR RANK can't be zero. Use 1 to start searching from the first match or -1 to start searching from the last match."));
+                    return CmdResult::Err(RespError::new(
+                        "ERR RANK can't be zero. Use 1 to start searching from the first match or -1 to start searching from the last match.",
+                    ));
                 }
             }
             b"COUNT" => {
-                let c = match parse_i64(&ctx.args[i + 1]) {
-                    Some(v) => v,
-                    None => return CmdResult::Err(RespError::integer()),
+                let Some(c) = parse_i64(&ctx.args[i + 1]) else {
+                    return CmdResult::Err(RespError::integer());
                 };
                 if c < 0 {
                     return CmdResult::Err(RespError::new("ERR COUNT can't be negative"));
@@ -306,19 +307,12 @@ fn exec_lpos(ctx: &mut OpContext) -> CmdResult {
             };
             let maxlen = maxlen.unwrap_or(items.len());
             let mut matches = Vec::new();
-            let mut seen = 0usize;
             let skip = rank.unsigned_abs().saturating_sub(1) as usize;
-            for (pos, item) in items.iter().enumerate() {
-                if seen >= maxlen {
-                    break;
-                }
-                seen += 1;
-                if item.as_bytes() == *value {
-                    if matches.len() >= skip {
-                        matches.push(pos as i64);
-                        if count.map(|c| matches.len() as i64 >= c).unwrap_or(false) {
-                            break;
-                        }
+            for (pos, item) in items.iter().enumerate().take(maxlen) {
+                if item.as_bytes() == *value && matches.len() >= skip {
+                    matches.push(pos as i64);
+                    if count.is_some_and(|c| matches.len() as i64 >= c) {
+                        break;
                     }
                 }
             }
@@ -384,7 +378,12 @@ fn list_items(l: &QuickList) -> Vec<ListItem> {
 }
 
 fn items_array(items: &[ListItem]) -> RespValue {
-    RespValue::Array(items.iter().map(|i| RespValue::Bulk(i.as_bytes())).collect())
+    RespValue::Array(
+        items
+            .iter()
+            .map(|i| RespValue::Bulk(i.as_bytes()))
+            .collect(),
+    )
 }
 
 /// Decode a report's element array (produced by `items_array`) back into items.
@@ -418,7 +417,11 @@ fn pop_values(l: &QuickList, dir: Dir, count: usize) -> (Vec<ListItem>, Vec<List
     let count = count.min(all.len());
     let mut values = Vec::with_capacity(count);
     for _ in 0..count {
-        let v = if dir == Dir::Left { all.remove(0) } else { all.pop().unwrap() };
+        let v = if dir == Dir::Left {
+            all.remove(0)
+        } else {
+            all.pop().unwrap()
+        };
         values.push(v);
     }
     (values, all)
@@ -426,7 +429,11 @@ fn pop_values(l: &QuickList, dir: Dir, count: usize) -> (Vec<ListItem>, Vec<List
 
 fn peek_one(l: &QuickList, dir: Dir) -> (ListItem, Vec<ListItem>) {
     let mut all = list_items(l);
-    let v = if dir == Dir::Left { all.remove(0) } else { all.pop().unwrap() };
+    let v = if dir == Dir::Left {
+        all.remove(0)
+    } else {
+        all.pop().unwrap()
+    };
     (v, all)
 }
 
@@ -499,9 +506,8 @@ fn move_single_shard(
     // Type-check the destination first (upstream `AddOrFind` runs before the
     // source lookup, so a wrong-type dest shadows a missing source).
     match ctx.db.find(dest_key, ctx.now_ms) {
-        Some(PrimeValue::List(_)) => {}
+        Some(PrimeValue::List(_)) | None => {}
         Some(_) => return CmdResult::Err(RespError::wrong_type()),
-        None => {}
     }
     let (v, remaining) = {
         let ql = match ctx.db.find_mut(src_key, ctx.now_ms) {
@@ -510,22 +516,24 @@ fn move_single_shard(
             None => return missing,
         };
         let mut all: Vec<ListItem> = ql.iter().cloned().collect();
-        let v = if src_dir == Dir::Left { all.remove(0) } else { all.pop().unwrap() };
+        let v = if src_dir == Dir::Left {
+            all.remove(0)
+        } else {
+            all.pop().unwrap()
+        };
         (v, all)
     };
     let bytes = v.as_bytes();
     if remaining.is_empty() {
         ctx.db.remove(src_key);
     } else {
-        let ql = match ctx.db.find_mut(src_key, ctx.now_ms) {
-            Some(PrimeValue::List(q)) => q,
-            _ => return CmdResult::Err(RespError::wrong_type()),
+        let Some(PrimeValue::List(ql)) = ctx.db.find_mut(src_key, ctx.now_ms) else {
+            return CmdResult::Err(RespError::wrong_type());
         };
         *ql = QuickList::from_items(remaining);
     }
-    let ql = match ensure_list(ctx, dest_key) {
-        Ok(q) => q,
-        Err(_) => return CmdResult::Err(RespError::wrong_type()),
+    let Ok(ql) = ensure_list(ctx, dest_key) else {
+        return CmdResult::Err(RespError::wrong_type());
     };
     push_to(ql, dest_dir, v);
     CmdResult::Ok(RespValue::Bulk(bytes))
@@ -548,9 +556,8 @@ fn move_partial(ctx: &mut OpContext, src_idx: usize, dest_idx: usize, src_dir: D
                     items_array(&remaining),
                 ]))
             }
-            Some(PrimeValue::List(_)) => CmdResult::Blocked,
+            Some(PrimeValue::List(_)) | None => CmdResult::Blocked,
             Some(_) => CmdResult::Ok(RespValue::Array(vec![integer(src_idx as i64)])),
-            None => CmdResult::Blocked,
         }
     } else {
         match ctx.db.find(dest_key, ctx.now_ms) {
@@ -579,7 +586,12 @@ fn collect_move_report(
     src_idx: usize,
     dest_idx: usize,
 ) -> Result<MoveReport, RespError> {
-    let mut rep = MoveReport { src_val: None, src_wrong: false, dest_list: None, dest_wrong: false };
+    let mut rep = MoveReport {
+        src_val: None,
+        src_wrong: false,
+        dest_list: None,
+        dest_wrong: false,
+    };
     for p in parts {
         match &p.result {
             CmdResult::Ok(RespValue::Array(r)) if r.len() == 1 => {
@@ -610,7 +622,6 @@ fn collect_move_report(
                     }
                 }
             }
-            CmdResult::Blocked => {}
             CmdResult::Err(e) => return Err(e.clone()),
             _ => {}
         }
@@ -667,10 +678,22 @@ fn merge_move(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u64) 
         Err(e) => return CmdResult::Err(e),
     };
     let (_src_dir, dest_dir) = move_dirs(args);
-    move_finish(rep, src_idx, dest_idx, args, dest_dir, CmdResult::Ok(RespValue::Nil))
+    move_finish(
+        rep,
+        src_idx,
+        dest_idx,
+        args,
+        dest_dir,
+        CmdResult::Ok(RespValue::Nil),
+    )
 }
 
-fn merge_move_blocking(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u64) -> CmdResult {
+fn merge_move_blocking(
+    parts: &[ShardPart],
+    args: &[Vec<u8>],
+    keys: &[usize],
+    _now: u64,
+) -> CmdResult {
     if parts.len() == 1 {
         return parts[0].result.clone();
     }
@@ -684,17 +707,22 @@ fn merge_move_blocking(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _n
 }
 
 fn exec_lmove(ctx: &mut OpContext) -> CmdResult {
-    let src_dir = match parse_dir(&ctx.args[3]) {
-        Some(d) => d,
-        None => return CmdResult::Err(RespError::syntax()),
+    let Some(src_dir) = parse_dir(&ctx.args[3]) else {
+        return CmdResult::Err(RespError::syntax());
     };
-    let dest_dir = match parse_dir(&ctx.args[4]) {
-        Some(d) => d,
-        None => return CmdResult::Err(RespError::syntax()),
+    let Some(dest_dir) = parse_dir(&ctx.args[4]) else {
+        return CmdResult::Err(RespError::syntax());
     };
     let (src_idx, dest_idx) = (ctx.first_key_idx, ctx.first_key_idx + 1);
     if ctx.owned_keys.contains(&src_idx) && ctx.owned_keys.contains(&dest_idx) {
-        move_single_shard(ctx, src_idx, dest_idx, src_dir, dest_dir, CmdResult::Ok(RespValue::Nil))
+        move_single_shard(
+            ctx,
+            src_idx,
+            dest_idx,
+            src_dir,
+            dest_dir,
+            CmdResult::Ok(RespValue::Nil),
+        )
     } else {
         move_partial(ctx, src_idx, dest_idx, src_dir)
     }
@@ -739,9 +767,8 @@ fn parse_lmpop_tail(
     let Some(dir_arg) = args.get(dir_idx) else {
         return Err(RespError::syntax());
     };
-    let dir = match parse_dir(dir_arg) {
-        Some(d) => d,
-        None => return Err(RespError::syntax()),
+    let Some(dir) = parse_dir(dir_arg) else {
+        return Err(RespError::syntax());
     };
     let mut i = dir_idx + 1;
     let mut count = 1usize;
@@ -752,9 +779,8 @@ fn parse_lmpop_tail(
         let Some(count_arg) = args.get(i + 1) else {
             return Err(RespError::syntax());
         };
-        let c = match parse_i64(count_arg) {
-            Some(v) => v,
-            None => return Err(RespError::integer()),
+        let Some(c) = parse_i64(count_arg) else {
+            return Err(RespError::integer());
         };
         if c < 0 {
             return Err(RespError::integer());
@@ -784,9 +810,8 @@ fn pop_partial(ctx: &mut OpContext, dir: Dir, count: usize, when_empty: CmdResul
                     items_array(&remaining),
                 ]));
             }
-            Some(PrimeValue::List(_)) => {}
+            Some(PrimeValue::List(_)) | None => {}
             Some(_) => return CmdResult::Ok(RespValue::Array(vec![integer(ki as i64)])),
-            None => {}
         }
     }
     when_empty
@@ -812,19 +837,19 @@ fn pop_inplace(
                 if remaining.is_empty() {
                     ctx.db.remove(key);
                 } else {
-                    let ql = match ctx.db.find_mut(key, ctx.now_ms) {
-                        Some(PrimeValue::List(q)) => q,
-                        _ => return CmdResult::Err(RespError::wrong_type()),
+                    let Some(PrimeValue::List(ql)) = ctx.db.find_mut(key, ctx.now_ms) else {
+                        return CmdResult::Err(RespError::wrong_type());
                     };
                     *ql = QuickList::from_items(remaining);
                 }
-                let vals: Vec<RespValue> =
-                    values.into_iter().map(|v| RespValue::Bulk(v.as_bytes())).collect();
+                let vals: Vec<RespValue> = values
+                    .into_iter()
+                    .map(|v| RespValue::Bulk(v.as_bytes()))
+                    .collect();
                 return CmdResult::Ok(pop_reply(ctx.args, ki, vals, shape));
             }
-            Some(PrimeValue::List(_)) => {}
+            Some(PrimeValue::List(_)) | None => {}
             Some(_) => return on_wrong_type,
-            None => {}
         }
     }
     on_empty
@@ -862,7 +887,6 @@ fn collect_pop_reports(
                     }
                 }
             }
-            CmdResult::Blocked => {}
             CmdResult::Err(e) => return Err(e.clone()),
             _ => {}
         }
@@ -902,7 +926,12 @@ enum PopReplyShape {
     Arrayed,
 }
 
-fn pop_reply(args: &[Vec<u8>], ki: usize, mut vals: Vec<RespValue>, shape: PopReplyShape) -> RespValue {
+fn pop_reply(
+    args: &[Vec<u8>],
+    ki: usize,
+    mut vals: Vec<RespValue>,
+    shape: PopReplyShape,
+) -> RespValue {
     match shape {
         PopReplyShape::Arrayed => RespValue::Array(vec![
             RespValue::Bulk(args[ki].clone()),
@@ -948,7 +977,13 @@ fn merge_pop(
     }
 }
 fn merge_lmpop(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64) -> CmdResult {
-    merge_pop(parts, args, PopReplyShape::Arrayed, CmdResult::Err(RespError::wrong_type()), CmdResult::Ok(RespValue::Nil))
+    merge_pop(
+        parts,
+        args,
+        PopReplyShape::Arrayed,
+        CmdResult::Err(RespError::wrong_type()),
+        CmdResult::Ok(RespValue::Nil),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -956,9 +991,8 @@ fn merge_lmpop(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64
 // ---------------------------------------------------------------------------
 
 fn exec_bpop(ctx: &mut OpContext, dir: Dir) -> CmdResult {
-    let timeout_arg = match ctx.args.last() {
-        Some(t) => t,
-        None => return CmdResult::err("ERR wrong number of arguments for 'blpop' command"),
+    let Some(timeout_arg) = ctx.args.last() else {
+        return CmdResult::err("ERR wrong number of arguments for 'blpop' command");
     };
     let _timeout = match parse_list_timeout(timeout_arg) {
         Ok(v) => v,
@@ -981,7 +1015,13 @@ fn exec_bpop(ctx: &mut OpContext, dir: Dir) -> CmdResult {
 
 /// BLPOP replies `[key, value]`; BRPOP follows the same shape.
 fn merge_bpop(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64) -> CmdResult {
-    merge_pop(parts, args, PopReplyShape::Flat, CmdResult::Err(RespError::wrong_type()), CmdResult::Blocked)
+    merge_pop(
+        parts,
+        args,
+        PopReplyShape::Flat,
+        CmdResult::Err(RespError::wrong_type()),
+        CmdResult::Blocked,
+    )
 }
 
 fn exec_blpop(ctx: &mut OpContext) -> CmdResult {
@@ -999,13 +1039,11 @@ fn exec_blmove(ctx: &mut OpContext) -> CmdResult {
     let (src_dir, dest_dir, timeout_idx) = if ctx.args[0].eq_ignore_ascii_case(b"BRPOPLPUSH") {
         (Dir::Right, Dir::Left, 3)
     } else {
-        let src_dir = match parse_dir(&ctx.args[3]) {
-            Some(d) => d,
-            None => return CmdResult::Err(RespError::syntax()),
+        let Some(src_dir) = parse_dir(&ctx.args[3]) else {
+            return CmdResult::Err(RespError::syntax());
         };
-        let dest_dir = match parse_dir(&ctx.args[4]) {
-            Some(d) => d,
-            None => return CmdResult::Err(RespError::syntax()),
+        let Some(dest_dir) = parse_dir(&ctx.args[4]) else {
+            return CmdResult::Err(RespError::syntax());
         };
         (src_dir, dest_dir, 5)
     };
@@ -1015,7 +1053,14 @@ fn exec_blmove(ctx: &mut OpContext) -> CmdResult {
     };
     let (src_idx, dest_idx) = (ctx.first_key_idx, ctx.first_key_idx + 1);
     if ctx.owned_keys.contains(&src_idx) && ctx.owned_keys.contains(&dest_idx) {
-        move_single_shard(ctx, src_idx, dest_idx, src_dir, dest_dir, CmdResult::Blocked)
+        move_single_shard(
+            ctx,
+            src_idx,
+            dest_idx,
+            src_dir,
+            dest_dir,
+            CmdResult::Blocked,
+        )
     } else {
         move_partial(ctx, src_idx, dest_idx, src_dir)
     }
@@ -1056,7 +1101,13 @@ fn exec_blmpop(ctx: &mut OpContext) -> CmdResult {
 /// BLMPOP replies `[key, [values]]`; a wrong-type key yields nil (not an
 /// error), per `CmdBLMPop`.
 fn merge_blmpop(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64) -> CmdResult {
-    merge_pop(parts, args, PopReplyShape::Arrayed, CmdResult::Ok(RespValue::Nil), CmdResult::Blocked)
+    merge_pop(
+        parts,
+        args,
+        PopReplyShape::Arrayed,
+        CmdResult::Ok(RespValue::Nil),
+        CmdResult::Blocked,
+    )
 }
 
 pub static CMD_LPUSH: Command = Command {
@@ -1240,21 +1291,22 @@ pub static CMD_BLMPOP: Command = Command {
 mod tests {
     use super::*;
     use crate::commands::MergeFn;
+    use crate::core::compact::CompactString;
     use crate::core::db::DbSlice;
 
     fn rpush_of(db: &mut DbSlice, key: &str, vals: &[&str]) {
-        let items: Vec<ListItem> = vals.iter().map(|s| ListItem::from_bytes(s.as_bytes())).collect();
+        let items: Vec<ListItem> = vals
+            .iter()
+            .map(|s| ListItem::from_bytes(s.as_bytes()))
+            .collect();
         db.insert(
-            CompactString::from_bytes(key.as_bytes()),
+            key.as_bytes(),
             PrimeValue::List(QuickList::from_items(items)),
         );
     }
 
     fn str_of(db: &mut DbSlice, key: &str, value: &str) {
-        db.insert(
-            CompactString::from_bytes(key.as_bytes()),
-            PrimeValue::Str(CompactString::from(value)),
-        );
+        db.insert(key.as_bytes(), PrimeValue::Str(CompactString::from(value)));
     }
 
     fn list_of(db: &mut DbSlice, key: &str) -> Vec<String> {
@@ -1263,7 +1315,7 @@ mod tests {
                 .iter()
                 .map(|i| String::from_utf8_lossy(&i.as_bytes()).into_owned())
                 .collect(),
-            _ => panic!("expected list at {}", key),
+            _ => panic!("expected list at {key}"),
         }
     }
 
@@ -1287,7 +1339,11 @@ mod tests {
     }
 
     fn nil(r: CmdResult) {
-        assert!(matches!(r, CmdResult::Ok(RespValue::Nil)), "expected nil, got {:?}", r.into_resp_value());
+        assert!(
+            matches!(r, CmdResult::Ok(RespValue::Nil)),
+            "expected nil, got {:?}",
+            r.into_resp_value()
+        );
     }
 
     fn err(r: CmdResult) -> String {
@@ -1298,14 +1354,18 @@ mod tests {
     }
 
     fn blocked(r: CmdResult) {
-        assert!(matches!(r, CmdResult::Blocked), "expected Blocked, got {:?}", r.into_resp_value());
+        assert!(
+            matches!(r, CmdResult::Blocked),
+            "expected Blocked, got {:?}",
+            r.into_resp_value()
+        );
     }
 
     fn strings(v: &[RespValue]) -> Vec<String> {
         v.iter()
             .map(|x| match x {
                 RespValue::Bulk(b) => String::from_utf8_lossy(b).into_owned(),
-                _ => panic!("unexpected element {:?}", x),
+                _ => panic!("unexpected element {x:?}"),
             })
             .collect()
     }
@@ -1313,7 +1373,12 @@ mod tests {
     /// Single-shard dispatch: every key is owned by one shard. Replicates the
     /// production pipeline — arity gate, then exec, then the merge (which
     /// reshapes the data report into the final reply).
-    type Dispatch = (fn(&mut OpContext) -> CmdResult, usize, Vec<usize>, Option<MergeFn>);
+    type Dispatch = (
+        fn(&mut OpContext) -> CmdResult,
+        usize,
+        Vec<usize>,
+        Option<MergeFn>,
+    );
     fn dispatch(db: &mut DbSlice, argv: &[Vec<u8>]) -> CmdResult {
         let (exec, first_key_idx, owned, merge): Dispatch = match argv[0].as_slice() {
             b"LINSERT" => (exec_linsert, 1, vec![1], None),
@@ -1323,10 +1388,19 @@ mod tests {
                 let n = parse_i64(&argv[1]).unwrap_or(0) as usize;
                 (exec_lmpop, 0, (2..2 + n).collect(), Some(merge_lmpop))
             }
-            b"BLPOP" => (exec_blpop, 1, (1..argv.len() - 1).collect(), Some(merge_bpop)),
-            b"BRPOP" => (exec_brpop, 1, (1..argv.len() - 1).collect(), Some(merge_bpop)),
-            b"BLMOVE" => (exec_blmove, 1, vec![1, 2], Some(merge_move_blocking)),
-            b"BRPOPLPUSH" => (exec_blmove, 1, vec![1, 2], Some(merge_move_blocking)),
+            b"BLPOP" => (
+                exec_blpop,
+                1,
+                (1..argv.len() - 1).collect(),
+                Some(merge_bpop),
+            ),
+            b"BRPOP" => (
+                exec_brpop,
+                1,
+                (1..argv.len() - 1).collect(),
+                Some(merge_bpop),
+            ),
+            b"BLMOVE" | b"BRPOPLPUSH" => (exec_blmove, 1, vec![1, 2], Some(merge_move_blocking)),
             b"BLMPOP" => {
                 let n = parse_i64(&argv[2]).unwrap_or(0) as usize;
                 (exec_blmpop, 0, (3..3 + n).collect(), Some(merge_blmpop))
@@ -1348,10 +1422,20 @@ mod tests {
         if let Some(m) = cmd.check_arity(argv.len()) {
             return CmdResult::err(m);
         }
-        let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx, now_ms: 0 };
+        let mut ctx = OpContext {
+            db,
+            args: argv,
+            owned_keys: &owned,
+            first_key_idx,
+            now_ms: 0,
+        };
         let result = exec(&mut ctx);
         if let Some(m) = merge {
-            let part = ShardPart { shard: 0, owned_key_idxs: owned.clone(), result };
+            let part = ShardPart {
+                shard: 0,
+                owned_key_idxs: owned.clone(),
+                result,
+            };
             return m(&[part], argv, &owned, 0);
         }
         result
@@ -1369,27 +1453,48 @@ mod tests {
     }
 
     fn part(result: CmdResult) -> ShardPart {
-        ShardPart { shard: 0, owned_key_idxs: vec![], result }
+        ShardPart {
+            shard: 0,
+            owned_key_idxs: vec![],
+            result,
+        }
     }
 
     #[test]
     fn linsert_basic() {
         let mut db = DbSlice::new(0);
-        assert_eq!(int(run!(&mut db, "LINSERT", "notfound", "before", "foo", "bar")), 0);
+        assert_eq!(
+            int(run!(&mut db, "LINSERT", "notfound", "before", "foo", "bar")),
+            0
+        );
 
         str_of(&mut db, "notalist", "x");
         let e = err(run!(&mut db, "LINSERT", "notalist", "before", "foo", "bar"));
         assert!(e.starts_with("WRONGTYPE"), "{}", e);
 
         rpush_of(&mut db, "mylist", &["foo"]);
-        assert_eq!(int(run!(&mut db, "LINSERT", "mylist", "before", "foo", "bar")), 2);
+        assert_eq!(
+            int(run!(&mut db, "LINSERT", "mylist", "before", "foo", "bar")),
+            2
+        );
         assert_eq!(list_of(&mut db, "mylist"), vec!["bar", "foo"]);
 
-        assert_eq!(int(run!(&mut db, "LINSERT", "mylist", "after", "foo", "car")), 3);
+        assert_eq!(
+            int(run!(&mut db, "LINSERT", "mylist", "after", "foo", "car")),
+            3
+        );
         assert_eq!(list_of(&mut db, "mylist"), vec!["bar", "foo", "car"]);
 
-        assert_eq!(int(run!(&mut db, "LINSERT", "mylist", "before", "notfound", "x")), -1);
-        assert_eq!(int(run!(&mut db, "LINSERT", "mylist", "after", "notfound", "x")), -1);
+        assert_eq!(
+            int(run!(
+                &mut db, "LINSERT", "mylist", "before", "notfound", "x"
+            )),
+            -1
+        );
+        assert_eq!(
+            int(run!(&mut db, "LINSERT", "mylist", "after", "notfound", "x")),
+            -1
+        );
 
         // Empty element can be inserted and used as a pivot; after the empty
         // element is popped the pivot is gone and the insert reports -1.
@@ -1413,17 +1518,32 @@ mod tests {
         rpush_of(&mut db, "k1", &["1", "2", "3", "4", "5"]);
         rpush_of(&mut db, "k2", &["9"]);
 
-        assert_eq!(bulk(run!(&mut db, "LMOVE", "k1", "k2", "LEFT", "RIGHT")), "1");
+        assert_eq!(
+            bulk(run!(&mut db, "LMOVE", "k1", "k2", "LEFT", "RIGHT")),
+            "1"
+        );
         assert_eq!(list_of(&mut db, "k2"), vec!["9", "1"]);
-        assert_eq!(bulk(run!(&mut db, "LMOVE", "k1", "k2", "LEFT", "LEFT")), "2");
+        assert_eq!(
+            bulk(run!(&mut db, "LMOVE", "k1", "k2", "LEFT", "LEFT")),
+            "2"
+        );
         assert_eq!(list_of(&mut db, "k2"), vec!["2", "9", "1"]);
-        assert_eq!(bulk(run!(&mut db, "LMOVE", "k1", "k2", "RIGHT", "RIGHT")), "5");
+        assert_eq!(
+            bulk(run!(&mut db, "LMOVE", "k1", "k2", "RIGHT", "RIGHT")),
+            "5"
+        );
         assert_eq!(list_of(&mut db, "k2"), vec!["2", "9", "1", "5"]);
         assert_eq!(list_of(&mut db, "k1"), vec!["3", "4"]);
 
         // Empty source returns nil and the source key is removed.
-        assert_eq!(bulk(run!(&mut db, "LMOVE", "k1", "k2", "LEFT", "RIGHT")), "3");
-        assert_eq!(bulk(run!(&mut db, "LMOVE", "k1", "k2", "LEFT", "RIGHT")), "4");
+        assert_eq!(
+            bulk(run!(&mut db, "LMOVE", "k1", "k2", "LEFT", "RIGHT")),
+            "3"
+        );
+        assert_eq!(
+            bulk(run!(&mut db, "LMOVE", "k1", "k2", "LEFT", "RIGHT")),
+            "4"
+        );
         nil(run!(&mut db, "LMOVE", "k1", "k2", "LEFT", "RIGHT"));
         assert!(missing(&mut db, "k1"));
 
@@ -1465,13 +1585,23 @@ mod tests {
     fn lmpop_invalid_syntax() {
         let mut db = DbSlice::new(0);
         assert!(err(run!(&mut db, "LMPOP", "1", "a")).contains("wrong number of arguments"));
-        assert!(err(run!(&mut db, "LMPOP", "0", "LEFT", "COUNT", "1")).contains("at least 1 input key"));
+        assert!(
+            err(run!(&mut db, "LMPOP", "0", "LEFT", "COUNT", "1")).contains("at least 1 input key")
+        );
         assert!(err(run!(&mut db, "LMPOP", "aa", "a", "LEFT")).contains("not an integer"));
         assert!(err(run!(&mut db, "LMPOP", "1", "a", "COUNT", "1")).contains("syntax"));
         assert!(err(run!(&mut db, "LMPOP", "1", "a", "b", "LEFT")).contains("syntax"));
         assert!(err(run!(&mut db, "LMPOP", "1", "a", "LEFT", "COUNT")).contains("syntax"));
-        assert!(err(run!(&mut db, "LMPOP", "1", "a", "LEFT", "COUNT", "boo")).contains("not an integer"));
-        assert!(err(run!(&mut db, "LMPOP", "1", "c", "LEFT", "COUNT", "2", "foo")).contains("syntax"));
+        assert!(
+            err(run!(&mut db, "LMPOP", "1", "a", "LEFT", "COUNT", "boo"))
+                .contains("not an integer")
+        );
+        assert!(
+            err(run!(
+                &mut db, "LMPOP", "1", "c", "LEFT", "COUNT", "2", "foo"
+            ))
+            .contains("syntax")
+        );
     }
 
     #[test]
@@ -1563,7 +1693,10 @@ mod tests {
         }
         assert_eq!(list_of(&mut db, "list"), vec!["a", "b"]);
         // Negative COUNT is rejected.
-        assert!(err(run!(&mut db, "LMPOP", "1", "list", "LEFT", "COUNT", "-1")).contains("not an integer"));
+        assert!(
+            err(run!(&mut db, "LMPOP", "1", "list", "LEFT", "COUNT", "-1"))
+                .contains("not an integer")
+        );
     }
 
     #[test]
@@ -1595,16 +1728,45 @@ mod tests {
     #[test]
     fn blmpop_invalid_syntax() {
         let mut db = DbSlice::new(0);
-        assert!(err(run!(&mut db, "BLMPOP", "0.1", "1", "k")).contains("wrong number of arguments"));
-        assert!(err(run!(&mut db, "BLMPOP", "foo", "1", "k1", "LEFT", "COUNT", "1")).contains("not a float"));
-        assert!(err(run!(&mut db, "BLMPOP", "-0.01", "1", "k1", "LEFT", "COUNT", "1")).contains("negative"));
-        assert!(err(run!(&mut db, "BLMPOP", "0.01", "0", "LEFT", "COUNT", "1")).contains("at least 1 input key"));
-        assert!(err(run!(&mut db, "BLMPOP", "0.01", "aa", "k1", "LEFT")).contains("not an integer"));
+        assert!(
+            err(run!(&mut db, "BLMPOP", "0.1", "1", "k")).contains("wrong number of arguments")
+        );
+        assert!(
+            err(run!(
+                &mut db, "BLMPOP", "foo", "1", "k1", "LEFT", "COUNT", "1"
+            ))
+            .contains("not a float")
+        );
+        assert!(
+            err(run!(
+                &mut db, "BLMPOP", "-0.01", "1", "k1", "LEFT", "COUNT", "1"
+            ))
+            .contains("negative")
+        );
+        assert!(
+            err(run!(&mut db, "BLMPOP", "0.01", "0", "LEFT", "COUNT", "1"))
+                .contains("at least 1 input key")
+        );
+        assert!(
+            err(run!(&mut db, "BLMPOP", "0.01", "aa", "k1", "LEFT")).contains("not an integer")
+        );
         assert!(err(run!(&mut db, "BLMPOP", "0.01", "1", "k1", "COUNT", "1")).contains("syntax"));
         assert!(err(run!(&mut db, "BLMPOP", "0.01", "1", "k1", "k2", "LEFT")).contains("syntax"));
-        assert!(err(run!(&mut db, "BLMPOP", "0.01", "1", "k1", "LEFT", "COUNT")).contains("syntax"));
-        assert!(err(run!(&mut db, "BLMPOP", "0.01", "1", "k1", "LEFT", "COUNT", "boo")).contains("not an integer"));
-        assert!(err(run!(&mut db, "BLMPOP", "0.01", "1", "c", "LEFT", "COUNT", "2", "foo")).contains("syntax"));
+        assert!(
+            err(run!(&mut db, "BLMPOP", "0.01", "1", "k1", "LEFT", "COUNT")).contains("syntax")
+        );
+        assert!(
+            err(run!(
+                &mut db, "BLMPOP", "0.01", "1", "k1", "LEFT", "COUNT", "boo"
+            ))
+            .contains("not an integer")
+        );
+        assert!(
+            err(run!(
+                &mut db, "BLMPOP", "0.01", "1", "c", "LEFT", "COUNT", "2", "foo"
+            ))
+            .contains("syntax")
+        );
     }
 
     #[test]
@@ -1616,8 +1778,13 @@ mod tests {
         assert!(err(run!(&mut db, "BRPOPLPUSH", "x", "y", "-inf")).contains("negative"));
         assert!(err(run!(&mut db, "BRPOPLPUSH", "x", "y", "-1")).contains("negative"));
 
-        assert!(err(run!(&mut db, "BLMOVE", "x", "y", "LEFT", "RIGHT", "abc")).contains("not a float"));
-        assert!(err(run!(&mut db, "BLMOVE", "x", "y", "LEFT", "RIGHT", "1e10")).contains("out of range"));
+        assert!(
+            err(run!(&mut db, "BLMOVE", "x", "y", "LEFT", "RIGHT", "abc")).contains("not a float")
+        );
+        assert!(
+            err(run!(&mut db, "BLMOVE", "x", "y", "LEFT", "RIGHT", "1e10"))
+                .contains("out of range")
+        );
 
         assert!(err(run!(&mut db, "BLMPOP", "abc", "1", "k", "LEFT")).contains("not a float"));
         assert!(err(run!(&mut db, "BLMPOP", "1e10", "1", "k", "LEFT")).contains("out of range"));
@@ -1687,7 +1854,10 @@ mod tests {
         let mut db = DbSlice::new(0);
         rpush_of(&mut db, "x", &["val1"]);
         rpush_of(&mut db, "y", &["val2"]);
-        assert_eq!(bulk(run!(&mut db, "BLMOVE", "x", "y", "right", "left", "0.01")), "val1");
+        assert_eq!(
+            bulk(run!(&mut db, "BLMOVE", "x", "y", "right", "left", "0.01")),
+            "val1"
+        );
         assert_eq!(list_of(&mut db, "y"), vec!["val1", "val2"]);
         assert!(missing(&mut db, "x"));
 
@@ -1738,8 +1908,14 @@ mod tests {
 
     #[test]
     fn merge_lmpop_multi_shard() {
-        let args: Vec<Vec<u8>> =
-            vec![b"LMPOP".to_vec(), b"3".to_vec(), b"e".to_vec(), b"x".to_vec(), b"y".to_vec(), b"LEFT".to_vec()];
+        let args: Vec<Vec<u8>> = vec![
+            b"LMPOP".to_vec(),
+            b"3".to_vec(),
+            b"e".to_vec(),
+            b"x".to_vec(),
+            b"y".to_vec(),
+            b"LEFT".to_vec(),
+        ];
         let keys = vec![2usize, 3, 4];
         let parts = vec![
             part(CmdResult::Ok(RespValue::Nil)), // shard with only empty keys
@@ -1763,7 +1939,7 @@ mod tests {
                             _ => panic!(),
                         }
                     }
-                    _ => panic!("unexpected reply {:?}", reply),
+                    _ => panic!("unexpected reply {reply:?}"),
                 }
             }
             o => panic!("unexpected {:?}", o.into_resp_value()),
@@ -1772,8 +1948,12 @@ mod tests {
 
     #[test]
     fn merge_bpop_multi_shard() {
-        let args: Vec<Vec<u8>> =
-            vec![b"BLPOP".to_vec(), b"e".to_vec(), b"x".to_vec(), b"0".to_vec()];
+        let args: Vec<Vec<u8>> = vec![
+            b"BLPOP".to_vec(),
+            b"e".to_vec(),
+            b"x".to_vec(),
+            b"0".to_vec(),
+        ];
         let keys = vec![1usize, 2];
         let parts = vec![
             part(CmdResult::Blocked), // empty shard
@@ -1790,7 +1970,7 @@ mod tests {
                 assert!(stores[0].1.is_some());
                 match reply {
                     RespValue::Array(p) => assert_eq!(strings(&p), vec!["x", "v"]),
-                    _ => panic!("unexpected reply {:?}", reply),
+                    _ => panic!("unexpected reply {reply:?}"),
                 }
             }
             o => panic!("unexpected {:?}", o.into_resp_value()),
@@ -1799,7 +1979,13 @@ mod tests {
 
     #[test]
     fn merge_blmpop_wrong_type_nils() {
-        let args: Vec<Vec<u8>> = vec![b"BLMPOP".to_vec(), b"0".to_vec(), b"1".to_vec(), b"z".to_vec(), b"LEFT".to_vec()];
+        let args: Vec<Vec<u8>> = vec![
+            b"BLMPOP".to_vec(),
+            b"0".to_vec(),
+            b"1".to_vec(),
+            b"z".to_vec(),
+            b"LEFT".to_vec(),
+        ];
         let keys = vec![3usize];
         // Wrong-type key report `[key_idx]` and an empty-list shard report.
         let parts = vec![
@@ -1811,7 +1997,13 @@ mod tests {
 
     #[test]
     fn merge_lmpop_wrong_type_errors() {
-        let args: Vec<Vec<u8>> = vec![b"LMPOP".to_vec(), b"2".to_vec(), b"foo".to_vec(), b"l1".to_vec(), b"left".to_vec()];
+        let args: Vec<Vec<u8>> = vec![
+            b"LMPOP".to_vec(),
+            b"2".to_vec(),
+            b"foo".to_vec(),
+            b"l1".to_vec(),
+            b"left".to_vec(),
+        ];
         let keys = vec![2usize, 3];
         let parts = vec![
             part(CmdResult::Ok(RespValue::Array(vec![integer(2)]))), // foo wrong type
@@ -1856,15 +2048,17 @@ mod tests {
                 assert_eq!(stores[1].0, b"dest".to_vec());
                 match &stores[1].1 {
                     Some(PrimeValue::List(l)) => {
-                        let v: Vec<String> =
-                            l.iter().map(|i| String::from_utf8_lossy(&i.as_bytes()).into_owned()).collect();
+                        let v: Vec<String> = l
+                            .iter()
+                            .map(|i| String::from_utf8_lossy(&i.as_bytes()).into_owned())
+                            .collect();
                         assert_eq!(v, vec!["c", "a"]); // pushed RIGHT onto [c]
                     }
                     _ => panic!("expected list store"),
                 }
                 match reply {
                     RespValue::Bulk(b) => assert_eq!(b, b"a"),
-                    _ => panic!("unexpected reply {:?}", reply),
+                    _ => panic!("unexpected reply {reply:?}"),
                 }
             }
             o => panic!("unexpected {:?}", o.into_resp_value()),

@@ -13,16 +13,25 @@ pub struct StreamId {
 
 impl StreamId {
     pub const MIN: StreamId = StreamId { ms: 0, seq: 0 };
-    pub const MAX: StreamId = StreamId { ms: u64::MAX, seq: u64::MAX };
+    pub const MAX: StreamId = StreamId {
+        ms: u64::MAX,
+        seq: u64::MAX,
+    };
 
+    #[must_use]
     pub fn is_zero(&self) -> bool {
         self.ms == 0 && self.seq == 0
     }
 
+    #[must_use]
     pub fn next(self) -> StreamId {
-        StreamId { ms: self.ms, seq: self.seq + 1 }
+        StreamId {
+            ms: self.ms,
+            seq: self.seq + 1,
+        }
     }
 
+    #[must_use]
     pub fn render(&self) -> String {
         format!("{}-{}", self.ms, self.seq)
     }
@@ -70,14 +79,18 @@ impl ConsumerGroup {
         let c = self
             .consumers
             .entry(name.clone())
-            .or_insert_with(|| Consumer { seen_time: now_ms, active_time: now_ms, pending: 0 });
+            .or_insert_with(|| Consumer {
+                seen_time: now_ms,
+                active_time: now_ms,
+                pending: 0,
+            });
         c.active_time = now_ms;
         c
     }
 }
 
 /// Dragonfly's STREAM type. Dragonfly stores entries in a rax (radix tree); we
-/// use a BTreeMap keyed by (ms, seq) which provides the same ordered semantics.
+/// use a `BTreeMap` keyed by (ms, seq) which provides the same ordered semantics.
 #[derive(Debug, Clone, Default)]
 pub struct Stream {
     pub entries: BTreeMap<StreamId, StreamEntry>,
@@ -88,46 +101,70 @@ pub struct Stream {
 }
 
 impl Stream {
+    #[must_use]
     pub fn new() -> Self {
-        Stream { entries: BTreeMap::new(), length: 0, last_id: StreamId::MIN, max_deleted_id: StreamId::MIN, groups: HashMap::new() }
+        Stream {
+            entries: BTreeMap::new(),
+            length: 0,
+            last_id: StreamId::MIN,
+            max_deleted_id: StreamId::MIN,
+            groups: HashMap::new(),
+        }
     }
 
+    #[must_use]
     pub fn len(&self) -> u64 {
         self.length
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.length == 0
     }
 
     /// First non-deleted entry id.
+    #[must_use]
     pub fn first_entry(&self) -> Option<&StreamId> {
-        self.entries.iter().find(|(_, e)| !e.deleted).map(|(id, _)| id)
+        self.entries
+            .iter()
+            .find(|(_, e)| !e.deleted)
+            .map(|(id, _)| id)
     }
 
     /// Last non-deleted entry id.
+    #[must_use]
     pub fn last_entry(&self) -> Option<&StreamId> {
-        self.entries.iter().rev().find(|(_, e)| !e.deleted).map(|(id, _)| id)
+        self.entries
+            .iter()
+            .rev()
+            .find(|(_, e)| !e.deleted)
+            .map(|(id, _)| id)
     }
 
-    /// Append an entry; caller guarantees id > last_id.
+    /// Append an entry; caller guarantees id > `last_id`.
     pub fn append(&mut self, id: StreamId, fields: Vec<(CompactString, CompactString)>) {
-        self.entries.insert(id, StreamEntry { fields, deleted: false });
+        self.entries.insert(
+            id,
+            StreamEntry {
+                fields,
+                deleted: false,
+            },
+        );
         self.last_id = id;
         self.length += 1;
     }
 
     /// Mark an entry deleted. Returns true if it existed and was not deleted.
     pub fn delete(&mut self, id: StreamId) -> bool {
-        if let Some(e) = self.entries.get_mut(&id) {
-            if !e.deleted {
-                e.deleted = true;
-                self.length -= 1;
-                if id > self.max_deleted_id {
-                    self.max_deleted_id = id;
-                }
-                return true;
+        if let Some(e) = self.entries.get_mut(&id)
+            && !e.deleted
+        {
+            e.deleted = true;
+            self.length -= 1;
+            if id > self.max_deleted_id {
+                self.max_deleted_id = id;
             }
+            return true;
         }
         false
     }
@@ -137,10 +174,9 @@ impl Stream {
     pub fn trim(&mut self, maxlen: Option<u64>, minid: Option<StreamId>) -> u64 {
         let mut removed = 0u64;
         // Use a threshold: remove the oldest entries while they exceed limits.
-        loop {
-            let Some(id) = self.first_entry().copied() else { break };
-            let over_len = maxlen.map(|m| self.length > m).unwrap_or(false);
-            let below_min = minid.map(|m| id < m).unwrap_or(false);
+        while let Some(id) = self.first_entry().copied() {
+            let over_len = maxlen.is_some_and(|m| self.length > m);
+            let below_min = minid.is_some_and(|m| id < m);
             if !over_len && !below_min {
                 break;
             }
@@ -159,6 +195,7 @@ impl Stream {
         self.groups.get_mut(name)
     }
 
+    #[must_use]
     pub fn group(&self, name: &CompactString) -> Option<&ConsumerGroup> {
         self.groups.get(name)
     }
@@ -188,7 +225,7 @@ impl Stream {
     }
 
     /// XREADGROUP: deliver entries after `group.last_delivered` to the consumer.
-    /// Returns (entries, ids_before_trim).
+    /// Returns (entries, `ids_before_trim`).
     pub fn read_group(
         &mut self,
         group_name: &CompactString,
@@ -199,21 +236,26 @@ impl Stream {
         now_ms: u64,
     ) -> Result<Vec<(StreamId, Vec<(CompactString, CompactString)>)>, String> {
         let Some(group) = self.groups.get_mut(group_name) else {
-            return Err(format!("NOGROUP No such key or consumer group '{}'", String::from_utf8_lossy(group_name.as_bytes())));
+            return Err(format!(
+                "NOGROUP No such key or consumer group '{}'",
+                String::from_utf8_lossy(group_name.as_bytes())
+            ));
         };
         let mut out = Vec::new();
         if id == (StreamId { ms: 0, seq: 1 }) {
             // Special ">" id: read new entries.
             let last = group.last_delivered;
-            let mut iter = self.entries.range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded));
-            while let Some((eid, entry)) = iter.next() {
+            let iter = self
+                .entries
+                .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded));
+            for (eid, entry) in iter {
                 if entry.deleted {
                     continue;
                 }
-                if let Some(c) = count {
-                    if out.len() >= c {
-                        break;
-                    }
+                if let Some(c) = count
+                    && out.len() >= c
+                {
+                    break;
                 }
                 let eid = *eid;
                 let fields = entry.fields.clone();
@@ -242,12 +284,12 @@ impl Stream {
                 if pe.consumer != *consumer_name {
                     continue;
                 }
-                if let Some(c) = count {
-                    if pending.len() >= c {
-                        break;
-                    }
+                if let Some(c) = count
+                    && pending.len() >= c
+                {
+                    break;
                 }
-                let fields = match self.entries.get(&eid) {
+                let fields = match self.entries.get(eid) {
                     Some(e) if !e.deleted => e.fields.clone(),
                     _ => Vec::new(),
                 };
@@ -299,8 +341,14 @@ mod tests {
     #[test]
     fn append_and_delete() {
         let mut s = Stream::new();
-        s.append(StreamId { ms: 1, seq: 0 }, vec![(CompactString::from("a"), CompactString::from("b"))]);
-        s.append(StreamId { ms: 2, seq: 0 }, vec![(CompactString::from("c"), CompactString::from("d"))]);
+        s.append(
+            StreamId { ms: 1, seq: 0 },
+            vec![(CompactString::from("a"), CompactString::from("b"))],
+        );
+        s.append(
+            StreamId { ms: 2, seq: 0 },
+            vec![(CompactString::from("c"), CompactString::from("d"))],
+        );
         assert_eq!(s.len(), 2);
         assert_eq!(s.first_entry(), Some(&StreamId { ms: 1, seq: 0 }));
         assert!(s.delete(StreamId { ms: 1, seq: 0 }));
@@ -313,18 +361,29 @@ mod tests {
     fn group_read_ack() {
         let mut s = Stream::new();
         for i in 1..=5u64 {
-            s.append(StreamId { ms: i, seq: 0 }, vec![(CompactString::from("k"), CompactString::from_bytes(format!("v{}", i).as_bytes()))]);
+            s.append(
+                StreamId { ms: i, seq: 0 },
+                vec![(
+                    CompactString::from("k"),
+                    CompactString::from_bytes(format!("v{i}").as_bytes()),
+                )],
+            );
         }
         let g = CompactString::from("g");
         let c = CompactString::from("c1");
-        assert!(s.create_group(g.clone(), StreamId { ms: 0, seq: 0 }, false, false).is_ok());
+        assert!(
+            s.create_group(g.clone(), StreamId { ms: 0, seq: 0 }, false, false)
+                .is_ok()
+        );
         let ids = s
             .read_group(&g, &c, StreamId { ms: 0, seq: 1 }, Some(3), false, now())
             .unwrap();
         assert_eq!(ids.len(), 3);
         let ack_ids: Vec<StreamId> = ids.iter().map(|(id, _)| *id).collect();
         assert_eq!(s.ack(&g, &ack_ids), 3);
-        let ids = s.read_group(&g, &c, StreamId { ms: 0, seq: 1 }, None, false, now()).unwrap();
+        let ids = s
+            .read_group(&g, &c, StreamId { ms: 0, seq: 1 }, None, false, now())
+            .unwrap();
         assert_eq!(ids.len(), 2);
     }
 }

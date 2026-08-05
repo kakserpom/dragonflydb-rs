@@ -1,8 +1,10 @@
 use crate::commands::exec::keys::glob_match;
-use crate::commands::{integer, ok, Command, OpContext, KeyRange, FLAG_DENYOOM, FLAG_FAST, FLAG_READONLY, FLAG_WRITE};
+use crate::commands::{
+    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext, integer, ok,
+};
+use crate::core::PrimeValue;
 use crate::core::compact::CompactString;
 use crate::core::hash::Hash;
-use crate::core::PrimeValue;
 use crate::error::{CmdResult, RespError, RespValue};
 use crate::util::{format_double, parse_double, parse_i64, parse_u64};
 
@@ -11,8 +13,10 @@ use crate::util::{format_double, parse_double, parse_i64, parse_u64};
 const MAX_EXPIRE_SEC: i64 = (1u64 << 28) as i64 - 1;
 
 const K_INVALID_NUM_FIELDS: &str = "ERR Number of fields must be a positive integer";
-const K_NUM_FIELDS_MISMATCH: &str = "ERR The `numfields` parameter must match the number of arguments";
-const K_MANDATORY_FIELDS: &str = "ERR Mandatory argument FIELDS is missing or not at the right position";
+const K_NUM_FIELDS_MISMATCH: &str =
+    "ERR The `numfields` parameter must match the number of arguments";
+const K_MANDATORY_FIELDS: &str =
+    "ERR Mandatory argument FIELDS is missing or not at the right position";
 
 /// Expiry unit tags for the EX/PX/EXAT/PXAT options.
 const EX_SEC: u8 = 0;
@@ -21,11 +25,11 @@ const EX_AT_SEC: u8 = 2;
 const PX_AT_MSEC: u8 = 3;
 
 fn invalid_expire_time(cmd: &str) -> String {
-    format!("ERR invalid expire time in '{}' command", cmd)
+    format!("ERR invalid expire time in '{cmd}' command")
 }
 
 fn wrong_num_args(cmd: &str) -> String {
-    format!("ERR wrong number of arguments for '{}' command", cmd)
+    format!("ERR wrong number of arguments for '{cmd}' command")
 }
 
 /// Port of `MakeFieldExpireParams` + `ExpireParams::Calculate`: returns the
@@ -35,16 +39,16 @@ fn field_expiry_ttl_ms(unit: u8, value: i64, now_ms: u64, allow_expired: bool) -
     if value < 0 {
         return None;
     }
-    let now = now_ms as i128;
-    let sec_to_ms = |v: i64| (v as i128).saturating_mul(1000);
+    let now = i128::from(now_ms);
+    let sec_to_ms = |v: i64| i128::from(v).saturating_mul(1000);
     let (rel_ms, at_ms) = match unit {
         EX_SEC => (sec_to_ms(value), now + sec_to_ms(value)),
-        PX_MSEC => (value as i128, now + value as i128),
+        PX_MSEC => (i128::from(value), now + i128::from(value)),
         EX_AT_SEC => (sec_to_ms(value) - now, sec_to_ms(value)),
-        PX_AT_MSEC => (value as i128 - now, value as i128),
+        PX_AT_MSEC => (i128::from(value) - now, i128::from(value)),
         _ => unreachable!(),
     };
-    let max_ms = (MAX_EXPIRE_SEC as i128) * 1000;
+    let max_ms = i128::from(MAX_EXPIRE_SEC) * 1000;
     if rel_ms > max_ms || (!allow_expired && rel_ms <= 0) {
         return None;
     }
@@ -106,7 +110,7 @@ fn prune_hash_key(ctx: &mut OpContext, key: &[u8]) -> Result<(), RespError> {
 
 fn ensure_hash<'a>(ctx: &'a mut OpContext, key: &[u8]) -> Result<&'a mut Hash, RespError> {
     if ctx.db.find(key, ctx.now_ms).is_none() {
-        ctx.db.insert(CompactString::from_bytes(key), PrimeValue::Hash(Hash::new()));
+        ctx.db.insert(key, PrimeValue::Hash(Hash::new()));
     }
     hash_mut(ctx, key)
 }
@@ -116,7 +120,9 @@ fn exec_hset_common(ctx: &mut OpContext) -> CmdResult {
     let key = &ctx.args[key_idx];
     let fvs = &ctx.args[key_idx + 1..];
     if fvs.is_empty() || !fvs.len().is_multiple_of(2) {
-        return CmdResult::Err(RespError::new("ERR wrong number of arguments for 'hset' command"));
+        return CmdResult::Err(RespError::new(
+            "ERR wrong number of arguments for 'hset' command",
+        ));
     }
     let h = match ensure_hash(ctx, key) {
         Ok(h) => h,
@@ -243,7 +249,10 @@ fn exec_hkeys(ctx: &mut OpContext) -> CmdResult {
     }
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::Hash(h)) => {
-            let out = h.iter().map(|(f, _)| RespValue::Bulk(f.as_bytes().to_vec())).collect();
+            let out = h
+                .iter()
+                .map(|(f, _)| RespValue::Bulk(f.as_bytes().to_vec()))
+                .collect();
             CmdResult::Ok(RespValue::Array(out))
         }
         Some(_) => CmdResult::Err(RespError::wrong_type()),
@@ -258,7 +267,10 @@ fn exec_hvals(ctx: &mut OpContext) -> CmdResult {
     }
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::Hash(h)) => {
-            let out = h.iter().map(|(_, v)| RespValue::Bulk(v.as_bytes().to_vec())).collect();
+            let out = h
+                .iter()
+                .map(|(_, v)| RespValue::Bulk(v.as_bytes().to_vec()))
+                .collect();
             CmdResult::Ok(RespValue::Array(out))
         }
         Some(_) => CmdResult::Err(RespError::wrong_type()),
@@ -274,7 +286,7 @@ fn exec_hexists(ctx: &mut OpContext) -> CmdResult {
         return CmdResult::Err(e);
     }
     match ctx.db.find(key, ctx.now_ms) {
-        Some(PrimeValue::Hash(h)) => CmdResult::Ok(integer(h.contains(field) as i64)),
+        Some(PrimeValue::Hash(h)) => CmdResult::Ok(integer(i64::from(h.contains(field)))),
         Some(_) => CmdResult::Err(RespError::wrong_type()),
         None => CmdResult::Ok(integer(0)),
     }
@@ -284,9 +296,8 @@ fn exec_hincrby(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
     let field = CompactString::from_bytes(&ctx.args[key_idx + 1]);
-    let delta = match parse_i64(&ctx.args[key_idx + 2]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(delta) = parse_i64(&ctx.args[key_idx + 2]) else {
+        return CmdResult::Err(RespError::integer());
     };
     let h = match ensure_hash(ctx, key) {
         Ok(h) => h,
@@ -300,11 +311,13 @@ fn exec_hincrby(ctx: &mut OpContext) -> CmdResult {
         },
         None => 0,
     };
-    let new_val = match cur.checked_add(delta) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(new_val) = cur.checked_add(delta) else {
+        return CmdResult::Err(RespError::integer());
     };
-    h.set(field, CompactString::from_bytes(&crate::util::itoa(new_val)));
+    h.set(
+        field,
+        CompactString::from_bytes(&crate::util::itoa(new_val)),
+    );
     CmdResult::Ok(integer(new_val))
 }
 
@@ -312,9 +325,8 @@ fn exec_hincrbyfloat(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
     let field = CompactString::from_bytes(&ctx.args[key_idx + 1]);
-    let delta = match parse_double(&ctx.args[key_idx + 2]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::float()),
+    let Some(delta) = parse_double(&ctx.args[key_idx + 2]) else {
+        return CmdResult::Err(RespError::float());
     };
     let h = match ensure_hash(ctx, key) {
         Ok(h) => h,
@@ -330,7 +342,9 @@ fn exec_hincrbyfloat(ctx: &mut OpContext) -> CmdResult {
     };
     let new_val = cur + delta;
     if !new_val.is_finite() {
-        return CmdResult::Err(RespError::new("ERR increment would produce NaN or Infinity"));
+        return CmdResult::Err(RespError::new(
+            "ERR increment would produce NaN or Infinity",
+        ));
     }
     let s = format_double(new_val);
     h.set(field, CompactString::from_bytes(s.as_bytes()));
@@ -374,17 +388,17 @@ type ExpireOptions = (usize, SetMode, bool, Option<(u8, i64)>);
 
 /// Parses the leading NX/FNX/FXX/KEEPTTL/EX/PX/EXAT/PXAT options shared by the
 /// HSETEX and HGETEX grammar, returning (mode, keepttl, expiry).
-fn parse_expire_options(
-    ctx: &OpContext,
-    key_idx: usize,
-) -> Result<ExpireOptions, RespError> {
+fn parse_expire_options(ctx: &OpContext, key_idx: usize) -> Result<ExpireOptions, RespError> {
     let mut i = key_idx + 1;
     let mut mode = SetMode::None;
     let mut keepttl = false;
     let mut expiry: Option<(u8, i64)> = None;
     while i < ctx.args.len() {
         let tok = &ctx.args[i];
-        if tok.eq_ignore_ascii_case(b"NX") || tok.eq_ignore_ascii_case(b"FNX") || tok.eq_ignore_ascii_case(b"FXX") {
+        if tok.eq_ignore_ascii_case(b"NX")
+            || tok.eq_ignore_ascii_case(b"FNX")
+            || tok.eq_ignore_ascii_case(b"FXX")
+        {
             let m = if tok.eq_ignore_ascii_case(b"NX") {
                 SetMode::Nx
             } else if tok.eq_ignore_ascii_case(b"FNX") {
@@ -403,8 +417,10 @@ fn parse_expire_options(
             }
             keepttl = true;
             i += 1;
-        } else if tok.eq_ignore_ascii_case(b"EX") || tok.eq_ignore_ascii_case(b"PX")
-            || tok.eq_ignore_ascii_case(b"EXAT") || tok.eq_ignore_ascii_case(b"PXAT")
+        } else if tok.eq_ignore_ascii_case(b"EX")
+            || tok.eq_ignore_ascii_case(b"PX")
+            || tok.eq_ignore_ascii_case(b"EXAT")
+            || tok.eq_ignore_ascii_case(b"PXAT")
         {
             if expiry.is_some() {
                 return Err(RespError::syntax());
@@ -442,17 +458,17 @@ fn parse_fields_prefix(
     i: &mut usize,
     count_err: Option<&str>,
 ) -> Result<usize, RespError> {
-    if !ctx.args.get(*i).is_some_and(|a| a.eq_ignore_ascii_case(b"FIELDS")) {
+    if !ctx
+        .args
+        .get(*i)
+        .is_some_and(|a| a.eq_ignore_ascii_case(b"FIELDS"))
+    {
         return Err(RespError::new(K_MANDATORY_FIELDS));
     }
     *i += 1;
     let numfields = match ctx.args.get(*i).and_then(|a| parse_u64(a)) {
-        Some(n) if n >= 1 && n <= u32::MAX as u64 => n as usize,
-        _ => {
-            return Err(RespError::new(
-                count_err.unwrap_or(K_NUM_FIELDS_MISMATCH),
-            ))
-        }
+        Some(n) if n >= 1 && u32::try_from(n).is_ok() => n as usize,
+        _ => return Err(RespError::new(count_err.unwrap_or(K_NUM_FIELDS_MISMATCH))),
     };
     *i += 1;
     let fields = &ctx.args[*i..];
@@ -465,7 +481,12 @@ fn parse_fields_prefix(
 /// Evaluates the FNX/FXX collective condition of HSETEX (CheckHSetExCondition):
 /// FNX holds only if none of the fields exist, FXX only if all exist. A missing
 /// key counts as "no fields exist".
-fn hsetex_condition(ctx: &mut OpContext, key: &[u8], fvs: &[Vec<u8>], fnx: bool) -> Result<bool, RespError> {
+fn hsetex_condition(
+    ctx: &mut OpContext,
+    key: &[u8],
+    fvs: &[Vec<u8>],
+    fnx: bool,
+) -> Result<bool, RespError> {
     prune_hash_key(ctx, key)?;
     let Some(PrimeValue::Hash(h)) = ctx.db.find(key, ctx.now_ms) else {
         return Ok(fnx);
@@ -479,7 +500,7 @@ fn hsetex_condition(ctx: &mut OpContext, key: &[u8], fvs: &[Vec<u8>], fnx: bool)
     Ok(true)
 }
 
-/// HSETEX key [NX | FNX | FXX] [KEEPTTL] ttl_sec field value [field value ...]
+/// HSETEX key [NX | FNX | FXX] [KEEPTTL] `ttl_sec` field value [field value ...]
 /// HSETEX key [FNX | FXX] [EX sec | PX ms | EXAT ts-sec | PXAT ts-ms | KEEPTTL]
 ///                FIELDS numfields field value [field value ...]
 ///
@@ -495,13 +516,17 @@ fn exec_hsetex(ctx: &mut OpContext) -> CmdResult {
     };
 
     // Redis format.
-    if ctx.args.get(i).is_some_and(|a| a.eq_ignore_ascii_case(b"FIELDS")) {
+    if ctx
+        .args
+        .get(i)
+        .is_some_and(|a| a.eq_ignore_ascii_case(b"FIELDS"))
+    {
         if mode == SetMode::Nx || (keepttl && expiry.is_some()) {
             return CmdResult::Err(RespError::syntax());
         }
         i += 1;
         let numfields = match ctx.args.get(i).and_then(|a| parse_u64(a)) {
-            Some(n) if n >= 1 && n <= u32::MAX as u64 => n as usize,
+            Some(n) if n >= 1 && u32::try_from(n).is_ok() => n as usize,
             _ => return CmdResult::Err(RespError::new(K_NUM_FIELDS_MISMATCH)),
         };
         i += 1;
@@ -513,7 +538,11 @@ fn exec_hsetex(ctx: &mut OpContext) -> CmdResult {
             Some((unit, value)) => match field_expiry_ttl_ms(unit, value, ctx.now_ms, false) {
                 Some(ttl_ms) => {
                     let ttl_sec = (ttl_ms + 999) / 1000;
-                    Some((ctx.now_ms / 1000).saturating_add(ttl_sec as u64).saturating_mul(1000))
+                    Some(
+                        (ctx.now_ms / 1000)
+                            .saturating_add(ttl_sec as u64)
+                            .saturating_mul(1000),
+                    )
                 }
                 None => return CmdResult::Err(RespError::new(invalid_expire_time("hsetex"))),
             },
@@ -560,7 +589,9 @@ fn exec_hsetex(ctx: &mut OpContext) -> CmdResult {
             Err(e) => return CmdResult::Err(e),
         }
     }
-    let expire_ms = (ctx.now_ms / 1000).saturating_add(ttl_sec as u64).saturating_mul(1000);
+    let expire_ms = (ctx.now_ms / 1000)
+        .saturating_add(ttl_sec as u64)
+        .saturating_mul(1000);
     let h = match ensure_hash(ctx, &key) {
         Ok(h) => h,
         Err(e) => return CmdResult::Err(e),
@@ -581,7 +612,7 @@ fn exec_hsetex(ctx: &mut OpContext) -> CmdResult {
     CmdResult::Ok(integer(created))
 }
 
-/// HEXPIRE key ttl_sec [NX | XX | GT | LT] FIELDS numfields field [field ...]
+/// HEXPIRE key `ttl_sec` [NX | XX | GT | LT] FIELDS numfields field [field ...]
 ///
 /// Replies per field: -2 missing, 0 condition not met, 1 TTL set, 2 removed
 /// (ttl 0). A key emptied by expiration is deleted.
@@ -625,7 +656,9 @@ fn exec_hexpire(ctx: &mut OpContext) -> CmdResult {
         return CmdResult::Ok(RespValue::Array(vec![integer(-2); numfields]));
     };
     let now_sec = (ctx.now_ms / 1000) as i64;
-    let expire_ms = (ctx.now_ms / 1000).saturating_add(ttl_sec).saturating_mul(1000);
+    let expire_ms = (ctx.now_ms / 1000)
+        .saturating_add(ttl_sec)
+        .saturating_mul(1000);
     let mut res = Vec::with_capacity(numfields);
     for f in fields {
         if !h.contains(f) {
@@ -655,7 +688,10 @@ fn exec_hexpire(ctx: &mut OpContext) -> CmdResult {
             h.remove(f);
             res.push(2);
         } else {
-            let v = h.get(f).cloned().unwrap_or_else(|| CompactString::from_bytes(f));
+            let v = h
+                .get(f)
+                .cloned()
+                .unwrap_or_else(|| CompactString::from_bytes(f));
             h.add_expirable(CompactString::from_bytes(f), v, Some(expire_ms), false);
             res.push(1);
         }
@@ -729,8 +765,10 @@ fn exec_hgetex(ctx: &mut OpContext) -> CmdResult {
             }
             persist = true;
             i += 1;
-        } else if tok.eq_ignore_ascii_case(b"EX") || tok.eq_ignore_ascii_case(b"PX")
-            || tok.eq_ignore_ascii_case(b"EXAT") || tok.eq_ignore_ascii_case(b"PXAT")
+        } else if tok.eq_ignore_ascii_case(b"EX")
+            || tok.eq_ignore_ascii_case(b"PX")
+            || tok.eq_ignore_ascii_case(b"EXAT")
+            || tok.eq_ignore_ascii_case(b"PXAT")
         {
             if persist || expiry.is_some() {
                 return CmdResult::Err(RespError::syntax());
@@ -781,9 +819,13 @@ fn exec_hgetex(ctx: &mut OpContext) -> CmdResult {
     let Some(PrimeValue::Hash(h)) = ctx.db.find_mut(&key, ctx.now_ms) else {
         return CmdResult::Ok(RespValue::Array(vec![RespValue::Nil; numfields]));
     };
-    let values: Vec<Option<Vec<u8>>> =
-        fields.iter().map(|f| h.get(f).map(|v| v.as_bytes().to_vec())).collect();
-    let expire_ms = (ctx.now_ms / 1000).saturating_add(ttl_sec as u64).saturating_mul(1000);
+    let values: Vec<Option<Vec<u8>>> = fields
+        .iter()
+        .map(|f| h.get(f).map(|v| v.as_bytes().to_vec()))
+        .collect();
+    let expire_ms = (ctx.now_ms / 1000)
+        .saturating_add(ttl_sec as u64)
+        .saturating_mul(1000);
     for f in fields {
         if !h.contains(f) {
             continue;
@@ -826,12 +868,14 @@ fn exec_hrandfield(ctx: &mut OpContext) -> CmdResult {
     let mut with_values = false;
     if has_count {
         match ctx.args.get(key_idx + 1).and_then(|a| parse_i64(a)) {
-            Some(v) if (i32::MIN as i64..=i32::MAX as i64).contains(&v) => count = v,
+            Some(v) if (i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&v) => count = v,
             _ => return CmdResult::Err(RespError::new("ERR count value is not an integer")),
         }
-        with_values =
-            ctx.args.get(key_idx + 2).is_some_and(|a| a.eq_ignore_ascii_case(b"WITHVALUES"));
-        if ctx.args.len() > key_idx + 2 + with_values as usize {
+        with_values = ctx
+            .args
+            .get(key_idx + 2)
+            .is_some_and(|a| a.eq_ignore_ascii_case(b"WITHVALUES"));
+        if ctx.args.len() > key_idx + 2 + usize::from(with_values) {
             return CmdResult::Err(RespError::syntax());
         }
     }
@@ -881,9 +925,8 @@ fn exec_hrandfield(ctx: &mut OpContext) -> CmdResult {
 fn exec_hscan(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = ctx.args[key_idx].clone();
-    let cursor = match parse_u64(&ctx.args[key_idx + 1]) {
-        Some(c) => c,
-        None => return CmdResult::Err(RespError::new("ERR invalid cursor")),
+    let Some(cursor) = parse_u64(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::new("ERR invalid cursor"));
     };
     let opts = &ctx.args[key_idx + 2..];
     if opts.len() > 5 {
@@ -944,7 +987,11 @@ fn exec_hscan(ctx: &mut OpContext) -> CmdResult {
             matched += 1;
         }
     }
-    let next = if pos >= entries.len() { 0u64 } else { pos as u64 };
+    let next = if pos >= entries.len() {
+        0u64
+    } else {
+        pos as u64
+    };
     CmdResult::Ok(hscan_reply(next, out))
 }
 
@@ -1144,7 +1191,7 @@ mod tests {
         }
     }
 
-    fn nil(r: CmdResult) -> bool {
+    fn nil(r: &CmdResult) -> bool {
         matches!(r, CmdResult::Ok(RespValue::Nil))
     }
 
@@ -1157,7 +1204,7 @@ mod tests {
                     RespValue::Bulk(b) => Some(String::from_utf8_lossy(&b).into_owned()),
                     RespValue::Integer(i) => Some(i.to_string()),
                     RespValue::Nil => None,
-                    o => panic!("unexpected element {:?}", o),
+                    o => panic!("unexpected element {o:?}"),
                 })
                 .collect(),
             o => panic!("expected array, got {:?}", o.into_resp_value()),
@@ -1199,7 +1246,13 @@ mod tests {
                 b"HSCAN" => (exec_hscan, 1, (1..2).collect()),
                 _ => panic!("unhandled command {:?}", argv[0]),
             };
-        let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx, now_ms };
+        let mut ctx = OpContext {
+            db,
+            args: argv,
+            owned_keys: &owned,
+            first_key_idx,
+            now_ms,
+        };
         exec(&mut ctx)
     }
 
@@ -1214,14 +1267,15 @@ mod tests {
     }
 
     fn run_at_sec(db: &mut DbSlice, now_sec: u64, args: &[&[u8]]) -> CmdResult {
-        dispatch_at(db, now_sec * 1000, &args.iter().map(|a| a.to_vec()).collect::<Vec<_>>())
+        dispatch_at(
+            db,
+            now_sec * 1000,
+            &args.iter().map(|a| a.to_vec()).collect::<Vec<_>>(),
+        )
     }
 
     fn str_of(db: &mut DbSlice, key: &str, value: &str) {
-        db.insert(
-            CompactString::from_bytes(key.as_bytes()),
-            PrimeValue::Str(CompactString::from(value)),
-        );
+        db.insert(key.as_bytes(), PrimeValue::Str(CompactString::from(value)));
     }
 
     fn exists(db: &mut DbSlice, key: &str) -> bool {
@@ -1231,41 +1285,128 @@ mod tests {
     #[test]
     fn hsetex_basic_replies() {
         let mut db = DbSlice::new(0);
-        assert_eq!(1, int(run(&mut db, &[b"HSETEX", b"k", b"100", b"f1", b"v1"])));
-        assert_eq!(0, int(run(&mut db, &[b"HSETEX", b"k", b"100", b"f1", b"v2"])));
-        assert_eq!(0, int(run(&mut db, &[b"HSETEX", b"k", b"NX", b"100", b"f1", b"v3"])));
-        assert_eq!(1, int(run(&mut db, &[b"HSETEX", b"k", b"NX", b"100", b"f2", b"v1"])));
-        assert_eq!(vec![Some("100".into())], flat(run(&mut db, &[b"HTTL", b"k", b"FIELDS", b"1", b"f1"])));
+        assert_eq!(
+            1,
+            int(run(&mut db, &[b"HSETEX", b"k", b"100", b"f1", b"v1"]))
+        );
+        assert_eq!(
+            0,
+            int(run(&mut db, &[b"HSETEX", b"k", b"100", b"f1", b"v2"]))
+        );
+        assert_eq!(
+            0,
+            int(run(
+                &mut db,
+                &[b"HSETEX", b"k", b"NX", b"100", b"f1", b"v3"]
+            ))
+        );
+        assert_eq!(
+            1,
+            int(run(
+                &mut db,
+                &[b"HSETEX", b"k", b"NX", b"100", b"f2", b"v1"]
+            ))
+        );
+        assert_eq!(
+            vec![Some("100".into())],
+            flat(run(&mut db, &[b"HTTL", b"k", b"FIELDS", b"1", b"f1"]))
+        );
     }
 
     #[test]
     fn hsetex_keepttl_keeps_existing() {
         let mut db = DbSlice::new(0);
-        assert_eq!(1, int(run(&mut db, &[b"HSETEX", b"k", b"100", b"f1", b"v1"])));
-        assert_eq!(0, int(run(&mut db, &[b"HSETEX", b"k", b"KEEPTTL", b"200", b"f1", b"v2"])));
-        assert_eq!(vec![Some("100".into())], flat(run(&mut db, &[b"HTTL", b"k", b"FIELDS", b"1", b"f1"])));
+        assert_eq!(
+            1,
+            int(run(&mut db, &[b"HSETEX", b"k", b"100", b"f1", b"v1"]))
+        );
+        assert_eq!(
+            0,
+            int(run(
+                &mut db,
+                &[b"HSETEX", b"k", b"KEEPTTL", b"200", b"f1", b"v2"]
+            ))
+        );
+        assert_eq!(
+            vec![Some("100".into())],
+            flat(run(&mut db, &[b"HTTL", b"k", b"FIELDS", b"1", b"f1"]))
+        );
     }
 
     #[test]
     fn hsetex_keepttl_applies_when_no_existing_ttl() {
         let mut db = DbSlice::new(0);
         assert_eq!(1, int(run(&mut db, &[b"HSET", b"k", b"f1", b"v1"])));
-        assert_eq!(0, int(run(&mut db, &[b"HSETEX", b"k", b"KEEPTTL", b"100", b"f1", b"v2"])));
-        assert_eq!(vec![Some("100".into())], flat(run(&mut db, &[b"HTTL", b"k", b"FIELDS", b"1", b"f1"])));
+        assert_eq!(
+            0,
+            int(run(
+                &mut db,
+                &[b"HSETEX", b"k", b"KEEPTTL", b"100", b"f1", b"v2"]
+            ))
+        );
+        assert_eq!(
+            vec![Some("100".into())],
+            flat(run(&mut db, &[b"HTTL", b"k", b"FIELDS", b"1", b"f1"]))
+        );
     }
 
     #[test]
     fn hsetex_fields_form() {
         let mut db = DbSlice::new(0);
         let now = 1_000_000_000_000u64;
-        assert_eq!(1, int(run_at!(&mut db, now, b"HSETEX", b"k", b"EX", b"50", b"FIELDS", b"1", b"f1", b"v1")));
-        assert_eq!(1, int(run_at!(&mut db, now, b"HSETEX", b"k", b"PX", b"30000", b"FIELDS", b"1", b"f2", b"v2")));
-        assert_eq!(1, int(run_at!(&mut db, now, b"HSETEX", b"k", b"EXAT", b"1000000050", b"FIELDS", b"1", b"f3", b"v3")));
-        assert_eq!(1, int(run_at!(&mut db, now, b"HSETEX", b"k", b"PXAT", b"1000000030000", b"FIELDS", b"1", b"f4", b"v4")));
-        let ttl = flat(run_at!(&mut db, now, b"HTTL", b"k", b"FIELDS", b"4", b"f1", b"f2", b"f3", b"f4"));
+        assert_eq!(
+            1,
+            int(run_at!(
+                &mut db, now, b"HSETEX", b"k", b"EX", b"50", b"FIELDS", b"1", b"f1", b"v1"
+            ))
+        );
+        assert_eq!(
+            1,
+            int(run_at!(
+                &mut db, now, b"HSETEX", b"k", b"PX", b"30000", b"FIELDS", b"1", b"f2", b"v2"
+            ))
+        );
+        assert_eq!(
+            1,
+            int(run_at!(
+                &mut db,
+                now,
+                b"HSETEX",
+                b"k",
+                b"EXAT",
+                b"1000000050",
+                b"FIELDS",
+                b"1",
+                b"f3",
+                b"v3"
+            ))
+        );
+        assert_eq!(
+            1,
+            int(run_at!(
+                &mut db,
+                now,
+                b"HSETEX",
+                b"k",
+                b"PXAT",
+                b"1000000030000",
+                b"FIELDS",
+                b"1",
+                b"f4",
+                b"v4"
+            ))
+        );
+        let ttl = flat(run_at!(
+            &mut db, now, b"HTTL", b"k", b"FIELDS", b"4", b"f1", b"f2", b"f3", b"f4"
+        ));
         assert_eq!(
             ttl,
-            vec![Some("50".into()), Some("30".into()), Some("50".into()), Some("30".into())]
+            vec![
+                Some("50".into()),
+                Some("30".into()),
+                Some("50".into()),
+                Some("30".into())
+            ]
         );
     }
 
@@ -1279,8 +1420,22 @@ mod tests {
             "ERR value is not an integer or out of range",
             err(run(&mut db, &[b"HSETEX", b"k", b"NX", b"zero", b"f", b"v"]))
         );
-        assert_eq!("ERR syntax error", err(run(&mut db, &[b"HSETEX", b"k", b"NX", b"KEEPTTL", b"NX", b"1", b"v", b"v2"])));
-        assert_eq!("ERR syntax error", err(run(&mut db, &[b"HSETEX", b"k", b"KEEPTTL", b"EX", b"10", b"FIELDS", b"1", b"f", b"v"])));
+        assert_eq!(
+            "ERR syntax error",
+            err(run(
+                &mut db,
+                &[b"HSETEX", b"k", b"NX", b"KEEPTTL", b"NX", b"1", b"v", b"v2"]
+            ))
+        );
+        assert_eq!(
+            "ERR syntax error",
+            err(run(
+                &mut db,
+                &[
+                    b"HSETEX", b"k", b"KEEPTTL", b"EX", b"10", b"FIELDS", b"1", b"f", b"v"
+                ]
+            ))
+        );
         // Bare-form ttl above the cap is rejected as out of range.
         let e = err(run(&mut db, &[b"HSETEX", b"k", b"268435456", b"f", b"v"]));
         assert!(e.contains("not an integer or out of range"), "{}", e);
@@ -1289,16 +1444,33 @@ mod tests {
     #[test]
     fn hexpire_basic_and_flags() {
         let mut db = DbSlice::new(0);
-        assert_eq!(3, int(run(&mut db, &[b"HSET", b"k", b"f1", b"v1", b"f2", b"v2", b"f3", b"v3"])));
+        assert_eq!(
+            3,
+            int(run(
+                &mut db,
+                &[b"HSET", b"k", b"f1", b"v1", b"f2", b"v2", b"f3", b"v3"]
+            ))
+        );
         assert_eq!(
             vec![Some("1".into())],
-            flat(run(&mut db, &[b"HEXPIRE", b"k", b"10", b"FIELDS", b"1", b"f1"]))
+            flat(run(
+                &mut db,
+                &[b"HEXPIRE", b"k", b"10", b"FIELDS", b"1", b"f1"]
+            ))
         );
-        assert_eq!(vec![Some("10".into()), Some("-1".into()), Some("-1".into())],
-            flat(run(&mut db, &[b"HTTL", b"k", b"FIELDS", b"3", b"f1", b"f2", b"f3"])));
+        assert_eq!(
+            vec![Some("10".into()), Some("-1".into()), Some("-1".into())],
+            flat(run(
+                &mut db,
+                &[b"HTTL", b"k", b"FIELDS", b"3", b"f1", b"f2", b"f3"]
+            ))
+        );
         assert_eq!(
             vec![Some("-2".into())],
-            flat(run(&mut db, &[b"HEXPIRE", b"k", b"10", b"FIELDS", b"1", b"nosuch"]))
+            flat(run(
+                &mut db,
+                &[b"HEXPIRE", b"k", b"10", b"FIELDS", b"1", b"nosuch"]
+            ))
         );
     }
 
@@ -1309,28 +1481,46 @@ mod tests {
         // GT never applies to a TTL-less field (infinite remaining), LT always does.
         assert_eq!(
             vec![Some("0".into())],
-            flat(run(&mut db, &[b"HEXPIRE", b"k", b"10", b"GT", b"FIELDS", b"1", b"f"]))
+            flat(run(
+                &mut db,
+                &[b"HEXPIRE", b"k", b"10", b"GT", b"FIELDS", b"1", b"f"]
+            ))
         );
         assert_eq!(
             vec![Some("1".into())],
-            flat(run(&mut db, &[b"HEXPIRE", b"k", b"10", b"LT", b"FIELDS", b"1", b"f"]))
+            flat(run(
+                &mut db,
+                &[b"HEXPIRE", b"k", b"10", b"LT", b"FIELDS", b"1", b"f"]
+            ))
         );
         // Now f has TTL 10.
         assert_eq!(
             vec![Some("0".into())],
-            flat(run(&mut db, &[b"HEXPIRE", b"k", b"5", b"GT", b"FIELDS", b"1", b"f"]))
+            flat(run(
+                &mut db,
+                &[b"HEXPIRE", b"k", b"5", b"GT", b"FIELDS", b"1", b"f"]
+            ))
         );
         assert_eq!(
             vec![Some("1".into())],
-            flat(run(&mut db, &[b"HEXPIRE", b"k", b"20", b"GT", b"FIELDS", b"1", b"f"]))
+            flat(run(
+                &mut db,
+                &[b"HEXPIRE", b"k", b"20", b"GT", b"FIELDS", b"1", b"f"]
+            ))
         );
         assert_eq!(
             vec![Some("0".into())],
-            flat(run(&mut db, &[b"HEXPIRE", b"k", b"20", b"NX", b"FIELDS", b"1", b"f"]))
+            flat(run(
+                &mut db,
+                &[b"HEXPIRE", b"k", b"20", b"NX", b"FIELDS", b"1", b"f"]
+            ))
         );
         assert_eq!(
             vec![Some("1".into())],
-            flat(run(&mut db, &[b"HEXPIRE", b"k", b"20", b"XX", b"FIELDS", b"1", b"f"]))
+            flat(run(
+                &mut db,
+                &[b"HEXPIRE", b"k", b"20", b"XX", b"FIELDS", b"1", b"f"]
+            ))
         );
     }
 
@@ -1340,13 +1530,19 @@ mod tests {
         assert_eq!(1, int(run(&mut db, &[b"HSET", b"k", b"f", b"v"])));
         assert_eq!(
             vec![Some("2".into())],
-            flat(run(&mut db, &[b"HEXPIRE", b"k", b"0", b"FIELDS", b"1", b"f"]))
+            flat(run(
+                &mut db,
+                &[b"HEXPIRE", b"k", b"0", b"FIELDS", b"1", b"f"]
+            ))
         );
         assert!(!exists(&mut db, "k"));
         // HEXPIRE on a missing key does not create it and reports -2.
         assert_eq!(
             vec![Some("-2".into())],
-            flat(run(&mut db, &[b"HEXPIRE", b"missing", b"10", b"FIELDS", b"1", b"f"]))
+            flat(run(
+                &mut db,
+                &[b"HEXPIRE", b"missing", b"10", b"FIELDS", b"1", b"f"]
+            ))
         );
         assert!(!exists(&mut db, "missing"));
     }
@@ -1354,13 +1550,21 @@ mod tests {
     #[test]
     fn hexpire_numfields_errors() {
         let mut db = DbSlice::new(0);
-        assert_eq!(2, int(run(&mut db, &[b"HSET", b"key", b"k0", b"v0", b"k1", b"v1"])));
+        assert_eq!(
+            2,
+            int(run(&mut db, &[b"HSET", b"key", b"k0", b"v0", b"k1", b"v1"]))
+        );
         let e = err(run(&mut db, &[b"HEXPIRE", b"key", b"10", b"1", b"k0"]));
         assert!(e.contains("Mandatory argument FIELDS"), "{}", e);
-        for a in ["HEXPIRE key 10 FIELDS 2 k0", "HEXPIRE key 10 FIELDS 1 k0 k1", "HEXPIRE key 10 FIELDS 0 k0", "HEXPIRE key 10 FIELDS 0"] {
-            let args: Vec<&[u8]> = a.split(' ').map(|s| s.as_bytes()).collect();
+        for a in [
+            "HEXPIRE key 10 FIELDS 2 k0",
+            "HEXPIRE key 10 FIELDS 1 k0 k1",
+            "HEXPIRE key 10 FIELDS 0 k0",
+            "HEXPIRE key 10 FIELDS 0",
+        ] {
+            let args: Vec<&[u8]> = a.split(' ').map(str::as_bytes).collect();
             let e = err(run(&mut db, &args));
-            assert!(e.contains("numfields"), "{} -> {}", a, e);
+            assert!(e.contains("numfields"), "{a} -> {e}");
         }
     }
 
@@ -1370,33 +1574,60 @@ mod tests {
         // Non-existent key -> -2 for all fields.
         assert_eq!(
             vec![Some("-2".into()), Some("-2".into())],
-            flat(run(&mut db, &[b"HTTL", b"nokey", b"FIELDS", b"2", b"f1", b"f2"]))
+            flat(run(
+                &mut db,
+                &[b"HTTL", b"nokey", b"FIELDS", b"2", b"f1", b"f2"]
+            ))
         );
-        assert_eq!(2, int(run(&mut db, &[b"HSET", b"key", b"k0", b"v0", b"k1", b"v1"])));
+        assert_eq!(
+            2,
+            int(run(&mut db, &[b"HSET", b"key", b"k0", b"v0", b"k1", b"v1"]))
+        );
         assert_eq!(
             vec![Some("-1".into()), Some("-1".into()), Some("-2".into())],
-            flat(run(&mut db, &[b"HTTL", b"key", b"FIELDS", b"3", b"k0", b"k1", b"nosuch"]))
+            flat(run(
+                &mut db,
+                &[b"HTTL", b"key", b"FIELDS", b"3", b"k0", b"k1", b"nosuch"]
+            ))
         );
         assert_eq!(
             vec![Some("1".into())],
-            flat(run(&mut db, &[b"HEXPIRE", b"key", b"10", b"FIELDS", b"1", b"k0"]))
+            flat(run(
+                &mut db,
+                &[b"HEXPIRE", b"key", b"10", b"FIELDS", b"1", b"k0"]
+            ))
         );
         // Advance 3s: relative TTL drops, absolute timestamp is unchanged.
-        let httl = flat(run_at_sec(&mut db, 3, &[b"HTTL", b"key", b"FIELDS", b"1", b"k0"]));
+        let httl = flat(run_at_sec(
+            &mut db,
+            3,
+            &[b"HTTL", b"key", b"FIELDS", b"1", b"k0"],
+        ));
         assert_eq!(vec![Some("7".into())], httl);
         // The stored absolute expiry is (write_now_sec + ttl) * 1000 = 10000.
-        let hpet = flat(run_at_sec(&mut db, 3, &[b"HPEXPIRETIME", b"key", b"FIELDS", b"1", b"k0"]));
+        let hpet = flat(run_at_sec(
+            &mut db,
+            3,
+            &[b"HPEXPIRETIME", b"key", b"FIELDS", b"1", b"k0"],
+        ));
         assert_eq!(vec![Some("10000".into())], hpet);
     }
 
     #[test]
     fn httl_deletes_empty_hash() {
         let mut db = DbSlice::new(0);
-        assert_eq!(1, int(run(&mut db, &[b"HSETEX", b"key", b"1", b"f1", b"v1"])));
+        assert_eq!(
+            1,
+            int(run(&mut db, &[b"HSETEX", b"key", b"1", b"f1", b"v1"]))
+        );
         // After expiry, HTTL triggers lazy pruning and removes the empty key.
         assert_eq!(
             vec![Some("-2".into())],
-            flat(run_at_sec(&mut db, 2000, &[b"HTTL", b"key", b"FIELDS", b"1", b"f1"]))
+            flat(run_at_sec(
+                &mut db,
+                2000,
+                &[b"HTTL", b"key", b"FIELDS", b"1", b"f1"]
+            ))
         );
         assert!(!exists(&mut db, "key"));
     }
@@ -1405,47 +1636,84 @@ mod tests {
     fn hgetex_sets_and_reads() {
         let mut db = DbSlice::new(0);
         let now = 1_000_000_000_000u64;
-        assert_eq!(3, int(run_at!(&mut db, now, b"HSET", b"key", b"f1", b"v1", b"f2", b"v2", b"f3", b"v3")));
+        assert_eq!(
+            3,
+            int(run_at!(
+                &mut db, now, b"HSET", b"key", b"f1", b"v1", b"f2", b"v2", b"f3", b"v3"
+            ))
+        );
         // No option: return values, leave TTLs untouched.
         assert_eq!(
             vec![Some("v1".into()), Some("v2".into()), None],
-            flat(run_at!(&mut db, now, b"HGETEX", b"key", b"FIELDS", b"3", b"f1", b"f2", b"nosuch"))
+            flat(run_at!(
+                &mut db, now, b"HGETEX", b"key", b"FIELDS", b"3", b"f1", b"f2", b"nosuch"
+            ))
         );
         assert_eq!(
             vec![Some("-1".into()), Some("-1".into())],
-            flat(run_at!(&mut db, now, b"HTTL", b"key", b"FIELDS", b"2", b"f1", b"f2"))
+            flat(run_at!(
+                &mut db, now, b"HTTL", b"key", b"FIELDS", b"2", b"f1", b"f2"
+            ))
         );
         // EX sets a relative TTL and still returns the value.
         assert_eq!(
             vec![Some("v1".into())],
-            flat(run_at!(&mut db, now, b"HGETEX", b"key", b"EX", b"100", b"FIELDS", b"1", b"f1"))
+            flat(run_at!(
+                &mut db, now, b"HGETEX", b"key", b"EX", b"100", b"FIELDS", b"1", b"f1"
+            ))
         );
-        assert_eq!(vec![Some("100".into())], flat(run_at!(&mut db, now, b"HTTL", b"key", b"FIELDS", b"1", b"f1")));
+        assert_eq!(
+            vec![Some("100".into())],
+            flat(run_at!(
+                &mut db, now, b"HTTL", b"key", b"FIELDS", b"1", b"f1"
+            ))
+        );
         // PERSIST removes the TTL.
         assert_eq!(
             vec![Some("v1".into())],
-            flat(run_at!(&mut db, now, b"HGETEX", b"key", b"PERSIST", b"FIELDS", b"1", b"f1"))
+            flat(run_at!(
+                &mut db, now, b"HGETEX", b"key", b"PERSIST", b"FIELDS", b"1", b"f1"
+            ))
         );
-        assert_eq!(vec![Some("-1".into())], flat(run_at!(&mut db, now, b"HTTL", b"key", b"FIELDS", b"1", b"f1")));
+        assert_eq!(
+            vec![Some("-1".into())],
+            flat(run_at!(
+                &mut db, now, b"HTTL", b"key", b"FIELDS", b"1", b"f1"
+            ))
+        );
     }
 
     #[test]
     fn hgetex_past_ttl_deletes_field_but_returns_value() {
         let mut db = DbSlice::new(0);
         let now = 1_000_000_000_000u64;
-        assert_eq!(2, int(run_at!(&mut db, now, b"HSET", b"key", b"f2", b"v2", b"f3", b"v3")));
+        assert_eq!(
+            2,
+            int(run_at!(
+                &mut db, now, b"HSET", b"key", b"f2", b"v2", b"f3", b"v3"
+            ))
+        );
         assert_eq!(
             vec![Some("v2".into())],
-            flat(run_at!(&mut db, now, b"HGETEX", b"key", b"PXAT", b"1", b"FIELDS", b"1", b"f2"))
+            flat(run_at!(
+                &mut db, now, b"HGETEX", b"key", b"PXAT", b"1", b"FIELDS", b"1", b"f2"
+            ))
         );
         assert_eq!(0, int(run_at!(&mut db, now, b"HEXISTS", b"key", b"f2")));
         assert_eq!(
             vec![Some("v3".into())],
-            flat(run_at!(&mut db, now, b"HGETEX", b"key", b"EX", b"0", b"FIELDS", b"1", b"f3"))
+            flat(run_at!(
+                &mut db, now, b"HGETEX", b"key", b"EX", b"0", b"FIELDS", b"1", b"f3"
+            ))
         );
         assert_eq!(0, int(run_at!(&mut db, now, b"HEXISTS", b"key", b"f3")));
         // Missing key -> array of nils, key stays gone.
-        assert_eq!(vec![None, None], flat(run_at!(&mut db, now, b"HGETEX", b"key", b"FIELDS", b"2", b"f1", b"f2")));
+        assert_eq!(
+            vec![None, None],
+            flat(run_at!(
+                &mut db, now, b"HGETEX", b"key", b"FIELDS", b"2", b"f1", b"f2"
+            ))
+        );
         assert!(!exists(&mut db, "key"));
     }
 
@@ -1453,31 +1721,88 @@ mod tests {
     fn hgetex_errors() {
         let mut db = DbSlice::new(0);
         assert_eq!(1, int(run(&mut db, &[b"HSET", b"key", b"f1", b"v1"])));
-        assert_eq!("ERR syntax error", err(run(&mut db, &[b"HGETEX", b"key", b"PERSIST", b"EX", b"10", b"FIELDS", b"1", b"f1"])));
-        assert_eq!("ERR syntax error", err(run(&mut db, &[b"HGETEX", b"key", b"EX", b"10", b"EX", b"20", b"FIELDS", b"1", b"f1"])));
-        let e = err(run(&mut db, &[b"HGETEX", b"key", b"KEEPTTL", b"FIELDS", b"1", b"f1"]));
+        assert_eq!(
+            "ERR syntax error",
+            err(run(
+                &mut db,
+                &[
+                    b"HGETEX", b"key", b"PERSIST", b"EX", b"10", b"FIELDS", b"1", b"f1"
+                ]
+            ))
+        );
+        assert_eq!(
+            "ERR syntax error",
+            err(run(
+                &mut db,
+                &[
+                    b"HGETEX", b"key", b"EX", b"10", b"EX", b"20", b"FIELDS", b"1", b"f1"
+                ]
+            ))
+        );
+        let e = err(run(
+            &mut db,
+            &[b"HGETEX", b"key", b"KEEPTTL", b"FIELDS", b"1", b"f1"],
+        ));
         assert!(e.contains("Mandatory argument FIELDS"), "{}", e);
-        let e = err(run(&mut db, &[b"HGETEX", b"key", b"EX", b"-1", b"FIELDS", b"1", b"f1"]));
+        let e = err(run(
+            &mut db,
+            &[b"HGETEX", b"key", b"EX", b"-1", b"FIELDS", b"1", b"f1"],
+        ));
         assert!(e.contains("invalid expire time"), "{}", e);
-        let e = err(run(&mut db, &[b"HGETEX", b"key", b"EX", b"abc", b"FIELDS", b"1", b"f1"]));
+        let e = err(run(
+            &mut db,
+            &[b"HGETEX", b"key", b"EX", b"abc", b"FIELDS", b"1", b"f1"],
+        ));
         assert!(e.contains("not an integer"), "{}", e);
         for unit in ["EX", "PX", "EXAT", "PXAT"] {
-            let e = err(run(&mut db, &[b"HGETEX", b"key", unit.as_bytes(), b"9223372036854775807", b"FIELDS", b"1", b"f1"]));
-            assert!(e.contains("invalid expire time"), "{} -> {}", unit, e);
+            let e = err(run(
+                &mut db,
+                &[
+                    b"HGETEX",
+                    b"key",
+                    unit.as_bytes(),
+                    b"9223372036854775807",
+                    b"FIELDS",
+                    b"1",
+                    b"f1",
+                ],
+            ));
+            assert!(e.contains("invalid expire time"), "{unit} -> {e}");
         }
-        let e = err(run(&mut db, &[b"HGETEX", b"key", b"EXAT", b"9999999999", b"FIELDS", b"1", b"f1"]));
+        let e = err(run(
+            &mut db,
+            &[
+                b"HGETEX",
+                b"key",
+                b"EXAT",
+                b"9999999999",
+                b"FIELDS",
+                b"1",
+                b"f1",
+            ],
+        ));
         assert!(e.contains("invalid expire time"), "{}", e);
-        let e = err(run(&mut db, &[b"HGETEX", b"key", b"notfields", b"1", b"f1"]));
+        let e = err(run(
+            &mut db,
+            &[b"HGETEX", b"key", b"notfields", b"1", b"f1"],
+        ));
         assert!(e.contains("Mandatory argument FIELDS"), "{}", e);
         for a in ["HGETEX key FIELDS 2 f1", "HGETEX key FIELDS 1 f1 EX 10"] {
-            let args: Vec<&[u8]> = a.split(' ').map(|s| s.as_bytes()).collect();
+            let args: Vec<&[u8]> = a.split(' ').map(str::as_bytes).collect();
             let e = err(run(&mut db, &args));
-            assert!(e.contains("numfields"), "{} -> {}", a, e);
+            assert!(e.contains("numfields"), "{a} -> {e}");
         }
-        for a in ["HGETEX key FIELDS 0 f1", "HGETEX key FIELDS -1 f1", "HGETEX key FIELDS abc f1"] {
-            let args: Vec<&[u8]> = a.split(' ').map(|s| s.as_bytes()).collect();
+        for a in [
+            "HGETEX key FIELDS 0 f1",
+            "HGETEX key FIELDS -1 f1",
+            "HGETEX key FIELDS abc f1",
+        ] {
+            let args: Vec<&[u8]> = a.split(' ').map(str::as_bytes).collect();
             let e = err(run(&mut db, &args));
-            assert!(e.contains("Number of fields must be a positive integer"), "{} -> {}", a, e);
+            assert!(
+                e.contains("Number of fields must be a positive integer"),
+                "{a} -> {e}"
+            );
         }
         let e = err(run(&mut db, &[b"HGETEX", b"key", b"FIELDS", b"1"]));
         assert!(e.contains("must match the number of arguments"), "{}", e);
@@ -1487,14 +1812,32 @@ mod tests {
     fn hash_commands_wrongtype() {
         let mut db = DbSlice::new(0);
         str_of(&mut db, "strkey", "val");
-        for cmd in [b"HTTL".as_slice(), b"HPEXPIRETIME".as_slice(), b"HGETEX".as_slice(), b"HEXPIRE".as_slice()] {
+        for cmd in [
+            b"HTTL".as_slice(),
+            b"HPEXPIRETIME".as_slice(),
+            b"HGETEX".as_slice(),
+            b"HEXPIRE".as_slice(),
+        ] {
             let args = if cmd == b"HEXPIRE" {
-                vec![cmd.to_vec(), b"strkey".to_vec(), b"10".to_vec(), b"FIELDS".to_vec(), b"1".to_vec(), b"f".to_vec()]
+                vec![
+                    cmd.to_vec(),
+                    b"strkey".to_vec(),
+                    b"10".to_vec(),
+                    b"FIELDS".to_vec(),
+                    b"1".to_vec(),
+                    b"f".to_vec(),
+                ]
             } else {
-                vec![cmd.to_vec(), b"strkey".to_vec(), b"FIELDS".to_vec(), b"1".to_vec(), b"f".to_vec()]
+                vec![
+                    cmd.to_vec(),
+                    b"strkey".to_vec(),
+                    b"FIELDS".to_vec(),
+                    b"1".to_vec(),
+                    b"f".to_vec(),
+                ]
             };
             let e = err(dispatch_at(&mut db, 0, &args));
-            assert!(e.contains("WRONGTYPE"), "{:?} -> {}", cmd, e);
+            assert!(e.contains("WRONGTYPE"), "{cmd:?} -> {e}");
         }
         let e = err(run(&mut db, &[b"HRANDFIELD", b"strkey"]));
         assert!(e.contains("WRONGTYPE"), "{}", e);
@@ -1505,10 +1848,19 @@ mod tests {
     #[test]
     fn hrandfield_basic() {
         let mut db = DbSlice::new(0);
-        assert!(nil(run(&mut db, &[b"HRANDFIELD", b"nokey"])));
-        assert_eq!(3, int(run(&mut db, &[b"HSET", b"key", b"a", b"1", b"b", b"2", b"c", b"3"])));
+        assert!(nil(&run(&mut db, &[b"HRANDFIELD", b"nokey"])));
+        assert_eq!(
+            3,
+            int(run(
+                &mut db,
+                &[b"HSET", b"key", b"a", b"1", b"b", b"2", b"c", b"3"]
+            ))
+        );
         let single = bulk(run(&mut db, &[b"HRANDFIELD", b"key"]));
-        assert!(["a", "b", "c"].contains(&String::from_utf8_lossy(&single).as_ref()), "{:?}", single);
+        assert!(
+            ["a", "b", "c"].contains(&String::from_utf8_lossy(&single).as_ref()),
+            "{single:?}"
+        );
         // Positive count: unique members.
         let v = arr(run(&mut db, &[b"HRANDFIELD", b"key", b"3"]));
         assert_eq!(v, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
@@ -1526,30 +1878,56 @@ mod tests {
     fn hrandfield_after_expiry() {
         let mut db = DbSlice::new(0);
         for i in 0..10 {
-            assert_eq!(1, int(run_at!(&mut db, 0, b"HSETEX", b"key", b"10", format!("k{}", i).into_bytes().as_slice(), b"v")));
+            assert_eq!(
+                1,
+                int(run_at!(
+                    &mut db,
+                    0,
+                    b"HSETEX",
+                    b"key",
+                    b"10",
+                    format!("k{i}").into_bytes().as_slice(),
+                    b"v"
+                ))
+            );
         }
         // One permanent field.
         assert_eq!(1, int(run_at!(&mut db, 0, b"HSET", b"key", b"keep", b"v")));
         // All short-TTL fields expired: only "keep" remains.
-        assert_eq!(b"keep".to_vec(), bulk(run_at!(&mut db, 10_000, b"HRANDFIELD", b"key")));
+        assert_eq!(
+            b"keep".to_vec(),
+            bulk(run_at!(&mut db, 10_000, b"HRANDFIELD", b"key"))
+        );
         // Count larger than live size must not crash.
         run_at!(&mut db, 10_000, b"HRANDFIELD", b"key", b"42");
         run_at!(&mut db, 10_000, b"HRANDFIELD", b"key", b"42", b"WITHVALUES");
         // All fields expired: nil.
-        assert_eq!(1, int(run_at!(&mut db, 0, b"HSETEX", b"all", b"1", b"x", b"y")));
-        assert_eq!(1, int(run_at!(&mut db, 0, b"HSETEX", b"all", b"1", b"z", b"w")));
-        assert!(nil(run_at!(&mut db, 2000, b"HRANDFIELD", b"all")));
+        assert_eq!(
+            1,
+            int(run_at!(&mut db, 0, b"HSETEX", b"all", b"1", b"x", b"y"))
+        );
+        assert_eq!(
+            1,
+            int(run_at!(&mut db, 0, b"HSETEX", b"all", b"1", b"z", b"w"))
+        );
+        assert!(nil(&run_at!(&mut db, 2000, b"HRANDFIELD", b"all")));
     }
 
     #[test]
     fn hscan_cursor_and_options() {
         let mut db = DbSlice::new(0);
-        assert_eq!(3, int(run(&mut db, &[b"HSET", b"key", b"a", b"1", b"b", b"2", b"c", b"3"])));
+        assert_eq!(
+            3,
+            int(run(
+                &mut db,
+                &[b"HSET", b"key", b"a", b"1", b"b", b"2", b"c", b"3"]
+            ))
+        );
         let (cursor, entries) = match run(&mut db, &[b"HSCAN", b"key", b"0"]) {
             CmdResult::Ok(RespValue::Array(v)) => {
                 let c = match &v[0] {
                     RespValue::Bulk(b) => String::from_utf8_lossy(b).into_owned(),
-                    o => panic!("bad cursor {:?}", o),
+                    o => panic!("bad cursor {o:?}"),
                 };
                 let e = flat(CmdResult::Ok(v[1].clone()));
                 (c, e)
@@ -1569,4 +1947,3 @@ mod tests {
         assert!(e.contains("invalid cursor"), "{}", e);
     }
 }
-

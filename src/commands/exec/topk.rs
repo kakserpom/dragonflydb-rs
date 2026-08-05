@@ -7,12 +7,10 @@
 //! LIST (optionally WITHCOUNT) and INFO report the current state.
 
 use crate::commands::{
-    bulk, integer, Command, OpContext, KeyRange, FLAG_DENYOOM, FLAG_FAST, FLAG_READONLY,
-    FLAG_WRITE,
+    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext, bulk, integer,
 };
-use crate::core::compact::CompactString;
-use crate::core::topk::{Topk, DEFAULT_DECAY, DEFAULT_DEPTH, DEFAULT_WIDTH};
 use crate::core::PrimeValue;
+use crate::core::topk::{DEFAULT_DECAY, DEFAULT_DEPTH, DEFAULT_WIDTH, Topk};
 use crate::error::{CmdResult, RespError, RespValue};
 use crate::util::{format_double, parse_double, parse_u64};
 
@@ -71,9 +69,8 @@ fn parse_u32(s: &[u8]) -> Option<u32> {
 fn exec_topk_reserve(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let k = match parse_u32(&ctx.args[key_idx + 1]) {
-        Some(k) => k,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(k) = parse_u32(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::integer());
     };
     if k == 0 {
         return CmdResult::Err(k_greater_than_zero());
@@ -125,10 +122,8 @@ fn exec_topk_reserve(ctx: &mut OpContext) -> CmdResult {
         Some(_) => return CmdResult::Err(RespError::wrong_type()),
         None => {}
     }
-    ctx.db.insert(
-        CompactString::from_bytes(key),
-        PrimeValue::Topk(Topk::new(k, width, depth, decay)),
-    );
+    ctx.db
+        .insert(key, PrimeValue::Topk(Topk::new(k, width, depth, decay)));
     CmdResult::Ok(crate::commands::ok())
 }
 
@@ -170,9 +165,8 @@ fn parse_incrby_pairs(args: &[Vec<u8>], key_idx: usize) -> Result<Vec<(Vec<u8>, 
             return Err(RespError::syntax());
         }
         let item = args[i].clone();
-        let incr = match crate::util::parse_i64(&args[i + 1]) {
-            Some(v) => v,
-            None => return Err(RespError::integer()),
+        let Some(incr) = crate::util::parse_i64(&args[i + 1]) else {
+            return Err(RespError::integer());
         };
         if !(1..=100_000).contains(&incr) {
             return Err(incr_range());
@@ -222,7 +216,10 @@ fn exec_topk_query(ctx: &mut OpContext) -> CmdResult {
         Some(_) => return CmdResult::Err(RespError::wrong_type()),
         None => return CmdResult::Err(no_such_key()),
     };
-    let results: Vec<RespValue> = items.iter().map(|it| integer(topk.query(it) as i64)).collect();
+    let results: Vec<RespValue> = items
+        .iter()
+        .map(|it| integer(i64::from(topk.query(it))))
+        .collect();
     CmdResult::Ok(RespValue::Array(results))
 }
 
@@ -237,7 +234,10 @@ fn exec_topk_count(ctx: &mut OpContext) -> CmdResult {
         Some(_) => return CmdResult::Err(RespError::wrong_type()),
         None => return CmdResult::Err(no_such_key()),
     };
-    let results: Vec<RespValue> = items.iter().map(|it| integer(topk.count(it) as i64)).collect();
+    let results: Vec<RespValue> = items
+        .iter()
+        .map(|it| integer(i64::from(topk.count(it))))
+        .collect();
     CmdResult::Ok(RespValue::Array(results))
 }
 
@@ -251,7 +251,7 @@ fn exec_topk_list(ctx: &mut OpContext) -> CmdResult {
         .args
         .get(key_idx + 1)
         .is_some_and(|a| a.eq_ignore_ascii_case(b"WITHCOUNT"));
-    if ctx.args.len() > key_idx + 1 + with_count as usize {
+    if ctx.args.len() > key_idx + 1 + usize::from(with_count) {
         return CmdResult::Err(RespError::syntax());
     }
     let topk = match ctx.db.find(&ctx.args[key_idx], ctx.now_ms) {
@@ -263,7 +263,7 @@ fn exec_topk_list(ctx: &mut OpContext) -> CmdResult {
     for item in topk.list() {
         reply.push(bulk(item.item.as_bytes()));
         if with_count {
-            reply.push(integer(item.count as i64));
+            reply.push(integer(i64::from(item.count)));
         }
     }
     CmdResult::Ok(RespValue::Array(reply))
@@ -282,11 +282,11 @@ fn exec_topk_info(ctx: &mut OpContext) -> CmdResult {
     };
     CmdResult::Ok(RespValue::Array(vec![
         bulk("k"),
-        integer(topk.k() as i64),
+        integer(i64::from(topk.k())),
         bulk("width"),
-        integer(topk.width() as i64),
+        integer(i64::from(topk.width())),
         bulk("depth"),
-        integer(topk.depth() as i64),
+        integer(i64::from(topk.depth())),
         bulk("decay"),
         bulk(format_double(topk.decay())),
     ]))
@@ -356,6 +356,7 @@ pub static CMD_TOPK_INFO: Command = Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::compact::CompactString;
     use crate::core::db::DbSlice;
 
     /// Dispatch with the framework-level arity check applied, mirroring
@@ -426,14 +427,16 @@ mod tests {
     }
 
     fn set(db: &mut DbSlice, key: &str, value: &str) {
-        db.insert(
-            CompactString::from_bytes(key.as_bytes()),
-            PrimeValue::Str(CompactString::from(value)),
-        );
+        db.insert(key.as_bytes(), PrimeValue::Str(CompactString::from(value)));
     }
 
     fn reserve_default(db: &mut DbSlice, key: &str, k: u32) {
-        ok_res(run!(db, b"TOPK.RESERVE", key.as_bytes(), k.to_string().as_bytes()));
+        ok_res(run!(
+            db,
+            b"TOPK.RESERVE",
+            key.as_bytes(),
+            k.to_string().as_bytes()
+        ));
     }
 
     fn reserve_custom(db: &mut DbSlice, key: &str, k: u32, width: u32, depth: u32, decay: f64) {
@@ -453,7 +456,13 @@ mod tests {
     }
 
     fn incr_by_item(db: &mut DbSlice, key: &str, item: &str, incr: u32) -> CmdResult {
-        run!(db, b"TOPK.INCRBY", key.as_bytes(), item.as_bytes(), incr.to_string().as_bytes())
+        run!(
+            db,
+            b"TOPK.INCRBY",
+            key.as_bytes(),
+            item.as_bytes(),
+            incr.to_string().as_bytes()
+        )
     }
 
     /// Assert every element of an array reply is Nil.
@@ -473,7 +482,9 @@ mod tests {
     fn commands_on_non_existent_key() {
         let mut db = DbSlice::new(0);
         assert!(err(run!(&mut db, b"TOPK.ADD", b"noexist", b"foo")).contains("no such key"));
-        assert!(err(run!(&mut db, b"TOPK.INCRBY", b"noexist", b"foo", b"1")).contains("no such key"));
+        assert!(
+            err(run!(&mut db, b"TOPK.INCRBY", b"noexist", b"foo", b"1")).contains("no such key")
+        );
         assert!(err(run!(&mut db, b"TOPK.QUERY", b"noexist", b"foo")).contains("no such key"));
         assert!(err(run!(&mut db, b"TOPK.COUNT", b"noexist", b"foo")).contains("no such key"));
         assert!(err(run!(&mut db, b"TOPK.LIST", b"noexist")).contains("no such key"));
@@ -555,7 +566,10 @@ mod tests {
     fn reserve_min_k() {
         let mut db = DbSlice::new(0);
         reserve_default(&mut db, "tk", 1);
-        assert_eq!(ints(run!(&mut db, b"TOPK.QUERY", b"tk", b"anything")), vec![0]);
+        assert_eq!(
+            ints(run!(&mut db, b"TOPK.QUERY", b"tk", b"anything")),
+            vec![0]
+        );
     }
 
     #[test]
@@ -594,7 +608,9 @@ mod tests {
     #[test]
     fn reserve_k_zero() {
         let mut db = DbSlice::new(0);
-        assert!(err(run!(&mut db, b"TOPK.RESERVE", b"tk", b"0")).contains("k must be greater than 0"));
+        assert!(
+            err(run!(&mut db, b"TOPK.RESERVE", b"tk", b"0")).contains("k must be greater than 0")
+        );
     }
 
     #[test]
@@ -654,24 +670,54 @@ mod tests {
     fn reserve_partial_optional_params() {
         let mut db = DbSlice::new(0);
         assert!(err(run!(&mut db, b"TOPK.RESERVE", b"tk", b"5", b"100")).contains("syntax error"));
-        assert!(err(run!(&mut db, b"TOPK.RESERVE", b"tk", b"5", b"100", b"7"))
-            .contains("syntax error"));
+        assert!(
+            err(run!(&mut db, b"TOPK.RESERVE", b"tk", b"5", b"100", b"7")).contains("syntax error")
+        );
     }
 
     #[test]
     fn reserve_trailing_args() {
         let mut db = DbSlice::new(0);
-        let r = run!(&mut db, b"TOPK.RESERVE", b"tk", b"5", b"8", b"7", b"0.9", b"extra");
+        let r = run!(
+            &mut db,
+            b"TOPK.RESERVE",
+            b"tk",
+            b"5",
+            b"8",
+            b"7",
+            b"0.9",
+            b"extra"
+        );
         assert!(err(r).contains("syntax error"));
     }
 
     #[test]
     fn reserve_dimensions_exceed_caps() {
         let mut db = DbSlice::new(0);
-        assert!(err(run!(&mut db, b"TOPK.RESERVE", b"tk1", b"50", b"1000001", b"7", b"0.9"))
-            .contains("must not exceed"));
-        assert!(err(run!(&mut db, b"TOPK.RESERVE", b"tk2", b"50", b"100000", b"101", b"0.9"))
-            .contains("must not exceed"));
+        assert!(
+            err(run!(
+                &mut db,
+                b"TOPK.RESERVE",
+                b"tk1",
+                b"50",
+                b"1000001",
+                b"7",
+                b"0.9"
+            ))
+            .contains("must not exceed")
+        );
+        assert!(
+            err(run!(
+                &mut db,
+                b"TOPK.RESERVE",
+                b"tk2",
+                b"50",
+                b"100000",
+                b"101",
+                b"0.9"
+            ))
+            .contains("must not exceed")
+        );
     }
 
     #[test]
@@ -720,15 +766,25 @@ mod tests {
             RespValue::Array(a) => assert_eq!(a.len(), 2),
             o => panic!("expected array, got {o:?}"),
         }
-        assert_eq!(ints(run!(&mut db, b"TOPK.QUERY", b"tk", b"heavy1")), vec![1]);
-        assert_eq!(ints(run!(&mut db, b"TOPK.QUERY", b"tk", b"heavy2")), vec![1]);
+        assert_eq!(
+            ints(run!(&mut db, b"TOPK.QUERY", b"tk", b"heavy1")),
+            vec![1]
+        );
+        assert_eq!(
+            ints(run!(&mut db, b"TOPK.QUERY", b"tk", b"heavy2")),
+            vec![1]
+        );
 
         // A strong item evicts the weakest: a bulk string, not nil.
-        let r = incr_by_item(&mut db, "tk", "newcomer", 100000);
+        let r = incr_by_item(&mut db, "tk", "newcomer", 100_000);
         match r.into_resp_value() {
             RespValue::Array(a) => {
                 assert_eq!(a.len(), 1);
-                assert!(matches!(a[0], RespValue::Bulk(_)), "expected evicted string, got {:?}", a[0]);
+                assert!(
+                    matches!(a[0], RespValue::Bulk(_)),
+                    "expected evicted string, got {:?}",
+                    a[0]
+                );
             }
             o => panic!("expected array, got {o:?}"),
         }
@@ -741,7 +797,10 @@ mod tests {
         let _ = add_item(&mut db, "tk", "hello world");
         let _ = add_item(&mut db, "tk", "foo\tbar");
         let _ = add_item(&mut db, "tk", "");
-        assert_eq!(ints(run!(&mut db, b"TOPK.QUERY", b"tk", b"hello world")), vec![1]);
+        assert_eq!(
+            ints(run!(&mut db, b"TOPK.QUERY", b"tk", b"hello world")),
+            vec![1]
+        );
     }
 
     #[test]
@@ -772,7 +831,17 @@ mod tests {
     fn incr_by_multiple_items() {
         let mut db = DbSlice::new(0);
         reserve_default(&mut db, "tk", 5);
-        assert_all_nil(run!(&mut db, b"TOPK.INCRBY", b"tk", b"a", b"5", b"b", b"3", b"c", b"7"));
+        assert_all_nil(run!(
+            &mut db,
+            b"TOPK.INCRBY",
+            b"tk",
+            b"a",
+            b"5",
+            b"b",
+            b"3",
+            b"c",
+            b"7"
+        ));
     }
 
     #[test]
@@ -796,7 +865,7 @@ mod tests {
     fn incr_by_max_increment() {
         let mut db = DbSlice::new(0);
         reserve_default(&mut db, "tk", 5);
-        assert_all_nil(incr_by_item(&mut db, "tk", "foo", 100000));
+        assert_all_nil(incr_by_item(&mut db, "tk", "foo", 100_000));
     }
 
     #[test]
@@ -827,9 +896,13 @@ mod tests {
     fn incr_by_odd_args() {
         let mut db = DbSlice::new(0);
         reserve_default(&mut db, "tk", 5);
-        assert!(err(run!(&mut db, b"TOPK.INCRBY", b"tk", b"foo")).contains("wrong number of arguments"));
-        assert!(err(run!(&mut db, b"TOPK.INCRBY", b"tk", b"foo", b"1", b"bar"))
-            .contains("syntax error"));
+        assert!(
+            err(run!(&mut db, b"TOPK.INCRBY", b"tk", b"foo")).contains("wrong number of arguments")
+        );
+        assert!(
+            err(run!(&mut db, b"TOPK.INCRBY", b"tk", b"foo", b"1", b"bar"))
+                .contains("syntax error")
+        );
     }
 
     #[test]
@@ -851,7 +924,10 @@ mod tests {
     fn query_absent_item() {
         let mut db = DbSlice::new(0);
         reserve_default(&mut db, "tk", 5);
-        assert_eq!(ints(run!(&mut db, b"TOPK.QUERY", b"tk", b"neveradded")), vec![0]);
+        assert_eq!(
+            ints(run!(&mut db, b"TOPK.QUERY", b"tk", b"neveradded")),
+            vec![0]
+        );
     }
 
     #[test]
@@ -870,7 +946,10 @@ mod tests {
     fn query_empty_topk() {
         let mut db = DbSlice::new(0);
         reserve_default(&mut db, "tk", 5);
-        assert_eq!(ints(run!(&mut db, b"TOPK.QUERY", b"tk", b"anything")), vec![0]);
+        assert_eq!(
+            ints(run!(&mut db, b"TOPK.QUERY", b"tk", b"anything")),
+            vec![0]
+        );
     }
 
     #[test]
@@ -893,7 +972,10 @@ mod tests {
     fn count_absent_item() {
         let mut db = DbSlice::new(0);
         reserve_default(&mut db, "tk", 5);
-        assert_eq!(ints(run!(&mut db, b"TOPK.COUNT", b"tk", b"neveradded")), vec![0]);
+        assert_eq!(
+            ints(run!(&mut db, b"TOPK.COUNT", b"tk", b"neveradded")),
+            vec![0]
+        );
     }
 
     #[test]
@@ -910,7 +992,10 @@ mod tests {
     fn count_empty_topk() {
         let mut db = DbSlice::new(0);
         reserve_default(&mut db, "tk", 5);
-        assert_eq!(ints(run!(&mut db, b"TOPK.COUNT", b"tk", b"anything")), vec![0]);
+        assert_eq!(
+            ints(run!(&mut db, b"TOPK.COUNT", b"tk", b"anything")),
+            vec![0]
+        );
     }
 
     #[test]
@@ -920,7 +1005,10 @@ mod tests {
         let _ = incr_by_item(&mut db, "tk", "heavy", 1000);
         let _ = incr_by_item(&mut db, "tk", "victim", 5);
 
-        assert_eq!(ints(run!(&mut db, b"TOPK.QUERY", b"tk", b"victim")), vec![0]);
+        assert_eq!(
+            ints(run!(&mut db, b"TOPK.QUERY", b"tk", b"victim")),
+            vec![0]
+        );
         let counts = ints(run!(&mut db, b"TOPK.COUNT", b"tk", b"victim"));
         assert!(counts[0] >= 5);
         let counts = ints(run!(&mut db, b"TOPK.COUNT", b"tk", b"heavy"));
@@ -1075,8 +1163,9 @@ mod tests {
     fn info_trailing_args() {
         let mut db = DbSlice::new(0);
         reserve_default(&mut db, "tk", 5);
-        assert!(err(run!(&mut db, b"TOPK.INFO", b"tk", b"extra"))
-            .contains("wrong number of arguments"));
+        assert!(
+            err(run!(&mut db, b"TOPK.INFO", b"tk", b"extra")).contains("wrong number of arguments")
+        );
     }
 
     #[test]
@@ -1118,10 +1207,22 @@ mod tests {
         let _ = add_item(&mut db, "tk1", "onlyin1");
         let _ = add_item(&mut db, "tk2", "onlyin2");
 
-        assert_eq!(ints(run!(&mut db, b"TOPK.QUERY", b"tk1", b"onlyin1")), vec![1]);
-        assert_eq!(ints(run!(&mut db, b"TOPK.QUERY", b"tk1", b"onlyin2")), vec![0]);
-        assert_eq!(ints(run!(&mut db, b"TOPK.QUERY", b"tk2", b"onlyin2")), vec![1]);
-        assert_eq!(ints(run!(&mut db, b"TOPK.QUERY", b"tk2", b"onlyin1")), vec![0]);
+        assert_eq!(
+            ints(run!(&mut db, b"TOPK.QUERY", b"tk1", b"onlyin1")),
+            vec![1]
+        );
+        assert_eq!(
+            ints(run!(&mut db, b"TOPK.QUERY", b"tk1", b"onlyin2")),
+            vec![0]
+        );
+        assert_eq!(
+            ints(run!(&mut db, b"TOPK.QUERY", b"tk2", b"onlyin2")),
+            vec![1]
+        );
+        assert_eq!(
+            ints(run!(&mut db, b"TOPK.QUERY", b"tk2", b"onlyin1")),
+            vec![0]
+        );
 
         match run!(&mut db, b"TOPK.INFO", b"tk1").into_resp_value() {
             RespValue::Array(a) => assert_eq!(a[1], RespValue::Integer(3)),

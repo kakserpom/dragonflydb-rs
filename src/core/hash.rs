@@ -29,6 +29,7 @@ impl Default for Hash {
 }
 
 impl Hash {
+    #[must_use]
     pub fn new() -> Self {
         Hash {
             repr: HashRepr::Small(Vec::new()),
@@ -52,9 +53,10 @@ impl Hash {
         let present = self.contains(field.as_bytes());
         if present {
             match (keepttl, self.field_expire_ms(field.as_bytes()), expire_ms) {
-                (false, _, Some(ms)) => self.set_expiry(field.clone(), ms),
+                (false, _, Some(ms)) | (true, None, Some(ms)) => {
+                    self.set_expiry(field.clone(), ms);
+                }
                 (false, _, None) => self.clear_field_expiry(field.as_bytes()),
-                (true, None, Some(ms)) => self.set_expiry(field.clone(), ms),
                 (true, _, _) => {}
             }
             self.set(field, value);
@@ -116,11 +118,13 @@ impl Hash {
     }
 
     /// Absolute expiry (in ms) of `field`, if it carries one.
+    #[must_use]
     pub fn field_expire_ms(&self, field: &[u8]) -> Option<u64> {
         self.expiry.as_ref().and_then(|exp| exp.get(field).copied())
     }
 
     /// Whether any field carries an expiry.
+    #[must_use]
     pub fn has_expiry(&self) -> bool {
         self.expiry.is_some()
     }
@@ -128,10 +132,12 @@ impl Hash {
     /// Whether the hash is still in the compact (listpack) representation,
     /// mirroring Dragonfly's `kEncodingListPack` encoding. Used by DUMP to pick
     /// `RDB_TYPE_HASH_LISTPACK`.
+    #[must_use]
     pub fn is_small(&self) -> bool {
         matches!(self.repr, HashRepr::Small(_))
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         match &self.repr {
             HashRepr::Small(v) => v.len(),
@@ -139,10 +145,12 @@ impl Hash {
         }
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    #[must_use]
     pub fn get(&self, field: &[u8]) -> Option<&CompactString> {
         match &self.repr {
             HashRepr::Small(v) => v
@@ -193,6 +201,7 @@ impl Hash {
         }
     }
 
+    #[must_use]
     pub fn contains(&self, field: &[u8]) -> bool {
         match &self.repr {
             HashRepr::Small(v) => v.iter().any(|(f, _)| f.as_bytes() == field),
@@ -207,6 +216,7 @@ impl Hash {
         }
     }
 
+    #[must_use]
     pub fn len_bytes(&self) -> usize {
         let mut total = 0;
         for (f, v) in self.iter() {
@@ -241,6 +251,7 @@ impl Hash {
     }
 
     /// Return a random (field, value) pair (for HRANDFIELD without COUNT).
+    #[must_use]
     pub fn rand_pair(&self) -> Option<(&CompactString, &CompactString)> {
         let len = self.len();
         if len == 0 {
@@ -252,6 +263,7 @@ impl Hash {
 
     /// Return `count` random (field, value) pairs, duplicates allowed
     /// (HRANDFIELD with a negative COUNT).
+    #[must_use]
     pub fn rand_pairs(&self, count: usize) -> Vec<(&CompactString, &CompactString)> {
         let len = self.len();
         if len == 0 || count == 0 {
@@ -268,6 +280,7 @@ impl Hash {
 
     /// Return `count` distinct random (field, value) pairs, at most the hash
     /// size (HRANDFIELD with a non-negative COUNT).
+    #[must_use]
     pub fn rand_pairs_unique(&self, count: usize) -> Vec<(&CompactString, &CompactString)> {
         let len = self.len();
         if len == 0 || count == 0 {
@@ -287,7 +300,7 @@ impl Hash {
     fn promote(&mut self) {
         if let HashRepr::Small(v) = &self.repr {
             let mut m: HashMap<CompactString, CompactString> = HashMap::with_capacity(v.len());
-            for (f, val) in v.iter() {
+            for (f, val) in v {
                 m.insert(f.clone(), val.clone());
             }
             self.repr = HashRepr::Large(m);
@@ -343,7 +356,11 @@ mod tests {
             h.set(CompactString::from("f1"), CompactString::from("v2"))
                 .is_some()
         );
-        assert_eq!(h.get(b"f1").map(|v| v.as_bytes()), Some(b"v2".as_slice()));
+        assert_eq!(
+            h.get(b"f1")
+                .map(super::super::compact::CompactString::as_bytes),
+            Some(b"v2".as_slice())
+        );
         assert_eq!(h.len(), 1);
         assert_eq!(h.remove(b"f1"), Some(CompactString::from("v2")));
         assert!(h.is_empty());
@@ -354,13 +371,17 @@ mod tests {
         let mut h = Hash::new();
         for i in 0..200 {
             h.set(
-                CompactString::from_bytes(format!("f{}", i).as_bytes()),
+                CompactString::from_bytes(format!("f{i}").as_bytes()),
                 CompactString::from("v"),
             );
         }
         assert_eq!(h.len(), 200);
         assert!(matches!(h.repr, HashRepr::Large(_)));
-        assert_eq!(h.get(b"f150").map(|v| v.as_bytes()), Some(b"v".as_slice()));
+        assert_eq!(
+            h.get(b"f150")
+                .map(super::super::compact::CompactString::as_bytes),
+            Some(b"v".as_slice())
+        );
         let pairs: Vec<_> = h.iter().map(|(f, v)| (f.clone(), v.clone())).collect();
         assert_eq!(pairs.len(), 200);
     }
@@ -466,7 +487,7 @@ mod tests {
         let mut h = Hash::new();
         for i in 0..10 {
             h.set(
-                CompactString::from_bytes(format!("f{}", i).as_bytes()),
+                CompactString::from_bytes(format!("f{i}").as_bytes()),
                 CompactString::from("v"),
             );
         }

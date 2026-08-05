@@ -1,10 +1,13 @@
 use hashbrown::HashSet;
 
 use crate::commands::exec::keys::glob_match;
-use crate::commands::{integer, Command, OpContext, ShardPart, KeyRange, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE};
+use crate::commands::{
+    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE, KeyRange,
+    OpContext, ShardPart, integer,
+};
+use crate::core::PrimeValue;
 use crate::core::compact::CompactString;
 use crate::core::set::Set;
-use crate::core::PrimeValue;
 use crate::error::{CmdResult, RespError, RespValue};
 use crate::util::{parse_i64, parse_u64};
 
@@ -43,7 +46,7 @@ fn prune_set_key(ctx: &mut OpContext, key: &[u8]) -> Result<(), RespError> {
 
 fn ensure_set<'a>(ctx: &'a mut OpContext, key: &[u8]) -> Result<&'a mut Set, RespError> {
     if ctx.db.find(key, ctx.now_ms).is_none() {
-        ctx.db.insert(CompactString::from_bytes(key), PrimeValue::Set(Set::new()));
+        ctx.db.insert(key, PrimeValue::Set(Set::new()));
     }
     set_mut(ctx, key)
 }
@@ -51,7 +54,10 @@ fn ensure_set<'a>(ctx: &'a mut OpContext, key: &[u8]) -> Result<&'a mut Set, Res
 fn exec_sadd(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let members: Vec<CompactString> = ctx.args[key_idx + 1..].iter().map(|m| CompactString::from_bytes(m)).collect();
+    let members: Vec<CompactString> = ctx.args[key_idx + 1..]
+        .iter()
+        .map(|m| CompactString::from_bytes(m))
+        .collect();
     let s = match ensure_set(ctx, key) {
         Ok(s) => s,
         Err(e) => return CmdResult::Err(e),
@@ -67,7 +73,7 @@ fn exec_sadd(ctx: &mut OpContext) -> CmdResult {
 
 /// SADDEX key [KEEPTTL] ttl member [member ...]
 ///
-/// Like SADD but attaches a per-member TTL in seconds (1..=MAX_EXPIRE_SEC).
+/// Like SADD but attaches a per-member TTL in seconds (`1..=MAX_EXPIRE_SEC`).
 /// Expired members are treated as absent: an SADDEX that refreshes an expired
 /// member reports it as newly added.
 fn exec_saddex(ctx: &mut OpContext) -> CmdResult {
@@ -77,8 +83,7 @@ fn exec_saddex(ctx: &mut OpContext) -> CmdResult {
     let keepttl = ctx
         .args
         .get(i)
-        .map(|a| a.eq_ignore_ascii_case(b"KEEPTTL"))
-        .unwrap_or(false);
+        .is_some_and(|a| a.eq_ignore_ascii_case(b"KEEPTTL"));
     if keepttl {
         i += 1;
     }
@@ -88,7 +93,9 @@ fn exec_saddex(ctx: &mut OpContext) -> CmdResult {
     };
     i += 1;
     if i >= ctx.args.len() {
-        return CmdResult::Err(RespError::new("ERR wrong number of arguments for 'saddex' command"));
+        return CmdResult::Err(RespError::new(
+            "ERR wrong number of arguments for 'saddex' command",
+        ));
     }
     if let Some(PrimeValue::Set(s)) = ctx.db.find_mut(key, ctx.now_ms) {
         s.prune_expired(ctx.now_ms);
@@ -116,9 +123,8 @@ fn exec_saddex(ctx: &mut OpContext) -> CmdResult {
 fn exec_sscan(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let cursor = match parse_u64(&ctx.args[key_idx + 1]) {
-        Some(c) => c,
-        None => return CmdResult::Err(RespError::new("ERR invalid cursor")),
+    let Some(cursor) = parse_u64(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::new("ERR invalid cursor"));
     };
     let opts = &ctx.args[key_idx + 2..];
     if opts.len() > 4 {
@@ -179,7 +185,11 @@ fn exec_sscan(ctx: &mut OpContext) -> CmdResult {
             out.push(RespValue::Bulk(m.as_bytes().to_vec()));
         }
     }
-    let next = if pos >= sorted.len() { 0u64 } else { pos as u64 };
+    let next = if pos >= sorted.len() {
+        0u64
+    } else {
+        pos as u64
+    };
     CmdResult::Ok(scan_reply(next, out))
 }
 
@@ -194,7 +204,10 @@ fn scan_reply(cursor: u64, members: Vec<RespValue>) -> RespValue {
 fn exec_srem(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let members: Vec<CompactString> = ctx.args[key_idx + 1..].iter().map(|m| CompactString::from_bytes(m)).collect();
+    let members: Vec<CompactString> = ctx.args[key_idx + 1..]
+        .iter()
+        .map(|m| CompactString::from_bytes(m))
+        .collect();
     let s = match set_mut(ctx, key) {
         Ok(s) => s,
         Err(e) => {
@@ -223,7 +236,11 @@ fn exec_smembers(ctx: &mut OpContext) -> CmdResult {
     }
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::Set(s)) => {
-            let out = s.members().into_iter().map(|m| RespValue::Bulk(m.as_bytes().to_vec())).collect();
+            let out = s
+                .members()
+                .into_iter()
+                .map(|m| RespValue::Bulk(m.as_bytes().to_vec()))
+                .collect();
             CmdResult::Ok(RespValue::Array(out))
         }
         Some(_) => CmdResult::Err(RespError::wrong_type()),
@@ -239,7 +256,7 @@ fn exec_sismember(ctx: &mut OpContext) -> CmdResult {
         return CmdResult::Err(e);
     }
     match ctx.db.find(key, ctx.now_ms) {
-        Some(PrimeValue::Set(s)) => CmdResult::Ok(integer(s.contains(member) as i64)),
+        Some(PrimeValue::Set(s)) => CmdResult::Ok(integer(i64::from(s.contains(member)))),
         Some(_) => CmdResult::Err(RespError::wrong_type()),
         None => CmdResult::Ok(integer(0)),
     }
@@ -255,12 +272,15 @@ fn exec_smismember(ctx: &mut OpContext) -> CmdResult {
         Some(PrimeValue::Set(s)) => {
             let out = ctx.args[key_idx + 1..]
                 .iter()
-                .map(|m| integer(s.contains(m) as i64))
+                .map(|m| integer(i64::from(s.contains(m))))
                 .collect();
             CmdResult::Ok(RespValue::Array(out))
         }
         Some(_) => CmdResult::Err(RespError::wrong_type()),
-        None => CmdResult::Ok(RespValue::Array(vec![integer(0); ctx.args.len() - key_idx - 1])),
+        None => CmdResult::Ok(RespValue::Array(vec![
+            integer(0);
+            ctx.args.len() - key_idx - 1
+        ])),
     }
 }
 
@@ -281,12 +301,13 @@ fn exec_spop(ctx: &mut OpContext) -> CmdResult {
     let key = &ctx.args[key_idx];
     let with_count = ctx.args.len() > key_idx + 1;
     let count = if with_count {
-        let c = match parse_i64(&ctx.args[key_idx + 1]) {
-            Some(v) => v,
-            None => return CmdResult::Err(RespError::integer()),
+        let Some(c) = parse_i64(&ctx.args[key_idx + 1]) else {
+            return CmdResult::Err(RespError::integer());
         };
         if c < 0 {
-            return CmdResult::Err(RespError::new("ERR value is out of range, must be positive"));
+            return CmdResult::Err(RespError::new(
+                "ERR value is out of range, must be positive",
+            ));
         }
         c as usize
     } else {
@@ -297,7 +318,11 @@ fn exec_spop(ctx: &mut OpContext) -> CmdResult {
             s.prune_expired(ctx.now_ms);
             if s.is_empty() {
                 ctx.db.remove(key);
-                return CmdResult::Ok(if with_count { RespValue::Array(vec![]) } else { RespValue::Nil });
+                return CmdResult::Ok(if with_count {
+                    RespValue::Array(vec![])
+                } else {
+                    RespValue::Nil
+                });
             }
             let mut out = Vec::new();
             for _ in 0..count {
@@ -316,7 +341,11 @@ fn exec_spop(ctx: &mut OpContext) -> CmdResult {
             }
         }
         Some(_) => CmdResult::Err(RespError::wrong_type()),
-        None => CmdResult::Ok(if with_count { RespValue::Array(vec![]) } else { RespValue::Nil }),
+        None => CmdResult::Ok(if with_count {
+            RespValue::Array(vec![])
+        } else {
+            RespValue::Nil
+        }),
     }
 }
 
@@ -368,7 +397,11 @@ fn exec_srandmember(ctx: &mut OpContext) -> CmdResult {
             CmdResult::Ok(RespValue::Array(out))
         }
         Some(_) => CmdResult::Err(RespError::wrong_type()),
-        None => CmdResult::Ok(if with_count { RespValue::Array(vec![]) } else { RespValue::Nil }),
+        None => CmdResult::Ok(if with_count {
+            RespValue::Array(vec![])
+        } else {
+            RespValue::Nil
+        }),
     }
 }
 
@@ -465,7 +498,11 @@ fn diff_of(ctx: &mut OpContext, base_idx: usize) -> Result<HashSet<CompactString
 }
 
 fn array_of(set: HashSet<CompactString>) -> RespValue {
-    RespValue::Array(set.into_iter().map(|m| RespValue::Bulk(m.as_bytes().to_vec())).collect())
+    RespValue::Array(
+        set.into_iter()
+            .map(|m| RespValue::Bulk(m.as_bytes().to_vec()))
+            .collect(),
+    )
 }
 
 /// Single-shard STORE fast path: write the result set to the destination on
@@ -479,7 +516,7 @@ fn store_single(ctx: &mut OpContext, result: HashSet<CompactString>) -> CmdResul
         let mut set = Set::new();
         set.extend(result.into_iter());
         ctx.db.clear_expiry(dest);
-        ctx.db.insert(CompactString::from_bytes(dest), PrimeValue::Set(set));
+        ctx.db.insert(dest, PrimeValue::Set(set));
     }
     CmdResult::Ok(integer(len))
 }
@@ -549,7 +586,9 @@ fn exec_sintercard(ctx: &mut OpContext) -> CmdResult {
         _ => return CmdResult::Err(RespError::integer()),
     };
     if numkeys == 0 {
-        return CmdResult::Err(RespError::new("ERR at least 1 input key is needed for this command"));
+        return CmdResult::Err(RespError::new(
+            "ERR at least 1 input key is needed for this command",
+        ));
     }
     // Real keys occupy args[2..key_end); anything after is the optional LIMIT
     // clause. Validated on every shard so errors surface regardless of routing.
@@ -590,8 +629,16 @@ fn exec_sintercard(ctx: &mut OpContext) -> CmdResult {
             None => any_missing = true,
         }
     }
-    let members = if any_missing { HashSet::new() } else { acc.unwrap_or_default() };
-    let count = if limit > 0 { (members.len() as i64).min(limit) } else { members.len() as i64 };
+    let members = if any_missing {
+        HashSet::new()
+    } else {
+        acc.unwrap_or_default()
+    };
+    let count = if limit > 0 {
+        (members.len() as i64).min(limit)
+    } else {
+        members.len() as i64
+    };
 
     let single = ctx.owned_keys.len() == ctx.args.len() - 2;
     if single {
@@ -679,7 +726,12 @@ fn merge_sdiff(parts: &[ShardPart], _args: &[Vec<u8>], keys: &[usize], _now: u64
     CmdResult::Ok(array_of(base))
 }
 
-fn merge_sinterstore(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u64) -> CmdResult {
+fn merge_sinterstore(
+    parts: &[ShardPart],
+    args: &[Vec<u8>],
+    keys: &[usize],
+    _now: u64,
+) -> CmdResult {
     let dest = &args[keys[0]];
     let mut acc: Option<HashSet<CompactString>> = None;
     for p in parts {
@@ -704,7 +756,12 @@ fn merge_sinterstore(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now
     CmdResult::deferred_store(dest.clone(), set_value(members), integer(len))
 }
 
-fn merge_sunionstore(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u64) -> CmdResult {
+fn merge_sunionstore(
+    parts: &[ShardPart],
+    args: &[Vec<u8>],
+    keys: &[usize],
+    _now: u64,
+) -> CmdResult {
     let dest = &args[keys[0]];
     let mut acc: HashSet<CompactString> = HashSet::new();
     for p in parts {
@@ -734,7 +791,9 @@ fn merge_sdiffstore(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now:
         }
     }
     if !have_base {
-        return CmdResult::Err(RespError::new("ERR internal: SDIFFSTORE base shard missing"));
+        return CmdResult::Err(RespError::new(
+            "ERR internal: SDIFFSTORE base shard missing",
+        ));
     }
     for p in parts {
         if p.owned_key_idxs.contains(&base_idx) {
@@ -750,7 +809,12 @@ fn merge_sdiffstore(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now:
     CmdResult::deferred_store(dest.clone(), set_value(base), integer(len))
 }
 
-fn merge_sintercard(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64) -> CmdResult {
+fn merge_sintercard(
+    parts: &[ShardPart],
+    args: &[Vec<u8>],
+    _keys: &[usize],
+    _now: u64,
+) -> CmdResult {
     for p in parts {
         if let CmdResult::Err(e) = &p.result {
             return CmdResult::Err(e.clone());
@@ -763,7 +827,10 @@ fn merge_sintercard(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now
     let key_end = 2usize.saturating_add(numkeys);
     let mut limit: i64 = 0;
     if args.len() > key_end && args[key_end].eq_ignore_ascii_case(b"LIMIT") {
-        limit = args.get(key_end + 1).and_then(|a| parse_i64(a)).unwrap_or(0);
+        limit = args
+            .get(key_end + 1)
+            .and_then(|a| parse_i64(a))
+            .unwrap_or(0);
     }
     let mut acc: Option<HashSet<CompactString>> = None;
     for p in parts {
@@ -785,7 +852,7 @@ fn merge_sintercard(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now
             Some(a) => a.retain(|m| members.contains(m)),
         }
     }
-    let n = acc.map(|a| a.len()).unwrap_or(0) as i64;
+    let n = acc.map_or(0, |a| a.len()) as i64;
     CmdResult::Ok(integer(if limit > 0 { n.min(limit) } else { n }))
 }
 
@@ -858,12 +925,9 @@ fn exec_smove(ctx: &mut OpContext) -> CmdResult {
         if src.is_empty() {
             ctx.db.remove(&ctx.args[src_idx]);
         } else {
-            ctx.db.insert(
-                CompactString::from_bytes(&ctx.args[src_idx]),
-                PrimeValue::Set(src),
-            );
+            ctx.db.insert(&ctx.args[src_idx], PrimeValue::Set(src));
         }
-        ctx.db.insert(CompactString::from_bytes(&ctx.args[dest_idx]), PrimeValue::Set(dest));
+        ctx.db.insert(&ctx.args[dest_idx], PrimeValue::Set(dest));
         return CmdResult::Ok(integer(1));
     }
 
@@ -877,8 +941,11 @@ fn exec_smove(ctx: &mut OpContext) -> CmdResult {
         match ctx.db.find(&ctx.args[src_idx], ctx.now_ms) {
             Some(PrimeValue::Set(s)) => {
                 result = CmdResult::Ok(RespValue::Array(
-                    s.members().into_iter().map(|m| RespValue::Bulk(m.as_bytes().to_vec())).collect(),
-                ))
+                    s.members()
+                        .into_iter()
+                        .map(|m| RespValue::Bulk(m.as_bytes().to_vec()))
+                        .collect(),
+                ));
             }
             Some(_) => return CmdResult::Err(RespError::wrong_type()),
             None => result = CmdResult::Ok(RespValue::Nil),
@@ -891,8 +958,11 @@ fn exec_smove(ctx: &mut OpContext) -> CmdResult {
         match ctx.db.find(&ctx.args[dest_idx], ctx.now_ms) {
             Some(PrimeValue::Set(s)) => {
                 result = CmdResult::Ok(RespValue::Array(
-                    s.members().into_iter().map(|m| RespValue::Bulk(m.as_bytes().to_vec())).collect(),
-                ))
+                    s.members()
+                        .into_iter()
+                        .map(|m| RespValue::Bulk(m.as_bytes().to_vec()))
+                        .collect(),
+                ));
             }
             Some(_) => return CmdResult::Err(RespError::wrong_type()),
             None => result = CmdResult::Ok(RespValue::Array(vec![])),
@@ -937,11 +1007,21 @@ fn merge_smove(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u64)
     } else {
         let mut set = Set::new();
         set.extend(new_src.into_iter());
-        stores.push((args[src_idx].clone(), Some(PrimeValue::Set(set)), None, false));
+        stores.push((
+            args[src_idx].clone(),
+            Some(PrimeValue::Set(set)),
+            None,
+            false,
+        ));
     }
     let mut dest_set = Set::new();
     dest_set.extend(dest.into_iter());
-    stores.push((args[dest_idx].clone(), Some(PrimeValue::Set(dest_set)), None, false));
+    stores.push((
+        args[dest_idx].clone(),
+        Some(PrimeValue::Set(dest_set)),
+        None,
+        false,
+    ));
     CmdResult::deferred_stores(stores, integer(1))
 }
 
@@ -1077,7 +1157,11 @@ pub static CMD_SINTERCARD: Command = Command {
     name: "SINTERCARD",
     arity: -3,
     flags: FLAG_READONLY | FLAG_MULTI_KEY,
-    key_range: KeyRange { first: 2, last: 0, step: 1 },
+    key_range: KeyRange {
+        first: 2,
+        last: 0,
+        step: 1,
+    },
     exec: exec_sintercard,
     merge: Some(merge_sintercard),
 };
@@ -1100,14 +1184,11 @@ mod tests {
         for &m in members {
             s.add(CompactString::from(m));
         }
-        db.insert(CompactString::from_bytes(key.as_bytes()), PrimeValue::Set(s));
+        db.insert(key.as_bytes(), PrimeValue::Set(s));
     }
 
     fn str_of(db: &mut DbSlice, key: &str, value: &str) {
-        db.insert(
-            CompactString::from_bytes(key.as_bytes()),
-            PrimeValue::Str(CompactString::from(value)),
-        );
+        db.insert(key.as_bytes(), PrimeValue::Str(CompactString::from(value)));
     }
 
     fn members_of(db: &mut DbSlice, key: &str) -> Vec<String> {
@@ -1117,7 +1198,7 @@ mod tests {
                 v.sort();
                 v
             }
-            _ => panic!("expected set at {}", key),
+            _ => panic!("expected set at {key}"),
         }
     }
 
@@ -1134,7 +1215,7 @@ mod tests {
                 .into_iter()
                 .map(|x| match x {
                     RespValue::Bulk(b) => String::from_utf8_lossy(&b).into_owned(),
-                    _ => panic!("unexpected element {:?}", x),
+                    _ => panic!("unexpected element {x:?}"),
                 })
                 .collect(),
             o => panic!("expected array, got {:?}", o.into_resp_value()),
@@ -1177,7 +1258,13 @@ mod tests {
                 b"SREM" => (exec_srem, 1, (1..2).collect()),
                 _ => panic!("unhandled command {:?}", argv[0]),
             };
-        let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx, now_ms };
+        let mut ctx = OpContext {
+            db,
+            args: argv,
+            owned_keys: &owned,
+            first_key_idx,
+            now_ms,
+        };
         exec(&mut ctx)
     }
 
@@ -1261,7 +1348,10 @@ mod tests {
         db.set_expiry(b"target", 1010, 0);
         assert_eq!(db.ttl_ms(b"target", 0), 1010);
 
-        assert_eq!(4, int(run!(&mut db, b"SUNIONSTORE", b"target", b"s1", b"s2")));
+        assert_eq!(
+            4,
+            int(run!(&mut db, b"SUNIONSTORE", b"target", b"s1", b"s2"))
+        );
         assert_eq!(members_of(&mut db, "target"), ["a", "b", "c", "d"]);
         assert_eq!(db.ttl_ms(b"target", 0), -1);
     }
@@ -1283,7 +1373,10 @@ mod tests {
         set_of(&mut db, "bar", &["x", "a", "b", "c"]);
         set_of(&mut db, "foo", &["c"]);
         set_of(&mut db, "car", &["a", "d"]);
-        assert_eq!(2, int(run!(&mut db, b"SDIFFSTORE", b"tar", b"bar", b"foo", b"car")));
+        assert_eq!(
+            2,
+            int(run!(&mut db, b"SDIFFSTORE", b"tar", b"bar", b"foo", b"car"))
+        );
         assert_eq!(members_of(&mut db, "tar"), ["b", "x"]);
     }
 
@@ -1320,7 +1413,10 @@ mod tests {
 
         set_of(&mut db, "src2", &["x", "y"]);
         str_of(&mut db, "dest3", "foo");
-        assert_eq!(2, int(run!(&mut db, b"SINTERSTORE", b"dest3", b"src", b"src2")));
+        assert_eq!(
+            2,
+            int(run!(&mut db, b"SINTERSTORE", b"dest3", b"src", b"src2"))
+        );
         assert!(matches!(db.find(b"dest3", 0), Some(PrimeValue::Set(_))));
     }
 
@@ -1333,28 +1429,65 @@ mod tests {
 
         assert_eq!(2, int(run!(&mut db, b"SINTERCARD", b"2", b"s1", b"s2")));
         assert_eq!(0, int(run!(&mut db, b"SINTERCARD", b"2", b"s1", b"s4")));
-        assert_eq!(2, int(run!(&mut db, b"SINTERCARD", b"2", b"s2", b"s3", b"LIMIT", b"2")));
+        assert_eq!(
+            2,
+            int(run!(
+                &mut db,
+                b"SINTERCARD",
+                b"2",
+                b"s2",
+                b"s3",
+                b"LIMIT",
+                b"2"
+            ))
+        );
         assert_eq!(4, int(run!(&mut db, b"SINTERCARD", b"1", b"s1")));
 
         assert!(err(run!(&mut db, b"SINTERCARD", b"a", b"s1", b"s2")).contains("not an integer"));
-        assert!(err(run!(&mut db, b"SINTERCARD", b"2", b"s1", b"s2", b"LIMIT")).contains("syntax error"));
         assert!(
-            err(run!(&mut db, b"SINTERCARD", b"2", b"s1", b"s2", b"LIMIT", b"a"))
-                .contains("limit can't be negative")
+            err(run!(&mut db, b"SINTERCARD", b"2", b"s1", b"s2", b"LIMIT"))
+                .contains("syntax error")
         );
         assert!(
-            err(run!(&mut db, b"SINTERCARD", b"2", b"s1", b"s2", b"LIMIT", b"-1"))
-                .contains("limit can't be negative")
+            err(run!(
+                &mut db,
+                b"SINTERCARD",
+                b"2",
+                b"s1",
+                b"s2",
+                b"LIMIT",
+                b"a"
+            ))
+            .contains("limit can't be negative")
+        );
+        assert!(
+            err(run!(
+                &mut db,
+                b"SINTERCARD",
+                b"2",
+                b"s1",
+                b"s2",
+                b"LIMIT",
+                b"-1"
+            ))
+            .contains("limit can't be negative")
         );
         assert!(err(run!(&mut db, b"SINTERCARD", b"2", b"s1")).contains("syntax error"));
-        assert!(err(run!(&mut db, b"SINTERCARD", b"0", b"LIMIT", b"0")).contains("at least 1 input key"));
+        assert!(
+            err(run!(&mut db, b"SINTERCARD", b"0", b"LIMIT", b"0"))
+                .contains("at least 1 input key")
+        );
         assert!(err(run!(&mut db, b"SINTERCARD", b"-1", b"s1")).contains("not an integer"));
     }
 
     #[test]
     fn merge_sinterstore_skips_dest_only_shard() {
-        let args =
-            vec![b"SINTERSTORE".to_vec(), b"d".to_vec(), b"a".to_vec(), b"b".to_vec()];
+        let args = vec![
+            b"SINTERSTORE".to_vec(),
+            b"d".to_vec(),
+            b"a".to_vec(),
+            b"b".to_vec(),
+        ];
         let keys = [1usize, 2, 3];
         // Shard 0 owns only the destination; shards 1/2 own the sources.
         let parts = [
@@ -1382,7 +1515,12 @@ mod tests {
 
     #[test]
     fn merge_sinterstore_empty_removes_dest() {
-        let args = vec![b"SINTERSTORE".to_vec(), b"d".to_vec(), b"a".to_vec(), b"b".to_vec()];
+        let args = vec![
+            b"SINTERSTORE".to_vec(),
+            b"d".to_vec(),
+            b"a".to_vec(),
+            b"b".to_vec(),
+        ];
         let keys = [1usize, 2, 3];
         let parts = [
             ShardPart {
@@ -1409,7 +1547,12 @@ mod tests {
 
     #[test]
     fn merge_sunionstore_basic() {
-        let args = vec![b"SUNIONSTORE".to_vec(), b"d".to_vec(), b"a".to_vec(), b"b".to_vec()];
+        let args = vec![
+            b"SUNIONSTORE".to_vec(),
+            b"d".to_vec(),
+            b"a".to_vec(),
+            b"b".to_vec(),
+        ];
         let keys = [1usize, 2, 3];
         let parts = [
             ShardPart {
@@ -1436,8 +1579,12 @@ mod tests {
 
     #[test]
     fn merge_sdiffstore_basic() {
-        let args =
-            vec![b"SDIFFSTORE".to_vec(), b"d".to_vec(), b"base".to_vec(), b"sub".to_vec()];
+        let args = vec![
+            b"SDIFFSTORE".to_vec(),
+            b"d".to_vec(),
+            b"base".to_vec(),
+            b"sub".to_vec(),
+        ];
         let keys = [1usize, 2, 3];
         let parts = [
             ShardPart {
@@ -1467,8 +1614,12 @@ mod tests {
         let mut db = DbSlice::new(0);
         set_of(&mut db, "s1", &["2", "b", "1", "a"]);
         set_of(&mut db, "s2", &["3", "c", "2", "b"]);
-        let argv =
-            vec![b"SINTERCARD".to_vec(), b"2".to_vec(), b"s1".to_vec(), b"s2".to_vec()];
+        let argv = vec![
+            b"SINTERCARD".to_vec(),
+            b"2".to_vec(),
+            b"s1".to_vec(),
+            b"s2".to_vec(),
+        ];
         let keys = [2usize, 3];
 
         // Shard 0 owns s1, shard 1 owns s2; "LIMIT"/value phantom keys live elsewhere.
@@ -1491,8 +1642,16 @@ mod tests {
         };
         let p1 = exec_sintercard(&mut ctx1);
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: owned0, result: p0 },
-            ShardPart { shard: 1, owned_key_idxs: owned1, result: p1 },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: owned0,
+                result: p0,
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: owned1,
+                result: p1,
+            },
         ];
         assert_eq!(2, int(merge_sintercard(&parts, &argv, &keys, 0)));
     }
@@ -1531,8 +1690,16 @@ mod tests {
         let p1 = exec_sintercard(&mut ctx1);
         assert!(matches!(p1, CmdResult::Ok(RespValue::Nil)));
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: owned0, result: p0 },
-            ShardPart { shard: 1, owned_key_idxs: owned1, result: p1 },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: owned0,
+                result: p0,
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: owned1,
+                result: p1,
+            },
         ];
         assert_eq!(4, int(merge_sintercard(&parts, &argv, &keys, 0)));
     }
@@ -1544,7 +1711,12 @@ mod tests {
         let mut db = DbSlice::new(0);
         set_of(&mut db, "s1", &["a"]);
         set_of(&mut db, "s2", &["b"]);
-        let argv = vec![b"SINTERCARD".to_vec(), b"a".to_vec(), b"s1".to_vec(), b"s2".to_vec()];
+        let argv = vec![
+            b"SINTERCARD".to_vec(),
+            b"a".to_vec(),
+            b"s1".to_vec(),
+            b"s2".to_vec(),
+        ];
         let keys = [2usize, 3];
         let owned0 = vec![2usize];
         let owned1 = vec![3usize];
@@ -1565,8 +1737,16 @@ mod tests {
         };
         let p1 = exec_sintercard(&mut ctx1);
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: owned0, result: p0 },
-            ShardPart { shard: 1, owned_key_idxs: owned1, result: p1 },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: owned0,
+                result: p0,
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: owned1,
+                result: p1,
+            },
         ];
         assert!(merge_sintercard(&parts, &argv, &keys, 0).is_err());
     }
@@ -1626,7 +1806,12 @@ mod tests {
     // Multi-shard merge: src on one shard, dest on another.
     #[test]
     fn s_move_multi_shard_merge() {
-        let args = vec![b"SMOVE".to_vec(), b"src".to_vec(), b"dest".to_vec(), b"m".to_vec()];
+        let args = vec![
+            b"SMOVE".to_vec(),
+            b"src".to_vec(),
+            b"dest".to_vec(),
+            b"m".to_vec(),
+        ];
         let keys = [1usize, 2];
         let parts = [
             ShardPart {
@@ -1652,7 +1837,12 @@ mod tests {
     // Multi-shard merge: moving the last member deletes src (store with None).
     #[test]
     fn s_move_multi_shard_merge_removes_src() {
-        let args = vec![b"SMOVE".to_vec(), b"src".to_vec(), b"dest".to_vec(), b"m".to_vec()];
+        let args = vec![
+            b"SMOVE".to_vec(),
+            b"src".to_vec(),
+            b"dest".to_vec(),
+            b"m".to_vec(),
+        ];
         let keys = [1usize, 2];
         let parts = [
             ShardPart {
@@ -1678,7 +1868,12 @@ mod tests {
     // Multi-shard merge: member absent from src replies 0 with no stores.
     #[test]
     fn s_move_multi_shard_merge_member_absent() {
-        let args = vec![b"SMOVE".to_vec(), b"src".to_vec(), b"dest".to_vec(), b"nope".to_vec()];
+        let args = vec![
+            b"SMOVE".to_vec(),
+            b"src".to_vec(),
+            b"dest".to_vec(),
+            b"nope".to_vec(),
+        ];
         let keys = [1usize, 2];
         let parts = [
             ShardPart {
@@ -1698,10 +1893,19 @@ mod tests {
     // Multi-shard merge: missing src replies 0.
     #[test]
     fn s_move_multi_shard_merge_missing_src() {
-        let args = vec![b"SMOVE".to_vec(), b"src".to_vec(), b"dest".to_vec(), b"m".to_vec()];
+        let args = vec![
+            b"SMOVE".to_vec(),
+            b"src".to_vec(),
+            b"dest".to_vec(),
+            b"m".to_vec(),
+        ];
         let keys = [1usize, 2];
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![1], result: CmdResult::Ok(RespValue::Nil) },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![1],
+                result: CmdResult::Ok(RespValue::Nil),
+            },
             ShardPart {
                 shard: 1,
                 owned_key_idxs: vec![2],
@@ -1714,7 +1918,12 @@ mod tests {
     // Multi-shard merge: wrong-type on either shard propagates.
     #[test]
     fn s_move_multi_shard_merge_wrong_type() {
-        let args = vec![b"SMOVE".to_vec(), b"src".to_vec(), b"dest".to_vec(), b"m".to_vec()];
+        let args = vec![
+            b"SMOVE".to_vec(),
+            b"src".to_vec(),
+            b"dest".to_vec(),
+            b"m".to_vec(),
+        ];
         let keys = [1usize, 2];
         let parts = [
             ShardPart {
@@ -1746,7 +1955,7 @@ mod tests {
     fn ttl_of(db: &mut DbSlice, key: &str, member: &str, now_ms: u64) -> i64 {
         match db.find(key.as_bytes(), 0) {
             Some(PrimeValue::Set(s)) => s.member_ttl_ms(member.as_bytes(), now_ms),
-            _ => panic!("expected set at {}", key),
+            _ => panic!("expected set at {key}"),
         }
     }
 
@@ -1764,17 +1973,17 @@ mod tests {
                 let mut it = v.into_iter();
                 let cursor = match it.next().unwrap() {
                     RespValue::Bulk(b) => String::from_utf8_lossy(&b).parse::<u64>().unwrap(),
-                    o => panic!("expected cursor bulk, got {:?}", o),
+                    o => panic!("expected cursor bulk, got {o:?}"),
                 };
                 let members = match it.next().unwrap() {
                     RespValue::Array(a) => a
                         .into_iter()
                         .map(|x| match x {
                             RespValue::Bulk(b) => String::from_utf8_lossy(&b).into_owned(),
-                            o => panic!("unexpected scan member {:?}", o),
+                            o => panic!("unexpected scan member {o:?}"),
                         })
                         .collect(),
-                    o => panic!("expected members array, got {:?}", o),
+                    o => panic!("expected members array, got {o:?}"),
                 };
                 (cursor, members)
             }
@@ -1785,16 +1994,23 @@ mod tests {
     fn set_of_i64(db: &mut DbSlice, key: &str, n: usize) {
         let mut s = Set::new();
         for i in 0..n {
-            s.add(CompactString::from(format!("{}", i)));
+            s.add(CompactString::from(format!("{i}")));
         }
-        db.insert(CompactString::from_bytes(key.as_bytes()), PrimeValue::Set(s));
+        db.insert(key.as_bytes(), PrimeValue::Set(s));
     }
 
     #[test]
     fn s_scan() {
         let mut db = DbSlice::new(0);
         // Missing key -> cursor 0, empty members.
-        let (c, v) = scan(run!(&mut db, b"SSCAN", b"non-existing-key", b"100", b"count", b"5"));
+        let (c, v) = scan(run!(
+            &mut db,
+            b"SSCAN",
+            b"non-existing-key",
+            b"100",
+            b"count",
+            b"5"
+        ));
         assert_eq!(c, 0);
         assert!(v.is_empty());
 
@@ -1808,17 +2024,36 @@ mod tests {
         assert_eq!(v, ["1", "10", "11", "12", "13", "14"]);
 
         // String set: paginated with COUNT.
-        let all: Vec<String> = (0..15).map(|i| format!("str-{}", i)).collect();
-        let refs: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+        let all: Vec<String> = (0..15).map(|i| format!("str-{i}")).collect();
+        let refs: Vec<&str> = all.iter().map(std::string::String::as_str).collect();
         set_of(&mut db, "mystrset", &refs);
 
         let (_, v) = scan(run!(&mut db, b"SSCAN", b"mystrset", b"0", b"count", b"5"));
         assert_eq!(v.len(), 5);
 
-        let (_, v) = scan(run!(&mut db, b"SSCAN", b"mystrset", b"0", b"match", b"str-1*"));
-        assert_eq!(v, ["str-1", "str-10", "str-11", "str-12", "str-13", "str-14"]);
+        let (_, v) = scan(run!(
+            &mut db,
+            b"SSCAN",
+            b"mystrset",
+            b"0",
+            b"match",
+            b"str-1*"
+        ));
+        assert_eq!(
+            v,
+            ["str-1", "str-10", "str-11", "str-12", "str-13", "str-14"]
+        );
 
-        let (_, v) = scan(run!(&mut db, b"SSCAN", b"mystrset", b"0", b"match", b"str-1*", b"count", b"3"));
+        let (_, v) = scan(run!(
+            &mut db,
+            b"SSCAN",
+            b"mystrset",
+            b"0",
+            b"match",
+            b"str-1*",
+            b"count",
+            b"3"
+        ));
         assert_eq!(v.len(), 3);
         assert!(v.iter().all(|m| m.starts_with("str-1")));
 
@@ -1832,15 +2067,22 @@ mod tests {
         assert!(err(r).contains("invalid cursor"));
 
         // Still responsive after the rejected cursors.
-        let (_, v) = scan(run!(&mut db, b"SSCAN", b"mystrset", b"0", b"match", b"str-1*"));
+        let (_, v) = scan(run!(
+            &mut db,
+            b"SSCAN",
+            b"mystrset",
+            b"0",
+            b"match",
+            b"str-1*"
+        ));
         assert_eq!(v.len(), 6);
     }
 
     #[test]
     fn s_scan_cursor_resume() {
         let mut db = DbSlice::new(0);
-        let all: Vec<String> = (0..100).map(|i| format!("key-{}", i)).collect();
-        let refs: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+        let all: Vec<String> = (0..100).map(|i| format!("key-{i}")).collect();
+        let refs: Vec<&str> = all.iter().map(std::string::String::as_str).collect();
         set_of(&mut db, "big", &refs);
 
         let mut cursor = 0u64;
@@ -1877,23 +2119,65 @@ mod tests {
     #[test]
     fn s_saddex() {
         let mut db = DbSlice::new(0);
-        assert_eq!(1, int(run_at!(&mut db, T0, b"SADDEX", b"key", b"2", b"val")));
+        assert_eq!(
+            1,
+            int(run_at!(&mut db, T0, b"SADDEX", b"key", b"2", b"val"))
+        );
         // Refresh: member still live, TTL renewed from now.
-        assert_eq!(0, int(run_at!(&mut db, T0 + 1500, b"SADDEX", b"key", b"2", b"val")));
-        assert_eq!(1, int(run_at!(&mut db, T0 + 2500, b"SISMEMBER", b"key", b"val")));
+        assert_eq!(
+            0,
+            int(run_at!(&mut db, T0 + 1500, b"SADDEX", b"key", b"2", b"val"))
+        );
+        assert_eq!(
+            1,
+            int(run_at!(&mut db, T0 + 2500, b"SISMEMBER", b"key", b"val"))
+        );
 
         // Non-numeric TTL is rejected.
         let r = run_at!(&mut db, T0, b"SADDEX", b"k", b"one", b"v");
         assert!(err(r).contains("value is not an integer or out of range"));
 
         // orig with TTL 10.
-        assert_eq!(1, int(run_at!(&mut db, T0 + 2500, b"SADDEX", b"key", b"10", b"orig")));
+        assert_eq!(
+            1,
+            int(run_at!(
+                &mut db,
+                T0 + 2500,
+                b"SADDEX",
+                b"key",
+                b"10",
+                b"orig"
+            ))
+        );
         // KEEPTTL: new gets TTL 1, orig's expiry is preserved.
-        assert_eq!(1, int(run_at!(&mut db, T0 + 2500, b"SADDEX", b"key", b"KEEPTTL", b"1", b"orig", b"new")));
+        assert_eq!(
+            1,
+            int(run_at!(
+                &mut db,
+                T0 + 2500,
+                b"SADDEX",
+                b"key",
+                b"KEEPTTL",
+                b"1",
+                b"orig",
+                b"new"
+            ))
+        );
         assert!(ttl_of(&mut db, "key", "new", T0 + 2500) <= 1000);
         assert!(ttl_of(&mut db, "key", "orig", T0 + 2500) > 5000);
         // Without KEEPTTL the TTL is overwritten.
-        assert_eq!(0, int(run_at!(&mut db, T0 + 2500, b"SADDEX", b"key", b"2", b"orig", b"new")));
+        assert_eq!(
+            0,
+            int(run_at!(
+                &mut db,
+                T0 + 2500,
+                b"SADDEX",
+                b"key",
+                b"2",
+                b"orig",
+                b"new"
+            ))
+        );
         assert!(ttl_of(&mut db, "key", "orig", T0 + 2500) <= 2000);
         // At least one member argument is required.
         let r = run_at!(&mut db, T0 + 2500, b"SADDEX", b"key", b"KEEPTTL", b"2");
@@ -1903,7 +2187,17 @@ mod tests {
     #[test]
     fn s_saddex_ttl_boundary() {
         let mut db = DbSlice::new(0);
-        assert_eq!(1, int(run_at!(&mut db, T0, b"SADDEX", b"key", b"268435455", b"at_cap")));
+        assert_eq!(
+            1,
+            int(run_at!(
+                &mut db,
+                T0,
+                b"SADDEX",
+                b"key",
+                b"268435455",
+                b"at_cap"
+            ))
+        );
         let r = run_at!(&mut db, T0, b"SADDEX", b"key", b"268435456", b"above_cap");
         assert!(err(r).contains("value is not an integer or out of range"));
     }
@@ -1912,10 +2206,20 @@ mod tests {
     fn s_saddex_expiry_transfer() {
         let mut db = DbSlice::new(0);
         for i in 0..10 {
-            assert_eq!(1, int(run_at!(&mut db, T0, b"SADDEX", b"key", b"5", format!("{}", i).into_bytes())));
+            assert_eq!(
+                1,
+                int(run_at!(
+                    &mut db,
+                    T0,
+                    b"SADDEX",
+                    b"key",
+                    b"5",
+                    format!("{i}").into_bytes()
+                ))
+            );
         }
         for i in 0..9 {
-            run_at!(&mut db, T0, b"SREM", b"key", format!("{}", i).into_bytes());
+            run_at!(&mut db, T0, b"SREM", b"key", format!("{i}").into_bytes());
         }
         assert_eq!(1, int(run_at!(&mut db, T0, b"SCARD", b"key")));
         // Advancing past the last member's TTL empties the set.
@@ -1927,7 +2231,10 @@ mod tests {
     fn s_pop_all_expired() {
         let mut db = DbSlice::new(0);
         set_of(&mut db, "key", &["member"]);
-        assert_eq!(0, int(run_at!(&mut db, T0, b"SADDEX", b"key", b"1", b"member")));
+        assert_eq!(
+            0,
+            int(run_at!(&mut db, T0, b"SADDEX", b"key", b"1", b"member"))
+        );
         let r = run_at!(&mut db, T0 + 2000, b"SPOP", b"key");
         assert!(matches!(r.into_resp_value(), RespValue::Nil));
         assert!(!exists(&mut db, "key"));
@@ -1936,12 +2243,20 @@ mod tests {
     #[test]
     fn s_pop_with_expired_members() {
         let mut db = DbSlice::new(0);
-        assert_eq!(3, int(run_at!(&mut db, T0, b"SADDEX", b"key", b"1", b"a", b"b", b"c")));
+        assert_eq!(
+            3,
+            int(run_at!(
+                &mut db, T0, b"SADDEX", b"key", b"1", b"a", b"b", b"c"
+            ))
+        );
         let r = run_at!(&mut db, T0 + 2000, b"SPOP", b"key", b"2");
         assert!(matches!(r.into_resp_value(), RespValue::Array(v) if v.is_empty()));
         assert!(!exists(&mut db, "key"));
         // Single-arg form -> NIL, key deleted.
-        assert_eq!(2, int(run_at!(&mut db, T0, b"SADDEX", b"key2", b"1", b"x", b"y")));
+        assert_eq!(
+            2,
+            int(run_at!(&mut db, T0, b"SADDEX", b"key2", b"1", b"x", b"y"))
+        );
         let r = run_at!(&mut db, T0 + 2000, b"SPOP", b"key2");
         assert!(matches!(r.into_resp_value(), RespValue::Nil));
         assert!(!exists(&mut db, "key2"));
@@ -1951,16 +2266,37 @@ mod tests {
     fn s_pop_single_arg_expired_case2() {
         let mut db = DbSlice::new(0);
         for attempt in 0..50 {
-            let key = format!("key{}", attempt);
+            let key = format!("key{attempt}");
             set_of(&mut db, &key, &["live"]);
-            assert_eq!(3, int(run_at!(&mut db, T0, b"SADDEX", key.as_bytes(), b"1", b"a", b"b", b"c")));
+            assert_eq!(
+                3,
+                int(run_at!(
+                    &mut db,
+                    T0,
+                    b"SADDEX",
+                    key.as_bytes(),
+                    b"1",
+                    b"a",
+                    b"b",
+                    b"c"
+                ))
+            );
             let r = run_at!(&mut db, T0 + 2000, b"SPOP", key.as_bytes());
             match r.into_resp_value() {
                 RespValue::Bulk(b) => assert_eq!(b, b"live"),
                 RespValue::Nil => {
-                    assert_eq!(1, int(run_at!(&mut db, T0 + 2000, b"SISMEMBER", key.as_bytes(), b"live")));
+                    assert_eq!(
+                        1,
+                        int(run_at!(
+                            &mut db,
+                            T0 + 2000,
+                            b"SISMEMBER",
+                            key.as_bytes(),
+                            b"live"
+                        ))
+                    );
                 }
-                o => panic!("unexpected SPOP reply {:?}", o),
+                o => panic!("unexpected SPOP reply {o:?}"),
             }
         }
     }
@@ -1969,22 +2305,30 @@ mod tests {
     fn s_rand_member_with_expired_members() {
         let mut db = DbSlice::new(0);
         // Without count -> NIL, key deleted.
-        run_at!(&mut db, T0, b"SADDEX", b"seed", b"1", b"a", b"b", b"c", b"d", b"e", b"f");
+        run_at!(
+            &mut db, T0, b"SADDEX", b"seed", b"1", b"a", b"b", b"c", b"d", b"e", b"f"
+        );
         let r = run_at!(&mut db, T0 + 2000, b"SRANDMEMBER", b"seed");
         assert!(matches!(r.into_resp_value(), RespValue::Nil));
         assert!(!exists(&mut db, "seed"));
         // Positive count -> empty array.
-        run_at!(&mut db, T0, b"SADDEX", b"seed", b"1", b"a", b"b", b"c", b"d", b"e", b"f");
+        run_at!(
+            &mut db, T0, b"SADDEX", b"seed", b"1", b"a", b"b", b"c", b"d", b"e", b"f"
+        );
         let r = run_at!(&mut db, T0 + 2000, b"SRANDMEMBER", b"seed", b"1");
         assert!(matches!(r.into_resp_value(), RespValue::Array(v) if v.is_empty()));
         assert!(!exists(&mut db, "seed"));
         // Negative count -> empty array.
-        run_at!(&mut db, T0, b"SADDEX", b"seed", b"1", b"a", b"b", b"c", b"d", b"e", b"f");
+        run_at!(
+            &mut db, T0, b"SADDEX", b"seed", b"1", b"a", b"b", b"c", b"d", b"e", b"f"
+        );
         let r = run_at!(&mut db, T0 + 2000, b"SRANDMEMBER", b"seed", b"-1");
         assert!(matches!(r.into_resp_value(), RespValue::Array(v) if v.is_empty()));
         assert!(!exists(&mut db, "seed"));
         // Large negative count -> empty array.
-        run_at!(&mut db, T0, b"SADDEX", b"seed", b"1", b"a", b"b", b"c", b"d", b"e", b"f");
+        run_at!(
+            &mut db, T0, b"SADDEX", b"seed", b"1", b"a", b"b", b"c", b"d", b"e", b"f"
+        );
         let r = run_at!(&mut db, T0 + 2000, b"SRANDMEMBER", b"seed", b"-25");
         assert!(matches!(r.into_resp_value(), RespValue::Array(v) if v.is_empty()));
         assert!(!exists(&mut db, "seed"));
@@ -1994,18 +2338,24 @@ mod tests {
     fn s_sismember_deletes_empty_set() {
         let mut db = DbSlice::new(0);
         assert_eq!(1, int(run_at!(&mut db, T0, b"SADDEX", b"key", b"1", b"a")));
-        assert_eq!(0, int(run_at!(&mut db, T0 + 2000, b"SISMEMBER", b"key", b"a")));
+        assert_eq!(
+            0,
+            int(run_at!(&mut db, T0 + 2000, b"SISMEMBER", b"key", b"a"))
+        );
         assert!(!exists(&mut db, "key"));
     }
 
     #[test]
     fn s_smismember_deletes_empty_set() {
         let mut db = DbSlice::new(0);
-        assert_eq!(2, int(run_at!(&mut db, T0, b"SADDEX", b"key", b"1", b"a", b"b")));
+        assert_eq!(
+            2,
+            int(run_at!(&mut db, T0, b"SADDEX", b"key", b"1", b"a", b"b"))
+        );
         let r = run_at!(&mut db, T0 + 2000, b"SMISMEMBER", b"key", b"a", b"b");
         match r.into_resp_value() {
             RespValue::Array(v) => assert_eq!(v.len(), 2),
-            o => panic!("expected array, got {:?}", o),
+            o => panic!("expected array, got {o:?}"),
         }
         assert!(!exists(&mut db, "key"));
     }
@@ -2013,25 +2363,51 @@ mod tests {
     #[test]
     fn s_sdiff_all_members_expired() {
         let mut db = DbSlice::new(0);
-        assert_eq!(3, int(run_at!(&mut db, T0, b"SADDEX", b"src", b"1", b"a", b"b", b"c")));
+        assert_eq!(
+            3,
+            int(run_at!(
+                &mut db, T0, b"SADDEX", b"src", b"1", b"a", b"b", b"c"
+            ))
+        );
         set_of(&mut db, "other", &["x"]);
         let r = run_at!(&mut db, T0 + 2000, b"SDIFF", b"src", b"other");
         assert_eq!(0, array_len(&r));
         assert!(!exists(&mut db, "src"));
         // SDIFFSTORE stores nothing and returns 0.
-        assert_eq!(3, int(run_at!(&mut db, T0, b"SADDEX", b"src", b"1", b"a", b"b", b"c")));
-        assert_eq!(0, int(run_at!(&mut db, T0 + 2000, b"SDIFFSTORE", b"dest", b"src", b"other")));
+        assert_eq!(
+            3,
+            int(run_at!(
+                &mut db, T0, b"SADDEX", b"src", b"1", b"a", b"b", b"c"
+            ))
+        );
+        assert_eq!(
+            0,
+            int(run_at!(
+                &mut db,
+                T0 + 2000,
+                b"SDIFFSTORE",
+                b"dest",
+                b"src",
+                b"other"
+            ))
+        );
         assert!(!exists(&mut db, "src"));
     }
 
     #[test]
     fn s_set_ops_delete_empty_after_expiry() {
         let mut db = DbSlice::new(0);
-        assert_eq!(2, int(run_at!(&mut db, T0, b"SADDEX", b"s1", b"1", b"a", b"b")));
+        assert_eq!(
+            2,
+            int(run_at!(&mut db, T0, b"SADDEX", b"s1", b"1", b"a", b"b"))
+        );
         let r = run_at!(&mut db, T0 + 2000, b"SUNION", b"s1");
         assert_eq!(0, array_len(&r));
         assert!(!exists(&mut db, "s1"));
-        assert_eq!(2, int(run_at!(&mut db, T0, b"SADDEX", b"s2", b"1", b"a", b"b")));
+        assert_eq!(
+            2,
+            int(run_at!(&mut db, T0, b"SADDEX", b"s2", b"1", b"a", b"b"))
+        );
         let r = run_at!(&mut db, T0 + 2000, b"SINTER", b"s2");
         assert_eq!(0, array_len(&r));
         assert!(!exists(&mut db, "s2"));
@@ -2040,7 +2416,10 @@ mod tests {
     #[test]
     fn s_scan_deletes_empty_set() {
         let mut db = DbSlice::new(0);
-        assert_eq!(2, int(run_at!(&mut db, T0, b"SADDEX", b"key", b"1", b"a", b"b")));
+        assert_eq!(
+            2,
+            int(run_at!(&mut db, T0, b"SADDEX", b"key", b"1", b"a", b"b"))
+        );
         let (c, v) = scan(run_at!(&mut db, T0 + 2000, b"SSCAN", b"key", b"0"));
         assert_eq!(c, 0);
         assert!(v.is_empty());
@@ -2050,7 +2429,10 @@ mod tests {
     #[test]
     fn s_inter_multi_key_deletes_empty_set() {
         let mut db = DbSlice::new(0);
-        assert_eq!(2, int(run_at!(&mut db, T0, b"SADDEX", b"key1", b"1", b"a", b"b")));
+        assert_eq!(
+            2,
+            int(run_at!(&mut db, T0, b"SADDEX", b"key1", b"1", b"a", b"b"))
+        );
         set_of(&mut db, "key2", &["a", "b"]);
         let r = run_at!(&mut db, T0 + 2000, b"SINTER", b"key1", b"key2");
         assert_eq!(0, array_len(&r));
@@ -2063,7 +2445,10 @@ mod tests {
         let mut db = DbSlice::new(0);
         assert_eq!(1, int(run_at!(&mut db, T0, b"SADDEX", b"src", b"1", b"a")));
         set_of(&mut db, "dst", &["x"]);
-        assert_eq!(0, int(run_at!(&mut db, T0 + 2000, b"SMOVE", b"src", b"dst", b"a")));
+        assert_eq!(
+            0,
+            int(run_at!(&mut db, T0 + 2000, b"SMOVE", b"src", b"dst", b"a"))
+        );
         assert!(!exists(&mut db, "src"));
     }
 }

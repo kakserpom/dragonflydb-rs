@@ -18,15 +18,25 @@ pub struct CompactString {
 }
 
 impl CompactString {
+    #[must_use]
     pub fn new() -> Self {
-        Self { inline: [0u8; INLINE_CAP], len: 0, heap: None }
+        Self {
+            inline: [0u8; INLINE_CAP],
+            len: 0,
+            heap: None,
+        }
     }
 
+    #[must_use]
     pub fn from_bytes(b: &[u8]) -> Self {
         if b.len() <= INLINE_CAP {
             let mut inline = [0u8; INLINE_CAP];
             inline[..b.len()].copy_from_slice(b);
-            Self { inline, len: b.len(), heap: None }
+            Self {
+                inline,
+                len: b.len(),
+                heap: None,
+            }
         } else {
             Self {
                 inline: [0u8; INLINE_CAP],
@@ -37,6 +47,7 @@ impl CompactString {
     }
 
     #[inline]
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         if self.len <= INLINE_CAP {
             &self.inline[..self.len]
@@ -46,20 +57,24 @@ impl CompactString {
     }
 
     #[inline]
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {
         self.as_bytes().to_vec()
     }
 
     /// Append at the end (creates a new compact string).
+    #[must_use]
     pub fn push_str(&self, suffix: &[u8]) -> Self {
         let mut v = Vec::with_capacity(self.len() + suffix.len());
         v.extend_from_slice(self.as_bytes());
@@ -159,7 +174,10 @@ mod tests {
 
         let long = CompactString::from("this is a very long string beyond 15 bytes");
         assert!(long.heap.is_some());
-        assert_eq!(long.as_bytes(), b"this is a very long string beyond 15 bytes");
+        assert_eq!(
+            long.as_bytes(),
+            b"this is a very long string beyond 15 bytes"
+        );
     }
 
     #[test]
@@ -173,7 +191,7 @@ mod tests {
         let a = CompactString::from("abc");
         let b = CompactString::from("abd");
         assert!(a < b);
-        assert!(a == CompactString::from("abc"));
-        assert!(a != CompactString::from("ab"));
+        assert_eq!(a, "abc");
+        assert_ne!(a, "ab");
     }
 }

@@ -5,11 +5,10 @@
 //! The CF family is a Rust `PrimeValue::Cuckoo` backed by `core::cuckoo::CuckooFilter`.
 
 use crate::commands::{
-    integer, ok, Command, OpContext, KeyRange, FLAG_DENYOOM, FLAG_FAST, FLAG_READONLY, FLAG_WRITE,
+    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext, integer, ok,
 };
-use crate::core::compact::CompactString;
-use crate::core::cuckoo::{CuckooFilter, CuckooFilterOptions};
 use crate::core::PrimeValue;
+use crate::core::cuckoo::{CuckooFilter, CuckooFilterOptions};
 use crate::error::{CmdResult, RespError, RespValue};
 use crate::util::parse_u64;
 
@@ -67,7 +66,7 @@ fn get_or_create_cf<'c>(
     };
     if !exists {
         ctx.db.insert(
-            CompactString::from_bytes(key),
+            key,
             PrimeValue::Cuckoo(CuckooFilter::new(&CuckooFilterOptions {
                 capacity,
                 ..Default::default()
@@ -96,17 +95,16 @@ fn parse_opt_value(args: &[Vec<u8>], i: usize) -> Result<u64, RespError> {
 fn exec_cf_reserve(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let capacity = match parse_u64(&ctx.args[key_idx + 1]) {
-        Some(c) => c,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(capacity) = parse_u64(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::integer());
     };
     if capacity == 0 {
         return CmdResult::Err(cf_capacity());
     }
 
-    let mut bucket_size: u64 = CuckooFilterOptions::default().slots_per_bucket as u64;
-    let mut max_iterations: u64 = CuckooFilterOptions::default().max_iterations as u64;
-    let mut expansion: u64 = CuckooFilterOptions::default().expansion as u64;
+    let mut bucket_size: u64 = u64::from(CuckooFilterOptions::default().slots_per_bucket);
+    let mut max_iterations: u64 = u64::from(CuckooFilterOptions::default().max_iterations);
+    let mut expansion: u64 = u64::from(CuckooFilterOptions::default().expansion);
     let mut i = key_idx + 2;
     while i < ctx.args.len() {
         match ctx.args[i].to_ascii_uppercase().as_slice() {
@@ -116,7 +114,7 @@ fn exec_cf_reserve(ctx: &mut OpContext) -> CmdResult {
                     Ok(v) => v,
                     Err(e) => return CmdResult::Err(e),
                 };
-                if v > u8::MAX as u64 {
+                if v > u64::from(u8::MAX) {
                     return CmdResult::Err(RespError::integer());
                 }
                 if v == 0 {
@@ -130,7 +128,7 @@ fn exec_cf_reserve(ctx: &mut OpContext) -> CmdResult {
                     Ok(v) => v,
                     Err(e) => return CmdResult::Err(e),
                 };
-                if v > u16::MAX as u64 {
+                if v > u64::from(u16::MAX) {
                     return CmdResult::Err(RespError::integer());
                 }
                 if v == 0 {
@@ -160,7 +158,7 @@ fn exec_cf_reserve(ctx: &mut OpContext) -> CmdResult {
         None => {}
     }
     ctx.db.insert(
-        CompactString::from_bytes(key),
+        key,
         PrimeValue::Cuckoo(CuckooFilter::new(&CuckooFilterOptions {
             capacity,
             slots_per_bucket: bucket_size as u8,
@@ -229,14 +227,16 @@ fn exists_or_mexists(ctx: &mut OpContext, multi: bool) -> CmdResult {
     };
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::Cuckoo(cf)) => {
-            let results: Vec<bool> =
-                items.iter().map(|it| cf.exists(CuckooFilter::hash(it))).collect();
+            let results: Vec<bool> = items
+                .iter()
+                .map(|it| cf.exists(CuckooFilter::hash(it)))
+                .collect();
             if multi {
                 CmdResult::Ok(RespValue::Array(
-                    results.into_iter().map(|b| integer(b as i64)).collect(),
+                    results.into_iter().map(|b| integer(i64::from(b))).collect(),
                 ))
             } else {
-                CmdResult::Ok(integer(results[0] as i64))
+                CmdResult::Ok(integer(i64::from(results[0])))
             }
         }
         Some(_) | None => CmdResult::Ok(zeros()),
@@ -276,11 +276,11 @@ fn exec_cf_info(ctx: &mut OpContext) -> CmdResult {
         RespValue::Bulk(b"Number of items deleted".to_vec()),
         integer(cf.num_deletes() as i64),
         RespValue::Bulk(b"Bucket size".to_vec()),
-        integer(cf.slots_per_bucket() as i64),
+        integer(i64::from(cf.slots_per_bucket())),
         RespValue::Bulk(b"Expansion rate".to_vec()),
-        integer(cf.expansion() as i64),
+        integer(i64::from(cf.expansion())),
         RespValue::Bulk(b"Max iterations".to_vec()),
-        integer(cf.max_iterations() as i64),
+        integer(i64::from(cf.max_iterations())),
     ]))
 }
 
@@ -306,7 +306,7 @@ fn exec_cf_count(ctx: &mut OpContext) -> CmdResult {
 // ---------------------------------------------------------------------------
 
 /// Port of `OpDel`/`CmdDel`: a missing key is an error; a successful delete
-/// auto-compacts once deletes exceed 10% of items (mirrors RedisBloom).
+/// auto-compacts once deletes exceed 10% of items (mirrors `RedisBloom`).
 fn exec_cf_del(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
@@ -320,7 +320,7 @@ fn exec_cf_del(ctx: &mut OpContext) -> CmdResult {
     if deleted && cf.num_filters() > 1 && cf.num_deletes() > cf.num_items() / 10 {
         cf.compact(false);
     }
-    CmdResult::Ok(integer(deleted as i64))
+    CmdResult::Ok(integer(i64::from(deleted)))
 }
 
 // ---------------------------------------------------------------------------
@@ -335,8 +335,14 @@ struct InsertOptions {
 
 /// Port of the `kInsertGrammar` + `CmdInsertImpl` parsing. Returns the options
 /// and the index of the first item argument.
-fn parse_insert_options(args: &[Vec<u8>], key_idx: usize) -> Result<(InsertOptions, usize), RespError> {
-    let mut opts = InsertOptions { capacity: K_DEFAULT_CAPACITY, nocreate: false };
+fn parse_insert_options(
+    args: &[Vec<u8>],
+    key_idx: usize,
+) -> Result<(InsertOptions, usize), RespError> {
+    let mut opts = InsertOptions {
+        capacity: K_DEFAULT_CAPACITY,
+        nocreate: false,
+    };
     let mut i = key_idx + 1;
     while let Some(tok) = args.get(i) {
         match tok.to_ascii_uppercase().as_slice() {
@@ -535,8 +541,9 @@ pub static CMD_CF_COMPACT: Command = Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::compact::CompactString;
     use crate::core::db::DbSlice;
-    use crate::core::rdb::{dump_value, restore_value, RestoreOutcome};
+    use crate::core::rdb::{RestoreOutcome, dump_value, restore_value};
 
     fn dispatch(db: &mut DbSlice, argv: &[Vec<u8>]) -> CmdResult {
         let (exec, first_key_idx, owned): (fn(&mut OpContext) -> CmdResult, usize, Vec<usize>) =
@@ -554,7 +561,13 @@ mod tests {
                 b"CF.COMPACT" => (exec_cf_compact, 1, vec![1]),
                 _ => panic!("unhandled command {:?}", argv[0]),
             };
-        let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx, now_ms: 0 };
+        let mut ctx = OpContext {
+            db,
+            args: argv,
+            owned_keys: &owned,
+            first_key_idx,
+            now_ms: 0,
+        };
         exec(&mut ctx)
     }
 
@@ -565,10 +578,7 @@ mod tests {
     }
 
     fn set(db: &mut DbSlice, key: &str, value: &str) {
-        db.insert(
-            CompactString::from_bytes(key.as_bytes()),
-            PrimeValue::Str(CompactString::from(value)),
-        );
+        db.insert(key.as_bytes(), PrimeValue::Str(CompactString::from(value)));
     }
 
     fn int(r: CmdResult) -> i64 {
@@ -620,22 +630,72 @@ mod tests {
 
         assert!(err(run!(&mut db, b"CF.RESERVE", b"cf1", b"1000")).contains("item exists"));
 
-        assert!(err(run!(&mut db, b"CF.RESERVE", b"cf2", b"0")).contains("capacity must be greater than 0"));
+        assert!(
+            err(run!(&mut db, b"CF.RESERVE", b"cf2", b"0"))
+                .contains("capacity must be greater than 0")
+        );
     }
 
     #[test]
     fn reserve_with_options() {
         let mut db = DbSlice::new(0);
-        ok_res(run!(&mut db, b"CF.RESERVE", b"cf1", b"1000", b"bucketsize", b"4", b"maxiterations", b"10", b"expansion", b"2"));
+        ok_res(run!(
+            &mut db,
+            b"CF.RESERVE",
+            b"cf1",
+            b"1000",
+            b"bucketsize",
+            b"4",
+            b"maxiterations",
+            b"10",
+            b"expansion",
+            b"2"
+        ));
 
-        assert!(err(run!(&mut db, b"CF.RESERVE", b"cf2", b"1000", b"BUCKETSIZE", b"0"))
-            .contains("bucket size must be between 1 and 255"));
-        assert!(err(run!(&mut db, b"CF.RESERVE", b"cf3", b"1000", b"BUCKETSIZE", b"256"))
-            .contains("value is not an integer or out of range"));
-        assert!(err(run!(&mut db, b"CF.RESERVE", b"cf4", b"1000", b"MAXITERATIONS", b"0"))
-            .contains("max iterations must be between 1 and 65535"));
-        assert!(err(run!(&mut db, b"CF.RESERVE", b"cf5", b"1000", b"EXPANSION", b"32768"))
-            .contains("expansion must be between 0 and 32767"));
+        assert!(
+            err(run!(
+                &mut db,
+                b"CF.RESERVE",
+                b"cf2",
+                b"1000",
+                b"BUCKETSIZE",
+                b"0"
+            ))
+            .contains("bucket size must be between 1 and 255")
+        );
+        assert!(
+            err(run!(
+                &mut db,
+                b"CF.RESERVE",
+                b"cf3",
+                b"1000",
+                b"BUCKETSIZE",
+                b"256"
+            ))
+            .contains("value is not an integer or out of range")
+        );
+        assert!(
+            err(run!(
+                &mut db,
+                b"CF.RESERVE",
+                b"cf4",
+                b"1000",
+                b"MAXITERATIONS",
+                b"0"
+            ))
+            .contains("max iterations must be between 1 and 65535")
+        );
+        assert!(
+            err(run!(
+                &mut db,
+                b"CF.RESERVE",
+                b"cf5",
+                b"1000",
+                b"EXPANSION",
+                b"32768"
+            ))
+            .contains("expansion must be between 0 and 32767")
+        );
     }
 
     #[test]
@@ -676,9 +736,19 @@ mod tests {
     #[test]
     fn add_filter_full() {
         let mut db = DbSlice::new(0);
-        ok_res(run!(&mut db, b"CF.RESERVE", b"cf", b"4", b"expansion", b"0"));
+        ok_res(run!(
+            &mut db,
+            b"CF.RESERVE",
+            b"cf",
+            b"4",
+            b"expansion",
+            b"0"
+        ));
         for i in 0..4 {
-            assert_eq!(1, int(run!(&mut db, b"CF.ADD", b"cf", i.to_string().as_bytes())));
+            assert_eq!(
+                1,
+                int(run!(&mut db, b"CF.ADD", b"cf", i.to_string().as_bytes()))
+            );
         }
         assert!(err(run!(&mut db, b"CF.ADD", b"cf", b"overflow")).contains("Filter is full"));
     }
@@ -686,29 +756,69 @@ mod tests {
     #[test]
     fn insert_filter_full() {
         let mut db = DbSlice::new(0);
-        ok_res(run!(&mut db, b"CF.RESERVE", b"cf", b"4", b"expansion", b"0"));
+        ok_res(run!(
+            &mut db,
+            b"CF.RESERVE",
+            b"cf",
+            b"4",
+            b"expansion",
+            b"0"
+        ));
         for i in 0..4 {
             assert_eq!(
                 vec![1],
-                ints(run!(&mut db, b"CF.INSERT", b"cf", b"ITEMS", i.to_string().as_bytes()))
+                ints(run!(
+                    &mut db,
+                    b"CF.INSERT",
+                    b"cf",
+                    b"ITEMS",
+                    i.to_string().as_bytes()
+                ))
             );
         }
         assert_eq!(
             vec![-1, -1],
-            ints(run!(&mut db, b"CF.INSERT", b"cf", b"ITEMS", b"overflow1", b"overflow2"))
+            ints(run!(
+                &mut db,
+                b"CF.INSERT",
+                b"cf",
+                b"ITEMS",
+                b"overflow1",
+                b"overflow2"
+            ))
         );
 
-        ok_res(run!(&mut db, b"CF.RESERVE", b"cfnx", b"4", b"expansion", b"0"));
+        ok_res(run!(
+            &mut db,
+            b"CF.RESERVE",
+            b"cfnx",
+            b"4",
+            b"expansion",
+            b"0"
+        ));
         for i in 0..4 {
             assert_eq!(
                 vec![1],
-                ints(run!(&mut db, b"CF.INSERTNX", b"cfnx", b"ITEMS", i.to_string().as_bytes()))
+                ints(run!(
+                    &mut db,
+                    b"CF.INSERTNX",
+                    b"cfnx",
+                    b"ITEMS",
+                    i.to_string().as_bytes()
+                ))
             );
         }
         // Item 0 already exists → 0; overflow → -1.
         assert_eq!(
             vec![0, -1],
-            ints(run!(&mut db, b"CF.INSERTNX", b"cfnx", b"ITEMS", b"0", b"overflow"))
+            ints(run!(
+                &mut db,
+                b"CF.INSERTNX",
+                b"cfnx",
+                b"ITEMS",
+                b"0",
+                b"overflow"
+            ))
         );
     }
 
@@ -720,7 +830,10 @@ mod tests {
         assert_eq!(0, int(run!(&mut db, b"CF.EXISTS", b"f1", b"bar")));
 
         // Missing key returns 0, not an error.
-        assert_eq!(0, int(run!(&mut db, b"CF.EXISTS", b"nonexist-key", b"blah")));
+        assert_eq!(
+            0,
+            int(run!(&mut db, b"CF.EXISTS", b"nonexist-key", b"blah"))
+        );
     }
 
     #[test]
@@ -741,10 +854,16 @@ mod tests {
             vec![1, 1, 1],
             ints(run!(&mut db, b"CF.MEXISTS", b"f1", b"foo", b"bar", b"baz"))
         );
-        assert_eq!(vec![1, 0], ints(run!(&mut db, b"CF.MEXISTS", b"f1", b"foo", b"nope")));
+        assert_eq!(
+            vec![1, 0],
+            ints(run!(&mut db, b"CF.MEXISTS", b"f1", b"foo", b"nope"))
+        );
 
         // Missing key returns an all-zero array, not an error.
-        assert_eq!(vec![0], ints(run!(&mut db, b"CF.MEXISTS", b"nonexist-key", b"blah")));
+        assert_eq!(
+            vec![0],
+            ints(run!(&mut db, b"CF.MEXISTS", b"nonexist-key", b"blah"))
+        );
     }
 
     #[test]
@@ -757,7 +876,18 @@ mod tests {
     #[test]
     fn info() {
         let mut db = DbSlice::new(0);
-        ok_res(run!(&mut db, b"CF.RESERVE", b"cf1", b"1000", b"BUCKETSIZE", b"4", b"MAXITERATIONS", b"10", b"EXPANSION", b"2"));
+        ok_res(run!(
+            &mut db,
+            b"CF.RESERVE",
+            b"cf1",
+            b"1000",
+            b"BUCKETSIZE",
+            b"4",
+            b"MAXITERATIONS",
+            b"10",
+            b"EXPANSION",
+            b"2"
+        ));
         assert_eq!(1, int(run!(&mut db, b"CF.ADD", b"cf1", b"foo")));
 
         let arr = match run!(&mut db, b"CF.INFO", b"cf1").into_resp_value() {
@@ -774,7 +904,10 @@ mod tests {
         assert_eq!(arr[3], RespValue::Integer(256));
         assert_eq!(arr[4], RespValue::Bulk(b"Number of filters".to_vec()));
         assert_eq!(arr[5], RespValue::Integer(1));
-        assert_eq!(arr[6], RespValue::Bulk(b"Number of items inserted".to_vec()));
+        assert_eq!(
+            arr[6],
+            RespValue::Bulk(b"Number of items inserted".to_vec())
+        );
         assert_eq!(arr[7], RespValue::Integer(1));
         assert_eq!(arr[8], RespValue::Bulk(b"Number of items deleted".to_vec()));
         assert_eq!(arr[9], RespValue::Integer(0));
@@ -842,10 +975,26 @@ mod tests {
         let mut db = DbSlice::new(0);
         ok_res(run!(&mut db, b"CF.RESERVE", b"cf1", b"4"));
         for i in 0..30 {
-            assert_eq!(1, int(run!(&mut db, b"CF.ADD", b"cf1", format!("item{i}").as_bytes())));
+            assert_eq!(
+                1,
+                int(run!(
+                    &mut db,
+                    b"CF.ADD",
+                    b"cf1",
+                    format!("item{i}").as_bytes()
+                ))
+            );
         }
         for i in 0..29 {
-            assert_eq!(1, int(run!(&mut db, b"CF.DEL", b"cf1", format!("item{i}").as_bytes())));
+            assert_eq!(
+                1,
+                int(run!(
+                    &mut db,
+                    b"CF.DEL",
+                    b"cf1",
+                    format!("item{i}").as_bytes()
+                ))
+            );
         }
 
         // Explicit CF.COMPACT should succeed even though CF.DEL's automatic
@@ -865,12 +1014,23 @@ mod tests {
         let mut db = DbSlice::new(0);
         assert_eq!(
             vec![1, 1, 1],
-            ints(run!(&mut db, b"CF.INSERT", b"cf", b"ITEMS", b"a", b"b", b"c"))
+            ints(run!(
+                &mut db,
+                b"CF.INSERT",
+                b"cf",
+                b"ITEMS",
+                b"a",
+                b"b",
+                b"c"
+            ))
         );
         assert_eq!(type_of(&mut db, "cf"), "MBbloomCF");
 
         // Duplicates are allowed (like CF.ADD).
-        assert_eq!(vec![1, 1], ints(run!(&mut db, b"CF.INSERT", b"cf", b"ITEMS", b"a", b"a")));
+        assert_eq!(
+            vec![1, 1],
+            ints(run!(&mut db, b"CF.INSERT", b"cf", b"ITEMS", b"a", b"a"))
+        );
     }
 
     #[test]
@@ -878,7 +1038,15 @@ mod tests {
         let mut db = DbSlice::new(0);
         assert_eq!(
             vec![1],
-            ints(run!(&mut db, b"CF.INSERT", b"cf", b"CAPACITY", b"500", b"ITEMS", b"x"))
+            ints(run!(
+                &mut db,
+                b"CF.INSERT",
+                b"cf",
+                b"CAPACITY",
+                b"500",
+                b"ITEMS",
+                b"x"
+            ))
         );
     }
 
@@ -886,12 +1054,29 @@ mod tests {
     fn insert_zero_capacity() {
         let mut db = DbSlice::new(0);
         assert!(
-            err(run!(&mut db, b"CF.INSERT", b"cf", b"CAPACITY", b"0", b"ITEMS", b"x"))
-                .contains("capacity must be greater than 0")
+            err(run!(
+                &mut db,
+                b"CF.INSERT",
+                b"cf",
+                b"CAPACITY",
+                b"0",
+                b"ITEMS",
+                b"x"
+            ))
+            .contains("capacity must be greater than 0")
         );
         assert!(
-            err(run!(&mut db, b"CF.INSERT", b"cf", b"CAPACITY", b"0", b"NOCREATE", b"ITEMS", b"x"))
-                .contains("no such key")
+            err(run!(
+                &mut db,
+                b"CF.INSERT",
+                b"cf",
+                b"CAPACITY",
+                b"0",
+                b"NOCREATE",
+                b"ITEMS",
+                b"x"
+            ))
+            .contains("no such key")
         );
     }
 
@@ -900,12 +1085,30 @@ mod tests {
         let mut db = DbSlice::new(0);
         // NOCREATE on missing key returns an error.
         assert!(
-            err(run!(&mut db, b"CF.INSERT", b"cf", b"NOCREATE", b"ITEMS", b"a")).contains("no such key")
+            err(run!(
+                &mut db,
+                b"CF.INSERT",
+                b"cf",
+                b"NOCREATE",
+                b"ITEMS",
+                b"a"
+            ))
+            .contains("no such key")
         );
 
         // NOCREATE on existing key works fine.
         ok_res(run!(&mut db, b"CF.RESERVE", b"cf", b"1000"));
-        assert_eq!(vec![1], ints(run!(&mut db, b"CF.INSERT", b"cf", b"NOCREATE", b"ITEMS", b"a")));
+        assert_eq!(
+            vec![1],
+            ints(run!(
+                &mut db,
+                b"CF.INSERT",
+                b"cf",
+                b"NOCREATE",
+                b"ITEMS",
+                b"a"
+            ))
+        );
     }
 
     #[test]
@@ -926,25 +1129,50 @@ mod tests {
         let mut db = DbSlice::new(0);
         assert_eq!(
             vec![1, 1, 1],
-            ints(run!(&mut db, b"CF.INSERTNX", b"cf", b"ITEMS", b"a", b"b", b"c"))
+            ints(run!(
+                &mut db,
+                b"CF.INSERTNX",
+                b"cf",
+                b"ITEMS",
+                b"a",
+                b"b",
+                b"c"
+            ))
         );
 
         // Existing items return 0 (like CF.ADDNX).
-        assert_eq!(vec![0, 1], ints(run!(&mut db, b"CF.INSERTNX", b"cf", b"ITEMS", b"a", b"d")));
+        assert_eq!(
+            vec![0, 1],
+            ints(run!(&mut db, b"CF.INSERTNX", b"cf", b"ITEMS", b"a", b"d"))
+        );
     }
 
     #[test]
     fn insertnx_nocreate() {
         let mut db = DbSlice::new(0);
         assert!(
-            err(run!(&mut db, b"CF.INSERTNX", b"cf", b"NOCREATE", b"ITEMS", b"a"))
-                .contains("no such key")
+            err(run!(
+                &mut db,
+                b"CF.INSERTNX",
+                b"cf",
+                b"NOCREATE",
+                b"ITEMS",
+                b"a"
+            ))
+            .contains("no such key")
         );
 
         ok_res(run!(&mut db, b"CF.RESERVE", b"cf", b"1000"));
         assert_eq!(
             vec![1],
-            ints(run!(&mut db, b"CF.INSERTNX", b"cf", b"NOCREATE", b"ITEMS", b"a"))
+            ints(run!(
+                &mut db,
+                b"CF.INSERTNX",
+                b"cf",
+                b"NOCREATE",
+                b"ITEMS",
+                b"a"
+            ))
         );
     }
 
@@ -952,15 +1180,24 @@ mod tests {
     fn insertnx_wrong_type() {
         let mut db = DbSlice::new(0);
         set(&mut db, "str1", "foo");
-        assert!(
-            err(run!(&mut db, b"CF.INSERTNX", b"str1", b"ITEMS", b"a")).contains("WRONGTYPE")
-        );
+        assert!(err(run!(&mut db, b"CF.INSERTNX", b"str1", b"ITEMS", b"a")).contains("WRONGTYPE"));
     }
 
     #[test]
     fn dump_restore_round_trip() {
         let mut db = DbSlice::new(0);
-        ok_res(run!(&mut db, b"CF.RESERVE", b"cf1", b"1000", b"BUCKETSIZE", b"4", b"MAXITERATIONS", b"10", b"EXPANSION", b"2"));
+        ok_res(run!(
+            &mut db,
+            b"CF.RESERVE",
+            b"cf1",
+            b"1000",
+            b"BUCKETSIZE",
+            b"4",
+            b"MAXITERATIONS",
+            b"10",
+            b"EXPANSION",
+            b"2"
+        ));
         assert_eq!(1, int(run!(&mut db, b"CF.ADD", b"cf1", b"foo")));
         assert_eq!(1, int(run!(&mut db, b"CF.ADD", b"cf1", b"foo")));
         assert_eq!(1, int(run!(&mut db, b"CF.ADD", b"cf1", b"bar")));
@@ -972,7 +1209,7 @@ mod tests {
             other => panic!("expected restored value, got {other:?}"),
         };
         assert_eq!(restored.type_name(), "MBbloomCF");
-        db.insert(CompactString::from_bytes(b"cf2"), restored);
+        db.insert(b"cf2", restored);
 
         assert_eq!(2, int(run!(&mut db, b"CF.COUNT", b"cf2", b"foo")));
         assert_eq!(1, int(run!(&mut db, b"CF.EXISTS", b"cf2", b"bar")));
@@ -994,9 +1231,24 @@ mod tests {
     #[test]
     fn dump_restore_after_expansion() {
         let mut db = DbSlice::new(0);
-        ok_res(run!(&mut db, b"CF.RESERVE", b"cf1", b"4", b"EXPANSION", b"2"));
+        ok_res(run!(
+            &mut db,
+            b"CF.RESERVE",
+            b"cf1",
+            b"4",
+            b"EXPANSION",
+            b"2"
+        ));
         for i in 0..100 {
-            assert_eq!(1, int(run!(&mut db, b"CF.ADD", b"cf1", format!("item{i}").as_bytes())));
+            assert_eq!(
+                1,
+                int(run!(
+                    &mut db,
+                    b"CF.ADD",
+                    b"cf1",
+                    format!("item{i}").as_bytes()
+                ))
+            );
         }
 
         let cf1 = db.find(b"cf1", 0).expect("cf1 exists").clone();
@@ -1005,12 +1257,17 @@ mod tests {
             Ok(RestoreOutcome::Value(v)) => v,
             other => panic!("expected restored value, got {other:?}"),
         };
-        db.insert(CompactString::from_bytes(b"cf2"), restored);
+        db.insert(b"cf2", restored);
 
         for i in 0..100 {
             assert_eq!(
                 1,
-                int(run!(&mut db, b"CF.EXISTS", b"cf2", format!("item{i}").as_bytes())),
+                int(run!(
+                    &mut db,
+                    b"CF.EXISTS",
+                    b"cf2",
+                    format!("item{i}").as_bytes()
+                )),
                 "exists item{i}"
             );
         }

@@ -12,26 +12,26 @@
 // ---------------------------------------------------------------------------
 
 use crate::commands::{
-    bulk, integer, Command, KeyRange, OpContext, ShardPart, FLAG_DENYOOM, FLAG_MOVABLEKEYS,
-    FLAG_READONLY, FLAG_WRITE,
+    Command, FLAG_DENYOOM, FLAG_MOVABLEKEYS, FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext,
+    ShardPart, bulk, integer,
 };
-use crate::core::compact::CompactString;
-use crate::core::geohash::{self, GeoHashBits, GeoHashRange, GeoShape, GEO_STEP_MAX};
-use crate::core::zset::ZSet;
 use crate::core::PrimeValue;
+use crate::core::compact::CompactString;
+use crate::core::geohash::{self, GEO_STEP_MAX, GeoHashBits, GeoHashRange, GeoShape};
+use crate::core::zset::ZSet;
 use crate::error::{CmdResult, RespError, RespValue};
 use crate::util::{format_double, parse_double, parse_u64};
 
 const ERR_COUNT: &str = "ERR COUNT must be > 0";
 const ERR_NX_XX: &str = "ERR XX and NX options at the same time are not compatible";
-const ERR_SOURCE_CONFLICT: &str = "ERR FROMMEMBER and FROMLONLAT options at the same time are not compatible";
-const ERR_SHAPE_CONFLICT: &str = "ERR BYRADIUS and BYBOX options at the same time are not compatible";
+const ERR_SOURCE_CONFLICT: &str =
+    "ERR FROMMEMBER and FROMLONLAT options at the same time are not compatible";
+const ERR_SHAPE_CONFLICT: &str =
+    "ERR BYRADIUS and BYBOX options at the same time are not compatible";
 const ERR_ASC_DESC: &str = "ERR ASC and DESC options at the same time are not compatible";
 const ERR_STORE_TYPE: &str = "ERR STORE and STOREDIST options at the same time are not compatible";
-const ERR_STORE_COMPAT_RADIUS: &str =
-    "ERR STORE option in GEORADIUS is not compatible with WITHDIST, WITHHASH and WITHCOORDS options";
-const ERR_STORE_COMPAT_BYMEMBER: &str =
-    "ERR STORE option in GEORADIUSBYMEMBER is not compatible with WITHDIST, WITHHASH and WITHCOORDS options";
+const ERR_STORE_COMPAT_RADIUS: &str = "ERR STORE option in GEORADIUS is not compatible with WITHDIST, WITHHASH and WITHCOORDS options";
+const ERR_STORE_COMPAT_BYMEMBER: &str = "ERR STORE option in GEORADIUSBYMEMBER is not compatible with WITHDIST, WITHHASH and WITHCOORDS options";
 const ERR_STORE_COMPAT_SEARCHSTORE: &str =
     "ERR GEOSEARCHSTORE is not compatible with WITHDIST, WITHHASH and WITHCOORD options";
 const ERR_MEMBER_NOT_FOUND: &str = "ERR could not decode requested zset member";
@@ -98,7 +98,7 @@ impl GeoSearchOpts {
     }
 }
 
-/// Incremental GeoShape builder used by the GEOSEARCH grammar, where FROMLONLAT
+/// Incremental `GeoShape` builder used by the GEOSEARCH grammar, where FROMLONLAT
 /// and BYRADIUS/BYBOX mutate the same struct so their order is irrelevant.
 #[derive(Debug, Clone, Copy)]
 struct ShapeAccum {
@@ -113,13 +113,29 @@ struct ShapeAccum {
 
 impl ShapeAccum {
     fn new() -> Self {
-        ShapeAccum { xy: [0.0, 0.0], radius: 0.0, width: 0.0, height: 0.0, conversion: 0.0, kind: 0 }
+        ShapeAccum {
+            xy: [0.0, 0.0],
+            radius: 0.0,
+            width: 0.0,
+            height: 0.0,
+            conversion: 0.0,
+            kind: 0,
+        }
     }
 
     fn into_shape(self) -> Option<GeoShape> {
         match self.kind {
-            1 => Some(GeoShape::Circle { xy: self.xy, radius: self.radius, conversion: self.conversion }),
-            2 => Some(GeoShape::Rect { xy: self.xy, width: self.width, height: self.height, conversion: self.conversion }),
+            1 => Some(GeoShape::Circle {
+                xy: self.xy,
+                radius: self.radius,
+                conversion: self.conversion,
+            }),
+            2 => Some(GeoShape::Rect {
+                xy: self.xy,
+                width: self.width,
+                height: self.height,
+                conversion: self.conversion,
+            }),
             _ => None,
         }
     }
@@ -162,7 +178,7 @@ fn is_valid_lonlat(long: f64, lat: f64) -> bool {
 
 /// Parse lon/lat for GEOSEARCH/GEORADIUS. Out-of-range / non-finite numerics
 /// report `invalid longitude,latitude pair` with the parsed values (mirrors
-/// `HandleGeoParserFinalize`); unparseable tokens report INVALID_FLOAT.
+/// `HandleGeoParserFinalize`); unparseable tokens report `INVALID_FLOAT`.
 fn parse_long_lat(lon: &[u8], lat: &[u8]) -> Result<[f64; 2], RespError> {
     let long = parse_double(lon);
     let latv = parse_double(lat);
@@ -203,15 +219,22 @@ fn parse_count(arg: &[u8], custom: Option<&'static str>) -> Result<u64, RespErro
 }
 
 /// Options loop shared by the GEORADIUS family (mirrors `ParseGeoResultOptions`).
-fn parse_geo_result_options(args: &[Vec<u8>], mut i: usize, opts: &mut GeoSearchOpts) -> Result<(), RespError> {
+fn parse_geo_result_options(
+    args: &[Vec<u8>],
+    mut i: usize,
+    opts: &mut GeoSearchOpts,
+) -> Result<(), RespError> {
     while i < args.len() {
         match args[i].to_ascii_uppercase().as_slice() {
             b"ASC" | b"DESC" => {
                 if opts.sorting != SortType::Unsorted {
                     return Err(RespError::new(ERR_ASC_DESC));
                 }
-                opts.sorting =
-                    if args[i].eq_ignore_ascii_case(b"ASC") { SortType::Asc } else { SortType::Desc };
+                opts.sorting = if args[i].eq_ignore_ascii_case(b"ASC") {
+                    SortType::Asc
+                } else {
+                    SortType::Desc
+                };
                 i += 1;
             }
             b"COUNT" => {
@@ -258,7 +281,11 @@ fn parse_geo_result_options(args: &[Vec<u8>], mut i: usize, opts: &mut GeoSearch
 }
 
 /// GEOSEARCH / GEOSEARCHSTORE option parser (mirrors `kGeoSearchGrammar`).
-fn parse_geosearch_opts(args: &[Vec<u8>], start: usize, is_store: bool) -> Result<GeoParse, RespError> {
+fn parse_geosearch_opts(
+    args: &[Vec<u8>],
+    start: usize,
+    is_store: bool,
+) -> Result<GeoParse, RespError> {
     let mut p = GeoParse {
         source: None,
         acc: ShapeAccum::new(),
@@ -316,8 +343,11 @@ fn parse_geosearch_opts(args: &[Vec<u8>], start: usize, is_store: bool) -> Resul
                 if p.opts.sorting != SortType::Unsorted {
                     return Err(RespError::new(ERR_ASC_DESC));
                 }
-                p.opts.sorting =
-                    if args[i].eq_ignore_ascii_case(b"ASC") { SortType::Asc } else { SortType::Desc };
+                p.opts.sorting = if args[i].eq_ignore_ascii_case(b"ASC") {
+                    SortType::Asc
+                } else {
+                    SortType::Desc
+                };
                 i += 1;
             }
             b"COUNT" => {
@@ -349,13 +379,22 @@ fn parse_geosearch_opts(args: &[Vec<u8>], start: usize, is_store: bool) -> Resul
 
 fn to_ascii_geohash(score: f64) -> Option<String> {
     const ALPHABET: &[u8; 32] = b"0123456789bcdefghjkmnpqrstuvwxyz";
-    let hash = GeoHashBits { bits: score as u64, step: GEO_STEP_MAX };
+    let hash = GeoHashBits {
+        bits: score as u64,
+        step: GEO_STEP_MAX,
+    };
     let xy = geohash::decode_to_long_lat(hash)?;
     // Re-encode at the max step so the string matches Redis's 11-char output.
     // Redis's GEOHASH re-encodes against the legacy ranges (-90..90 latitude),
     // not the WGS84 projection used for the stored score.
-    let long_range = GeoHashRange { min: -180.0, max: 180.0 };
-    let lat_range = GeoHashRange { min: -90.0, max: 90.0 };
+    let long_range = GeoHashRange {
+        min: -180.0,
+        max: 180.0,
+    };
+    let lat_range = GeoHashRange {
+        min: -90.0,
+        max: 90.0,
+    };
     let hash = geohash::encode(&long_range, &lat_range, xy[0], xy[1], GEO_STEP_MAX)?;
     let bits = hash.bits;
     let mut out = [0u8; 11];
@@ -380,10 +419,22 @@ fn sort_if_needed(ga: &mut Vec<GeoPoint>, sorting: SortType, count: u64) {
     let asc = sorting == SortType::Asc;
     if count > 0 {
         let count = (count as usize).min(ga.len());
-        ga.sort_by(|a, b| if asc { a.dist.total_cmp(&b.dist) } else { b.dist.total_cmp(&a.dist) });
+        ga.sort_by(|a, b| {
+            if asc {
+                a.dist.total_cmp(&b.dist)
+            } else {
+                b.dist.total_cmp(&a.dist)
+            }
+        });
         ga.truncate(count);
     } else {
-        ga.sort_by(|a, b| if asc { a.dist.total_cmp(&b.dist) } else { b.dist.total_cmp(&a.dist) });
+        ga.sort_by(|a, b| {
+            if asc {
+                a.dist.total_cmp(&b.dist)
+            } else {
+                b.dist.total_cmp(&a.dist)
+            }
+        });
     }
 }
 
@@ -437,7 +488,7 @@ fn geo_search_store_generic(
                     match xy {
                         Some(xy) => match &mut shape {
                             GeoShape::Circle { xy: c, .. } | GeoShape::Rect { xy: c, .. } => {
-                                *c = xy
+                                *c = xy;
                             }
                         },
                         None => return empty_or_store(ctx, dest),
@@ -452,9 +503,8 @@ fn geo_search_store_generic(
             None => return empty_or_store(ctx, dest),
         },
     }
-    let z = match ctx.db.find(key, ctx.now_ms) {
-        Some(PrimeValue::ZSet(z)) => z,
-        _ => return empty_or_store(ctx, dest),
+    let Some(PrimeValue::ZSet(z)) = ctx.db.find(key, ctx.now_ms) else {
+        return empty_or_store(ctx, dest);
     };
 
     // Gather candidates from the geohash areas covering the search shape.
@@ -489,7 +539,13 @@ fn geo_search_store_generic(
         let max = max as f64;
         for (member, score) in z.range_by_score_filtered(|s| s >= min && s < max, false, None) {
             if let Some((xy, dist)) = geohash::within_shape(&shape, score) {
-                ga.push(GeoPoint { longitude: xy[0], latitude: xy[1], dist, score, member });
+                ga.push(GeoPoint {
+                    longitude: xy[0],
+                    latitude: xy[1],
+                    dist,
+                    score,
+                    member,
+                });
                 if limit > 0 && ga.len() >= limit as usize {
                     break 'outer;
                 }
@@ -499,61 +555,61 @@ fn geo_search_store_generic(
     sort_if_needed(&mut ga, opts.sorting, opts.count);
 
     let conversion = opts.conversion;
-    match dest {
-        Some(dest_idx) => {
-            let count = ga.len() as i64;
-            if ga.is_empty() {
-                empty_store(ctx, dest_idx)
+    if let Some(dest_idx) = dest {
+        let count = ga.len() as i64;
+        if ga.is_empty() {
+            empty_store(ctx, dest_idx)
+        } else {
+            let store_dist = opts.store == GeoStoreType::StoreDist;
+            let mut zs = ZSet::new();
+            for p in &ga {
+                let score = if store_dist {
+                    p.dist / conversion
+                } else {
+                    p.score
+                };
+                zs.insert(p.member.clone(), score);
+            }
+            if ctx.owned_keys.contains(&dest_idx) {
+                ctx.db.insert(&ctx.args[dest_idx], PrimeValue::ZSet(zs));
+                CmdResult::Ok(integer(count))
             } else {
-                let store_dist = opts.store == GeoStoreType::StoreDist;
-                let mut zs = ZSet::new();
-                for p in &ga {
-                    let score = if store_dist { p.dist / conversion } else { p.score };
-                    zs.insert(p.member.clone(), score);
-                }
-                if ctx.owned_keys.contains(&dest_idx) {
-                    ctx.db.insert(
-                        CompactString::from_bytes(&ctx.args[dest_idx]),
-                        PrimeValue::ZSet(zs),
-                    );
-                    CmdResult::Ok(integer(count))
-                } else {
-                    CmdResult::deferred_store(
-                        ctx.args[dest_idx].clone(),
-                        Some(PrimeValue::ZSet(zs)),
-                        integer(count),
-                    )
-                }
+                CmdResult::deferred_store(
+                    ctx.args[dest_idx].clone(),
+                    Some(PrimeValue::ZSet(zs)),
+                    integer(count),
+                )
             }
         }
-        None => {
-            let with = opts.has_with_statement();
-            let record_size =
-                1 + (opts.withdist as usize) + (opts.withhash as usize) + (opts.withcoord as usize);
-            let mut out = Vec::with_capacity(ga.len());
-            for p in ga {
-                if with {
-                    let mut rec = Vec::with_capacity(record_size);
-                    rec.push(RespValue::Bulk(p.member.as_bytes().to_vec()));
-                    if opts.withdist {
-                        rec.push(bulk(format_double(p.dist / conversion).into_bytes()));
-                    }
-                    if opts.withhash {
-                        rec.push(bulk(format_double(p.score).into_bytes()));
-                    }
-                    if opts.withcoord {
-                        rec.push(RespValue::Array(vec![
-                            bulk(format_double(p.longitude).into_bytes()),
-                            bulk(format_double(p.latitude).into_bytes()),
-                        ]));
-                    }
-                    out.push(RespValue::Array(rec));
-                } else {
-                    out.push(RespValue::Bulk(p.member.as_bytes().to_vec()));
+    } else {
+        let with = opts.has_with_statement();
+        let record_size = 1
+            + usize::from(opts.withdist)
+            + usize::from(opts.withhash)
+            + usize::from(opts.withcoord);
+        let mut out = Vec::with_capacity(ga.len());
+        for p in ga {
+            if with {
+                let mut rec = Vec::with_capacity(record_size);
+                rec.push(RespValue::Bulk(p.member.as_bytes().to_vec()));
+                if opts.withdist {
+                    rec.push(bulk(format_double(p.dist / conversion).into_bytes()));
                 }
+                if opts.withhash {
+                    rec.push(bulk(format_double(p.score).into_bytes()));
+                }
+                if opts.withcoord {
+                    rec.push(RespValue::Array(vec![
+                        bulk(format_double(p.longitude).into_bytes()),
+                        bulk(format_double(p.latitude).into_bytes()),
+                    ]));
+                }
+                out.push(RespValue::Array(rec));
+            } else {
+                out.push(RespValue::Bulk(p.member.as_bytes().to_vec()));
             }
-            CmdResult::Ok(RespValue::Array(out))
         }
+        CmdResult::Ok(RespValue::Array(out))
     }
 }
 
@@ -592,14 +648,17 @@ fn exec_geoadd(ctx: &mut OpContext) -> CmdResult {
             Err(e) => return CmdResult::Err(e),
         };
         let hash = geohash::encode_wgs84(xy[0], xy[1], GEO_STEP_MAX).expect("valid coords");
-        members.push((geohash::align_52_bits(hash) as f64, CompactString::from_bytes(&c[2])));
+        members.push((
+            geohash::align_52_bits(hash) as f64,
+            CompactString::from_bytes(&c[2]),
+        ));
     }
 
     let z = match ctx.db.find_mut(key, ctx.now_ms) {
         Some(PrimeValue::ZSet(z)) => z,
         Some(_) => return CmdResult::Err(RespError::wrong_type()),
         None => {
-            ctx.db.insert(CompactString::from_bytes(key), PrimeValue::ZSet(ZSet::new()));
+            ctx.db.insert(key, PrimeValue::ZSet(ZSet::new()));
             match ctx.db.find_mut(key, ctx.now_ms) {
                 Some(PrimeValue::ZSet(z)) => z,
                 _ => unreachable!("zset was just inserted"),
@@ -660,9 +719,12 @@ fn exec_geopos(ctx: &mut OpContext) -> CmdResult {
     };
     let mut out = Vec::with_capacity(members.len());
     for m in members {
-        let xy = z
-            .and_then(|z| z.score(m))
-            .and_then(|s| geohash::decode_to_long_lat(GeoHashBits { bits: s as u64, step: GEO_STEP_MAX }));
+        let xy = z.and_then(|z| z.score(m)).and_then(|s| {
+            geohash::decode_to_long_lat(GeoHashBits {
+                bits: s as u64,
+                step: GEO_STEP_MAX,
+            })
+        });
         match xy {
             Some([lon, lat]) => out.push(RespValue::Array(vec![
                 bulk(format_double(lon).into_bytes()),
@@ -694,14 +756,16 @@ fn exec_geodist(ctx: &mut OpContext) -> CmdResult {
     let (Some(s1), Some(s2)) = (z.score(&ctx.args[2]), z.score(&ctx.args[3])) else {
         return CmdResult::Ok(RespValue::Nil);
     };
-    let Some(xy1) =
-        geohash::decode_to_long_lat(GeoHashBits { bits: s1 as u64, step: GEO_STEP_MAX })
-    else {
+    let Some(xy1) = geohash::decode_to_long_lat(GeoHashBits {
+        bits: s1 as u64,
+        step: GEO_STEP_MAX,
+    }) else {
         return CmdResult::Ok(RespValue::Nil);
     };
-    let Some(xy2) =
-        geohash::decode_to_long_lat(GeoHashBits { bits: s2 as u64, step: GEO_STEP_MAX })
-    else {
+    let Some(xy2) = geohash::decode_to_long_lat(GeoHashBits {
+        bits: s2 as u64,
+        step: GEO_STEP_MAX,
+    }) else {
         return CmdResult::Ok(RespValue::Nil);
     };
     let d = geohash::haversine(xy1[0], xy1[1], xy2[0], xy2[1]);
@@ -739,7 +803,11 @@ fn geosearch_common(ctx: &mut OpContext, is_store: bool) -> CmdResult {
     if is_store && opts.has_with_statement() {
         return CmdResult::Err(RespError::new(ERR_STORE_COMPAT_SEARCHSTORE));
     }
-    opts.count = if opts.count == u64::MAX { 0 } else { opts.count };
+    opts.count = if opts.count == u64::MAX {
+        0
+    } else {
+        opts.count
+    };
     let shape = parsed.acc.into_shape().expect("shape kind checked");
     let source = parsed.source.expect("source checked");
     let source_key = ctx.args[source_idx].clone();
@@ -781,13 +849,16 @@ fn georadius_common(ctx: &mut OpContext, by_member: bool, read_only: bool) -> Cm
         Ok(v) => v,
         Err(e) => return CmdResult::Err(e),
     };
-    let conversion = match parse_geo_unit(&ctx.args[shape_start + 1]) {
-        Some(c) => c,
-        None => return CmdResult::Err(RespError::new(ERR_INVALID_UNIT)),
+    let Some(conversion) = parse_geo_unit(&ctx.args[shape_start + 1]) else {
+        return CmdResult::Err(RespError::new(ERR_INVALID_UNIT));
     };
     let mut opts = GeoSearchOpts::new(!read_only);
     opts.conversion = conversion;
-    opts.count_err = if by_member { Some("ERR syntax error") } else { None };
+    opts.count_err = if by_member {
+        Some("ERR syntax error")
+    } else {
+        None
+    };
     if let Err(e) = parse_geo_result_options(ctx.args, shape_start + 2, &mut opts) {
         return CmdResult::Err(e);
     }
@@ -801,14 +872,28 @@ fn georadius_common(ctx: &mut OpContext, by_member: bool, read_only: bool) -> Cm
             ERR_STORE_COMPAT_RADIUS
         }));
     }
-    opts.count = if opts.count == u64::MAX { 0 } else { opts.count };
+    opts.count = if opts.count == u64::MAX {
+        0
+    } else {
+        opts.count
+    };
     let source = if by_member {
-        GeoSource::Member { member: ctx.args[2].clone() }
+        GeoSource::Member {
+            member: ctx.args[2].clone(),
+        }
     } else {
         GeoSource::LonLat
     };
-    let shape = GeoShape::Circle { xy, radius, conversion };
-    let dest = if opts.store_key_nonzero { Some(opts.store_key) } else { None };
+    let shape = GeoShape::Circle {
+        xy,
+        radius,
+        conversion,
+    };
+    let dest = if opts.store_key_nonzero {
+        Some(opts.store_key)
+    } else {
+        None
+    };
     geo_search_store_generic(ctx, &ctx.args[1], &shape, &source, dest, &opts)
 }
 
@@ -817,7 +902,12 @@ fn georadius_common(ctx: &mut OpContext, by_member: bool, read_only: bool) -> Cm
 // that owns the source key; destination-only parts contribute placeholders).
 // ---------------------------------------------------------------------------
 
-fn merge_geosearchstore(parts: &[ShardPart], _args: &[Vec<u8>], keys: &[usize], _now_ms: u64) -> CmdResult {
+fn merge_geosearchstore(
+    parts: &[ShardPart],
+    _args: &[Vec<u8>],
+    keys: &[usize],
+    _now_ms: u64,
+) -> CmdResult {
     for p in parts {
         if let CmdResult::Err(e) = &p.result {
             return CmdResult::Err(e.clone());
@@ -829,7 +919,12 @@ fn merge_geosearchstore(parts: &[ShardPart], _args: &[Vec<u8>], keys: &[usize], 
     parts[0].result.clone()
 }
 
-fn merge_geo_radius(parts: &[ShardPart], _args: &[Vec<u8>], keys: &[usize], _now_ms: u64) -> CmdResult {
+fn merge_geo_radius(
+    parts: &[ShardPart],
+    _args: &[Vec<u8>],
+    keys: &[usize],
+    _now_ms: u64,
+) -> CmdResult {
     for p in parts {
         if let CmdResult::Err(e) = &p.result {
             return CmdResult::Err(e.clone());
@@ -955,17 +1050,23 @@ mod tests {
                 b"GEORADIUSBYMEMBER_RO" => (exec_georadiusbymember_ro, 1, vec![1]),
                 _ => panic!("unhandled command {:?}", argv[0]),
             };
-        let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx, now_ms };
+        let mut ctx = OpContext {
+            db,
+            args: argv,
+            owned_keys: &owned,
+            first_key_idx,
+            now_ms,
+        };
         let r = (exec)(&mut ctx);
         // Apply deferred stores so STORE results are visible to later commands.
         match r {
             CmdResult::DeferredStore { key, value, reply } => {
-                apply_store(db, key, value);
+                apply_store(db, &key, value);
                 CmdResult::Ok(reply)
             }
             CmdResult::DeferredStores { stores, reply } => {
                 for (key, value, _exp, _sticky) in stores {
-                    apply_store(db, key, value);
+                    apply_store(db, &key, value);
                 }
                 CmdResult::Ok(reply)
             }
@@ -973,11 +1074,11 @@ mod tests {
         }
     }
 
-    fn apply_store(db: &mut DbSlice, key: Vec<u8>, value: Option<PrimeValue>) {
+    fn apply_store(db: &mut DbSlice, key: &[u8], value: Option<PrimeValue>) {
         match value {
-            Some(v) => db.insert(CompactString::from_bytes(&key), v),
+            Some(v) => db.insert(key, v),
             None => {
-                db.remove(&key);
+                db.remove(key);
             }
         }
     }
@@ -1035,9 +1136,7 @@ mod tests {
         match db.find(key.as_bytes(), 0) {
             Some(PrimeValue::ZSet(z)) => z
                 .iter()
-                .flat_map(|(m, s)| {
-                    vec![m.to_string(), format_double(s)]
-                })
+                .flat_map(|(m, s)| vec![m.to_string(), format_double(s)])
                 .collect(),
             o => panic!("expected zset at {key}, got {o:?}"),
         }
@@ -1054,10 +1153,46 @@ mod tests {
     #[test]
     fn geoadd_geohash() {
         let mut d = db();
-        assert_eq!(int(dispatch_at(&mut d, 0, &b_args(&["GEOADD", "Sicily", "13.361389", "38.115556", "Palermo", "15.087269", "37.502669", "Catania"]))), 2);
-        assert_eq!(int(dispatch_at(&mut d, 0, &b_args(&["GEOADD", "Sicily", "13.361389", "38.115556", "Palermo", "15.087269", "37.502669", "Catania"]))), 0);
         assert_eq!(
-            flat(dispatch_at(&mut d, 0, &b_args(&["GEOHASH", "Sicily", "Palermo", "Catania"]))),
+            int(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOADD",
+                    "Sicily",
+                    "13.361389",
+                    "38.115556",
+                    "Palermo",
+                    "15.087269",
+                    "37.502669",
+                    "Catania"
+                ])
+            )),
+            2
+        );
+        assert_eq!(
+            int(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOADD",
+                    "Sicily",
+                    "13.361389",
+                    "38.115556",
+                    "Palermo",
+                    "15.087269",
+                    "37.502669",
+                    "Catania"
+                ])
+            )),
+            0
+        );
+        assert_eq!(
+            flat(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&["GEOHASH", "Sicily", "Palermo", "Catania"])
+            )),
             vec!["sqc8b49rny0", "sqdtr74hyu0"]
         );
     }
@@ -1065,29 +1200,134 @@ mod tests {
     #[test]
     fn geoadd_options() {
         let mut d = db();
-        dispatch_at(&mut d, 0, &b_args(&["GEOADD", "Sicily", "13.361389", "38.115556", "Palermo", "15.087269", "37.502669", "Catania"]));
+        dispatch_at(
+            &mut d,
+            0,
+            &b_args(&[
+                "GEOADD",
+                "Sicily",
+                "13.361389",
+                "38.115556",
+                "Palermo",
+                "15.087269",
+                "37.502669",
+                "Catania",
+            ]),
+        );
         // XX: update Palermo, skip Messina (new).
-        assert_eq!(int(dispatch_at(&mut d, 0, &b_args(&["GEOADD", "Sicily", "XX", "15.361389", "38.115556", "Palermo", "15.554167", "38.193611", "Messina"]))), 0);
-        let pos = flat(dispatch_at(&mut d, 0, &b_args(&["GEOPOS", "Sicily", "Palermo", "Messina"])));
+        assert_eq!(
+            int(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOADD",
+                    "Sicily",
+                    "XX",
+                    "15.361389",
+                    "38.115556",
+                    "Palermo",
+                    "15.554167",
+                    "38.193611",
+                    "Messina"
+                ])
+            )),
+            0
+        );
+        let pos = flat(dispatch_at(
+            &mut d,
+            0,
+            &b_args(&["GEOPOS", "Sicily", "Palermo", "Messina"]),
+        ));
         assert_eq!(pos[0], "[15.361389219760895, 38.1155563954963]");
         assert_eq!(pos[1], "(nil)");
         // NX: add Syracuse, skip Palermo (existing).
-        assert_eq!(int(dispatch_at(&mut d, 0, &b_args(&["GEOADD", "Sicily", "NX", "18.361389", "38.115556", "Palermo", "15.2875", "37.069167", "Syracuse"]))), 1);
+        assert_eq!(
+            int(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOADD",
+                    "Sicily",
+                    "NX",
+                    "18.361389",
+                    "38.115556",
+                    "Palermo",
+                    "15.2875",
+                    "37.069167",
+                    "Syracuse"
+                ])
+            )),
+            1
+        );
         // CH: update Palermo, add Marsala -> 2.
-        assert_eq!(int(dispatch_at(&mut d, 0, &b_args(&["GEOADD", "Sicily", "CH", "18.361389", "38.115556", "Palermo", "12.434167", "37.798056", "Marsala"]))), 2);
+        assert_eq!(
+            int(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOADD",
+                    "Sicily",
+                    "CH",
+                    "18.361389",
+                    "38.115556",
+                    "Palermo",
+                    "12.434167",
+                    "37.798056",
+                    "Marsala"
+                ])
+            )),
+            2
+        );
         // XX + NX conflict.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEOADD", "Sicily", "XX", "NX", "14.75", "36.933333", "Ragusa"]))), "ERR XX and NX options at the same time are not compatible");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOADD",
+                    "Sicily",
+                    "XX",
+                    "NX",
+                    "14.75",
+                    "36.933333",
+                    "Ragusa"
+                ])
+            )),
+            "ERR XX and NX options at the same time are not compatible"
+        );
         // Bad arg count.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEOADD", "Sicily", "14.75", "36.933333", "Ragusa", "10.23"]))), "ERR syntax error");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&["GEOADD", "Sicily", "14.75", "36.933333", "Ragusa", "10.23"])
+            )),
+            "ERR syntax error"
+        );
         // Bad coordinates.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEOADD", "Sicily", "200", "1", "m"]))), "ERR invalid longitude,latitude pair 200,1,m");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&["GEOADD", "Sicily", "200", "1", "m"])
+            )),
+            "ERR invalid longitude,latitude pair 200,1,m"
+        );
     }
 
     #[test]
     fn geopos_missing() {
         let mut d = db();
-        dispatch_at(&mut d, 0, &b_args(&["GEOADD", "Sicily", "13.361389", "38.115556", "Palermo"]));
-        let pos = flat(dispatch_at(&mut d, 0, &b_args(&["GEOPOS", "Sicily", "Palermo", "NonExisting"])));
+        dispatch_at(
+            &mut d,
+            0,
+            &b_args(&["GEOADD", "Sicily", "13.361389", "38.115556", "Palermo"]),
+        );
+        let pos = flat(dispatch_at(
+            &mut d,
+            0,
+            &b_args(&["GEOPOS", "Sicily", "Palermo", "NonExisting"]),
+        ));
         assert_eq!(pos[0], "[13.361389338970184, 38.1155563954963]");
         assert_eq!(pos[1], "(nil)");
     }
@@ -1111,41 +1351,145 @@ mod tests {
     #[test]
     fn geodist() {
         let mut d = db();
-        dispatch_at(&mut d, 0, &b_args(&["GEOADD", "Sicily", "13.361389", "38.115556", "Palermo", "15.087269", "37.502669", "Catania"]));
-        let d1 = bulk_str(dispatch_at(&mut d, 0, &b_args(&["GEODIST", "Sicily", "Palermo", "Catania"])));
-        assert!((d1.parse::<f64>().unwrap() - 166274.15156960033).abs() < 1e-6, "got {:?}", d1);
-        let km = bulk_str(dispatch_at(&mut d, 0, &b_args(&["GEODIST", "Sicily", "Palermo", "Catania", "km"])));
-        assert!((km.parse::<f64>().unwrap() - 166.27415156960032).abs() < 1e-9, "got {:?}", km);
+        dispatch_at(
+            &mut d,
+            0,
+            &b_args(&[
+                "GEOADD",
+                "Sicily",
+                "13.361389",
+                "38.115556",
+                "Palermo",
+                "15.087269",
+                "37.502669",
+                "Catania",
+            ]),
+        );
+        let d1 = bulk_str(dispatch_at(
+            &mut d,
+            0,
+            &b_args(&["GEODIST", "Sicily", "Palermo", "Catania"]),
+        ));
+        assert!(
+            (d1.parse::<f64>().unwrap() - 166_274.151_569_600_33).abs() < 1e-6,
+            "got {d1:?}"
+        );
+        let km = bulk_str(dispatch_at(
+            &mut d,
+            0,
+            &b_args(&["GEODIST", "Sicily", "Palermo", "Catania", "km"]),
+        ));
+        assert!(
+            (km.parse::<f64>().unwrap() - 166.274_151_569_600_32).abs() < 1e-9,
+            "got {km:?}"
+        );
         // Unit scaling (reference `GeoDist`: MI / FT).
-        let mi = bulk_str(dispatch_at(&mut d, 0, &b_args(&["GEODIST", "Sicily", "Palermo", "Catania", "MI"])));
-        assert!((mi.parse::<f64>().unwrap() - 103.31822459492733).abs() < 1e-9, "got {:?}", mi);
-        let ft = bulk_str(dispatch_at(&mut d, 0, &b_args(&["GEODIST", "Sicily", "Palermo", "Catania", "FT"])));
-        assert!((ft.parse::<f64>().unwrap() - 545518.8699790037).abs() < 1e-6, "got {:?}", ft);
+        let mi = bulk_str(dispatch_at(
+            &mut d,
+            0,
+            &b_args(&["GEODIST", "Sicily", "Palermo", "Catania", "MI"]),
+        ));
+        assert!(
+            (mi.parse::<f64>().unwrap() - 103.318_224_594_927_33).abs() < 1e-9,
+            "got {mi:?}"
+        );
+        let ft = bulk_str(dispatch_at(
+            &mut d,
+            0,
+            &b_args(&["GEODIST", "Sicily", "Palermo", "Catania", "FT"]),
+        ));
+        assert!(
+            (ft.parse::<f64>().unwrap() - 545_518.869_979_003_7).abs() < 1e-6,
+            "got {ft:?}"
+        );
         // Missing members -> nil.
         let r = dispatch_at(&mut d, 0, &b_args(&["GEODIST", "Sicily", "Foo", "Bar"]));
         assert!(matches!(r, CmdResult::Ok(RespValue::Nil)));
         // Bad unit.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEODIST", "Sicily", "Palermo", "Catania", "parsecs"]))), "ERR unsupported unit provided. please use M, KM, FT, MI");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&["GEODIST", "Sicily", "Palermo", "Catania", "parsecs"])
+            )),
+            "ERR unsupported unit provided. please use M, KM, FT, MI"
+        );
     }
 
     fn geoadd_europe(d: &mut DbSlice) {
-        dispatch_at(d, 0, &b_args(&[
-            "GEOADD", "Europe", "13.4050", "52.5200", "Berlin", "3.7038", "40.4168", "Madrid",
-            "9.1427", "38.7369", "Lisbon", "2.3522", "48.8566", "Paris", "16.3738", "48.2082",
-            "Vienna", "4.8952", "52.3702", "Amsterdam", "10.7522", "59.9139", "Oslo", "23.7275",
-            "37.9838", "Athens", "19.0402", "47.4979", "Budapest", "6.2603", "53.3498", "Dublin",
-        ]));
+        dispatch_at(
+            d,
+            0,
+            &b_args(&[
+                "GEOADD",
+                "Europe",
+                "13.4050",
+                "52.5200",
+                "Berlin",
+                "3.7038",
+                "40.4168",
+                "Madrid",
+                "9.1427",
+                "38.7369",
+                "Lisbon",
+                "2.3522",
+                "48.8566",
+                "Paris",
+                "16.3738",
+                "48.2082",
+                "Vienna",
+                "4.8952",
+                "52.3702",
+                "Amsterdam",
+                "10.7522",
+                "59.9139",
+                "Oslo",
+                "23.7275",
+                "37.9838",
+                "Athens",
+                "19.0402",
+                "47.4979",
+                "Budapest",
+                "6.2603",
+                "53.3498",
+                "Dublin",
+            ]),
+        );
     }
 
     #[test]
     fn geosearch_radius() {
         let mut d = db();
         geoadd_europe(&mut d);
-        let r = dispatch_at(&mut d, 0, &b_args(&["GEOSEARCH", "Europe", "FROMLONLAT", "13.4050", "52.5200", "BYRADIUS", "500", "KM", "WITHCOORD", "WITHDIST", "WITHHASH"]));
+        let r = dispatch_at(
+            &mut d,
+            0,
+            &b_args(&[
+                "GEOSEARCH",
+                "Europe",
+                "FROMLONLAT",
+                "13.4050",
+                "52.5200",
+                "BYRADIUS",
+                "500",
+                "KM",
+                "WITHCOORD",
+                "WITHDIST",
+                "WITHHASH",
+            ]),
+        );
         let rows = flat(r);
         assert_eq!(rows.len(), 2);
-        assert!(rows[0].contains("Berlin") && rows[0].contains("3673983950397063"), "got {:?}", rows[0]);
-        assert!(rows[1].contains("Dublin") && rows[1].contains("3678981558208417"), "got {:?}", rows[1]);
+        assert!(
+            rows[0].contains("Berlin") && rows[0].contains("3673983950397063"),
+            "got {:?}",
+            rows[0]
+        );
+        assert!(
+            rows[1].contains("Dublin") && rows[1].contains("3678981558208417"),
+            "got {:?}",
+            rows[1]
+        );
     }
 
     #[test]
@@ -1153,24 +1497,98 @@ mod tests {
         let mut d = db();
         geoadd_europe(&mut d);
         // Missing key -> empty array (read variant).
-        let r = dispatch_at(&mut d, 0, &b_args(&["GEOSEARCH", "invalid_key", "FROMMEMBER", "Madrid", "BYRADIUS", "700", "KM"]));
+        let r = dispatch_at(
+            &mut d,
+            0,
+            &b_args(&[
+                "GEOSEARCH",
+                "invalid_key",
+                "FROMMEMBER",
+                "Madrid",
+                "BYRADIUS",
+                "700",
+                "KM",
+            ]),
+        );
         assert!(matches!(r, CmdResult::Ok(RespValue::Array(v)) if v.is_empty()));
         // Missing member -> error.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEOSEARCH", "Europe", "FROMMEMBER", "invalid_member", "BYRADIUS", "700", "KM"]))), "ERR could not decode requested zset member");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOSEARCH",
+                    "Europe",
+                    "FROMMEMBER",
+                    "invalid_member",
+                    "BYRADIUS",
+                    "700",
+                    "KM"
+                ])
+            )),
+            "ERR could not decode requested zset member"
+        );
         // No results within box.
-        let r = dispatch_at(&mut d, 0, &b_args(&["GEOSEARCH", "America", "FROMLONLAT", "13.4050", "52.5200", "BYBOX", "1000", "1000", "KM"]));
+        let r = dispatch_at(
+            &mut d,
+            0,
+            &b_args(&[
+                "GEOSEARCH",
+                "America",
+                "FROMLONLAT",
+                "13.4050",
+                "52.5200",
+                "BYBOX",
+                "1000",
+                "1000",
+                "KM",
+            ]),
+        );
         assert!(matches!(r, CmdResult::Ok(RespValue::Array(v)) if v.is_empty()));
         // Out-of-range lon -> empty.
-        let r = dispatch_at(&mut d, 0, &b_args(&["GEOSEARCH", "Europe", "FROMLONLAT", "130.4050", "52.5200", "BYBOX", "10", "10", "KM"]));
+        let r = dispatch_at(
+            &mut d,
+            0,
+            &b_args(&[
+                "GEOSEARCH",
+                "Europe",
+                "FROMLONLAT",
+                "130.4050",
+                "52.5200",
+                "BYBOX",
+                "10",
+                "10",
+                "KM",
+            ]),
+        );
         assert!(matches!(r, CmdResult::Ok(RespValue::Array(v)) if v.is_empty()));
     }
 
     #[test]
     fn geosearch_nan_coord() {
         let mut d = db();
-        dispatch_at(&mut d, 0, &b_args(&["GEOADD", "cities", "13.361", "38.115", "Palermo", "15.087", "37.502", "Catania"]));
+        dispatch_at(
+            &mut d,
+            0,
+            &b_args(&[
+                "GEOADD", "cities", "13.361", "38.115", "Palermo", "15.087", "37.502", "Catania",
+            ]),
+        );
         assert_eq!(
-            err(dispatch_at(&mut d, 0, &b_args(&["GEOSEARCH", "cities", "FROMLONLAT", "15", "NaN", "BYRADIUS", "200", "km"]))),
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOSEARCH",
+                    "cities",
+                    "FROMLONLAT",
+                    "15",
+                    "NaN",
+                    "BYRADIUS",
+                    "200",
+                    "km"
+                ])
+            )),
             "ERR invalid longitude,latitude pair 15,nan"
         );
     }
@@ -1180,22 +1598,158 @@ mod tests {
         let mut d = db();
         geoadd_europe(&mut d);
         // COUNT 0.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEOSEARCH", "Europe", "FROMLONLAT", "13.4050", "52.5200", "BYRADIUS", "500", "KM", "COUNT", "0"]))), "ERR COUNT must be > 0");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOSEARCH",
+                    "Europe",
+                    "FROMLONLAT",
+                    "13.4050",
+                    "52.5200",
+                    "BYRADIUS",
+                    "500",
+                    "KM",
+                    "COUNT",
+                    "0"
+                ])
+            )),
+            "ERR COUNT must be > 0"
+        );
         // COUNT non-numeric.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEOSEARCH", "Europe", "FROMLONLAT", "13.4050", "52.5200", "BYRADIUS", "500", "KM", "COUNT", "abc"]))), "ERR value is not an integer or out of range");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOSEARCH",
+                    "Europe",
+                    "FROMLONLAT",
+                    "13.4050",
+                    "52.5200",
+                    "BYRADIUS",
+                    "500",
+                    "KM",
+                    "COUNT",
+                    "abc"
+                ])
+            )),
+            "ERR value is not an integer or out of range"
+        );
         // Missing BY*.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEOSEARCH", "Europe", "FROMLONLAT", "13.4050", "52.5200"]))), "ERR syntax error");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&["GEOSEARCH", "Europe", "FROMLONLAT", "13.4050", "52.5200"])
+            )),
+            "ERR syntax error"
+        );
         // Missing FROM*.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEOSEARCH", "Europe", "BYRADIUS", "500", "KM"]))), "ERR syntax error");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&["GEOSEARCH", "Europe", "BYRADIUS", "500", "KM"])
+            )),
+            "ERR syntax error"
+        );
         // Conflicting source / shape.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEOSEARCH", "Europe", "FROMMEMBER", "Madrid", "FROMLONLAT", "1", "1", "BYRADIUS", "500", "KM"]))), "ERR FROMMEMBER and FROMLONLAT options at the same time are not compatible");
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEOSEARCH", "Europe", "FROMMEMBER", "Madrid", "BYRADIUS", "500", "KM", "BYBOX", "1", "1", "KM"]))), "ERR BYRADIUS and BYBOX options at the same time are not compatible");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOSEARCH",
+                    "Europe",
+                    "FROMMEMBER",
+                    "Madrid",
+                    "FROMLONLAT",
+                    "1",
+                    "1",
+                    "BYRADIUS",
+                    "500",
+                    "KM"
+                ])
+            )),
+            "ERR FROMMEMBER and FROMLONLAT options at the same time are not compatible"
+        );
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOSEARCH",
+                    "Europe",
+                    "FROMMEMBER",
+                    "Madrid",
+                    "BYRADIUS",
+                    "500",
+                    "KM",
+                    "BYBOX",
+                    "1",
+                    "1",
+                    "KM"
+                ])
+            )),
+            "ERR BYRADIUS and BYBOX options at the same time are not compatible"
+        );
         // ASC+DESC.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEOSEARCH", "Europe", "FROMMEMBER", "Madrid", "BYRADIUS", "500", "KM", "ASC", "DESC"]))), "ERR ASC and DESC options at the same time are not compatible");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOSEARCH",
+                    "Europe",
+                    "FROMMEMBER",
+                    "Madrid",
+                    "BYRADIUS",
+                    "500",
+                    "KM",
+                    "ASC",
+                    "DESC"
+                ])
+            )),
+            "ERR ASC and DESC options at the same time are not compatible"
+        );
         // Trailing junk.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEOSEARCH", "Europe", "FROMMEMBER", "Madrid", "BYRADIUS", "500", "KM", "STORE", "x"]))), "ERR syntax error");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOSEARCH",
+                    "Europe",
+                    "FROMMEMBER",
+                    "Madrid",
+                    "BYRADIUS",
+                    "500",
+                    "KM",
+                    "STORE",
+                    "x"
+                ])
+            )),
+            "ERR syntax error"
+        );
         // Bad unit.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEOSEARCH", "Europe", "FROMMEMBER", "Madrid", "BYRADIUS", "500", "parsecs"]))), "ERR unsupported unit provided. please use M, KM, FT, MI");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOSEARCH",
+                    "Europe",
+                    "FROMMEMBER",
+                    "Madrid",
+                    "BYRADIUS",
+                    "500",
+                    "parsecs"
+                ])
+            )),
+            "ERR unsupported unit provided. please use M, KM, FT, MI"
+        );
     }
 
     #[test]
@@ -1203,89 +1757,469 @@ mod tests {
         let mut d = db();
         geoadd_europe(&mut d);
         // Store two hits (defaults to StoreHash scores).
-        assert_eq!(int(dispatch_at(&mut d, 0, &b_args(&["GEOSEARCHSTORE", "dst", "Europe", "FROMLONLAT", "13.4050", "52.5200", "BYRADIUS", "500", "KM"]))), 2);
-        assert_eq!(zmembers(&mut d, "dst"), vec!["Berlin".to_string(), "Dublin".to_string()]);
+        assert_eq!(
+            int(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOSEARCHSTORE",
+                    "dst",
+                    "Europe",
+                    "FROMLONLAT",
+                    "13.4050",
+                    "52.5200",
+                    "BYRADIUS",
+                    "500",
+                    "KM"
+                ])
+            )),
+            2
+        );
+        assert_eq!(
+            zmembers(&mut d, "dst"),
+            vec!["Berlin".to_string(), "Dublin".to_string()]
+        );
         // Missing source: delete dest + reply 0.
-        assert_eq!(int(dispatch_at(&mut d, 0, &b_args(&["GEOSEARCHSTORE", "dst", "missing", "FROMLONLAT", "0", "0", "BYRADIUS", "10", "km"]))), 0);
+        assert_eq!(
+            int(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOSEARCHSTORE",
+                    "dst",
+                    "missing",
+                    "FROMLONLAT",
+                    "0",
+                    "0",
+                    "BYRADIUS",
+                    "10",
+                    "km"
+                ])
+            )),
+            0
+        );
         assert!(!exists(&mut d, "dst"), "dest should be deleted");
         // STOREDIST stores distance (km).
-        assert_eq!(int(dispatch_at(&mut d, 0, &b_args(&["GEOSEARCHSTORE", "dst", "Europe", "FROMLONLAT", "13.4050", "52.5200", "BYRADIUS", "500", "KM", "STOREDIST"]))), 2);
+        assert_eq!(
+            int(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOSEARCHSTORE",
+                    "dst",
+                    "Europe",
+                    "FROMLONLAT",
+                    "13.4050",
+                    "52.5200",
+                    "BYRADIUS",
+                    "500",
+                    "KM",
+                    "STOREDIST"
+                ])
+            )),
+            2
+        );
         let scores = zscores(&mut d, "dst");
         assert_eq!(scores.len(), 4);
         // Berlin is the search center: its distance is ~0.17 m, not exactly 0,
         // because the stored score is the cell center (Redis behaves likewise).
-        assert!((scores[1].parse::<f64>().unwrap()).abs() < 1e-3, "got {:?}", scores);
+        assert!(
+            (scores[1].parse::<f64>().unwrap()).abs() < 1e-3,
+            "got {scores:?}"
+        );
         // With-statement incompatibility (WITHDIST wins over COUNT error only if COUNT is valid).
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEOSEARCHSTORE", "dst", "Europe", "FROMLONLAT", "13.4050", "52.5200", "BYRADIUS", "500", "KM", "WITHDIST"]))), "ERR GEOSEARCHSTORE is not compatible with WITHDIST, WITHHASH and WITHCOORD options");
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEOSEARCHSTORE", "dst", "Europe", "FROMLONLAT", "13.4050", "52.5200", "BYRADIUS", "500", "KM", "COUNT", "0", "WITHDIST"]))), "ERR COUNT must be > 0");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOSEARCHSTORE",
+                    "dst",
+                    "Europe",
+                    "FROMLONLAT",
+                    "13.4050",
+                    "52.5200",
+                    "BYRADIUS",
+                    "500",
+                    "KM",
+                    "WITHDIST"
+                ])
+            )),
+            "ERR GEOSEARCHSTORE is not compatible with WITHDIST, WITHHASH and WITHCOORD options"
+        );
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEOSEARCHSTORE",
+                    "dst",
+                    "Europe",
+                    "FROMLONLAT",
+                    "13.4050",
+                    "52.5200",
+                    "BYRADIUS",
+                    "500",
+                    "KM",
+                    "COUNT",
+                    "0",
+                    "WITHDIST"
+                ])
+            )),
+            "ERR COUNT must be > 0"
+        );
     }
 
     #[test]
     fn georadius_family() {
         let mut d = db();
         geoadd_europe(&mut d);
-        let r = dispatch_at(&mut d, 0, &b_args(&["GEORADIUS", "Europe", "13.4050", "52.5200", "500", "KM", "COUNT", "3", "WITHCOORD", "WITHDIST"]));
+        let r = dispatch_at(
+            &mut d,
+            0,
+            &b_args(&[
+                "GEORADIUS",
+                "Europe",
+                "13.4050",
+                "52.5200",
+                "500",
+                "KM",
+                "COUNT",
+                "3",
+                "WITHCOORD",
+                "WITHDIST",
+            ]),
+        );
         let rows = flat(r);
         assert_eq!(rows.len(), 2);
         assert!(rows[0].contains("Berlin"), "got {:?}", rows[0]);
         assert!(rows[1].contains("Dublin"), "got {:?}", rows[1]);
         // DESC flips the order.
-        let r = dispatch_at(&mut d, 0, &b_args(&["GEORADIUS", "Europe", "13.4050", "52.5200", "500", "KM", "DESC", "WITHCOORD", "WITHDIST"]));
+        let r = dispatch_at(
+            &mut d,
+            0,
+            &b_args(&[
+                "GEORADIUS",
+                "Europe",
+                "13.4050",
+                "52.5200",
+                "500",
+                "KM",
+                "DESC",
+                "WITHCOORD",
+                "WITHDIST",
+            ]),
+        );
         let rows = flat(r);
         assert!(rows[0].contains("Dublin"), "got {:?}", rows[0]);
         assert!(rows[1].contains("Berlin"), "got {:?}", rows[1]);
         // Missing key -> empty array.
-        let r = dispatch_at(&mut d, 0, &b_args(&["GEORADIUS", "invalid_key", "16.3738", "48.2082", "900", "KM"]));
+        let r = dispatch_at(
+            &mut d,
+            0,
+            &b_args(&[
+                "GEORADIUS",
+                "invalid_key",
+                "16.3738",
+                "48.2082",
+                "900",
+                "KM",
+            ]),
+        );
         assert!(matches!(r, CmdResult::Ok(RespValue::Array(v)) if v.is_empty()));
         // COUNT 0.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEORADIUS", "Europe", "13.4050", "52.5200", "500", "KM", "COUNT", "0"]))), "ERR COUNT must be > 0");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEORADIUS",
+                    "Europe",
+                    "13.4050",
+                    "52.5200",
+                    "500",
+                    "KM",
+                    "COUNT",
+                    "0"
+                ])
+            )),
+            "ERR COUNT must be > 0"
+        );
         // Store incompatibility.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEORADIUS", "Europe", "13.4050", "52.5200", "500", "KM", "WITHDIST", "STORE", "result"]))), "ERR STORE option in GEORADIUS is not compatible with WITHDIST, WITHHASH and WITHCOORDS options");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEORADIUS",
+                    "Europe",
+                    "13.4050",
+                    "52.5200",
+                    "500",
+                    "KM",
+                    "WITHDIST",
+                    "STORE",
+                    "result"
+                ])
+            )),
+            "ERR STORE option in GEORADIUS is not compatible with WITHDIST, WITHHASH and WITHCOORDS options"
+        );
         // RO variants reject STORE / STOREDIST.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEORADIUS_RO", "Europe", "13.4050", "52.5200", "900", "KM", "STORE", "store_key"]))), "ERR syntax error");
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEORADIUS_RO", "Europe", "13.4050", "52.5200", "900", "KM", "STOREDIST", "store_key"]))), "ERR syntax error");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEORADIUS_RO",
+                    "Europe",
+                    "13.4050",
+                    "52.5200",
+                    "900",
+                    "KM",
+                    "STORE",
+                    "store_key"
+                ])
+            )),
+            "ERR syntax error"
+        );
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEORADIUS_RO",
+                    "Europe",
+                    "13.4050",
+                    "52.5200",
+                    "900",
+                    "KM",
+                    "STOREDIST",
+                    "store_key"
+                ])
+            )),
+            "ERR syntax error"
+        );
     }
 
     #[test]
     fn georadiusbymember_family() {
         let mut d = db();
         geoadd_europe(&mut d);
-        let r = dispatch_at(&mut d, 0, &b_args(&["GEORADIUSBYMEMBER", "Europe", "Madrid", "700", "KM", "WITHCOORD", "WITHDIST"]));
+        let r = dispatch_at(
+            &mut d,
+            0,
+            &b_args(&[
+                "GEORADIUSBYMEMBER",
+                "Europe",
+                "Madrid",
+                "700",
+                "KM",
+                "WITHCOORD",
+                "WITHDIST",
+            ]),
+        );
         let rows = flat(r);
         assert_eq!(rows.len(), 2);
         assert!(rows[0].contains("Madrid"), "got {:?}", rows[0]);
         assert!(rows[1].contains("Lisbon"), "got {:?}", rows[1]);
         // Missing member -> error.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEORADIUSBYMEMBER", "Europe", "invalid_mem", "900", "KM", "STORE", "store_key"]))), "ERR could not decode requested zset member");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEORADIUSBYMEMBER",
+                    "Europe",
+                    "invalid_mem",
+                    "900",
+                    "KM",
+                    "STORE",
+                    "store_key"
+                ])
+            )),
+            "ERR could not decode requested zset member"
+        );
         // Missing key -> delete dest + reply 0 (live Redis semantics; the
         // reference's `geo_family_test.cc` diverges and expects an empty array).
-        assert_eq!(int(dispatch_at(&mut d, 0, &b_args(&["GEORADIUSBYMEMBER", "invalid_key", "Madrid", "900", "KM", "STORE", "store_key"]))), 0);
+        assert_eq!(
+            int(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEORADIUSBYMEMBER",
+                    "invalid_key",
+                    "Madrid",
+                    "900",
+                    "KM",
+                    "STORE",
+                    "store_key"
+                ])
+            )),
+            0
+        );
         assert!(!exists(&mut d, "store_key"), "dest should be deleted");
         // STORE.
-        assert_eq!(int(dispatch_at(&mut d, 0, &b_args(&["GEORADIUSBYMEMBER", "Europe", "Madrid", "700", "KM", "STORE", "store_key"]))), 2);
+        assert_eq!(
+            int(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEORADIUSBYMEMBER",
+                    "Europe",
+                    "Madrid",
+                    "700",
+                    "KM",
+                    "STORE",
+                    "store_key"
+                ])
+            )),
+            2
+        );
         assert_eq!(
             zscores(&mut d, "store_key"),
-            vec!["Madrid".to_string(), "3471766229222696".to_string(), "Lisbon".to_string(), "3473121093062745".to_string()]
+            vec![
+                "Madrid".to_string(),
+                "3471766229222696".to_string(),
+                "Lisbon".to_string(),
+                "3473121093062745".to_string()
+            ]
         );
         // STOREDIST stores distance in the query unit.
-        assert_eq!(int(dispatch_at(&mut d, 0, &b_args(&["GEORADIUSBYMEMBER", "Europe", "Madrid", "700", "KM", "STOREDIST", "store_dist_key"]))), 2);
+        assert_eq!(
+            int(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEORADIUSBYMEMBER",
+                    "Europe",
+                    "Madrid",
+                    "700",
+                    "KM",
+                    "STOREDIST",
+                    "store_dist_key"
+                ])
+            )),
+            2
+        );
         let sd = zscores(&mut d, "store_dist_key");
         assert_eq!(sd[0], "Madrid");
         assert_eq!(sd[1], "0");
-        assert!((sd[3].parse::<f64>().unwrap() - 502.207694).abs() < 1e-4, "got {:?}", sd);
+        assert!(
+            (sd[3].parse::<f64>().unwrap() - 502.207_694).abs() < 1e-4,
+            "got {sd:?}"
+        );
         // WITHCOORD+STORE incompatibility (reference `GeoRadiusByMember`).
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEORADIUSBYMEMBER", "Europe", "Madrid", "900", "KM", "STORE", "store_key", "WITHCOORD"]))), "ERR STORE option in GEORADIUSBYMEMBER is not compatible with WITHDIST, WITHHASH and WITHCOORDS options");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEORADIUSBYMEMBER",
+                    "Europe",
+                    "Madrid",
+                    "900",
+                    "KM",
+                    "STORE",
+                    "store_key",
+                    "WITHCOORD"
+                ])
+            )),
+            "ERR STORE option in GEORADIUSBYMEMBER is not compatible with WITHDIST, WITHHASH and WITHCOORDS options"
+        );
         // WITHHASH before STORE: different arg permutation must also be caught.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEORADIUSBYMEMBER", "Sicily", "Agrigento", "100", "km", "WITHHASH", "store", "tmp"]))), "ERR STORE option in GEORADIUSBYMEMBER is not compatible with WITHDIST, WITHHASH and WITHCOORDS options");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEORADIUSBYMEMBER",
+                    "Sicily",
+                    "Agrigento",
+                    "100",
+                    "km",
+                    "WITHHASH",
+                    "store",
+                    "tmp"
+                ])
+            )),
+            "ERR STORE option in GEORADIUSBYMEMBER is not compatible with WITHDIST, WITHHASH and WITHCOORDS options"
+        );
         // COUNT 0.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEORADIUSBYMEMBER", "Sicily", "Agrigento", "100", "km", "COUNT", "0"]))), "ERR COUNT must be > 0");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEORADIUSBYMEMBER",
+                    "Sicily",
+                    "Agrigento",
+                    "100",
+                    "km",
+                    "COUNT",
+                    "0"
+                ])
+            )),
+            "ERR COUNT must be > 0"
+        );
         // Non-numeric COUNT -> syntax error for the BYMEMBER family.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEORADIUSBYMEMBER", "Europe", "Madrid", "700", "KM", "COUNT", "notanumber"]))), "ERR syntax error");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEORADIUSBYMEMBER",
+                    "Europe",
+                    "Madrid",
+                    "700",
+                    "KM",
+                    "COUNT",
+                    "notanumber"
+                ])
+            )),
+            "ERR syntax error"
+        );
         // Bad unit.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEORADIUSBYMEMBER", "Europe", "Madrid", "700", "badunit"]))), "ERR unsupported unit provided. please use M, KM, FT, MI");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&["GEORADIUSBYMEMBER", "Europe", "Madrid", "700", "badunit"])
+            )),
+            "ERR unsupported unit provided. please use M, KM, FT, MI"
+        );
         // RO variant rejects STORE and STOREDIST.
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEORADIUSBYMEMBER_RO", "Europe", "Madrid", "700", "KM", "STORE", "store_key"]))), "ERR syntax error");
-        assert_eq!(err(dispatch_at(&mut d, 0, &b_args(&["GEORADIUSBYMEMBER_RO", "Europe", "Madrid", "700", "KM", "STOREDIST", "store_dist_key"]))), "ERR syntax error");
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEORADIUSBYMEMBER_RO",
+                    "Europe",
+                    "Madrid",
+                    "700",
+                    "KM",
+                    "STORE",
+                    "store_key"
+                ])
+            )),
+            "ERR syntax error"
+        );
+        assert_eq!(
+            err(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEORADIUSBYMEMBER_RO",
+                    "Europe",
+                    "Madrid",
+                    "700",
+                    "KM",
+                    "STOREDIST",
+                    "store_dist_key"
+                ])
+            )),
+            "ERR syntax error"
+        );
     }
 
     /// Reference `GeoRadiusByMemberUb`: unit-boundary search in `mi` with
@@ -1294,23 +2228,58 @@ mod tests {
     #[test]
     fn georadius_by_member_ub() {
         let mut d = db();
-        dispatch_at(&mut d, 0, &b_args(&["GEOADD", "geo", "-118.2437", "34.0522", "972"]));
-        dispatch_at(&mut d, 0, &b_args(&["GEOADD", "geo", "-73.935242", "40.730610", "973"]));
-        dispatch_at(&mut d, 0, &b_args(&["GEOADD", "geo", "-122.4194", "37.7749", "971"]));
-        let r = dispatch_at(&mut d, 0, &b_args(&["GEORADIUSBYMEMBER", "geo", "971", "200", "mi", "WITHCOORD", "WITHDIST", "COUNT", "40", "ASC"]));
+        dispatch_at(
+            &mut d,
+            0,
+            &b_args(&["GEOADD", "geo", "-118.2437", "34.0522", "972"]),
+        );
+        dispatch_at(
+            &mut d,
+            0,
+            &b_args(&["GEOADD", "geo", "-73.935242", "40.730610", "973"]),
+        );
+        dispatch_at(
+            &mut d,
+            0,
+            &b_args(&["GEOADD", "geo", "-122.4194", "37.7749", "971"]),
+        );
+        let r = dispatch_at(
+            &mut d,
+            0,
+            &b_args(&[
+                "GEORADIUSBYMEMBER",
+                "geo",
+                "971",
+                "200",
+                "mi",
+                "WITHCOORD",
+                "WITHDIST",
+                "COUNT",
+                "40",
+                "ASC",
+            ]),
+        );
         let rows = match r.into_resp_value() {
             RespValue::Array(v) => v,
             o => panic!("expected array, got {o:?}"),
         };
-        assert_eq!(rows.len(), 1, "got {:?}", rows);
+        assert_eq!(rows.len(), 1, "got {rows:?}");
         let row = match &rows[0] {
             RespValue::Array(v) => v,
             o => panic!("expected row array, got {o:?}"),
         };
-        assert!(matches!(&row[0], RespValue::Bulk(b) if b == b"971"), "got {:?}", row[0]);
+        assert!(
+            matches!(&row[0], RespValue::Bulk(b) if b == b"971"),
+            "got {:?}",
+            row[0]
+        );
         // Member's distance to itself is ~0 (cell-center residual).
         let dist = bulk_str(CmdResult::Ok(row[1].clone()));
-        assert!(dist.parse::<f64>().unwrap().abs() < 1e-6, "got {:?}", row[1]);
+        assert!(
+            dist.parse::<f64>().unwrap().abs() < 1e-6,
+            "got {:?}",
+            row[1]
+        );
         // Cell-center coordinates (reference: -122.41940170526505, 37.77490001056578).
         let coord = match &row[2] {
             RespValue::Array(v) => v,
@@ -1318,8 +2287,14 @@ mod tests {
         };
         let lon = bulk_str(CmdResult::Ok(coord[0].clone()));
         let lat = bulk_str(CmdResult::Ok(coord[1].clone()));
-        assert!((lon.parse::<f64>().unwrap() - (-122.41940170526505)).abs() < 1e-9, "got {:?}", lon);
-        assert!((lat.parse::<f64>().unwrap() - 37.77490001056578).abs() < 1e-9, "got {:?}", lat);
+        assert!(
+            (lon.parse::<f64>().unwrap() - (-122.419_401_705_265_05)).abs() < 1e-9,
+            "got {lon:?}"
+        );
+        assert!(
+            (lat.parse::<f64>().unwrap() - 37.774_900_010_565_78).abs() < 1e-9,
+            "got {lat:?}"
+        );
     }
 
     #[test]
@@ -1327,7 +2302,23 @@ mod tests {
         let mut d = db();
         geoadd_europe(&mut d);
         // Existing source, empty search: destination deleted + reply 0.
-        assert_eq!(int(dispatch_at(&mut d, 0, &b_args(&["GEORADIUS", "Europe", "0", "0", "0.001", "KM", "STORE", "store_key"]))), 0);
+        assert_eq!(
+            int(dispatch_at(
+                &mut d,
+                0,
+                &b_args(&[
+                    "GEORADIUS",
+                    "Europe",
+                    "0",
+                    "0",
+                    "0.001",
+                    "KM",
+                    "STORE",
+                    "store_key"
+                ])
+            )),
+            0
+        );
         assert!(!exists(&mut d, "store_key"), "dest should be deleted");
     }
 

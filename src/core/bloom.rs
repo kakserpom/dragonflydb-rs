@@ -1,8 +1,8 @@
 //! Scalable bloom filter, ported from `dragonfly/src/core/bloom.{h,cc}`.
 //!
 //! `Bloom` is a single bloom filter based on the design of
-//! https://github.com/jvirkki/libbloom; `SBF` is a scalable bloom filter based
-//! on https://gsd.di.uminho.pt/members/cbm/ps/dbloom.pdf. The SBF grows a
+//! <https://github.com/jvirkki/libbloom>; `SBF` is a scalable bloom filter based
+//! on <https://gsd.di.uminho.pt/members/cbm/ps/dbloom.pdf>. The SBF grows a
 //! sequence of filters, each doubling the previous capacity, so the false
 //! positive rate stays bounded as the key grows.
 //!
@@ -15,14 +15,14 @@ use xxhash_rust::xxh3::xxh3_128_with_seed;
 
 /// kSbfDumpVersion: version of the SCANDUMP wire format.
 pub const K_SBF_DUMP_VERSION: u32 = 1;
-/// Default false-positive probability for keys created implicitly (bloom_family.cc).
+/// Default false-positive probability for keys created implicitly (`bloom_family.cc`).
 pub const K_DEFAULT_FP_PROB: f64 = 0.01;
-/// Default expansion (growth) factor for keys created implicitly (bloom_family.cc).
+/// Default expansion (growth) factor for keys created implicitly (`bloom_family.cc`).
 pub const K_DEFAULT_GROW_FACTOR: f64 = 2.0;
-/// version(4) + grow_factor(8).
+/// version(4) + `grow_factor(8)`.
 pub const K_DUMP_HEADER_SIZE: usize = 12;
-/// hash_cnt(4) + data_length(8) + fp_prob(8) + max_capacity(8) +
-/// current_size(8) + prev_size(8).
+/// `hash_cnt(4)` + `data_length(8)` + `fp_prob(8)` + `max_capacity(8)` +
+/// `current_size(8)` + `prev_size(8)`.
 pub const K_DUMP_FILTER_META_SIZE: usize = 44;
 /// Maximum size of one SCANDUMP/LOADCHUNK payload.
 pub const K_MAX_CHUNK_SIZE: usize = 16 * 1024 * 1024;
@@ -30,7 +30,7 @@ pub const K_MAX_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 /// Optimal fill ratio for an SBF slice (the paper suggests 50%).
 const K_SBF_ERROR_FACTOR: f64 = 0.5;
 /// The murmur2 seed used by the reference fingerprint hash.
-const K_BLOOM_SEED: u64 = 0xc6a4a7935bd1e995;
+const K_BLOOM_SEED: u64 = 0xc6a4_a793_5bd1_e995;
 
 fn hash_fp(str: &[u8]) -> (u64, u64) {
     let h = xxh3_128_with_seed(str, K_BLOOM_SEED);
@@ -63,8 +63,12 @@ pub struct Bloom {
 }
 
 impl Bloom {
+    #[must_use]
     pub fn new() -> Self {
-        Bloom { hash_cnt: 0, bits: Vec::new() }
+        Bloom {
+            hash_cnt: 0,
+            bits: Vec::new(),
+        }
     }
 
     /// Initializes a new Bloom object, mirroring `Bloom::Init(entries, fp_prob, heap)`.
@@ -85,19 +89,22 @@ impl Bloom {
 
     /// Direct initializer for loading persisted filters. `len * 8` must be a
     /// power of two (enforced by the loaders), mirroring `Bloom::Init(blob, len, hash_cnt)`.
+    #[must_use]
     pub fn init_direct(bits: Vec<u8>, hash_cnt: u8) -> Self {
         debug_assert!((bits.len() * 8).is_power_of_two());
         Bloom { hash_cnt, bits }
     }
 
+    #[must_use]
     pub fn exists(&self, str: &[u8]) -> bool {
         self.exists_fp(hash_fp(str))
     }
 
     /// Equivalent to `Exists(str)` but accepts the two fingerprint parts.
+    #[must_use]
     pub fn exists_fp(&self, fp: (u64, u64)) -> bool {
         let mask = self.mask();
-        for i in 0..self.hash_cnt as u64 {
+        for i in 0..u64::from(self.hash_cnt) {
             if !self.is_set(bit_index(fp.0, fp.1, i, mask)) {
                 return false;
             }
@@ -115,7 +122,7 @@ impl Bloom {
     pub fn add_fp(&mut self, fp: (u64, u64)) -> bool {
         let mask = self.mask();
         let mut changes = 0u32;
-        for i in 0..self.hash_cnt as u64 {
+        for i in 0..u64::from(self.hash_cnt) {
             if self.set(bit_index(fp.0, fp.1, i, mask)) {
                 changes += 1;
             }
@@ -123,21 +130,25 @@ impl Bloom {
         changes != 0
     }
 
+    #[must_use]
     pub fn bitlen(&self) -> usize {
         self.bits.len() * 8
     }
 
-    /// Max element capacity for this bloom filter: floor(bit_len / bpe).
+    /// Max element capacity for this bloom filter: `floor(bit_len` / bpe).
+    #[must_use]
     pub fn capacity(&self, fp_prob: f64) -> usize {
         let fp_prob = if fp_prob > 0.5 { 0.5 } else { fp_prob };
         let bpe = bpe(fp_prob);
         (self.bitlen() as f64 / bpe).floor() as usize
     }
 
+    #[must_use]
     pub fn data(&self) -> &[u8] {
         &self.bits
     }
 
+    #[must_use]
     pub fn hash_cnt(&self) -> u8 {
         self.hash_cnt
     }
@@ -191,6 +202,7 @@ pub struct StateUpdate {
 
 impl SBF {
     /// Create a new scalable filter, mirroring the main `SBF` constructor.
+    #[must_use]
     pub fn new(initial_capacity: u64, fp_prob: f64, grow_factor: f64) -> Self {
         let fp_prob = fp_prob * K_SBF_ERROR_FACTOR;
         let mut first = Bloom::new();
@@ -208,6 +220,7 @@ impl SBF {
 
     /// Constructor for loading persisted filters; should be followed by
     /// `add_new_filter_to_sbf`.
+    #[must_use]
     pub fn new_loaded(
         grow_factor: f64,
         fp_prob: f64,
@@ -247,7 +260,10 @@ impl SBF {
             self.prev_size += self.max_capacity;
             self.fp_prob *= K_SBF_ERROR_FACTOR;
             let mut nf = Bloom::new();
-            nf.init((self.max_capacity as f64 * self.grow_factor) as u64, self.fp_prob);
+            nf.init(
+                (self.max_capacity as f64 * self.grow_factor) as u64,
+                self.fp_prob,
+            );
             self.filters.push(nf);
             self.current_size = 0;
             self.max_capacity = self.filters[self.filters.len() - 1].capacity(self.fp_prob);
@@ -256,58 +272,71 @@ impl SBF {
         true
     }
 
+    #[must_use]
     pub fn exists(&self, str: &[u8]) -> bool {
         let fp = hash_fp(str);
         self.filters.iter().any(|f| f.exists_fp(fp))
     }
 
+    #[must_use]
     pub fn current_size(&self) -> usize {
         self.current_size
     }
 
+    #[must_use]
     pub fn prev_size(&self) -> usize {
         self.prev_size
     }
 
+    #[must_use]
     pub fn grow_factor(&self) -> f64 {
         self.grow_factor
     }
 
     /// Expected fp probability for the current filter.
+    #[must_use]
     pub fn fp_probability(&self) -> f64 {
         self.fp_prob
     }
 
+    #[must_use]
     pub fn num_filters(&self) -> usize {
         self.filters.len()
     }
 
+    #[must_use]
     pub fn data(&self, idx: usize) -> &[u8] {
         self.filters[idx].data()
     }
 
+    #[must_use]
     pub fn hashfunc_cnt(&self, idx: usize) -> u8 {
         self.filters[idx].hash_cnt()
     }
 
     /// Max capacity of the current filter.
+    #[must_use]
     pub fn max_capacity(&self) -> usize {
         self.max_capacity
     }
 
     /// Total design capacity across all filters (completed filters plus the
     /// current one).
+    #[must_use]
     pub fn total_capacity(&self) -> usize {
         self.prev_size + self.max_capacity
     }
 
     /// Total number of items inserted across all filters.
+    #[must_use]
     pub fn total_items(&self) -> usize {
         self.prev_size + self.current_size
     }
 
+    #[must_use]
     pub fn malloc_used(&self) -> usize {
-        let mut res = std::mem::size_of::<SBF>() + std::mem::size_of::<Bloom>() * self.filters.capacity();
+        let mut res =
+            std::mem::size_of::<SBF>() + std::mem::size_of::<Bloom>() * self.filters.capacity();
         for f in &self.filters {
             res += f.bitlen() / 8;
         }
@@ -324,12 +353,13 @@ impl SBF {
     /// Serialize the whole filter as a single blob in the SCANDUMP wire format
     /// (header, then every filter's meta + bytes). Used by the RDB DUMP path;
     /// the chunked SCANDUMP view is produced by `SbfDumpIterator`.
+    #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::new();
         append_u32(&mut out, K_SBF_DUMP_VERSION);
         append_u64(&mut out, self.grow_factor.to_bits());
         for i in 0..self.num_filters() {
-            append_u32(&mut out, self.hashfunc_cnt(i) as u32);
+            append_u32(&mut out, u32::from(self.hashfunc_cnt(i)));
             append_u64(&mut out, self.data(i).len() as u64);
             append_u64(&mut out, self.fp_probability().to_bits());
             append_u64(&mut out, self.max_capacity() as u64);
@@ -385,8 +415,14 @@ pub struct SbfDumpIterator<'a> {
 
 impl<'a> SbfDumpIterator<'a> {
     /// `cursor` is the client-supplied cursor; 0 starts from the beginning.
+    #[must_use]
     pub fn new(sbf: &'a SBF, cursor: i64) -> Self {
-        let mut it = SbfDumpIterator { sbf, cursor, filter_index: 0, byte_offset: 0 };
+        let mut it = SbfDumpIterator {
+            sbf,
+            cursor,
+            filter_index: 0,
+            byte_offset: 0,
+        };
         it.resolve_cursor_to_pos();
         it
     }
@@ -424,7 +460,10 @@ impl<'a> SbfDumpIterator<'a> {
     fn build_filter_header(&self, filter_data: &[u8]) -> Vec<u8> {
         let data_chunk_len = (K_MAX_CHUNK_SIZE - K_DUMP_FILTER_META_SIZE).min(filter_data.len());
         let mut chunk = Vec::with_capacity(K_DUMP_FILTER_META_SIZE + data_chunk_len);
-        append_u32(&mut chunk, self.sbf.hashfunc_cnt(self.filter_index) as u32);
+        append_u32(
+            &mut chunk,
+            u32::from(self.sbf.hashfunc_cnt(self.filter_index)),
+        );
         append_u64(&mut chunk, filter_data.len() as u64);
         append_u64(&mut chunk, self.sbf.fp_probability().to_bits());
         append_u64(&mut chunk, self.sbf.max_capacity() as u64);
@@ -446,7 +485,10 @@ impl<'a> SbfDumpIterator<'a> {
     pub fn next_chunk(&mut self) -> SbfChunk {
         if self.cursor == 0 {
             self.cursor = 1;
-            return SbfChunk { cursor: 1, data: self.serialize_header() };
+            return SbfChunk {
+                cursor: 1,
+                data: self.serialize_header(),
+            };
         }
 
         if self.filter_index < self.sbf.num_filters() {
@@ -459,7 +501,10 @@ impl<'a> SbfDumpIterator<'a> {
                 self.cursor += chunk.len() as i64;
             } else {
                 if self.byte_offset < K_DUMP_FILTER_META_SIZE {
-                    return SbfChunk { cursor: 0, data: Vec::new() };
+                    return SbfChunk {
+                        cursor: 0,
+                        data: Vec::new(),
+                    };
                 }
                 // Continuing data for the current filter.
                 chunk = self.build_filter_continuation(filter_data);
@@ -474,10 +519,16 @@ impl<'a> SbfDumpIterator<'a> {
                 self.byte_offset = 0;
             }
 
-            return SbfChunk { cursor: self.cursor, data: chunk };
+            return SbfChunk {
+                cursor: self.cursor,
+                data: chunk,
+            };
         }
 
-        SbfChunk { cursor: 0, data: Vec::new() }
+        SbfChunk {
+            cursor: 0,
+            data: Vec::new(),
+        }
     }
 }
 
@@ -525,7 +576,7 @@ fn add_new_filter_to_sbf(data: &[u8], sbf: &mut SBF) -> Result<(), SbfLoadError>
     }
 
     let hash_cnt = read_u32(data);
-    if hash_cnt == 0 || hash_cnt > u8::MAX as u32 {
+    if hash_cnt == 0 || hash_cnt > u32::from(u8::MAX) {
         return Err(SbfLoadError::BadInput);
     }
 
@@ -551,7 +602,12 @@ fn add_new_filter_to_sbf(data: &[u8], sbf: &mut SBF) -> Result<(), SbfLoadError>
         return Err(SbfLoadError::OutOfRange);
     }
 
-    sbf.apply_state_update(&StateUpdate { fp_prob, max_capacity, current_size, prev_size });
+    sbf.apply_state_update(&StateUpdate {
+        fp_prob,
+        max_capacity,
+        current_size,
+        prev_size,
+    });
 
     let mut bits = vec![0u8; data_length as usize];
     if payload > 0 {
@@ -720,6 +776,9 @@ mod tests {
         bad[..4].copy_from_slice(&1u32.to_le_bytes());
         bad[4..].copy_from_slice(&1.0f64.to_bits().to_le_bytes());
         assert!(load_sbf_header(&bad).is_ok());
-        assert_eq!(load_sbf_chunk(1, b"data", &mut sbf), Err(SbfLoadError::OutOfRange));
+        assert_eq!(
+            load_sbf_chunk(1, b"data", &mut sbf),
+            Err(SbfLoadError::OutOfRange)
+        );
     }
 }

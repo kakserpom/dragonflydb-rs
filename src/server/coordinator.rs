@@ -103,16 +103,16 @@ impl Coordinator {
                     return;
                 }
                 let cmd = command_for(&msg.args);
-                let deadline_ms = cmd
-                    .and_then(|c| blocking_timeout_ms(c, &msg.args))
-                    .map(|ms| {
+                let deadline_ms = cmd.and_then(|c| blocking_timeout_ms(c, &msg.args)).map_or(
+                    Some(now_ms()),
+                    |ms| {
                         if ms == 0 {
                             None // wait forever
                         } else {
                             Some(now_ms().saturating_add(ms))
                         }
-                    })
-                    .unwrap_or(Some(now_ms()));
+                    },
+                );
                 self.pending.push_back(PendingTx { msg, deadline_ms });
             }
             other => self.reply_result(msg.conn_id, msg.seq, other),
@@ -125,12 +125,12 @@ impl Coordinator {
         }
         let mut remaining = Vec::with_capacity(self.pending.len());
         while let Some(p) = self.pending.pop_front() {
-            if let Some(dl) = p.deadline_ms {
-                if now >= dl {
-                    let bytes = encode_result(CmdResult::Ok(RespValue::Nil));
-                    self.reply(p.msg.conn_id, p.msg.seq, bytes);
-                    continue;
-                }
+            if let Some(dl) = p.deadline_ms
+                && now >= dl
+            {
+                let bytes = encode_result(CmdResult::Ok(RespValue::Nil));
+                self.reply(p.msg.conn_id, p.msg.seq, bytes);
+                continue;
             }
             match self.execute_tx(&p.msg) {
                 CmdResult::Blocked => remaining.push(p),
@@ -176,10 +176,9 @@ impl Coordinator {
                     result_tx: res_tx,
                 })
                 .is_ok()
+                && let Ok(p) = res_rx.recv()
             {
-                if let Ok(p) = res_rx.recv() {
-                    parts.push(p);
-                }
+                parts.push(p);
             }
         }
 
@@ -188,7 +187,7 @@ impl Coordinator {
             let _ = self.shard_txs[s].send(ShardMsg::TxUnlock { tx_id });
         }
 
-        match self.finish_tx(msg, parts) {
+        match Self::finish_tx(msg, &parts) {
             CmdResult::DeferredStore { key, value, reply } => {
                 self.perform_deferred_store(&key, value, None, false, msg.db_idx);
                 CmdResult::Ok(reply)
@@ -309,7 +308,7 @@ impl Coordinator {
                     tx_id,
                     conn_id: msg.conn_id,
                     seq: msg.seq,
-                    args: args.to_vec(),
+                    args: args.clone(),
                     owned_key_idxs: owned_for(&per, s),
                     first_key_idx: 0,
                     db_idx: msg.db_idx,
@@ -401,7 +400,7 @@ impl Coordinator {
             .unwrap_or_else(|_| CmdResult::err("ERR internal: shard thread exited"))
     }
 
-    fn finish_tx(&self, msg: &CoordMsg, parts: Vec<ShardPart>) -> CmdResult {
+    fn finish_tx(msg: &CoordMsg, parts: &[ShardPart]) -> CmdResult {
         let any_err = parts.iter().any(|p| p.result.is_err());
         let any_ok = parts.iter().any(|p| matches!(&p.result, CmdResult::Ok(_)));
         if parts.is_empty() {
@@ -412,7 +411,7 @@ impl Coordinator {
                 return CmdResult::err("ERR unknown command");
             };
             if let Some(merge) = cmd.merge {
-                merge(&parts, &msg.args, &msg.keys, now_ms())
+                merge(parts, &msg.args, &msg.keys, now_ms())
             } else {
                 parts[0].result.clone()
             }
@@ -453,7 +452,7 @@ struct ScriptCtx {
     declared: Vec<Vec<u8>>,
     /// Whether subcommands may touch undeclared keys (allow-undeclared-keys).
     undeclared_keys: bool,
-    /// EVAL_RO / EVALSHA_RO: reject any write subcommand.
+    /// `EVAL_RO` / `EVALSHA_RO`: reject any write subcommand.
     read_only: bool,
     num_shards: usize,
     /// The DB all subcommands run in (the connection's selected DB).

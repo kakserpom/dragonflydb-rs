@@ -39,6 +39,7 @@ pub struct DbStats {
 }
 
 impl DbSlice {
+    #[must_use]
     pub fn new(shard_id: usize) -> Self {
         DbSlice {
             shard_id,
@@ -53,10 +54,12 @@ impl DbSlice {
         }
     }
 
+    #[must_use]
     pub fn shard_id(&self) -> usize {
         self.shard_id
     }
 
+    #[must_use]
     pub fn key_count(&self) -> usize {
         self.prime_table.len()
     }
@@ -90,20 +93,22 @@ impl DbSlice {
         found
     }
 
-    pub fn insert(&mut self, key: CompactString, value: PrimeValue) {
-        self.prime_table.insert(key.clone(), value);
-        self.bump_version(key.as_bytes());
+    pub fn insert(&mut self, key: &[u8], value: PrimeValue) {
+        self.prime_table
+            .insert(CompactString::from_bytes(key), value);
+        self.bump_version(key);
         self.refresh_stats();
     }
 
     /// Insert only if the key does not exist. Returns true if inserted.
-    pub fn insert_if_absent(&mut self, key: CompactString, value: PrimeValue, now_ms: u64) -> bool {
-        self.expire_if_needed(&key, now_ms);
-        if self.prime_table.contains_key(&key) {
+    pub fn insert_if_absent(&mut self, key: &[u8], value: PrimeValue, now_ms: u64) -> bool {
+        self.expire_if_needed(key, now_ms);
+        if self.prime_table.contains_key(key) {
             return false;
         }
-        self.prime_table.insert(key.clone(), value);
-        self.bump_version(key.as_bytes());
+        self.prime_table
+            .insert(CompactString::from_bytes(key), value);
+        self.bump_version(key);
         self.refresh_stats();
         true
     }
@@ -146,7 +151,8 @@ impl DbSlice {
                 self.expire.remove(key);
             } else {
                 self.bump_version(key);
-                self.expire.insert(CompactString::from_bytes(key), expire_at_ms);
+                self.expire
+                    .insert(CompactString::from_bytes(key), expire_at_ms);
             }
         }
         self.refresh_stats();
@@ -200,12 +206,13 @@ impl DbSlice {
     }
 
     /// Absolute expiration time in ms for a key, if any (no expiry check).
+    #[must_use]
     pub fn expire_at(&self, key: &[u8]) -> Option<u64> {
         self.expire.get(key).copied()
     }
 
     /// Mark a key sticky if it exists and was not already sticky. Returns true
-    /// if the flag was newly applied (mirrors OpStick).
+    /// if the flag was newly applied (mirrors `OpStick`).
     pub fn set_sticky(&mut self, key: &[u8], now_ms: u64) -> bool {
         self.expire_if_needed(key, now_ms);
         if self.prime_table.contains_key(key) && !self.sticky.contains(key) {
@@ -217,11 +224,13 @@ impl DbSlice {
     }
 
     /// Whether the key is sticky.
+    #[must_use]
     pub fn is_sticky(&self, key: &[u8]) -> bool {
         self.sticky.contains(key)
     }
 
     /// Whether the key has been accessed since it was created (SCAN `ATTR a|u`).
+    #[must_use]
     pub fn is_touched(&self, key: &[u8]) -> bool {
         self.touched.contains(key)
     }
@@ -238,11 +247,13 @@ impl DbSlice {
     }
 
     /// The current modification version of `key` (0 if never modified).
+    #[must_use]
     pub fn version_of(&self, key: &[u8]) -> u64 {
         self.versions.get(key).copied().unwrap_or(0)
     }
 
     /// Monotonic DB epoch, bumped on whole-DB flush.
+    #[must_use]
     pub fn db_epoch(&self) -> u64 {
         self.db_epoch
     }
@@ -253,7 +264,10 @@ impl DbSlice {
     }
 
     fn bump_version(&mut self, key: &[u8]) {
-        let e = self.versions.entry(CompactString::from_bytes(key)).or_insert(0);
+        let e = self
+            .versions
+            .entry(CompactString::from_bytes(key))
+            .or_insert(0);
         *e += 1;
     }
 
@@ -264,6 +278,7 @@ impl DbSlice {
     }
 
     /// The resolved last ID for a blocking XREAD `$` on `key`, if one is pending.
+    #[must_use]
     pub fn stream_watermark(&self, key: &[u8]) -> Option<StreamId> {
         self.stream_block_watermarks.get(key).copied()
     }
@@ -293,8 +308,12 @@ mod tests {
     #[test]
     fn insert_find_remove() {
         let mut db = DbSlice::new(0);
-        db.insert(CompactString::from("k"), PrimeValue::Str(CompactString::from("v")));
-        assert_eq!(db.find(b"k", now()).map(|v| v.obj_type()), Some(crate::core::ObjType::Str));
+        db.insert(b"k", PrimeValue::Str(CompactString::from("v")));
+        assert_eq!(
+            db.find(b"k", now())
+                .map(super::super::value::PrimeValue::obj_type),
+            Some(crate::core::ObjType::Str)
+        );
         assert_eq!(db.key_count(), 1);
         assert!(db.remove_if_exists(b"k"));
         assert!(db.find(b"k", now()).is_none());
@@ -303,7 +322,7 @@ mod tests {
     #[test]
     fn expiry_works() {
         let mut db = DbSlice::new(0);
-        db.insert(CompactString::from("k"), PrimeValue::Str(CompactString::from("v")));
+        db.insert(b"k", PrimeValue::Str(CompactString::from("v")));
         db.set_expiry(b"k", 2000, now());
         assert_eq!(db.ttl_ms(b"k", now()), 1000);
         assert!(db.find(b"k", now()).is_some());
@@ -317,22 +336,22 @@ mod tests {
     fn versions_bump_on_mutation_only() {
         let mut db = DbSlice::new(0);
         assert_eq!(db.version_of(b"k"), 0);
-        db.insert(CompactString::from("k"), PrimeValue::Str(CompactString::from("v")));
+        db.insert(b"k", PrimeValue::Str(CompactString::from("v")));
         assert_eq!(db.version_of(b"k"), 1);
         // Reads do not bump.
         let _ = db.find(b"k", now());
         assert_eq!(db.version_of(b"k"), 1);
         // Overwrite bumps.
-        db.insert(CompactString::from("k"), PrimeValue::Str(CompactString::from("v2")));
+        db.insert(b"k", PrimeValue::Str(CompactString::from("v2")));
         assert_eq!(db.version_of(b"k"), 2);
         // insert_if_absent on an existing key does not bump.
-        assert!(!db.insert_if_absent(CompactString::from("k"), PrimeValue::Str(CompactString::from("v3")), now()));
+        assert!(!db.insert_if_absent(b"k", PrimeValue::Str(CompactString::from("v3")), now()));
         assert_eq!(db.version_of(b"k"), 2);
         // Remove bumps.
         assert!(db.remove_if_exists(b"k"));
         assert_eq!(db.version_of(b"k"), 3);
         // Expiry assignment bumps; clearing expiry bumps; lazy expiry bumps.
-        db.insert(CompactString::from("k"), PrimeValue::Str(CompactString::from("v")));
+        db.insert(b"k", PrimeValue::Str(CompactString::from("v")));
         let v = db.version_of(b"k");
         db.set_expiry(b"k", 2000, now());
         assert_eq!(db.version_of(b"k"), v + 1);
@@ -352,11 +371,11 @@ mod tests {
     fn db_epoch_bumps_on_flush() {
         let mut db = DbSlice::new(0);
         assert_eq!(db.db_epoch(), 0);
-        db.insert(CompactString::from("k"), PrimeValue::Str(CompactString::from("v")));
+        db.insert(b"k", PrimeValue::Str(CompactString::from("v")));
         db.bump_db_epoch();
         assert_eq!(db.db_epoch(), 1);
         // A plain write must not bump the epoch.
-        db.insert(CompactString::from("k"), PrimeValue::Str(CompactString::from("v2")));
+        db.insert(b"k", PrimeValue::Str(CompactString::from("v2")));
         assert_eq!(db.db_epoch(), 1);
     }
 }

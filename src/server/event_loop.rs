@@ -4,6 +4,8 @@ use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::fmt::Write as _;
+
 use crate::commands::exec::server;
 use crate::commands::{Command, FLAG_ADMIN, FLAG_BLOCKING, FLAG_GLOBAL, FLAG_LOCAL};
 use crate::error::RespValue;
@@ -42,7 +44,7 @@ fn monitor_escape(bytes: &[u8]) -> String {
             b'\t' => s.push_str("\\t"),
             7 => s.push_str("\\a"),
             8 => s.push_str("\\b"),
-            0..=31 | 127..=255 => s.push_str(&format!("\\x{:02x}", b)),
+            0..=31 | 127..=255 => write!(s, "\\x{b:02x}").unwrap(),
             _ => s.push(b as char),
         }
     }
@@ -79,7 +81,7 @@ struct MultiState {
 }
 
 struct Conn {
-    conn_id: u64,
+    id: u64,
     fd: RawFd,
     parser: RespParser,
     out: Vec<u8>,
@@ -225,8 +227,7 @@ impl IoLoop {
                 Ok((stream, _)) => {
                     let remote = stream
                         .peer_addr()
-                        .map(|a| a.to_string())
-                        .unwrap_or_else(|_| "0.0.0.0:0".into());
+                        .map_or_else(|_| "0.0.0.0:0".into(), |a| a.to_string());
                     let _ = stream.set_nonblocking(true);
                     let fd = stream.into_raw_fd();
                     self.register_conn(fd, remote);
@@ -243,7 +244,7 @@ impl IoLoop {
         self.conns.insert(
             conn_id,
             Conn {
-                conn_id,
+                id: conn_id,
                 fd,
                 parser: RespParser::new(),
                 out: Vec::new(),
@@ -280,7 +281,7 @@ impl IoLoop {
             return;
         };
         let mut buf = [0u8; 16384];
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
         if n <= 0 {
             if n < 0 && is_again(&std::io::Error::last_os_error()) {
                 return;
@@ -305,7 +306,7 @@ impl IoLoop {
             }
         }
         if let Some(e) = protocol_error {
-            let bytes = encode_value(&RespValue::Error(format!("ERR {}", e)));
+            let bytes = encode_value(&RespValue::Error(format!("ERR {e}")));
             if let Some(conn) = self.conns.get_mut(&conn_id) {
                 conn.out.extend_from_slice(&bytes);
             }
@@ -343,7 +344,7 @@ impl IoLoop {
 
         // A MONITOR connection may only run RESET or QUIT
         // (`main_service.cc:1413-1414`).
-        if self.conns.get(&conn_id).map(|c| c.monitor).unwrap_or(false)
+        if self.conns.get(&conn_id).is_some_and(|c| c.monitor)
             && !matches!(cmd.name, "RESET" | "QUIT")
         {
             self.deliver(
@@ -489,8 +490,7 @@ impl IoLoop {
     fn in_multi(&self, conn_id: u64) -> bool {
         self.conns
             .get(&conn_id)
-            .map(|c| c.multi.phase == MultiPhase::Collect)
-            .unwrap_or(false)
+            .is_some_and(|c| c.multi.phase == MultiPhase::Collect)
     }
 
     fn handle_local(&mut self, conn_id: u64, cmd: &Command, args: &[Vec<u8>]) -> RespValue {
@@ -538,13 +538,7 @@ impl IoLoop {
         // While subscribed in RESP2, PING echoes the message inside a
         // `["pong", msg]` array instead of a plain bulk reply
         // (`GenericFamily::Ping`).
-        if cmd.name == "PING"
-            && self
-                .conns
-                .get(&conn_id)
-                .map(|c| !c.sub.is_empty())
-                .unwrap_or(false)
-        {
+        if cmd.name == "PING" && self.conns.get(&conn_id).is_some_and(|c| !c.sub.is_empty()) {
             let msg = args.get(1).map_or(&b""[..], |a| a.as_slice());
             return pubsub::ping_pubsub(msg);
         }
@@ -559,8 +553,7 @@ impl IoLoop {
         let phase = self
             .conns
             .get(&conn_id)
-            .map(|c| c.multi.phase)
-            .unwrap_or(MultiPhase::Inactive);
+            .map_or(MultiPhase::Inactive, |c| c.multi.phase);
         if phase == MultiPhase::Collect {
             self.deliver(
                 conn_id,
@@ -582,8 +575,7 @@ impl IoLoop {
         let phase = self
             .conns
             .get(&conn_id)
-            .map(|c| c.multi.phase)
-            .unwrap_or(MultiPhase::Inactive);
+            .map_or(MultiPhase::Inactive, |c| c.multi.phase);
         // Upstream `MultiCleanup` runs before the IsInMulti check, so DISCARD
         // outside a MULTI block still unwatches all keys and drains the queue.
         if let Some(conn) = self.conns.get_mut(&conn_id) {
@@ -608,9 +600,8 @@ impl IoLoop {
     /// last clear) the command is a no-op that will make EXEC abort.
     fn local_watch(&mut self, conn_id: u64, seq: u64, args: &[Vec<u8>]) {
         let (db_idx, already_dirty) = {
-            let conn = match self.conns.get(&conn_id) {
-                Some(c) => c,
-                None => return,
+            let Some(conn) = self.conns.get(&conn_id) else {
+                return;
             };
             (conn.db_idx, conn.watched_dirty)
         };
@@ -624,9 +615,8 @@ impl IoLoop {
         // the key dirty on every update and refuses to re-register afterwards).
         let mut dirty = false;
         let existing: Vec<Vec<u8>> = {
-            let conn = match self.conns.get(&conn_id) {
-                Some(c) => c,
-                None => return,
+            let Some(conn) = self.conns.get(&conn_id) else {
+                return;
             };
             conn.watched.iter().map(|w| w.key.clone()).collect()
         };
@@ -636,14 +626,11 @@ impl IoLoop {
                 states.iter().map(|(k, s)| (k.as_slice(), s)).collect();
             let conn = self.conns.get(&conn_id).unwrap();
             dirty = conn.watched.iter().any(|w| {
-                by_key
-                    .get(w.key.as_slice())
-                    .map(|s| {
-                        s.version != w.state.version
-                            || s.existed != w.state.existed
-                            || s.db_epoch != w.state.db_epoch
-                    })
-                    .unwrap_or(true)
+                by_key.get(w.key.as_slice()).is_none_or(|s| {
+                    s.version != w.state.version
+                        || s.existed != w.state.existed
+                        || s.db_epoch != w.state.db_epoch
+                })
             });
         }
         let states = self.watch_snapshot(&new_keys, db_idx);
@@ -672,9 +659,8 @@ impl IoLoop {
 
     fn local_exec(&mut self, conn_id: u64, seq: u64) {
         let (phase, queue, watched, dirty) = {
-            let conn = match self.conns.get_mut(&conn_id) {
-                Some(c) => c,
-                None => return,
+            let Some(conn) = self.conns.get_mut(&conn_id) else {
+                return;
             };
             (
                 conn.multi.phase,
@@ -711,7 +697,7 @@ impl IoLoop {
         // Watch guards: a nil reply aborts the transaction (upstream
         // `watched_dirty` / `CheckWatchedKeyExpiry`).
         if !watched.is_empty() || dirty {
-            let db_idx = self.conns.get(&conn_id).map(|c| c.db_idx).unwrap_or(0);
+            let db_idx = self.conns.get(&conn_id).map_or(0, |c| c.db_idx);
             if watched.iter().any(|w| w.db != db_idx) {
                 self.deliver(
                     conn_id,
@@ -731,14 +717,11 @@ impl IoLoop {
             let by_key: HashMap<&[u8], &WatchState> =
                 states.iter().map(|(k, s)| (k.as_slice(), s)).collect();
             let is_dirty = watched.iter().any(|w| {
-                by_key
-                    .get(w.key.as_slice())
-                    .map(|s| {
-                        s.version != w.state.version
-                            || s.existed != w.state.existed
-                            || s.db_epoch != w.state.db_epoch
-                    })
-                    .unwrap_or(true)
+                by_key.get(w.key.as_slice()).is_none_or(|s| {
+                    s.version != w.state.version
+                        || s.existed != w.state.existed
+                        || s.db_epoch != w.state.db_epoch
+                })
             });
             if is_dirty {
                 self.deliver(conn_id, seq, encode_value(&RespValue::Nil));
@@ -792,9 +775,9 @@ impl IoLoop {
         for (seq, ch) in (seq..).zip(args[1..].iter()) {
             self.pubsub.subscribe(ch, conn_id);
             if let Some(conn) = self.conns.get_mut(&conn_id) {
-                conn.sub.channels.insert(ch.to_vec());
+                conn.sub.channels.insert(ch.clone());
             }
-            let count = self.conns.get(&conn_id).map(|c| c.sub.count()).unwrap_or(0);
+            let count = self.conns.get(&conn_id).map_or(0, |c| c.sub.count());
             let reply = encode_value(&pubsub::sub_change("subscribe", Some(ch), count));
             self.deliver(conn_id, seq, reply);
         }
@@ -822,7 +805,7 @@ impl IoLoop {
             if let Some(conn) = self.conns.get_mut(&conn_id) {
                 conn.sub.channels.remove(&ch);
             }
-            let count = self.conns.get(&conn_id).map(|c| c.sub.count()).unwrap_or(0);
+            let count = self.conns.get(&conn_id).map_or(0, |c| c.sub.count());
             let reply = encode_value(&pubsub::sub_change("unsubscribe", Some(&ch), count));
             self.deliver(conn_id, seq, reply);
         }
@@ -832,9 +815,9 @@ impl IoLoop {
         for (seq, pat) in (seq..).zip(args[1..].iter()) {
             self.pubsub.psubscribe(pat, conn_id);
             if let Some(conn) = self.conns.get_mut(&conn_id) {
-                conn.sub.patterns.insert(pat.to_vec());
+                conn.sub.patterns.insert(pat.clone());
             }
-            let count = self.conns.get(&conn_id).map(|c| c.sub.count()).unwrap_or(0);
+            let count = self.conns.get(&conn_id).map_or(0, |c| c.sub.count());
             let reply = encode_value(&pubsub::sub_change("psubscribe", Some(pat), count));
             self.deliver(conn_id, seq, reply);
         }
@@ -859,7 +842,7 @@ impl IoLoop {
             if let Some(conn) = self.conns.get_mut(&conn_id) {
                 conn.sub.patterns.remove(&pat);
             }
-            let count = self.conns.get(&conn_id).map(|c| c.sub.count()).unwrap_or(0);
+            let count = self.conns.get(&conn_id).map_or(0, |c| c.sub.count());
             let reply = encode_value(&pubsub::sub_change("punsubscribe", Some(&pat), count));
             self.deliver(conn_id, seq, reply);
         }
@@ -873,9 +856,9 @@ impl IoLoop {
         for (seq, ch) in (seq..).zip(args[1..].iter()) {
             self.pubsub.ssubscribe(ch, conn_id);
             if let Some(conn) = self.conns.get_mut(&conn_id) {
-                conn.sub.sharded.insert(ch.to_vec());
+                conn.sub.sharded.insert(ch.clone());
             }
-            let count = self.conns.get(&conn_id).map(|c| c.sub.count()).unwrap_or(0);
+            let count = self.conns.get(&conn_id).map_or(0, |c| c.sub.count());
             let reply = encode_value(&pubsub::sub_change("ssubscribe", Some(ch), count));
             self.deliver(conn_id, seq, reply);
         }
@@ -900,7 +883,7 @@ impl IoLoop {
             if let Some(conn) = self.conns.get_mut(&conn_id) {
                 conn.sub.sharded.remove(&ch);
             }
-            let count = self.conns.get(&conn_id).map(|c| c.sub.count()).unwrap_or(0);
+            let count = self.conns.get(&conn_id).map_or(0, |c| c.sub.count());
             let reply = encode_value(&pubsub::sub_change("sunsubscribe", Some(&ch), count));
             self.deliver(conn_id, seq, reply);
         }
@@ -1072,7 +1055,7 @@ impl IoLoop {
             return;
         }
         let ts = monitor_timestamp();
-        let db = self.conns.get(&conn_id).map(|c| c.db_idx).unwrap_or(0);
+        let db = self.conns.get(&conn_id).map_or(0, |c| c.db_idx);
         let src = self
             .conns
             .get(&conn_id)
@@ -1109,7 +1092,7 @@ impl IoLoop {
         args: Vec<Vec<u8>>,
         owned: Vec<usize>,
     ) {
-        let db_idx = self.conns.get(&conn_id).map(|c| c.db_idx).unwrap_or(0);
+        let db_idx = self.conns.get(&conn_id).map_or(0, |c| c.db_idx);
         let op = SingleOp {
             conn_id,
             seq,
@@ -1130,7 +1113,7 @@ impl IoLoop {
         shards: Vec<usize>,
         first_key_idx: usize,
     ) {
-        let db_idx = self.conns.get(&conn_id).map(|c| c.db_idx).unwrap_or(0);
+        let db_idx = self.conns.get(&conn_id).map_or(0, |c| c.db_idx);
         let msg = CoordMsg {
             conn_id,
             seq,
@@ -1176,7 +1159,7 @@ impl IoLoop {
             let n = unsafe {
                 libc::read(
                     self.wake_r,
-                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
                     buf.len(),
                 )
             };
@@ -1195,7 +1178,7 @@ impl IoLoop {
             .conns
             .values()
             .filter(|c| !c.out.is_empty() || c.closing)
-            .map(|c| c.conn_id)
+            .map(|c| c.id)
             .collect();
         for id in ids {
             self.flush_conn(id);
@@ -1203,8 +1186,7 @@ impl IoLoop {
             if self
                 .conns
                 .get(&id)
-                .map(|c| c.closing && c.out.is_empty())
-                .unwrap_or(false)
+                .is_some_and(|c| c.closing && c.out.is_empty())
             {
                 self.close_conn(id);
             }
@@ -1218,14 +1200,13 @@ impl IoLoop {
         };
         loop {
             let n = {
-                let conn = match self.conns.get_mut(&conn_id) {
-                    Some(c) => c,
-                    None => return,
+                let Some(conn) = self.conns.get_mut(&conn_id) else {
+                    return;
                 };
                 if conn.out.is_empty() {
                     break;
                 }
-                unsafe { libc::write(fd, conn.out.as_ptr() as *const libc::c_void, conn.out.len()) }
+                unsafe { libc::write(fd, conn.out.as_ptr().cast::<libc::c_void>(), conn.out.len()) }
             };
             if n < 0 {
                 let e = std::io::Error::last_os_error();

@@ -1,9 +1,9 @@
 use crate::commands::{
-    integer, Command, OpContext, ShardPart, KeyRange, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY,
-    FLAG_READONLY, FLAG_WRITE,
+    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE, KeyRange,
+    OpContext, ShardPart, integer,
 };
-use crate::core::compact::CompactString;
 use crate::core::PrimeValue;
+use crate::core::compact::CompactString;
 use crate::error::{CmdResult, RespError, RespValue};
 use crate::util::{parse_i64, parse_u64};
 
@@ -44,7 +44,10 @@ fn turn_bit_off(on: u8, offset: u32) -> u8 {
 }
 
 fn get_bit_value(entry: &[u8], offset: u32) -> bool {
-    check_bit_status(get_byte_value(entry, offset), get_normalized_bit_index(offset))
+    check_bit_status(
+        get_byte_value(entry, offset),
+        get_normalized_bit_index(offset),
+    )
 }
 
 /// Set the bit at `offset` to `bit_value`; returns the old value.
@@ -75,7 +78,10 @@ fn count_bit_set_by_byte_indices(at: &[u8], start: usize, end: usize) -> usize {
         return 0;
     }
     let end = end.min(at.len());
-    at[start..end].iter().map(|&b| b.count_ones() as usize).sum()
+    at[start..end]
+        .iter()
+        .map(|&b| b.count_ones() as usize)
+        .sum()
 }
 
 /// Count bits in the inclusive bit range `[front, back]`. Caller guarantees
@@ -102,9 +108,13 @@ fn normalized_offset(size: i64, offset: i64) -> i64 {
     offset.clamp(0, size)
 }
 
-/// Port of `CountBitSet` (bitops_family.cc): count on bits (`bits`) or bytes.
+/// Port of `CountBitSet` (`bitops_family.cc)`: count on bits (`bits`) or bytes.
 fn count_bit_set(str: &[u8], start: i64, end: i64, bits: bool) -> usize {
-    let strlen = if bits { (str.len() as i64) * 8 } else { str.len() as i64 };
+    let strlen = if bits {
+        (str.len() as i64) * 8
+    } else {
+        str.len() as i64
+    };
     if strlen == 0 {
         return 0;
     }
@@ -137,7 +147,12 @@ fn get_first_bit_with_value_in_byte(byte: u8, value: bool) -> u32 {
     }
 }
 
-fn find_first_bit_with_value_as_bit(value_str: &[u8], bit_value: bool, start: i64, end: i64) -> i64 {
+fn find_first_bit_with_value_as_bit(
+    value_str: &[u8],
+    bit_value: bool,
+    start: i64,
+    end: i64,
+) -> i64 {
     let mut i = start;
     while i <= end {
         if get_byte_index(i as u32) >= value_str.len() {
@@ -153,7 +168,12 @@ fn find_first_bit_with_value_as_bit(value_str: &[u8], bit_value: bool, start: i6
     -1
 }
 
-fn find_first_bit_with_value_as_byte(value_str: &[u8], bit_value: bool, start: i64, end: i64) -> i64 {
+fn find_first_bit_with_value_as_byte(
+    value_str: &[u8],
+    bit_value: bool,
+    start: i64,
+    end: i64,
+) -> i64 {
     let mut i = start;
     while i <= end {
         if i as usize >= value_str.len() {
@@ -165,15 +185,21 @@ fn find_first_bit_with_value_as_byte(value_str: &[u8], bit_value: bool, start: i
             i += 1;
             continue;
         }
-        return i * 8 + get_first_bit_with_value_in_byte(current_byte, bit_value) as i64;
+        return i * 8 + i64::from(get_first_bit_with_value_in_byte(current_byte, bit_value));
     }
     -1
 }
 
-fn find_first_bit_with_value(value: &[u8], bit_value: bool, start: i64, end: i64, as_bit: bool) -> i64 {
+fn find_first_bit_with_value(
+    value: &[u8],
+    bit_value: bool,
+    start: i64,
+    end: i64,
+    as_bit: bool,
+) -> i64 {
     let mut size = value.len() as i64;
     if as_bit {
-        size *= OFFSET_FACTOR as i64;
+        size *= i64::from(OFFSET_FACTOR);
     }
     let normalized_start = normalized_offset(size, start);
     let normalized_end = normalized_offset(size, end);
@@ -185,7 +211,11 @@ fn find_first_bit_with_value(value: &[u8], bit_value: bool, start: i64, end: i64
     } else {
         find_first_bit_with_value_as_byte(value, bit_value, normalized_start, normalized_end)
     };
-    if position == -1 && !bit_value && start >= 0 && (start as usize) < value.len() && end == i64::MAX
+    if position == -1
+        && !bit_value
+        && start >= 0
+        && (start as usize) < value.len()
+        && end == i64::MAX
     {
         // Returning bit-size of the value, compatible with Redis (but a weird API).
         (value.len() * OFFSET_FACTOR as usize) as i64
@@ -233,7 +263,7 @@ fn should_skip(op: u8, byte: u8) -> bool {
     }
 }
 
-/// Port of `RunBitOperationOnValues` (bitops_family.cc). The combined length is
+/// Port of `RunBitOperationOnValues` (`bitops_family.cc`). The combined length is
 /// the longest input; a single value is returned unchanged (except for NOT).
 fn run_bit_operation_on_values(op: &[u8], values: &[Vec<u8>]) -> Vec<u8> {
     if values.is_empty() {
@@ -257,11 +287,15 @@ fn run_bit_operation_on_values(op: &[u8], values: &[Vec<u8>]) -> Vec<u8> {
         b"OR" => values[max_len_index].clone(),
         _ => vec![0u8; max_len],
     };
-    bit_op_string(match op {
-        b"AND" => b'&',
-        b"OR" => b'|',
-        _ => b'^',
-    }, values, &mut new_value);
+    bit_op_string(
+        match op {
+            b"AND" => b'&',
+            b"OR" => b'|',
+            _ => b'^',
+        },
+        values,
+        &mut new_value,
+    );
     new_value
 }
 
@@ -319,7 +353,11 @@ fn is_bit_write_in_range(bit_offset: u64, bit_size: u64) -> bool {
     bit_offset < K_MAX_STR_LEN * 8 && (bit_offset + bit_size - 1) / 8 < K_MAX_STR_LEN
 }
 
-fn parse_common_attr(args: &[Vec<u8>], i: &mut usize, is_write: bool) -> Result<CommonAttr, RespError> {
+fn parse_common_attr(
+    args: &[Vec<u8>],
+    i: &mut usize,
+    is_write: bool,
+) -> Result<CommonAttr, RespError> {
     if *i >= args.len() {
         return Err(RespError::syntax());
     }
@@ -337,7 +375,7 @@ fn parse_common_attr(args: &[Vec<u8>], i: &mut usize, is_write: bool) -> Result<
     if bits_s.is_empty() {
         return Err(RespError::syntax());
     }
-    if !bits_s.iter().all(|c| c.is_ascii_digit()) {
+    if !bits_s.iter().all(u8::is_ascii_digit) {
         return Err(invalid_bitfield_type());
     }
     let bits: u64 = match std::str::from_utf8(bits_s) {
@@ -364,7 +402,7 @@ fn parse_common_attr(args: &[Vec<u8>], i: &mut usize, is_write: bool) -> Result<
         Err(_) => return Err(RespError::syntax()),
     };
     let offset = if is_proxy {
-        if offset > (u32::MAX as u64) / bits {
+        if offset > u64::from(u32::MAX) / bits {
             return Err(bit_offset_out_of_range());
         }
         offset * bits
@@ -374,12 +412,16 @@ fn parse_common_attr(args: &[Vec<u8>], i: &mut usize, is_write: bool) -> Result<
     let in_range = if is_write {
         is_bit_write_in_range(offset, bits)
     } else {
-        offset <= u32::MAX as u64
+        u32::try_from(offset).is_ok()
     };
     if !in_range {
         return Err(bit_offset_out_of_range());
     }
-    Ok(CommonAttr { etype, bits: bits as u32, offset: offset as u32 })
+    Ok(CommonAttr {
+        etype,
+        bits: bits as u32,
+        offset: offset as u32,
+    })
 }
 
 fn parse_to_command_list(
@@ -504,11 +546,11 @@ fn int_overflow(total_bits: u32, incr: i64, policy: Policy, value: &mut i64) -> 
     true
 }
 
-/// Port of `Get::ApplyTo` (bitops_family.cc).
+/// Port of `Get::ApplyTo` (`bitops_family.cc`).
 fn bitfield_get(attr: &CommonAttr, bitfield: &[u8]) -> i64 {
-    let offset = attr.offset as u64;
+    let offset = u64::from(attr.offset);
     let total_bytes = bitfield.len() as u64;
-    let last_byte_offset = (offset + attr.bits as u64 - 1) / 8;
+    let last_byte_offset = (offset + u64::from(attr.bits) - 1) / 8;
     if offset / 8 >= total_bytes {
         return 0;
     }
@@ -526,12 +568,12 @@ fn bitfield_get(attr: &CommonAttr, bitfield: &[u8]) -> i64 {
 
     let is_negative = get_bit_value(bitfield, attr.offset);
     let mut result: i64 = 0;
-    let mut lsb = offset + attr.bits as u64 - 1;
-    for i in 0..attr.bits as u64 {
+    let mut lsb = offset + u64::from(attr.bits) - 1;
+    for i in 0..u64::from(attr.bits) {
         let byte = get_byte_value(result_bytes, lsb as u32);
         let index = get_normalized_bit_index(lsb as u32);
         let old_bit = check_bit_status(byte, index);
-        result |= (old_bit as i64) << i;
+        result |= i64::from(old_bit) << i;
         lsb = lsb.wrapping_sub(1);
     }
     if is_negative && attr.etype == EncodingType::Int && result > 0 && attr.bits < 64 {
@@ -540,12 +582,17 @@ fn bitfield_get(attr: &CommonAttr, bitfield: &[u8]) -> i64 {
     result
 }
 
-/// Port of `Set::ApplyTo` (bitops_family.cc). Returns the old field value, or
+/// Port of `Set::ApplyTo` (`bitops_family.cc`). Returns the old field value, or
 /// None if the value was rejected by the overflow FAIL policy.
-fn bitfield_set(attr: &CommonAttr, set_value: i64, policy: Policy, bitfield: &mut Vec<u8>) -> Option<i64> {
-    let offset = attr.offset as u64;
+fn bitfield_set(
+    attr: &CommonAttr,
+    set_value: i64,
+    policy: Policy,
+    bitfield: &mut Vec<u8>,
+) -> Option<i64> {
+    let offset = u64::from(attr.offset);
     let total_bytes = bitfield.len() as u64;
-    let last_byte_offset = (offset + attr.bits as u64 - 1) / 8 + 1;
+    let last_byte_offset = (offset + u64::from(attr.bits) - 1) / 8 + 1;
     if last_byte_offset > total_bytes {
         bitfield.resize(last_byte_offset as usize, 0);
     }
@@ -559,10 +606,10 @@ fn bitfield_set(attr: &CommonAttr, set_value: i64, policy: Policy, bitfield: &mu
         return None;
     }
 
-    let mut lsb = offset + attr.bits as u64 - 1;
+    let mut lsb = offset + u64::from(attr.bits) - 1;
     let mut old_value: i64 = 0;
     let is_negative = get_bit_value(bitfield, attr.offset);
-    for i in 0..attr.bits as u64 {
+    for i in 0..u64::from(attr.bits) {
         let bit_value = (set_value >> i) & 1 != 0;
         let byte = get_byte_value(bitfield, lsb as u32);
         let index = get_normalized_bit_index(lsb as u32);
@@ -573,7 +620,7 @@ fn bitfield_set(attr: &CommonAttr, set_value: i64, policy: Policy, bitfield: &mu
             turn_bit_off(byte, index)
         };
         bitfield[get_byte_index(lsb as u32)] = byte;
-        old_value |= (old_bit as i64) << i;
+        old_value |= i64::from(old_bit) << i;
         lsb = lsb.wrapping_sub(1);
     }
     if is_negative && attr.etype == EncodingType::Int && old_value > 0 && attr.bits < 64 {
@@ -582,12 +629,17 @@ fn bitfield_set(attr: &CommonAttr, set_value: i64, policy: Policy, bitfield: &mu
     Some(old_value)
 }
 
-/// Port of `IncrBy::ApplyTo` (bitops_family.cc).
-fn bitfield_incrby(attr: &CommonAttr, incr_value: i64, policy: Policy, bitfield: &mut Vec<u8>) -> Option<i64> {
+/// Port of `IncrBy::ApplyTo` (`bitops_family.cc`).
+fn bitfield_incrby(
+    attr: &CommonAttr,
+    incr_value: i64,
+    policy: Policy,
+    bitfield: &mut Vec<u8>,
+) -> Option<i64> {
     let mut res = bitfield_get(attr, bitfield);
-    let offset = attr.offset as u64;
+    let offset = u64::from(attr.offset);
     let total_bytes = bitfield.len() as u64;
-    let last_byte_offset = (offset + attr.bits as u64 - 1) / 8;
+    let last_byte_offset = (offset + u64::from(attr.bits) - 1) / 8;
     if last_byte_offset >= total_bytes {
         bitfield.resize(last_byte_offset as usize + 1, 0);
     }
@@ -608,20 +660,20 @@ fn apply_subcmd(
     policy: &mut Policy,
     value: &mut Vec<u8>,
     should_commit: &mut bool,
-) -> Option<Option<i64>> {
+    results: &mut Vec<Option<i64>>,
+) {
     match *sub {
         SubCmd::Overflow(p) => {
             *policy = p;
-            None
         }
-        SubCmd::Get(attr) => Some(Some(bitfield_get(&attr, value))),
+        SubCmd::Get(attr) => results.push(Some(bitfield_get(&attr, value))),
         SubCmd::Set(attr, v) => {
             *should_commit = true;
-            Some(bitfield_set(&attr, v, *policy, value))
+            results.push(bitfield_set(&attr, v, *policy, value));
         }
         SubCmd::IncrBy(attr, v) => {
             *should_commit = true;
-            Some(bitfield_incrby(&attr, v, *policy, value))
+            results.push(bitfield_incrby(&attr, v, *policy, value));
         }
     }
 }
@@ -648,19 +700,21 @@ fn exec_bitfield_generic(ctx: &mut OpContext, read_only: bool) -> CmdResult {
     let mut policy = Policy::Wrap;
     let mut should_commit = false;
     for sub in &subcmds {
-        if let Some(r) = apply_subcmd(sub, &mut policy, &mut value, &mut should_commit) {
-            results.push(r);
-        }
+        apply_subcmd(
+            sub,
+            &mut policy,
+            &mut value,
+            &mut should_commit,
+            &mut results,
+        );
     }
 
     if should_commit {
         if value.is_empty() {
             ctx.db.remove(key);
         } else {
-            ctx.db.insert(
-                CompactString::from_bytes(key),
-                PrimeValue::Str(CompactString::from_bytes(&value)),
-            );
+            ctx.db
+                .insert(key, PrimeValue::Str(CompactString::from_bytes(&value)));
         }
     }
 
@@ -718,10 +772,8 @@ fn exec_bitop(ctx: &mut OpContext) -> CmdResult {
             ctx.db.remove(dest);
         } else {
             ctx.db.clear_expiry(dest);
-            ctx.db.insert(
-                CompactString::from_bytes(dest),
-                PrimeValue::Str(CompactString::from_bytes(&result)),
-            );
+            ctx.db
+                .insert(dest, PrimeValue::Str(CompactString::from_bytes(&result)));
         }
         return CmdResult::Ok(integer(len));
     }
@@ -769,7 +821,7 @@ fn merge_bitop(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u64)
 
 fn parse_bit_offset(args: &[Vec<u8>], i: usize) -> Result<u32, RespError> {
     let offset = parse_u64(&args[i]).ok_or_else(RespError::integer)?;
-    if offset > u32::MAX as u64 {
+    if offset > u64::from(u32::MAX) {
         return Err(RespError::integer());
     }
     Ok(offset as u32)
@@ -787,7 +839,7 @@ fn exec_getbit(ctx: &mut OpContext) -> CmdResult {
             if get_byte_index(offset) >= s.len() {
                 CmdResult::Ok(integer(0))
             } else {
-                CmdResult::Ok(integer(get_bit_value(s.as_bytes(), offset) as i64))
+                CmdResult::Ok(integer(i64::from(get_bit_value(s.as_bytes(), offset))))
             }
         }
         Some(_) => CmdResult::Err(RespError::wrong_type()),
@@ -802,7 +854,7 @@ fn exec_setbit(ctx: &mut OpContext) -> CmdResult {
         Ok(o) => o,
         Err(e) => return CmdResult::Err(e),
     };
-    if !is_bit_write_in_range(offset as u64, 1) {
+    if !is_bit_write_in_range(u64::from(offset), 1) {
         return CmdResult::Err(bit_offset_out_of_range());
     }
     let bit_value = match parse_i64(&ctx.args[key_idx + 2]) {
@@ -822,11 +874,9 @@ fn exec_setbit(ctx: &mut OpContext) -> CmdResult {
         bytes.resize(byte_index + 1, 0);
     }
     let old_bit = set_bit_value(offset, bit_value, &mut bytes);
-    ctx.db.insert(
-        CompactString::from_bytes(key),
-        PrimeValue::Str(CompactString::from_bytes(&bytes)),
-    );
-    CmdResult::Ok(integer(old_bit as i64))
+    ctx.db
+        .insert(key, PrimeValue::Str(CompactString::from_bytes(&bytes)));
+    CmdResult::Ok(integer(i64::from(old_bit)))
 }
 
 // ---------------------------------------------------------------------------
@@ -974,7 +1024,11 @@ pub static CMD_BITOP: Command = Command {
     name: "BITOP",
     arity: -4,
     flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY,
-    key_range: KeyRange { first: 2, last: 0, step: 1 },
+    key_range: KeyRange {
+        first: 2,
+        last: 0,
+        step: 1,
+    },
     exec: exec_bitop,
     merge: Some(merge_bitop),
 };
@@ -1002,7 +1056,7 @@ mod tests {
 
     fn set(db: &mut DbSlice, key: &str, value: &[u8]) {
         db.insert(
-            CompactString::from_bytes(key.as_bytes()),
+            key.as_bytes(),
             PrimeValue::Str(CompactString::from_bytes(value)),
         );
     }
@@ -1017,7 +1071,7 @@ mod tests {
     fn assert_str_store(value: Option<PrimeValue>, expected: &[u8]) {
         match value {
             Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), expected),
-            _ => panic!("expected string deferred store, got {:?}", value),
+            _ => panic!("expected string deferred store, got {value:?}"),
         }
     }
 
@@ -1035,7 +1089,13 @@ mod tests {
                 b"BITOP" => (exec_bitop, 2, (2..argv.len()).collect()),
                 _ => panic!("unhandled command {:?}", argv[0]),
             };
-        let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx, now_ms: 0 };
+        let mut ctx = OpContext {
+            db,
+            args: argv,
+            owned_keys: &owned,
+            first_key_idx,
+            now_ms: 0,
+        };
         exec(&mut ctx)
     }
 
@@ -1073,8 +1133,7 @@ mod tests {
     }
 
     const SYNTAX: &str = "ERR syntax error";
-    const INVALID_TYPE: &str =
-        "ERR invalid bitfield type. use something like i16 u8. note that u64 is not supported but \
+    const INVALID_TYPE: &str = "ERR invalid bitfield type. use something like i16 u8. note that u64 is not supported but \
          i64 is.";
     const BIT_ARG: &str = "ERR The bit argument must be 1 or 0";
     const BIT_OFFSET: &str = "ERR bit offset is not an integer or out of range";
@@ -1088,7 +1147,10 @@ mod tests {
         set(&mut db, "foo", b"abc");
         for (i, &expected) in EXPECTED_SETBIT.iter().enumerate() {
             let o = i.to_string();
-            assert_eq!(expected, int(run!(&mut db, b"GETBIT", b"foo", o.as_bytes())));
+            assert_eq!(
+                expected,
+                int(run!(&mut db, b"GETBIT", b"foo", o.as_bytes()))
+            );
         }
         // Out-of-range bits read as 0.
         assert_eq!(0, int(run!(&mut db, b"GETBIT", b"foo", b"100")));
@@ -1102,7 +1164,10 @@ mod tests {
         set(&mut db, "foo", b"abc");
         for (i, &expected) in EXPECTED_SETBIT.iter().enumerate() {
             let o = i.to_string();
-            assert_eq!(expected, int(run!(&mut db, b"SETBIT", b"foo", o.as_bytes(), b"1")));
+            assert_eq!(
+                expected,
+                int(run!(&mut db, b"SETBIT", b"foo", o.as_bytes(), b"1"))
+            );
         }
         for (i, _) in EXPECTED_SETBIT.iter().enumerate() {
             let o = i.to_string();
@@ -1151,8 +1216,14 @@ mod tests {
         assert_eq!(1, int(run!(&mut db, b"GETBIT", b"foo", b"100")));
         assert_eq!(0, int(run!(&mut db, b"GETBIT", b"foo", b"24")));
         assert_eq!(0, int(run!(&mut db, b"GETBIT", b"foo", b"99")));
-        assert_eq!(EXPECTED_SETBIT[0], int(run!(&mut db, b"GETBIT", b"foo", b"0")));
-        assert_eq!(EXPECTED_SETBIT[1], int(run!(&mut db, b"GETBIT", b"foo", b"1")));
+        assert_eq!(
+            EXPECTED_SETBIT[0],
+            int(run!(&mut db, b"GETBIT", b"foo", b"0"))
+        );
+        assert_eq!(
+            EXPECTED_SETBIT[1],
+            int(run!(&mut db, b"GETBIT", b"foo", b"1"))
+        );
         // Clearing the bit returns its old value.
         assert_eq!(1, int(run!(&mut db, b"SETBIT", b"foo", b"100", b"0")));
         assert_eq!(0, int(run!(&mut db, b"GETBIT", b"foo", b"100")));
@@ -1177,7 +1248,10 @@ mod tests {
         assert_eq!(0, int(run!(&mut db, b"BITCOUNT", b"foo2")));
         for (i, &c) in BYTES_BIT_COUNT.iter().enumerate() {
             let e = i.to_string();
-            assert_eq!(c, int(run!(&mut db, b"BITCOUNT", b"foo", b"0", e.as_bytes())));
+            assert_eq!(
+                c,
+                int(run!(&mut db, b"BITCOUNT", b"foo", b"0", e.as_bytes()))
+            );
         }
         assert_eq!(21, int(run!(&mut db, b"BITCOUNT", b"foo")));
     }
@@ -1211,25 +1285,58 @@ mod tests {
             "ERR value is not an integer or out of range",
             err(run!(&mut db, b"BITCOUNT", b"foo", b"bar", b"BIT"))
         );
-        assert_eq!(1, int(run!(&mut db, b"BITCOUNT", b"foo", b"1", b"1", b"BIT")));
-        assert_eq!(2, int(run!(&mut db, b"BITCOUNT", b"foo", b"1", b"2", b"BIT")));
-        assert_eq!(0, int(run!(&mut db, b"BITCOUNT", b"foo", b"3", b"2", b"BIT")));
-        assert_eq!(2, int(run!(&mut db, b"BITCOUNT", b"foo", b"-3", b"-1", b"BIT")));
-        assert_eq!(4, int(run!(&mut db, b"BITCOUNT", b"foo", b"1", b"9", b"BIT")));
-        assert_eq!(0, int(run!(&mut db, b"BITCOUNT", b"foo", b"-1", b"-2", b"BIT")));
+        assert_eq!(
+            1,
+            int(run!(&mut db, b"BITCOUNT", b"foo", b"1", b"1", b"BIT"))
+        );
+        assert_eq!(
+            2,
+            int(run!(&mut db, b"BITCOUNT", b"foo", b"1", b"2", b"BIT"))
+        );
+        assert_eq!(
+            0,
+            int(run!(&mut db, b"BITCOUNT", b"foo", b"3", b"2", b"BIT"))
+        );
+        assert_eq!(
+            2,
+            int(run!(&mut db, b"BITCOUNT", b"foo", b"-3", b"-1", b"BIT"))
+        );
+        assert_eq!(
+            4,
+            int(run!(&mut db, b"BITCOUNT", b"foo", b"1", b"9", b"BIT"))
+        );
+        assert_eq!(
+            0,
+            int(run!(&mut db, b"BITCOUNT", b"foo", b"-1", b"-2", b"BIT"))
+        );
         // Both-negative inverted range past the end of a 1-byte key.
         set(&mut db, "x", &[0xff]);
-        assert_eq!(0, int(run!(&mut db, b"BITCOUNT", b"x", b"-9", b"-10", b"BIT")));
+        assert_eq!(
+            0,
+            int(run!(&mut db, b"BITCOUNT", b"x", b"-9", b"-10", b"BIT"))
+        );
     }
 
     #[test]
     fn bit_count_bit_last_bit_regression() {
         let mut db = DbSlice::new(0);
         set(&mut db, "k1", &[0x81]);
-        assert_eq!(2, int(run!(&mut db, b"BITCOUNT", b"k1", b"0", b"7", b"BIT")));
-        assert_eq!(1, int(run!(&mut db, b"BITCOUNT", b"k1", b"1", b"7", b"BIT")));
-        assert_eq!(2, int(run!(&mut db, b"BITCOUNT", b"k1", b"-8", b"-1", b"BIT")));
-        assert_eq!(0, int(run!(&mut db, b"BITCOUNT", b"k1", b"8", b"8", b"BIT")));
+        assert_eq!(
+            2,
+            int(run!(&mut db, b"BITCOUNT", b"k1", b"0", b"7", b"BIT"))
+        );
+        assert_eq!(
+            1,
+            int(run!(&mut db, b"BITCOUNT", b"k1", b"1", b"7", b"BIT"))
+        );
+        assert_eq!(
+            2,
+            int(run!(&mut db, b"BITCOUNT", b"k1", b"-8", b"-1", b"BIT"))
+        );
+        assert_eq!(
+            0,
+            int(run!(&mut db, b"BITCOUNT", b"k1", b"8", b"8", b"BIT"))
+        );
 
         set(&mut db, "k2", b"abcdef");
         assert_eq!(
@@ -1240,8 +1347,14 @@ mod tests {
             int(run!(&mut db, b"BITCOUNT", b"k2", b"5", b"5")),
             int(run!(&mut db, b"BITCOUNT", b"k2", b"40", b"47", b"BIT"))
         );
-        assert_eq!(0, int(run!(&mut db, b"BITCOUNT", b"k2", b"48", b"48", b"BIT")));
-        assert_eq!(0, int(run!(&mut db, b"BITCOUNT", b"k2", b"100", b"200", b"BIT")));
+        assert_eq!(
+            0,
+            int(run!(&mut db, b"BITCOUNT", b"k2", b"48", b"48", b"BIT"))
+        );
+        assert_eq!(
+            0,
+            int(run!(&mut db, b"BITCOUNT", b"k2", b"100", b"200", b"BIT"))
+        );
     }
 
     const K1: [u8; 3] = [0xff, 0xaa, 0xcc];
@@ -1249,7 +1362,10 @@ mod tests {
     const K3: [u8; 1] = [0x0f];
 
     fn bitop(db: &mut DbSlice, args: &[&[u8]]) -> i64 {
-        int(dispatch(db, &args.iter().map(|a| a.to_vec()).collect::<Vec<_>>()))
+        int(dispatch(
+            db,
+            &args.iter().map(|a| a.to_vec()).collect::<Vec<_>>(),
+        ))
     }
 
     #[test]
@@ -1261,19 +1377,34 @@ mod tests {
         // Illegal operation: op name isn't AND/OR/XOR/NOT.
         assert_eq!(SYNTAX, err(run!(&mut db, b"BITOP", b"foo", b"bar", b"abc")));
         // Nonexistent keys -> 0 and no dest.
-        assert_eq!(0, bitop(&mut db, &[b"BITOP", b"AND", b"dest", b"1", b"2", b"3"]));
+        assert_eq!(
+            0,
+            bitop(&mut db, &[b"BITOP", b"AND", b"dest", b"1", b"2", b"3"])
+        );
         assert_eq!(None, get(&mut db, "dest"));
 
         // Single source returns the source unchanged.
-        assert_eq!(K1.len() as i64, bitop(&mut db, &[b"BITOP", b"AND", b"out", b"first"]));
+        assert_eq!(
+            K1.len() as i64,
+            bitop(&mut db, &[b"BITOP", b"AND", b"out", b"first"])
+        );
         assert_eq!(K1.to_vec(), get(&mut db, "out").unwrap());
 
         // Two sources, result length = longest input.
-        assert_eq!(3, bitop(&mut db, &[b"BITOP", b"AND", b"out", b"first", b"second"]));
+        assert_eq!(
+            3,
+            bitop(&mut db, &[b"BITOP", b"AND", b"out", b"first", b"second"])
+        );
         assert_eq!(vec![0x01, 0xaa, 0x00], get(&mut db, "out").unwrap());
 
         // Three sources.
-        assert_eq!(3, bitop(&mut db, &[b"BITOP", b"AND", b"out", b"first", b"second", b"third"]));
+        assert_eq!(
+            3,
+            bitop(
+                &mut db,
+                &[b"BITOP", b"AND", b"out", b"first", b"second", b"third"]
+            )
+        );
         assert_eq!(vec![0x01, 0x00, 0x00], get(&mut db, "out").unwrap());
     }
 
@@ -1283,14 +1414,35 @@ mod tests {
         set(&mut db, "first", &K1);
         set(&mut db, "second", &K2);
         set(&mut db, "third", &K3);
-        assert_eq!(0, bitop(&mut db, &[b"BITOP", b"OR", b"dest", b"1", b"2", b"3"]));
-        assert_eq!(3, bitop(&mut db, &[b"BITOP", b"OR", b"out", b"first", b"second"]));
+        assert_eq!(
+            0,
+            bitop(&mut db, &[b"BITOP", b"OR", b"dest", b"1", b"2", b"3"])
+        );
+        assert_eq!(
+            3,
+            bitop(&mut db, &[b"BITOP", b"OR", b"out", b"first", b"second"])
+        );
         assert_eq!(vec![0xff, 0xbb, 0xcc], get(&mut db, "out").unwrap());
-        assert_eq!(3, bitop(&mut db, &[b"BITOP", b"OR", b"out", b"first", b"second", b"third"]));
+        assert_eq!(
+            3,
+            bitop(
+                &mut db,
+                &[b"BITOP", b"OR", b"out", b"first", b"second", b"third"]
+            )
+        );
         assert_eq!(vec![0xff, 0xbb, 0xcc], get(&mut db, "out").unwrap());
-        assert_eq!(3, bitop(&mut db, &[b"BITOP", b"XOR", b"out", b"first", b"second"]));
+        assert_eq!(
+            3,
+            bitop(&mut db, &[b"BITOP", b"XOR", b"out", b"first", b"second"])
+        );
         assert_eq!(vec![0xfe, 0x11, 0xcc], get(&mut db, "out").unwrap());
-        assert_eq!(3, bitop(&mut db, &[b"BITOP", b"XOR", b"out", b"first", b"second", b"third"]));
+        assert_eq!(
+            3,
+            bitop(
+                &mut db,
+                &[b"BITOP", b"XOR", b"out", b"first", b"second", b"third"]
+            )
+        );
         assert_eq!(vec![0xf1, 0x11, 0xcc], get(&mut db, "out").unwrap());
     }
 
@@ -1298,7 +1450,10 @@ mod tests {
     fn bit_ops_not() {
         let mut db = DbSlice::new(0);
         // NOT takes exactly one source.
-        assert_eq!(SYNTAX, err(run!(&mut db, b"BITOP", b"NOT", b"bar", b"abc", b"efg")));
+        assert_eq!(
+            SYNTAX,
+            err(run!(&mut db, b"BITOP", b"NOT", b"bar", b"abc", b"efg"))
+        );
         // Nonexistent source deletes the destination.
         assert_eq!(0, bitop(&mut db, &[b"BITOP", b"NOT", b"dest", b"missing"]));
         assert_eq!(None, get(&mut db, "dest"));
@@ -1313,7 +1468,7 @@ mod tests {
         let mut db = DbSlice::new(0);
         set(&mut db, "src", &[b'a'; 4]);
         db.insert(
-            CompactString::from_bytes(b"dest"),
+            b"dest",
             PrimeValue::List(crate::core::quicklist::QuickList::default()),
         );
         assert_eq!(4, bitop(&mut db, &[b"BITOP", b"OR", b"dest", b"src"]));
@@ -1324,7 +1479,7 @@ mod tests {
     fn bit_ops_wrong_type_source() {
         let mut db = DbSlice::new(0);
         db.insert(
-            CompactString::from_bytes(b"lst"),
+            b"lst",
             PrimeValue::List(crate::core::quicklist::QuickList::default()),
         );
         set(&mut db, "first", &K1);
@@ -1368,7 +1523,11 @@ mod tests {
 
         // A shard with no sources contributes nil and is skipped.
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![3], result: CmdResult::Ok(RespValue::Nil) },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![3],
+                result: CmdResult::Ok(RespValue::Nil),
+            },
             ShardPart {
                 shard: 1,
                 owned_key_idxs: vec![4],
@@ -1397,7 +1556,11 @@ mod tests {
                 owned_key_idxs: vec![3],
                 result: CmdResult::Ok(RespValue::Bulk(K1.to_vec())),
             },
-            ShardPart { shard: 1, owned_key_idxs: vec![4], result: CmdResult::Ok(RespValue::Nil) },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: vec![4],
+                result: CmdResult::Ok(RespValue::Nil),
+            },
         ];
         match merge_bitop(&parts, &args, &keys, 0) {
             CmdResult::DeferredStore { value, reply, .. } => {
@@ -1418,7 +1581,10 @@ mod tests {
         assert_eq!(8, int(run!(&mut db, b"BITPOS", b"a", b"0", b"1")));
         assert_eq!(16, int(run!(&mut db, b"BITPOS", b"a", b"0", b"2")));
         assert_eq!(-1, int(run!(&mut db, b"BITPOS", b"a", b"0", b"100")));
-        assert_eq!(-1, int(run!(&mut db, b"BITPOS", b"a", b"0", b"100", b"103")));
+        assert_eq!(
+            -1,
+            int(run!(&mut db, b"BITPOS", b"a", b"0", b"100", b"103"))
+        );
         assert_eq!(0, int(run!(&mut db, b"BITPOS", b"a", b"0", b"0", b"100")));
         assert_eq!(36, int(run!(&mut db, b"BITPOS", b"a", b"0", b"3")));
         assert_eq!(36, int(run!(&mut db, b"BITPOS", b"a", b"0", b"-2")));
@@ -1426,12 +1592,30 @@ mod tests {
         assert_eq!(0, int(run!(&mut db, b"BITPOS", b"a", b"0", b"-100")));
 
         // Clear bits, BIT mode.
-        assert_eq!(0, int(run!(&mut db, b"BITPOS", b"a", b"0", b"0", b"100", b"BIT")));
-        assert_eq!(1, int(run!(&mut db, b"BITPOS", b"a", b"0", b"1", b"100", b"BIT")));
-        assert_eq!(16, int(run!(&mut db, b"BITPOS", b"a", b"0", b"16", b"100", b"BIT")));
-        assert_eq!(23, int(run!(&mut db, b"BITPOS", b"a", b"0", b"21", b"100", b"BIT")));
-        assert_eq!(36, int(run!(&mut db, b"BITPOS", b"a", b"0", b"24", b"100", b"BIT")));
-        assert_eq!(38, int(run!(&mut db, b"BITPOS", b"a", b"0", b"-2", b"-1", b"BIT")));
+        assert_eq!(
+            0,
+            int(run!(&mut db, b"BITPOS", b"a", b"0", b"0", b"100", b"BIT"))
+        );
+        assert_eq!(
+            1,
+            int(run!(&mut db, b"BITPOS", b"a", b"0", b"1", b"100", b"BIT"))
+        );
+        assert_eq!(
+            16,
+            int(run!(&mut db, b"BITPOS", b"a", b"0", b"16", b"100", b"BIT"))
+        );
+        assert_eq!(
+            23,
+            int(run!(&mut db, b"BITPOS", b"a", b"0", b"21", b"100", b"BIT"))
+        );
+        assert_eq!(
+            36,
+            int(run!(&mut db, b"BITPOS", b"a", b"0", b"24", b"100", b"BIT"))
+        );
+        assert_eq!(
+            38,
+            int(run!(&mut db, b"BITPOS", b"a", b"0", b"-2", b"-1", b"BIT"))
+        );
 
         // Set bits.
         assert_eq!(21, int(run!(&mut db, b"BITPOS", b"a", b"1")));
@@ -1449,19 +1633,40 @@ mod tests {
         assert_eq!(-1, int(run!(&mut db, b"BITPOS", b"a", b"1", b"-1", b"-2")));
 
         // Set bits, BIT mode.
-        assert_eq!(21, int(run!(&mut db, b"BITPOS", b"a", b"1", b"0", b"21", b"BIT")));
-        assert_eq!(21, int(run!(&mut db, b"BITPOS", b"a", b"1", b"21", b"21", b"BIT")));
-        assert_eq!(21, int(run!(&mut db, b"BITPOS", b"a", b"1", b"0", b"100", b"BIT")));
-        assert_eq!(-1, int(run!(&mut db, b"BITPOS", b"a", b"1", b"-1", b"-1", b"BIT")));
-        assert_eq!(35, int(run!(&mut db, b"BITPOS", b"a", b"1", b"-5", b"-1", b"BIT")));
-        assert_eq!(34, int(run!(&mut db, b"BITPOS", b"a", b"1", b"-6", b"-1", b"BIT")));
+        assert_eq!(
+            21,
+            int(run!(&mut db, b"BITPOS", b"a", b"1", b"0", b"21", b"BIT"))
+        );
+        assert_eq!(
+            21,
+            int(run!(&mut db, b"BITPOS", b"a", b"1", b"21", b"21", b"BIT"))
+        );
+        assert_eq!(
+            21,
+            int(run!(&mut db, b"BITPOS", b"a", b"1", b"0", b"100", b"BIT"))
+        );
+        assert_eq!(
+            -1,
+            int(run!(&mut db, b"BITPOS", b"a", b"1", b"-1", b"-1", b"BIT"))
+        );
+        assert_eq!(
+            35,
+            int(run!(&mut db, b"BITPOS", b"a", b"1", b"-5", b"-1", b"BIT"))
+        );
+        assert_eq!(
+            34,
+            int(run!(&mut db, b"BITPOS", b"a", b"1", b"-6", b"-1", b"BIT"))
+        );
 
         // Clear bit in an all-set string reports the length.
         set(&mut db, "b", &[0xff, 0xff, 0xff]);
         assert_eq!(24, int(run!(&mut db, b"BITPOS", b"b", b"0")));
         assert_eq!(-1, int(run!(&mut db, b"BITPOS", b"b", b"0", b"3")));
         assert_eq!(-1, int(run!(&mut db, b"BITPOS", b"b", b"0", b"0", b"1")));
-        assert_eq!(-1, int(run!(&mut db, b"BITPOS", b"b", b"0", b"0", b"1", b"BYTE")));
+        assert_eq!(
+            -1,
+            int(run!(&mut db, b"BITPOS", b"b", b"0", b"0", b"1", b"BYTE"))
+        );
 
         // Empty key.
         set(&mut db, "empty", b"");
@@ -1481,48 +1686,204 @@ mod tests {
     fn bit_field_parsing() {
         let mut db = DbSlice::new(0);
         for args in [
-            &[b"BITFIELD".as_slice(), b"foo".as_slice(), b"SET".as_slice(), b"u1".as_slice()][..],
-            &[b"BITFIELD".as_slice(), b"foo".as_slice(), b"SET".as_slice(), b"u1".as_slice(), b"0".as_slice()][..],
-            &[b"BITFIELD".as_slice(), b"foo".as_slice(), b"SET".as_slice(), b"u1".as_slice(), b"0".as_slice(), b"0".as_slice(), b"55".as_slice()][..],
-            &[b"BITFIELD".as_slice(), b"foo".as_slice(), b"SET".as_slice(), b"u1".as_slice(), b"0".as_slice(), b"0".as_slice(), b"GET".as_slice(), b"u1".as_slice()][..],
-            &[b"BITFIELD".as_slice(), b"foo".as_slice(), b"GET".as_slice(), b"u1".as_slice(), b"0".as_slice(), b"15".as_slice()][..],
+            &[
+                b"BITFIELD".as_slice(),
+                b"foo".as_slice(),
+                b"SET".as_slice(),
+                b"u1".as_slice(),
+            ][..],
+            &[
+                b"BITFIELD".as_slice(),
+                b"foo".as_slice(),
+                b"SET".as_slice(),
+                b"u1".as_slice(),
+                b"0".as_slice(),
+            ][..],
+            &[
+                b"BITFIELD".as_slice(),
+                b"foo".as_slice(),
+                b"SET".as_slice(),
+                b"u1".as_slice(),
+                b"0".as_slice(),
+                b"0".as_slice(),
+                b"55".as_slice(),
+            ][..],
+            &[
+                b"BITFIELD".as_slice(),
+                b"foo".as_slice(),
+                b"SET".as_slice(),
+                b"u1".as_slice(),
+                b"0".as_slice(),
+                b"0".as_slice(),
+                b"GET".as_slice(),
+                b"u1".as_slice(),
+            ][..],
+            &[
+                b"BITFIELD".as_slice(),
+                b"foo".as_slice(),
+                b"GET".as_slice(),
+                b"u1".as_slice(),
+                b"0".as_slice(),
+                b"15".as_slice(),
+            ][..],
             &[b"BITFIELD".as_slice(), b"foo".as_slice(), b"GET".as_slice()][..],
-            &[b"BITFIELD".as_slice(), b"foo".as_slice(), b"SET".as_slice(), b"u1".as_slice(), b"0".as_slice(), b"0".as_slice(), b"SET".as_slice()][..],
-            &[b"BITFIELD".as_slice(), b"foo".as_slice(), b"OVERFLOW".as_slice()][..],
-            &[b"BITFIELD".as_slice(), b"foo".as_slice(), b"OVERFLOW".as_slice(), b"nonsense".as_slice()][..],
-            &[b"BITFIELD".as_slice(), b"foo".as_slice(), b"GET".as_slice(), b"i16".as_slice(), b"-1".as_slice()][..],
-            &[b"BITFIELD".as_slice(), b"foo".as_slice(), b"SET".as_slice(), b"i16".as_slice(), b"0".as_slice(), b"foo".as_slice()][..],
-            &[b"BITFIELD".as_slice(), b"foo".as_slice(), b"INCRBY".as_slice(), b"i16".as_slice(), b"0".as_slice(), b"bar".as_slice()][..],
+            &[
+                b"BITFIELD".as_slice(),
+                b"foo".as_slice(),
+                b"SET".as_slice(),
+                b"u1".as_slice(),
+                b"0".as_slice(),
+                b"0".as_slice(),
+                b"SET".as_slice(),
+            ][..],
+            &[
+                b"BITFIELD".as_slice(),
+                b"foo".as_slice(),
+                b"OVERFLOW".as_slice(),
+            ][..],
+            &[
+                b"BITFIELD".as_slice(),
+                b"foo".as_slice(),
+                b"OVERFLOW".as_slice(),
+                b"nonsense".as_slice(),
+            ][..],
+            &[
+                b"BITFIELD".as_slice(),
+                b"foo".as_slice(),
+                b"GET".as_slice(),
+                b"i16".as_slice(),
+                b"-1".as_slice(),
+            ][..],
+            &[
+                b"BITFIELD".as_slice(),
+                b"foo".as_slice(),
+                b"SET".as_slice(),
+                b"i16".as_slice(),
+                b"0".as_slice(),
+                b"foo".as_slice(),
+            ][..],
+            &[
+                b"BITFIELD".as_slice(),
+                b"foo".as_slice(),
+                b"INCRBY".as_slice(),
+                b"i16".as_slice(),
+                b"0".as_slice(),
+                b"bar".as_slice(),
+            ][..],
         ] {
             assert_eq!(SYNTAX, err(dispatch_slices(&mut db, args)));
         }
         for args in [
-            &[b"BITFIELD".as_slice(), b"foo".as_slice(), b"SET".as_slice(), b"u0".as_slice(), b"0".as_slice(), b"0".as_slice()][..],
-            &[b"BITFIELD".as_slice(), b"foo".as_slice(), b"SET".as_slice(), b"u64".as_slice(), b"0".as_slice(), b"0".as_slice()][..],
-            &[b"BITFIELD".as_slice(), b"foo".as_slice(), b"SET".as_slice(), b"u65".as_slice(), b"0".as_slice(), b"0".as_slice()][..],
-            &[b"BITFIELD".as_slice(), b"foo".as_slice(), b"SET".as_slice(), b"i65".as_slice(), b"0".as_slice(), b"0".as_slice()][..],
-            &[b"BITFIELD".as_slice(), b"foo".as_slice(), b"GET".as_slice(), b"i-42".as_slice(), b"0".as_slice()][..],
-            &[b"BITFIELD".as_slice(), b"foo".as_slice(), b"GET".as_slice(), b"I8".as_slice(), b"0".as_slice()][..],
+            &[
+                b"BITFIELD".as_slice(),
+                b"foo".as_slice(),
+                b"SET".as_slice(),
+                b"u0".as_slice(),
+                b"0".as_slice(),
+                b"0".as_slice(),
+            ][..],
+            &[
+                b"BITFIELD".as_slice(),
+                b"foo".as_slice(),
+                b"SET".as_slice(),
+                b"u64".as_slice(),
+                b"0".as_slice(),
+                b"0".as_slice(),
+            ][..],
+            &[
+                b"BITFIELD".as_slice(),
+                b"foo".as_slice(),
+                b"SET".as_slice(),
+                b"u65".as_slice(),
+                b"0".as_slice(),
+                b"0".as_slice(),
+            ][..],
+            &[
+                b"BITFIELD".as_slice(),
+                b"foo".as_slice(),
+                b"SET".as_slice(),
+                b"i65".as_slice(),
+                b"0".as_slice(),
+                b"0".as_slice(),
+            ][..],
+            &[
+                b"BITFIELD".as_slice(),
+                b"foo".as_slice(),
+                b"GET".as_slice(),
+                b"i-42".as_slice(),
+                b"0".as_slice(),
+            ][..],
+            &[
+                b"BITFIELD".as_slice(),
+                b"foo".as_slice(),
+                b"GET".as_slice(),
+                b"I8".as_slice(),
+                b"0".as_slice(),
+            ][..],
         ] {
             assert_eq!(INVALID_TYPE, err(dispatch_slices(&mut db, args)));
         }
         assert_eq!(
             "ERR BITFIELD_RO only supports the GET subcommand",
-            err(run!(&mut db, b"BITFIELD_RO", b"foo", b"SET", b"u1", b"0", b"0"))
+            err(run!(
+                &mut db,
+                b"BITFIELD_RO",
+                b"foo",
+                b"SET",
+                b"u1",
+                b"0",
+                b"0"
+            ))
         );
         assert_eq!(
             "ERR BITFIELD_RO only supports the GET subcommand",
-            err(run!(&mut db, b"BITFIELD_RO", b"foo", b"INCRBY", b"i64", b"0", b"15"))
+            err(run!(
+                &mut db,
+                b"BITFIELD_RO",
+                b"foo",
+                b"INCRBY",
+                b"i64",
+                b"0",
+                b"15"
+            ))
         );
     }
 
     #[test]
     fn bit_field_create() {
         let mut db = DbSlice::new(0);
-        assert_eq!(vec![RespValue::Integer(0)], arr(run!(&mut db, b"BITFIELD", b"foo", b"SET", b"u1", b"0", b"1")));
-        assert_eq!(vec![RespValue::Integer(1)], arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u1", b"0")));
-        assert_eq!(vec![RespValue::Integer(1)], arr(run!(&mut db, b"BITFIELD", b"foo", b"INCRBY", b"u1", b"1", b"1")));
-        assert_eq!(vec![RespValue::Integer(1)], arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u1", b"1")));
+        assert_eq!(
+            vec![RespValue::Integer(0)],
+            arr(run!(
+                &mut db,
+                b"BITFIELD",
+                b"foo",
+                b"SET",
+                b"u1",
+                b"0",
+                b"1"
+            ))
+        );
+        assert_eq!(
+            vec![RespValue::Integer(1)],
+            arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u1", b"0"))
+        );
+        assert_eq!(
+            vec![RespValue::Integer(1)],
+            arr(run!(
+                &mut db,
+                b"BITFIELD",
+                b"foo",
+                b"INCRBY",
+                b"u1",
+                b"1",
+                b"1"
+            ))
+        );
+        assert_eq!(
+            vec![RespValue::Integer(1)],
+            arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u1", b"1"))
+        );
     }
 
     #[test]
@@ -1533,36 +1894,100 @@ mod tests {
         // u1 WRAP.
         assert_eq!(
             vec![RespValue::Integer(1)],
-            arr(run!(&mut db, b"BITFIELD", b"foo", b"SET", b"u1", b"0", b"2"))
+            arr(run!(
+                &mut db,
+                b"BITFIELD",
+                b"foo",
+                b"SET",
+                b"u1",
+                b"0",
+                b"2"
+            ))
         );
-        assert_eq!(vec![RespValue::Integer(0)], arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u1", b"0")));
+        assert_eq!(
+            vec![RespValue::Integer(0)],
+            arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u1", b"0"))
+        );
 
         // i64 WRAP: max + 1 -> min.
-        run!(&mut db, b"BITFIELD", b"foo", b"SET", b"i64", b"0", b"9223372036854775807");
+        run!(
+            &mut db,
+            b"BITFIELD",
+            b"foo",
+            b"SET",
+            b"i64",
+            b"0",
+            b"9223372036854775807"
+        );
         assert_eq!(
             vec![RespValue::Integer(i64::MIN)],
-            arr(run!(&mut db, b"BITFIELD", b"foo", b"INCRBY", b"i64", b"0", b"1"))
+            arr(run!(
+                &mut db,
+                b"BITFIELD",
+                b"foo",
+                b"INCRBY",
+                b"i64",
+                b"0",
+                b"1"
+            ))
         );
         // i64 WRAP: min - 1 -> max.
-        run!(&mut db, b"BITFIELD", b"foo", b"SET", b"i64", b"0", b"-9223372036854775808");
+        run!(
+            &mut db,
+            b"BITFIELD",
+            b"foo",
+            b"SET",
+            b"i64",
+            b"0",
+            b"-9223372036854775808"
+        );
         assert_eq!(
             vec![RespValue::Integer(i64::MAX)],
-            arr(run!(&mut db, b"BITFIELD", b"foo", b"INCRBY", b"i64", b"0", b"-1"))
+            arr(run!(
+                &mut db,
+                b"BITFIELD",
+                b"foo",
+                b"INCRBY",
+                b"i64",
+                b"0",
+                b"-1"
+            ))
         );
 
         // i1 WRAP.
         run!(&mut db, b"BITFIELD", b"foo", b"SET", b"i1", b"0", b"-2");
-        assert_eq!(vec![RespValue::Integer(0)], arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"i1", b"0")));
+        assert_eq!(
+            vec![RespValue::Integer(0)],
+            arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"i1", b"0"))
+        );
         assert_eq!(
             vec![RespValue::Integer(-1)],
-            arr(run!(&mut db, b"BITFIELD", b"foo", b"INCRBY", b"i1", b"0", b"-1"))
+            arr(run!(
+                &mut db,
+                b"BITFIELD",
+                b"foo",
+                b"INCRBY",
+                b"i1",
+                b"0",
+                b"-1"
+            ))
         );
 
         // SAT on u8.
         run!(&mut db, b"BITFIELD", b"foo", b"SET", b"u1", b"0", b"0");
         assert_eq!(
             vec![RespValue::Integer(255)],
-            arr(run!(&mut db, b"BITFIELD", b"foo", b"OVERFLOW", b"SAT", b"INCRBY", b"u8", b"0", b"300"))
+            arr(run!(
+                &mut db,
+                b"BITFIELD",
+                b"foo",
+                b"OVERFLOW",
+                b"SAT",
+                b"INCRBY",
+                b"u8",
+                b"0",
+                b"300"
+            ))
         );
         assert_eq!(
             vec![RespValue::Integer(255)],
@@ -1573,20 +1998,53 @@ mod tests {
         run!(&mut db, b"BITFIELD", b"foo", b"SET", b"u8", b"0", b"0");
         assert_eq!(
             vec![RespValue::Integer(0)],
-            arr(run!(&mut db, b"BITFIELD", b"foo", b"OVERFLOW", b"SAT", b"SET", b"i8", b"0", b"300"))
+            arr(run!(
+                &mut db,
+                b"BITFIELD",
+                b"foo",
+                b"OVERFLOW",
+                b"SAT",
+                b"SET",
+                b"i8",
+                b"0",
+                b"300"
+            ))
         );
         assert_eq!(
             vec![RespValue::Integer(-128)],
-            arr(run!(&mut db, b"BITFIELD", b"foo", b"OVERFLOW", b"SAT", b"INCRBY", b"i8", b"0", b"-255"))
+            arr(run!(
+                &mut db,
+                b"BITFIELD",
+                b"foo",
+                b"OVERFLOW",
+                b"SAT",
+                b"INCRBY",
+                b"i8",
+                b"0",
+                b"-255"
+            ))
         );
 
         // FAIL leaves the value unchanged and returns nil.
         run!(&mut db, b"BITFIELD", b"foo", b"SET", b"u8", b"0", b"200");
         assert_eq!(
             vec![RespValue::Nil],
-            arr(run!(&mut db, b"BITFIELD", b"foo", b"OVERFLOW", b"FAIL", b"INCRBY", b"u8", b"0", b"100"))
+            arr(run!(
+                &mut db,
+                b"BITFIELD",
+                b"foo",
+                b"OVERFLOW",
+                b"FAIL",
+                b"INCRBY",
+                b"u8",
+                b"0",
+                b"100"
+            ))
         );
-        assert_eq!(vec![RespValue::Integer(200)], arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u8", b"0")));
+        assert_eq!(
+            vec![RespValue::Integer(200)],
+            arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u8", b"0"))
+        );
 
         // Overflow policy sticks across a chain of subcommands.
         run!(&mut db, b"BITFIELD", b"foo", b"SET", b"u8", b"0", b"0");
@@ -1620,14 +2078,33 @@ mod tests {
             let v = val.to_string();
             assert_eq!(
                 vec![RespValue::Integer(0)],
-                arr(run!(&mut db, b"BITFIELD", b"foo", b"SET", b"u8", o.as_bytes(), v.as_bytes()))
+                arr(run!(
+                    &mut db,
+                    b"BITFIELD",
+                    b"foo",
+                    b"SET",
+                    b"u8",
+                    o.as_bytes(),
+                    v.as_bytes()
+                ))
             );
         }
         assert_eq!(
-            vec![RespValue::Integer(2013331722)],
+            vec![RespValue::Integer(2_013_331_722)],
             arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u32", b"0"))
         );
-        assert_eq!(vec![RespValue::Integer(240)], arr(run!(&mut db, b"BITFIELD", b"foo", b"INCRBY", b"u8", b"0", b"120")));
+        assert_eq!(
+            vec![RespValue::Integer(240)],
+            arr(run!(
+                &mut db,
+                b"BITFIELD",
+                b"foo",
+                b"INCRBY",
+                b"u8",
+                b"0",
+                b"120"
+            ))
+        );
 
         // Signed aligned.
         run!(&mut db, b"BITFIELD", b"foo", b"SET", b"u32", b"0", b"0");
@@ -1636,11 +2113,19 @@ mod tests {
             let v = val.to_string();
             assert_eq!(
                 vec![RespValue::Integer(0)],
-                arr(run!(&mut db, b"BITFIELD", b"foo", b"SET", b"i8", o.as_bytes(), v.as_bytes()))
+                arr(run!(
+                    &mut db,
+                    b"BITFIELD",
+                    b"foo",
+                    b"SET",
+                    b"i8",
+                    o.as_bytes(),
+                    v.as_bytes()
+                ))
             );
         }
         assert_eq!(
-            vec![RespValue::Integer(-1996488714)],
+            vec![RespValue::Integer(-1_996_488_714)],
             arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"i32", b"0"))
         );
 
@@ -1650,12 +2135,29 @@ mod tests {
             let o = off.to_string();
             assert_eq!(
                 vec![RespValue::Integer(0)],
-                arr(run!(&mut db, b"BITFIELD", b"foo", b"SET", b"u8", o.as_bytes(), b"1"))
+                arr(run!(
+                    &mut db,
+                    b"BITFIELD",
+                    b"foo",
+                    b"SET",
+                    b"u8",
+                    o.as_bytes(),
+                    b"1"
+                ))
             );
         }
-        assert_eq!(vec![RespValue::Integer(1)], arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u1", b"8")));
-        assert_eq!(vec![RespValue::Integer(1)], arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u1", b"32")));
-        assert_eq!(vec![RespValue::Integer(16843009)], arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u33", b"0")));
+        assert_eq!(
+            vec![RespValue::Integer(1)],
+            arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u1", b"8"))
+        );
+        assert_eq!(
+            vec![RespValue::Integer(1)],
+            arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u1", b"32"))
+        );
+        assert_eq!(
+            vec![RespValue::Integer(16_843_009)],
+            arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u33", b"0"))
+        );
 
         // Positional offsets: #0 -> 0, #1 -> 8, #2 -> 16 (u8 fields).
         run!(
@@ -1675,8 +2177,14 @@ mod tests {
             b"#2",
             b"1"
         );
-        assert_eq!(vec![RespValue::Integer(1)], arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u1", b"7")));
-        assert_eq!(vec![RespValue::Integer(1)], arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u1", b"15")));
+        assert_eq!(
+            vec![RespValue::Integer(1)],
+            arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u1", b"7"))
+        );
+        assert_eq!(
+            vec![RespValue::Integer(1)],
+            arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u1", b"15"))
+        );
     }
 
     #[test]
@@ -1685,7 +2193,7 @@ mod tests {
         set(&mut db, "foo", b"bar");
         // GET works past the end; the FAIL incrby grew the string to 4 bytes.
         assert_eq!(
-            vec![RespValue::Integer(1650553344), RespValue::Nil],
+            vec![RespValue::Integer(1_650_553_344), RespValue::Nil],
             arr(run!(
                 &mut db,
                 b"BITFIELD",
@@ -1704,24 +2212,61 @@ mod tests {
         assert_eq!(vec![b'b', b'a', b'r', 0], get(&mut db, "foo").unwrap());
         assert_eq!(
             vec![RespValue::Integer(0)],
-            arr(run!(&mut db, b"BITFIELD", b"foo", b"GET", b"u32", b"4294967295"))
+            arr(run!(
+                &mut db,
+                b"BITFIELD",
+                b"foo",
+                b"GET",
+                b"u32",
+                b"4294967295"
+            ))
         );
         // Reads beyond the uint32 bit-index space are rejected; writes are bounded.
         assert_eq!(
             vec![RespValue::Integer(0)],
-            arr(run!(&mut db, b"BITFIELD", b"bk", b"GET", b"u8", b"2200000000"))
+            arr(run!(
+                &mut db,
+                b"BITFIELD",
+                b"bk",
+                b"GET",
+                b"u8",
+                b"2200000000"
+            ))
         );
         assert_eq!(
             BIT_OFFSET,
-            err(run!(&mut db, b"BITFIELD", b"bk", b"GET", b"u8", b"5000000000"))
+            err(run!(
+                &mut db,
+                b"BITFIELD",
+                b"bk",
+                b"GET",
+                b"u8",
+                b"5000000000"
+            ))
         );
         assert_eq!(
             BIT_OFFSET,
-            err(run!(&mut db, b"BITFIELD", b"bk", b"SET", b"u8", b"2200000000", b"1"))
+            err(run!(
+                &mut db,
+                b"BITFIELD",
+                b"bk",
+                b"SET",
+                b"u8",
+                b"2200000000",
+                b"1"
+            ))
         );
         assert_eq!(
             BIT_OFFSET,
-            err(run!(&mut db, b"BITFIELD", b"bk", b"INCRBY", b"u8", b"2200000000", b"1"))
+            err(run!(
+                &mut db,
+                b"BITFIELD",
+                b"bk",
+                b"INCRBY",
+                b"u8",
+                b"2200000000",
+                b"1"
+            ))
         );
     }
 
@@ -1773,11 +2318,17 @@ mod tests {
             Vec::<RespValue>::new(),
             arr(run!(&mut db, b"BITFIELD", b"k", b"OVERFLOW", b"SAT"))
         );
-        assert_eq!(Vec::<RespValue>::new(), arr(run!(&mut db, b"BITFIELD", b"k")));
+        assert_eq!(
+            Vec::<RespValue>::new(),
+            arr(run!(&mut db, b"BITFIELD", b"k"))
+        );
         assert_eq!(
             Vec::<RespValue>::new(),
             arr(run!(&mut db, b"BITFIELD_RO", b"k", b"OVERFLOW", b"SAT"))
         );
-        assert_eq!(Vec::<RespValue>::new(), arr(run!(&mut db, b"BITFIELD_RO", b"k")));
+        assert_eq!(
+            Vec::<RespValue>::new(),
+            arr(run!(&mut db, b"BITFIELD_RO", b"k"))
+        );
     }
 }

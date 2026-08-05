@@ -35,12 +35,14 @@ const LP_ENCODING_64BIT_INT: u8 = 0xf4;
 /// Max length of a string that `string_to_i64` will consider (`LONG_STR_SIZE`).
 const LONG_STR_SIZE: usize = 21;
 
+#[must_use]
 pub fn total_bytes(buf: &[u8]) -> u32 {
     u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
 }
 
+#[must_use]
 pub fn num_elements(buf: &[u8]) -> u32 {
-    (buf[4] as u32) | ((buf[5] as u32) << 8)
+    u32::from(buf[4]) | (u32::from(buf[5]) << 8)
 }
 
 fn set_total(buf: &mut [u8], v: u32) {
@@ -61,8 +63,8 @@ fn backlen_size(l: u64) -> usize {
     match l {
         0..=127 => 1,
         128..=16382 => 2,
-        16383..=2097150 => 3,
-        2097151..=268435454 => 4,
+        16383..=2_097_150 => 3,
+        2_097_151..=268_435_454 => 4,
         _ => 5,
     }
 }
@@ -123,6 +125,7 @@ fn decode_backlen(buf: &[u8], mut pos: usize) -> Option<u64> {
 /// Parse a byte string as an integer, exactly like `lpStringToInt64`. Rejects
 /// empty strings, strings >= 21 bytes, strings with leading zeros (except "0"),
 /// a bare "-", non-digit bytes and overflowing values.
+#[must_use]
 pub fn string_to_i64(s: &[u8]) -> Option<i64> {
     if s.is_empty() || s.len() >= LONG_STR_SIZE {
         return None;
@@ -178,14 +181,14 @@ pub fn encode_integer(v: i64, out: &mut [u8; 9]) -> usize {
         out[1] = uv as u8;
         out[2] = (uv >> 8) as u8;
         3
-    } else if (-8388608..=8388607).contains(&v) {
+    } else if (-8_388_608..=8_388_607).contains(&v) {
         let uv = if v < 0 { (1i64 << 24) + v } else { v };
         out[0] = LP_ENCODING_24BIT_INT;
         out[1] = uv as u8;
         out[2] = (uv >> 8) as u8;
         out[3] = (uv >> 16) as u8;
         4
-    } else if (-2147483648..=2147483647).contains(&v) {
+    } else if (-2_147_483_648..=2_147_483_647).contains(&v) {
         let uv = if v < 0 { (1i64 << 32) + v } else { v };
         out[0] = LP_ENCODING_32BIT_INT;
         out[1] = uv as u8;
@@ -208,7 +211,7 @@ fn read_le_u16(buf: &[u8], pos: usize) -> Option<u16> {
 
 fn read_le_u24(buf: &[u8], pos: usize) -> Option<u32> {
     let b = buf.get(pos..pos + 3)?;
-    Some(b[0] as u32 | (b[1] as u32) << 8 | (b[2] as u32) << 16)
+    Some(u32::from(b[0]) | u32::from(b[1]) << 8 | u32::from(b[2]) << 16)
 }
 
 fn read_le_u32(buf: &[u8], pos: usize) -> Option<u32> {
@@ -243,10 +246,8 @@ fn size_bytes(b: u8) -> usize {
         2
     } else if b == LP_ENCODING_32BIT_STR {
         5
-    } else if b == LP_EOF {
-        1
     } else {
-        0
+        usize::from(b == LP_EOF)
     }
 }
 
@@ -314,6 +315,7 @@ fn validate_next(buf: &[u8], p: usize) -> Option<usize> {
 }
 
 /// Deep integrity validation, equivalent to `lpValidateIntegrity(lp, size, 1)`.
+#[must_use]
 pub fn validate_deep(buf: &[u8]) -> bool {
     if buf.len() < LP_HDR_SIZE + 1 {
         return false;
@@ -351,6 +353,7 @@ pub fn validate_deep(buf: &[u8]) -> bool {
 
 /// Position of the first element, if the listpack is non-empty
 /// (`lpFirst`/`lpValidateFirst`).
+#[must_use]
 pub fn first(buf: &[u8]) -> Option<usize> {
     if buf.len() < LP_HDR_SIZE + 1 {
         return None;
@@ -361,6 +364,7 @@ pub fn first(buf: &[u8]) -> Option<usize> {
 
 /// Position of the element after the one at `pos`, or `None` if `pos` was the
 /// last element (`lpNext`).
+#[must_use]
 pub fn next(buf: &[u8], pos: usize) -> Option<usize> {
     let np = validate_next(buf, pos)?;
     if buf.get(np)? == &LP_EOF {
@@ -378,10 +382,11 @@ pub enum Entry<'a> {
 }
 
 /// Decode the element at `pos` (`lpGet` semantics).
+#[must_use]
 pub fn entry_at(buf: &[u8], pos: usize) -> Option<Entry<'_>> {
     let b = *buf.get(pos)?;
     if b & 0x80 == 0 {
-        return Some(Entry::Int(b as i64));
+        return Some(Entry::Int(i64::from(b)));
     }
     if b & 0xc0 == 0x80 {
         let len = (b & 0x3f) as usize;
@@ -389,22 +394,22 @@ pub fn entry_at(buf: &[u8], pos: usize) -> Option<Entry<'_>> {
         return Some(Entry::Str(s));
     }
     if b & 0xe0 == 0xc0 {
-        let u = (((b & 0x1f) as u16) << 8) | *buf.get(pos + 1)? as u16;
-        let v = (u & 0x1fff) as i64;
+        let u = (u16::from(b & 0x1f) << 8) | u16::from(*buf.get(pos + 1)?);
+        let v = i64::from(u & 0x1fff);
         return Some(Entry::Int(if v >= 4096 { v - 8192 } else { v }));
     }
     match b {
         LP_ENCODING_16BIT_INT => {
             let u = read_le_u16(buf, pos + 1)?;
-            Some(Entry::Int(u as i16 as i64))
+            Some(Entry::Int(i64::from(u as i16)))
         }
         LP_ENCODING_24BIT_INT => {
             let u = read_le_u24(buf, pos + 1)?;
-            Some(Entry::Int(((u << 8) as i32 >> 8) as i64))
+            Some(Entry::Int(i64::from((u << 8) as i32 >> 8)))
         }
         LP_ENCODING_32BIT_INT => {
             let u = read_le_u32(buf, pos + 1)?;
-            Some(Entry::Int(u as i32 as i64))
+            Some(Entry::Int(i64::from(u as i32)))
         }
         LP_ENCODING_64BIT_INT => {
             let u = read_le_u64(buf, pos + 1)?;
@@ -426,33 +431,34 @@ pub fn entry_at(buf: &[u8], pos: usize) -> Option<Entry<'_>> {
 
 /// `lpGetInteger`: decode an integer element. Returns `None` for string
 /// encodings, the EOF byte and unknown encodings.
+#[must_use]
 pub fn get_integer(buf: &[u8], pos: usize) -> Option<i64> {
     let encoding = *buf.get(pos)?;
     let (uval, negstart, negmax): (u64, u64, u64) = if encoding < 0x80 {
-        (encoding as u64, u64::MAX, 0)
+        (u64::from(encoding), u64::MAX, 0)
     } else if encoding > LP_ENCODING_32BIT_STR {
         match encoding {
             LP_ENCODING_16BIT_INT => (
-                read_le_u16(buf, pos + 1)? as u64,
+                u64::from(read_le_u16(buf, pos + 1)?),
                 1u64 << 15,
-                u16::MAX as u64,
+                u64::from(u16::MAX),
             ),
             LP_ENCODING_24BIT_INT => (
-                read_le_u24(buf, pos + 1)? as u64,
+                u64::from(read_le_u24(buf, pos + 1)?),
                 1 << 23,
-                (u32::MAX >> 8) as u64,
+                u64::from(u32::MAX >> 8),
             ),
             LP_ENCODING_32BIT_INT => (
-                read_le_u32(buf, pos + 1)? as u64,
+                u64::from(read_le_u32(buf, pos + 1)?),
                 1u64 << 31,
-                u32::MAX as u64,
+                u64::from(u32::MAX),
             ),
             LP_ENCODING_64BIT_INT => (read_le_u64(buf, pos + 1)?, 1u64 << 63, u64::MAX),
             _ => return None,
         }
     } else if (LP_ENCODING_13BIT_INT..0xe0).contains(&encoding) {
-        let u = (((encoding & 0x1f) as u16) << 8) | *buf.get(pos + 1)? as u16;
-        (u as u64, 1u64 << 12, 8191)
+        let u = (u16::from(encoding & 0x1f) << 8) | u16::from(*buf.get(pos + 1)?);
+        (u64::from(u), 1u64 << 12, 8191)
     } else {
         return None;
     };
@@ -479,6 +485,7 @@ impl Default for Listpack {
 
 impl Listpack {
     /// Create an empty listpack (`lpNew`).
+    #[must_use]
     pub fn new() -> Self {
         let mut buf = vec![0u8; LP_HDR_SIZE + 1];
         set_total(&mut buf, (LP_HDR_SIZE + 1) as u32);
@@ -489,9 +496,9 @@ impl Listpack {
     fn append_encoded(&mut self, elem: &[u8]) {
         let enclen = elem.len() as u64;
         let blen = backlen_size(enclen) as u64;
-        let old_total = total_bytes(&self.buf) as u64;
+        let old_total = u64::from(total_bytes(&self.buf));
         let new_total = old_total + enclen + blen;
-        debug_assert!(new_total <= u32::MAX as u64);
+        debug_assert!(u32::try_from(new_total).is_ok());
         // Drop the EOF, append the element and its backlen, restore the EOF.
         self.buf.truncate(self.buf.len() - 1);
         self.buf.extend_from_slice(elem);
@@ -539,16 +546,19 @@ impl Listpack {
     }
 
     /// Number of elements stored.
+    #[must_use]
     pub fn elements(&self) -> u32 {
         num_elements(&self.buf)
     }
 
     /// Current total size of the listpack in bytes (`lpBytes`).
+    #[must_use]
     pub fn byte_len(&self) -> usize {
         total_bytes(&self.buf) as usize
     }
 
     /// Finish building and return the raw listpack bytes.
+    #[must_use]
     pub fn into_vec(self) -> Vec<u8> {
         self.buf
     }
@@ -651,7 +661,7 @@ mod tests {
         loop {
             match entry_at(&buf, p).unwrap() {
                 Entry::Str(s) => lens.push(s.len()),
-                _ => panic!("expected string"),
+                Entry::Int(_) => panic!("expected string"),
             }
             match next(&buf, p) {
                 Some(np) => p = np,
@@ -807,12 +817,12 @@ mod tests {
             16382,
             16383,
             16384,
-            2097150,
-            2097151,
-            2097152,
-            268435454,
-            268435455,
-            268435456,
+            2_097_150,
+            2_097_151,
+            2_097_152,
+            268_435_454,
+            268_435_455,
+            268_435_456,
             u32::MAX as u64,
         ] {
             let mut buf = Vec::new();

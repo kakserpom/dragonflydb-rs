@@ -2,7 +2,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::commands::{ok, Command, OpContext, ShardPart, KeyRange, FLAG_ADMIN, FLAG_FAST, FLAG_GLOBAL, FLAG_LOCAL, FLAG_NOSCRIPT, FLAG_READONLY, FLAG_WRITE};
+use std::fmt::Write as _;
+
+use crate::commands::{
+    Command, FLAG_ADMIN, FLAG_FAST, FLAG_GLOBAL, FLAG_LOCAL, FLAG_NOSCRIPT, FLAG_READONLY,
+    FLAG_WRITE, KeyRange, OpContext, ShardPart, ok,
+};
 use crate::core::value::ObjType;
 use crate::error::{CmdResult, RespError, RespValue};
 
@@ -12,7 +17,9 @@ static LAST_SAVE: AtomicU64 = AtomicU64::new(0);
 
 /// Stub for commands handled entirely on the connection (IO) thread.
 fn local_stub(_ctx: &mut OpContext) -> CmdResult {
-    CmdResult::Err(RespError::new("ERR internal: local command should not reach a shard"))
+    CmdResult::Err(RespError::new(
+        "ERR internal: local command should not reach a shard",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -82,7 +89,8 @@ fn merge_info(parts: &[ShardPart], _args: &[Vec<u8>], _keys: &[usize], now_ms: u
     let (mut keys, mut expires) = (0i64, 0i64);
     for p in parts {
         if let CmdResult::Ok(RespValue::Array(a)) = &p.result
-            && let (Some(RespValue::Integer(k)), Some(RespValue::Integer(e))) = (a.first(), a.get(1))
+            && let (Some(RespValue::Integer(k)), Some(RespValue::Integer(e))) =
+                (a.first(), a.get(1))
         {
             keys += k;
             expires += e;
@@ -96,7 +104,7 @@ fn merge_info(parts: &[ShardPart], _args: &[Vec<u8>], _keys: &[usize], now_ms: u
     lines.push_str("os:macos\r\n");
     lines.push_str("arch_bits:64\r\n");
     lines.push_str("process_id:1\r\n");
-    lines.push_str(&format!("uptime_in_seconds:{}\r\n", uptime));
+    write!(lines, "uptime_in_seconds:{uptime}\r\n").unwrap();
     lines.push_str("# Clients\r\n");
     lines.push_str("connected_clients:0\r\n");
     lines.push_str("# Memory\r\n");
@@ -107,7 +115,7 @@ fn merge_info(parts: &[ShardPart], _args: &[Vec<u8>], _keys: &[usize], now_ms: u
     lines.push_str("total_commands_processed:0\r\n");
     lines.push_str("instantaneous_ops_per_sec:0\r\n");
     lines.push_str("# Keyspace\r\n");
-    lines.push_str(&format!("db0:keys={},expires={},avg_ttl=0\r\n", keys, expires));
+    write!(lines, "db0:keys={keys},expires={expires},avg_ttl=0\r\n").unwrap();
     CmdResult::Ok(RespValue::Bulk(lines.into_bytes()))
 }
 
@@ -115,6 +123,7 @@ fn merge_info(parts: &[ShardPart], _args: &[Vec<u8>], _keys: &[usize], now_ms: u
 // LOCAL commands handled by the connection thread
 // ---------------------------------------------------------------------------
 
+#[must_use]
 pub fn local_ping(args: &[Vec<u8>]) -> RespValue {
     if args.len() > 2 {
         return RespValue::Error("ERR wrong number of arguments for 'ping' command".into());
@@ -125,6 +134,7 @@ pub fn local_ping(args: &[Vec<u8>]) -> RespValue {
     }
 }
 
+#[must_use]
 pub fn local_echo(args: &[Vec<u8>]) -> RespValue {
     if args.len() != 2 {
         return RespValue::Error("ERR wrong number of arguments for 'echo' command".into());
@@ -132,6 +142,7 @@ pub fn local_echo(args: &[Vec<u8>]) -> RespValue {
     RespValue::Bulk(args[1].clone())
 }
 
+#[must_use]
 pub fn local_select(args: &[Vec<u8>]) -> RespValue {
     if args.len() != 2 {
         return RespValue::Error("ERR wrong number of arguments for 'select' command".into());
@@ -142,6 +153,7 @@ pub fn local_select(args: &[Vec<u8>]) -> RespValue {
     }
 }
 
+#[must_use]
 pub fn local_auth(args: &[Vec<u8>]) -> RespValue {
     // No password configured: accept anything.
     if args.len() < 2 || args.len() > 3 {
@@ -150,57 +162,83 @@ pub fn local_auth(args: &[Vec<u8>]) -> RespValue {
     RespValue::Simple("OK".into())
 }
 
+#[must_use]
 pub fn local_command(_args: &[Vec<u8>]) -> RespValue {
     RespValue::Array(vec![])
 }
 
+#[must_use]
 pub fn local_hello(args: &[Vec<u8>]) -> RespValue {
-    let proto = args.get(1).and_then(|a| crate::util::parse_i64(a)).unwrap_or(2);
+    let proto = args
+        .get(1)
+        .and_then(|a| crate::util::parse_i64(a))
+        .unwrap_or(2);
     if proto != 2 && proto != 3 {
         return RespValue::Error("NOPROTO unsupported protocol version".into());
     }
     let mut m: Vec<(RespValue, RespValue)> = vec![
-        (RespValue::Bulk(b"server".to_vec()), RespValue::Bulk(b"dragonflydb-rs".to_vec())),
-        (RespValue::Bulk(b"version".to_vec()), RespValue::Bulk(b"0.1.0".to_vec())),
+        (
+            RespValue::Bulk(b"server".to_vec()),
+            RespValue::Bulk(b"dragonflydb-rs".to_vec()),
+        ),
+        (
+            RespValue::Bulk(b"version".to_vec()),
+            RespValue::Bulk(b"0.1.0".to_vec()),
+        ),
         (RespValue::Bulk(b"proto".to_vec()), RespValue::Integer(2)),
         (RespValue::Bulk(b"id".to_vec()), RespValue::Integer(0)),
-        (RespValue::Bulk(b"mode".to_vec()), RespValue::Bulk(b"standalone".to_vec())),
-        (RespValue::Bulk(b"role".to_vec()), RespValue::Bulk(b"master".to_vec())),
-        (RespValue::Bulk(b"modules".to_vec()), RespValue::Array(vec![])),
+        (
+            RespValue::Bulk(b"mode".to_vec()),
+            RespValue::Bulk(b"standalone".to_vec()),
+        ),
+        (
+            RespValue::Bulk(b"role".to_vec()),
+            RespValue::Bulk(b"master".to_vec()),
+        ),
+        (
+            RespValue::Bulk(b"modules".to_vec()),
+            RespValue::Array(vec![]),
+        ),
     ];
     let _ = &mut m;
     RespValue::Map(m)
 }
 
+#[must_use]
 pub fn local_config(args: &[Vec<u8>]) -> RespValue {
     if args.len() < 2 {
         return RespValue::Error("ERR wrong number of arguments for 'config' command".into());
     }
     match args[1].to_ascii_uppercase().as_slice() {
         b"GET" => RespValue::Array(vec![]),
-        b"SET" => RespValue::Simple("OK".into()),
-        b"RESETSTAT" => RespValue::Simple("OK".into()),
-        _ => RespValue::Error("ERR Unknown CONFIG subcommand or wrong number of arguments for 'config' command".into()),
+        b"SET" | b"RESETSTAT" => RespValue::Simple("OK".into()),
+        _ => RespValue::Error(
+            "ERR Unknown CONFIG subcommand or wrong number of arguments for 'config' command"
+                .into(),
+        ),
     }
 }
 
+#[must_use]
 pub fn local_client(args: &[Vec<u8>]) -> RespValue {
     if args.len() < 2 {
         return RespValue::Error("ERR wrong number of arguments for 'client' command".into());
     }
     match args[1].to_ascii_uppercase().as_slice() {
-        b"SETNAME" | b"SETINFO" => RespValue::Simple("OK".into()),
+        b"SETNAME" | b"SETINFO" | b"NO-EVICT" | b"NO-TOUCH" => RespValue::Simple("OK".into()),
         b"GETNAME" => RespValue::Bulk(b"".to_vec()),
         b"ID" => RespValue::Integer(0),
         b"INFO" => RespValue::Bulk(b"id=0 addr=127.0.0.1:0 fd=0 name= age=0 idle=0 flags=N db=0 sub=0 psub=0 multi=-1 watch=0 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd=client user=default redir=-1 resp=2".to_vec()),
-        b"NO-EVICT" | b"NO-TOUCH" => RespValue::Simple("OK".into()),
         b"LIST" => RespValue::Array(vec![]),
         _ => RespValue::Error("ERR Unknown CLIENT subcommand or wrong number of arguments for 'client' command".into()),
     }
 }
 
+#[must_use]
 pub fn local_time(_args: &[Vec<u8>]) -> RespValue {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = now.as_secs();
     let micros = now.subsec_micros();
     RespValue::Array(vec![
@@ -209,8 +247,12 @@ pub fn local_time(_args: &[Vec<u8>]) -> RespValue {
     ])
 }
 
+#[must_use]
 pub fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -220,11 +262,9 @@ pub fn now_ms() -> u64 {
 /// ROLE on a standalone master: `["master", []]`. The port never takes the
 /// replica role and tracks no connected replicas, mirroring
 /// `ServerFamily::Role` with an empty `GetReplicasRoleInfo`.
+#[must_use]
 pub fn local_role(_args: &[Vec<u8>]) -> RespValue {
-    RespValue::Array(vec![
-        RespValue::bulk("master"),
-        RespValue::Array(vec![]),
-    ])
+    RespValue::Array(vec![RespValue::bulk("master"), RespValue::Array(vec![])])
 }
 
 /// LASTSAVE: epoch seconds of the last completed snapshot (0 before any save).
@@ -234,6 +274,7 @@ pub fn local_lastsave(_args: &[Vec<u8>]) -> RespValue {
 
 /// LATENCY: the reference tracks no latency samples and replies with an empty
 /// array for LATEST/HISTOGRAM; every other subcommand errors.
+#[must_use]
 pub fn local_latency(args: &[Vec<u8>]) -> RespValue {
     if args.len() < 2 {
         return RespValue::Error("ERR wrong number of arguments for 'latency' command".into());
@@ -247,17 +288,26 @@ pub fn local_latency(args: &[Vec<u8>]) -> RespValue {
 /// SLOWLOG: commands are not timed in this port, so the log is always empty,
 /// but the full subcommand surface (HELP/LEN/RESET/GET) is honored. Mirrors
 /// `ServerFamily::SlowLog`.
+#[must_use]
 pub fn local_slowlog(args: &[Vec<u8>]) -> RespValue {
     if args.len() < 2 {
         return RespValue::Error("ERR wrong number of arguments for 'slowlog' command".into());
     }
     match args[1].to_ascii_uppercase().as_slice() {
         b"HELP" => RespValue::Array(vec![
-            RespValue::Simple("SLOWLOG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:".into()),
+            RespValue::Simple(
+                "SLOWLOG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:".into(),
+            ),
             RespValue::Simple("GET [<count>]".into()),
-            RespValue::Simple("    Return top <count> entries from the slowlog (default: 10, -1 mean all).".into()),
+            RespValue::Simple(
+                "    Return top <count> entries from the slowlog (default: 10, -1 mean all)."
+                    .into(),
+            ),
             RespValue::Simple("    Entries are made of:".into()),
-            RespValue::Simple("    id, timestamp, time in microseconds, arguments array, client IP and port,".into()),
+            RespValue::Simple(
+                "    id, timestamp, time in microseconds, arguments array, client IP and port,"
+                    .into(),
+            ),
             RespValue::Simple("    client name".into()),
             RespValue::Simple("LEN".into()),
             RespValue::Simple("    Return the length of the slowlog.".into()),
@@ -281,11 +331,7 @@ fn slowlog_get(args: &[Vec<u8>]) -> RespValue {
     if args.len() == 3 {
         match crate::util::parse_i64(&args[2]) {
             Some(n) if n >= -1 => {}
-            _ => {
-                return RespValue::Error(
-                    "ERR count should be greater than or equal to -1".into(),
-                )
-            }
+            _ => return RespValue::Error("ERR count should be greater than or equal to -1".into()),
         }
     }
     RespValue::Array(vec![])
@@ -314,7 +360,9 @@ fn exec_memory(ctx: &mut OpContext) -> CmdResult {
             RespValue::Simple("    Shows breakdown of memory.".into()),
             RespValue::Simple("USAGE <key> [WITHOUTKEY]".into()),
             RespValue::Simple("    Show memory usage of a key.".into()),
-            RespValue::Simple("    If WITHOUTKEY is specified, the key itself is not accounted.".into()),
+            RespValue::Simple(
+                "    If WITHOUTKEY is specified, the key itself is not accounted.".into(),
+            ),
             RespValue::Simple("HELP".into()),
             RespValue::Simple("    Prints this help.".into()),
         ])),
@@ -360,7 +408,9 @@ fn exec_debug(ctx: &mut OpContext) -> CmdResult {
     let sub = ctx.args[1].to_ascii_uppercase();
     match sub.as_slice() {
         b"HELP" => CmdResult::Ok(RespValue::Array(vec![
-            RespValue::Simple("DEBUG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:".into()),
+            RespValue::Simple(
+                "DEBUG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:".into(),
+            ),
             RespValue::Simple("OBJECT <key>".into()),
             RespValue::Simple("    Show low-level info about `key` and associated value.".into()),
             RespValue::Simple("HELP".into()),
@@ -384,7 +434,7 @@ fn debug_object(ctx: &mut OpContext) -> CmdResult {
             if let Some(at) = ctx.db.expire_at(key)
                 && let Some(remaining) = at.checked_sub(ctx.now_ms)
             {
-                s.push_str(&format!(" ttl:{}ms", remaining));
+                write!(s, " ttl:{remaining}ms").unwrap();
             }
             CmdResult::Ok(RespValue::Simple(s))
         }
@@ -461,7 +511,7 @@ fn save_inner(ctx: &mut OpContext, is_bgsave: bool) -> CmdResult {
     let bytes = crate::core::rdb::save_db(ctx.db);
     let path = snapshot_path(ctx.db.shard_id(), basename.as_deref());
     if let Err(e) = std::fs::write(&path, &bytes) {
-        return CmdResult::err(format!("ERR {}", e));
+        return CmdResult::err(format!("ERR {e}"));
     }
     LAST_SAVE.store(ctx.now_ms / 1000, Ordering::Relaxed);
     if is_bgsave {
@@ -478,7 +528,7 @@ fn snapshot_path(shard_id: usize, basename: Option<&[u8]>) -> PathBuf {
     let name = match basename {
         Some(b) => String::from_utf8_lossy(b).into_owned(),
         None if shard_id == 0 => "dump.rdb".to_string(),
-        None => format!("dump-{}.rdb", shard_id),
+        None => format!("dump-{shard_id}.rdb"),
     };
     match std::env::var_os("DRAGONFLYDB_RS_DUMP_DIR") {
         Some(dir) => PathBuf::from(dir).join(name),
@@ -494,15 +544,12 @@ fn snapshot_path(shard_id: usize, basename: Option<&[u8]>) -> PathBuf {
 /// replicas, so the reply is always `:0` immediately (the reference's
 /// `replicas.empty()` fast path). Both arguments must be non-negative
 /// integers; anything else is the reference `FInt<0, max>` parse error.
+#[must_use]
 pub fn local_wait(args: &[Vec<u8>]) -> RespValue {
     for a in &args[1..] {
         match crate::util::parse_i64(a) {
             Some(n) if n >= 0 => {}
-            _ => {
-                return RespValue::Error(
-                    "ERR value is not an integer or out of range".into(),
-                )
-            }
+            _ => return RespValue::Error("ERR value is not an integer or out of range".into()),
         }
     }
     RespValue::Integer(0)
@@ -522,7 +569,7 @@ pub fn local_shutdown(args: &[Vec<u8>]) -> Result<(), RespValue> {
             b"ABORT" => {
                 return Err(RespValue::Error(
                     "ERR SHUTDOWN ABORT is not supported".into(),
-                ))
+                ));
             }
             _ => return Err(RespValue::Error("ERR syntax error".into())),
         }
@@ -538,6 +585,7 @@ pub fn local_shutdown(args: &[Vec<u8>]) -> Result<(), RespValue> {
 /// (this port has no replication flow, matching the reference's no-flow path),
 /// represented by `None`. Odd argument counts and unknown options are syntax
 /// errors; LISTENING-PORT / CLIENT-VERSION values must be 32-bit integers.
+#[must_use]
 pub fn local_replconf(args: &[Vec<u8>]) -> Option<RespValue> {
     let rest = &args[1..];
     if rest.len() % 2 == 1 {
@@ -565,10 +613,11 @@ pub fn local_replconf(args: &[Vec<u8>]) -> Option<RespValue> {
 /// always-master standalone port (reference `ReplicaOfNoOne`). A `host port`
 /// pair would start replication in the reference; there is no replication
 /// stack here, so after the port-range validation it is rejected explicitly.
+#[must_use]
 pub fn local_replicaof(args: &[Vec<u8>]) -> RespValue {
-    let no = args.get(1).map(|a| a.eq_ignore_ascii_case(b"NO")).unwrap_or(false);
+    let no = args.get(1).is_some_and(|a| a.eq_ignore_ascii_case(b"NO"));
     if no {
-        if args.get(2).map(|a| a.eq_ignore_ascii_case(b"ONE")).unwrap_or(false) {
+        if args.get(2).is_some_and(|a| a.eq_ignore_ascii_case(b"ONE")) {
             return RespValue::Simple("OK".into());
         }
         // "NO" without "ONE": the reference's ExpectTag fails.
@@ -578,8 +627,7 @@ pub fn local_replicaof(args: &[Vec<u8>]) -> RespValue {
         let port_ok = std::str::from_utf8(&args[2])
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
-            .map(|p| p > 0)
-            .unwrap_or(false);
+            .is_some_and(|p| p > 0);
         if !port_ok {
             return RespValue::Error("ERR port is out of range".into());
         }
@@ -590,6 +638,7 @@ pub fn local_replicaof(args: &[Vec<u8>]) -> RespValue {
 
 /// ADDREPLICAOF always errors on this port: the reference rejects the command
 /// whenever the server is already a master (note the "OFF" typo upstream).
+#[must_use]
 pub fn local_addreplicaof(_args: &[Vec<u8>]) -> RespValue {
     RespValue::Error(
         "ERR Calling ADDREPLICAOFF allowed only after server is already a replica".into(),
@@ -599,10 +648,14 @@ pub fn local_addreplicaof(_args: &[Vec<u8>]) -> RespValue {
 /// REPLTAKEOVER seconds [SAVE]. On a master the reference validates the
 /// arguments and returns OK (idempotency semantics); parse/option errors keep
 /// the reference order so "Unsupported option" wins over the integer error.
+#[must_use]
 pub fn local_repltakeover(args: &[Vec<u8>]) -> RespValue {
     let timeout = crate::util::parse_i64(&args[1]);
     let mut rest = &args[2..];
-    if rest.first().map(|a| a.eq_ignore_ascii_case(b"SAVE")).unwrap_or(false) {
+    if rest
+        .first()
+        .is_some_and(|a| a.eq_ignore_ascii_case(b"SAVE"))
+    {
         rest = &rest[1..];
     }
     if let Some(extra) = rest.first() {
@@ -612,9 +665,7 @@ pub fn local_repltakeover(args: &[Vec<u8>]) -> RespValue {
         ));
     }
     let Some(n) = timeout else {
-        return RespValue::Error(
-            "ERR value is not an integer or out of range".into(),
-        );
+        return RespValue::Error("ERR value is not an integer or out of range".into());
     };
     if n < 0 {
         return RespValue::Error("ERR timeout is negative".into());
@@ -622,10 +673,14 @@ pub fn local_repltakeover(args: &[Vec<u8>]) -> RespValue {
     RespValue::Simple("OK".into())
 }
 
-/// MODULE LIST replies with the two statically loaded modules (ReJSON v20808,
+/// MODULE LIST replies with the two statically loaded modules (`ReJSON` v20808,
 /// search v21015); the reference errors on any other subcommand.
+#[must_use]
 pub fn local_module(args: &[Vec<u8>]) -> RespValue {
-    let sub = args.get(1).map(|a| a.to_ascii_uppercase()).unwrap_or_default();
+    let sub = args
+        .get(1)
+        .map(|a| a.to_ascii_uppercase())
+        .unwrap_or_default();
     if sub.as_slice() != b"LIST" {
         return RespValue::Error("ERR syntax error".into());
     }
@@ -647,8 +702,12 @@ pub fn local_module(args: &[Vec<u8>]) -> RespValue {
 
 /// FUNCTION: only `FLUSH` is implemented in the reference (a decorator for
 /// tests); anything else is an unknown-subcommand error.
+#[must_use]
 pub fn local_function(args: &[Vec<u8>]) -> RespValue {
-    let sub = args.get(1).map(|a| a.to_ascii_uppercase()).unwrap_or_default();
+    let sub = args
+        .get(1)
+        .map(|a| a.to_ascii_uppercase())
+        .unwrap_or_default();
     if sub.as_slice() == b"FLUSH" {
         return RespValue::Simple("OK".into());
     }
@@ -657,20 +716,23 @@ pub fn local_function(args: &[Vec<u8>]) -> RespValue {
 
 /// DFLY is the replication control protocol (`dflycmd.cc`); the port has no
 /// replication stack, so it is rejected explicitly.
+#[must_use]
 pub fn local_dfly(_args: &[Vec<u8>]) -> RespValue {
     RespValue::Error("ERR DFLY replication control is not supported".into())
 }
 
 fn is_u32(s: &[u8]) -> bool {
-    std::str::from_utf8(s)
-        .map(|s| s.parse::<u32>().is_ok())
-        .unwrap_or(false)
+    std::str::from_utf8(s).is_ok_and(|s| s.parse::<u32>().is_ok())
 }
 
 fn save_help(is_bgsave: bool) -> RespValue {
     let mut v = vec![RespValue::Simple(format!(
         "{} [DF|RDB [CLOUD_URI [BASENAME]]]. Sub-options are:",
-        if is_bgsave { "BGSAVE [SCHEDULE]" } else { "SAVE" }
+        if is_bgsave {
+            "BGSAVE [SCHEDULE]"
+        } else {
+            "SAVE"
+        }
     ))];
     if is_bgsave {
         v.push(RespValue::Simple("SCHEDULE".into()));
@@ -885,7 +947,11 @@ pub static CMD_MEMORY: Command = Command {
     name: "MEMORY",
     arity: -2,
     flags: FLAG_READONLY | FLAG_FAST,
-    key_range: KeyRange { first: 2, last: 2, step: 1 },
+    key_range: KeyRange {
+        first: 2,
+        last: 2,
+        step: 1,
+    },
     exec: exec_memory,
     merge: None,
 };
@@ -893,7 +959,11 @@ pub static CMD_DEBUG: Command = Command {
     name: "DEBUG",
     arity: -2,
     flags: FLAG_ADMIN,
-    key_range: KeyRange { first: 2, last: 2, step: 1 },
+    key_range: KeyRange {
+        first: 2,
+        last: 2,
+        step: 1,
+    },
     exec: exec_debug,
     merge: None,
 };
@@ -1133,8 +1203,8 @@ pub static CMD_DFLY: Command = Command {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::value::PrimeValue;
     use crate::core::DbSlice;
+    use crate::core::value::PrimeValue;
 
     fn b_args(a: &[&str]) -> Vec<Vec<u8>> {
         a.iter().map(|s| s.as_bytes().to_vec()).collect()
@@ -1214,7 +1284,10 @@ mod tests {
 
     #[test]
     fn latency_replies() {
-        assert_eq!(render(&local_latency(&b_args(&["LATENCY", "LATEST"]))), "[]");
+        assert_eq!(
+            render(&local_latency(&b_args(&["LATENCY", "LATEST"]))),
+            "[]"
+        );
         assert_eq!(
             render(&local_latency(&b_args(&["LATENCY", "HISTOGRAM"]))),
             "[]"
@@ -1228,10 +1301,7 @@ mod tests {
     #[test]
     fn slowlog_replies() {
         assert_eq!(render(&local_slowlog(&b_args(&["SLOWLOG", "LEN"]))), "0");
-        assert_eq!(
-            render(&local_slowlog(&b_args(&["SLOWLOG", "RESET"]))),
-            "OK"
-        );
+        assert_eq!(render(&local_slowlog(&b_args(&["SLOWLOG", "RESET"]))), "OK");
         assert_eq!(render(&local_slowlog(&b_args(&["SLOWLOG", "GET"]))), "[]");
         assert_eq!(
             render(&local_slowlog(&b_args(&["SLOWLOG", "GET", "10"]))),
@@ -1254,8 +1324,7 @@ mod tests {
             "ERR Unknown subcommand or wrong number of arguments for 'BOGUS'. Try SLOWLOG HELP."
         );
         assert!(
-            render(&local_slowlog(&b_args(&["SLOWLOG", "HELP"])))
-                .contains("SLOWLOG <subcommand>")
+            render(&local_slowlog(&b_args(&["SLOWLOG", "HELP"]))).contains("SLOWLOG <subcommand>")
         );
     }
 
@@ -1292,8 +1361,10 @@ mod tests {
     fn debug_object() {
         let mut d = db();
         assert_eq!(s(&mut d, &["SET", "k", "v"]), "OK");
-        assert!(s(&mut d, &["DEBUG", "OBJECT", "k"])
-            .starts_with("encoding:raw bucket_id:0 slot:0 shard:0"));
+        assert!(
+            s(&mut d, &["DEBUG", "OBJECT", "k"])
+                .starts_with("encoding:raw bucket_id:0 slot:0 shard:0")
+        );
         assert_eq!(s(&mut d, &["DEBUG", "OBJECT", "nosuch"]), "ERR no such key");
         assert_eq!(
             s(&mut d, &["DEBUG", "BOGUS"]),
@@ -1307,7 +1378,10 @@ mod tests {
         let dir = dump_dir();
         let mut d = db();
         assert_eq!(s(&mut d, &["SET", "k", "v"]), "OK");
-        assert_eq!(s(&mut d, &["SAVE", "RDB", "save_writes_snapshot.rdb"]), "OK");
+        assert_eq!(
+            s(&mut d, &["SAVE", "RDB", "save_writes_snapshot.rdb"]),
+            "OK"
+        );
 
         let bytes = std::fs::read(dir.join("save_writes_snapshot.rdb")).unwrap();
         let decoded = crate::core::rdb::decode_snapshot(&bytes, 0);
@@ -1327,7 +1401,7 @@ mod tests {
             ("hash", &["HSET", "hash", "f", "1"], "1"),
             ("zset", &["ZADD", "zset", "1.5", "m"], "1"),
         ] {
-            assert_eq!(s(&mut d, argv), expect, "setup {}", key);
+            assert_eq!(s(&mut d, argv), expect, "setup {key}");
         }
         assert_eq!(
             s(&mut d, &["SAVE", "RDB", "save_roundtrip_all_types.rdb"]),
@@ -1398,7 +1472,10 @@ mod tests {
         assert_eq!(render(&shutdown(&["SHUTDOWN"])), "OK");
         assert_eq!(render(&shutdown(&["SHUTDOWN", "NOSAVE"])), "OK");
         assert_eq!(render(&shutdown(&["SHUTDOWN", "SAVE"])), "OK");
-        assert_eq!(render(&shutdown(&["SHUTDOWN", "SAFE", "FORCE", "NOW"])), "OK");
+        assert_eq!(
+            render(&shutdown(&["SHUTDOWN", "SAFE", "FORCE", "NOW"])),
+            "OK"
+        );
         assert_eq!(
             render(&shutdown(&["SHUTDOWN", "SAVE", "NOSAVE"])),
             "ERR syntax error"
@@ -1407,7 +1484,10 @@ mod tests {
             render(&shutdown(&["SHUTDOWN", "ABORT"])),
             "ERR SHUTDOWN ABORT is not supported"
         );
-        assert_eq!(render(&shutdown(&["SHUTDOWN", "BOGUS"])), "ERR syntax error");
+        assert_eq!(
+            render(&shutdown(&["SHUTDOWN", "BOGUS"])),
+            "ERR syntax error"
+        );
     }
 
     fn shutdown(a: &[&str]) -> RespValue {
@@ -1437,7 +1517,10 @@ mod tests {
         );
         assert_eq!(c(&["REPLCONF", "ACK", "1"]), "<silence>");
         assert_eq!(c(&["REPLCONF", "ACK"]), "ERR syntax error");
-        assert_eq!(c(&["REPLCONF", "IP-ADDRESS", "1.2.3.4", "CAPA", "eof"]), "OK");
+        assert_eq!(
+            c(&["REPLCONF", "IP-ADDRESS", "1.2.3.4", "CAPA", "eof"]),
+            "OK"
+        );
         assert_eq!(c(&["REPLCONF", "BOGUS", "x"]), "ERR syntax error");
         assert_eq!(
             c(&["REPLCONF", "LISTENING-PORT", "6379", "ACK", "1"]),
@@ -1469,7 +1552,13 @@ mod tests {
     #[test]
     fn addreplicaof_reply() {
         assert_eq!(
-            render(&local_addreplicaof(&b_args(&["ADDREPLICAOF", "h", "1", "2", "3"]))),
+            render(&local_addreplicaof(&b_args(&[
+                "ADDREPLICAOF",
+                "h",
+                "1",
+                "2",
+                "3"
+            ]))),
             "ERR Calling ADDREPLICAOFF allowed only after server is already a replica"
         );
     }
@@ -1487,10 +1576,7 @@ mod tests {
             r(&["REPLTAKEOVER", "x"]),
             "ERR value is not an integer or out of range"
         );
-        assert_eq!(
-            r(&["REPLTAKEOVER", "-1"]),
-            "ERR timeout is negative"
-        );
+        assert_eq!(r(&["REPLTAKEOVER", "-1"]), "ERR timeout is negative");
     }
 
     #[test]
@@ -1503,7 +1589,7 @@ mod tests {
                 let m1 = render(&mods[1]);
                 assert!(m1.contains("search") && m1.contains("21015"));
             }
-            other => panic!("unexpected MODULE LIST: {:?}", other),
+            other => panic!("unexpected MODULE LIST: {other:?}"),
         }
         assert_eq!(
             render(&local_module(&b_args(&["MODULE", "LOAD", "foo"]))),
@@ -1513,7 +1599,10 @@ mod tests {
 
     #[test]
     fn function_reply() {
-        assert_eq!(render(&local_function(&b_args(&["FUNCTION", "FLUSH"]))), "OK");
+        assert_eq!(
+            render(&local_function(&b_args(&["FUNCTION", "FLUSH"]))),
+            "OK"
+        );
         assert_eq!(
             render(&local_function(&b_args(&["FUNCTION", "LOAD", "x"]))),
             "ERR Unknown subcommand or wrong number of arguments for 'LOAD'. Try FUNCTION HELP."
@@ -1531,16 +1620,28 @@ mod tests {
         assert_eq!(r(&mut mgr, &["SCRIPT", "EXISTS", "a", "b"]), "[0, 0]");
         assert_eq!(r(&mut mgr, &["SCRIPT", "LIST"]), "[]");
         let sha = "e0e1f9fabfc9d4800c877a703b823ac0578ff8db";
-        assert_eq!(r(&mut mgr, &["SCRIPT", "FLAGS", sha, "allow-undeclared-keys"]), "OK");
+        assert_eq!(
+            r(&mut mgr, &["SCRIPT", "FLAGS", sha, "allow-undeclared-keys"]),
+            "OK"
+        );
         // A sha with no flags applies nothing and replies OK (reference ConfigCmd).
         assert_eq!(r(&mut mgr, &["SCRIPT", "FLAGS", sha]), "OK");
-        assert_eq!(r(&mut mgr, &["SCRIPT", "FLAGS"]), "ERR Unknown subcommand or wrong number of arguments for 'FLAGS'. Try SCRIPT HELP.");
+        assert_eq!(
+            r(&mut mgr, &["SCRIPT", "FLAGS"]),
+            "ERR Unknown subcommand or wrong number of arguments for 'FLAGS'. Try SCRIPT HELP."
+        );
         let sha40 = "0123456789012345678901234567890123456789";
         assert_eq!(r(&mut mgr, &["SCRIPT", "FLAGS", sha40]), "OK");
-        assert_eq!(r(&mut mgr, &["SCRIPT", "FLAGS", "short", "x"]), "ERR syntax error");
+        assert_eq!(
+            r(&mut mgr, &["SCRIPT", "FLAGS", "short", "x"]),
+            "ERR syntax error"
+        );
         assert_eq!(r(&mut mgr, &["SCRIPT", "LOAD", "return 1"]), sha);
         assert_eq!(r(&mut mgr, &["SCRIPT", "EXISTS", sha]), "[1]");
-        assert_eq!(r(&mut mgr, &["SCRIPT", "FLAGS", sha, "bogus"]), "ERR Invalid config format: Invalid flag: bogus");
+        assert_eq!(
+            r(&mut mgr, &["SCRIPT", "FLAGS", sha, "bogus"]),
+            "ERR Invalid config format: Invalid flag: bogus"
+        );
         assert!(r(&mut mgr, &["SCRIPT", "LOAD", "return {"]).starts_with("ERR syntax error"));
         assert!(r(&mut mgr, &["SCRIPT", "HELP"]).contains("SCRIPT <subcommand>"));
     }

@@ -44,6 +44,7 @@ pub enum PrimeValue {
 }
 
 impl PrimeValue {
+    #[must_use]
     pub fn obj_type(&self) -> ObjType {
         match self {
             PrimeValue::Str(_) => ObjType::Str,
@@ -60,6 +61,7 @@ impl PrimeValue {
         }
     }
 
+    #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self.obj_type() {
             ObjType::Str => "string",
@@ -83,6 +85,7 @@ impl PrimeValue {
     /// allocator's 8-byte granularity for LargeString-sized values. Calibrated
     /// to the reference `ScanMallocSize` test: 15/500/1000-byte values report
     /// 0/496/1000.
+    #[must_use]
     pub fn malloc_used(&self) -> usize {
         match self {
             PrimeValue::Str(s) => {
@@ -112,6 +115,7 @@ impl ObjType {
     /// Parse a TYPE argument (case-insensitive). Returns `None` for unknown
     /// names. Pseudo-types ("key", ...) are valid for SCAN but never match a
     /// stored value; they are handled by the caller.
+    #[must_use]
     pub fn from_name(s: &[u8]) -> Option<ObjType> {
         match s.to_ascii_lowercase().as_slice() {
             b"string" => Some(ObjType::Str),

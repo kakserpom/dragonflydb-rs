@@ -64,11 +64,13 @@ impl Json {
     }
 
     /// A JSON null value.
+    #[must_use]
     pub fn null() -> Json {
         Json::Null
     }
 
     /// The JSON type name reported by `JSON.TYPE`.
+    #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
             Json::Null => "null",
@@ -80,42 +82,52 @@ impl Json {
         }
     }
 
+    #[must_use]
     pub fn is_null(&self) -> bool {
         matches!(self, Json::Null)
     }
 
+    #[must_use]
     pub fn is_bool(&self) -> bool {
         matches!(self, Json::Bool(_))
     }
 
+    #[must_use]
     pub fn is_number(&self) -> bool {
         matches!(self, Json::Int(_) | Json::Uint(_) | Json::Double(_))
     }
 
+    #[must_use]
     pub fn is_int64(&self) -> bool {
         matches!(self, Json::Int(_))
     }
 
+    #[must_use]
     pub fn is_uint64(&self) -> bool {
         matches!(self, Json::Uint(_))
     }
 
+    #[must_use]
     pub fn is_double(&self) -> bool {
         matches!(self, Json::Double(_))
     }
 
+    #[must_use]
     pub fn is_string(&self) -> bool {
         matches!(self, Json::String(_))
     }
 
+    #[must_use]
     pub fn is_array(&self) -> bool {
         matches!(self, Json::Array(_))
     }
 
+    #[must_use]
     pub fn is_object(&self) -> bool {
         matches!(self, Json::Object(_))
     }
 
+    #[must_use]
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Json::Bool(b) => Some(*b),
@@ -123,6 +135,7 @@ impl Json {
         }
     }
 
+    #[must_use]
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Json::Int(i) => Some(*i),
@@ -130,6 +143,7 @@ impl Json {
         }
     }
 
+    #[must_use]
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Json::Uint(u) => Some(*u),
@@ -139,6 +153,7 @@ impl Json {
 
     /// Lossy floating-point view of a number (`JSON.NUMINCRBY` mixes integer
     /// and double arithmetic through this path).
+    #[must_use]
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Json::Int(i) => Some(*i as f64),
@@ -148,6 +163,7 @@ impl Json {
         }
     }
 
+    #[must_use]
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Json::String(s) => Some(s),
@@ -156,6 +172,7 @@ impl Json {
     }
 
     /// The number of elements of an array or members of an object.
+    #[must_use]
     pub fn len(&self) -> usize {
         match self {
             Json::Array(items) => items.len(),
@@ -164,6 +181,7 @@ impl Json {
         }
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -172,6 +190,7 @@ impl Json {
     /// `ComputeMemorySize` (`core_json_json_object.cc`): trivial storage
     /// (null, bool, integer, double, short strings) reports 0, while arrays,
     /// objects, and long strings report their heap usage.
+    #[must_use]
     pub fn memory_usage(&self) -> usize {
         const SSO: usize = 15;
         let mut total = 0usize;
@@ -206,6 +225,7 @@ impl Json {
         total
     }
 
+    #[must_use]
     pub fn array_items(&self) -> &[Json] {
         match self {
             Json::Array(items) => items,
@@ -220,6 +240,7 @@ impl Json {
         }
     }
 
+    #[must_use]
     pub fn object_members(&self) -> &[(String, Json)] {
         match self {
             Json::Object(members) => members,
@@ -236,6 +257,7 @@ impl Json {
 
     /// Look up an object member by key (binary search over the sorted
     /// members). Returns `None` for non-objects and missing keys.
+    #[must_use]
     pub fn object_get(&self, key: &str) -> Option<&Json> {
         let members = self.object_members();
         members
@@ -252,6 +274,7 @@ impl Json {
         Some(&mut members[idx].1)
     }
 
+    #[must_use]
     pub fn object_contains_key(&self, key: &str) -> bool {
         self.object_get(key).is_some()
     }
@@ -314,6 +337,7 @@ impl Json {
 
     /// Serialize the value as compact JSON, matching `jsoncons::json::dump`
     /// with default options (sorted keys, `.0`-suffixed integral doubles).
+    #[must_use]
     pub fn dump(&self) -> String {
         let mut out = String::with_capacity(64);
         self.write(&mut out, 0, &Format::default());
@@ -323,6 +347,7 @@ impl Json {
     /// Serialize with the `JSON.GET` formatting options. `indent`, `newline`
     /// and `space` are the literal strings supplied via `INDENT`, `NEWLINE`
     /// and `SPACE` (empty strings reproduce the compact form).
+    #[must_use]
     pub fn dump_with_options(&self, indent: &str, newline: &str, space: &str) -> String {
         let mut out = String::with_capacity(64);
         let fmt = Format::Pretty {
@@ -526,7 +551,7 @@ fn write_double(out: &mut String, value: f64) {
         out.push_str("0.0");
         return;
     }
-    let sci = format!("{:e}", value);
+    let sci = format!("{value:e}");
     let negative = sci.starts_with('-');
     let sci = if negative { &sci[1..] } else { &sci[..] };
     let (mantissa, exp) = sci.split_once('e').expect("scientific format");

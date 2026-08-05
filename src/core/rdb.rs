@@ -17,23 +17,23 @@ use std::collections::BTreeMap;
 
 use hashbrown::HashMap;
 
+use crate::core::DbSlice;
 use crate::core::bloom::SBF;
 use crate::core::cms::Cms;
-use crate::core::cuckoo::CuckooFilter;
-use crate::core::json::Json;
-use crate::core::topk::Topk;
 use crate::core::compact::CompactString;
 use crate::core::crc64;
+use crate::core::cuckoo::CuckooFilter;
 use crate::core::hash::Hash;
 use crate::core::intset;
+use crate::core::json::Json;
 use crate::core::listpack;
 use crate::core::lzf;
 use crate::core::quicklist::{ListItem, QuickList};
 use crate::core::set::Set;
 use crate::core::stream::{Consumer, ConsumerGroup, PendingEntry, Stream, StreamEntry, StreamId};
+use crate::core::topk::Topk;
 use crate::core::value::PrimeValue;
 use crate::core::zset::ZSet;
-use crate::core::DbSlice;
 
 /// RDB version accepted by RESTORE (`RDB_VERSION` in `rdb.h`).
 pub const RDB_VERSION: u64 = 12;
@@ -112,7 +112,7 @@ fn write_len(out: &mut Vec<u8>, len: u64) {
     } else if len < 1 << 14 {
         out.push(((len >> 8) as u8 & 0x3f) | (RDB_14BITLEN << 6));
         out.push(len as u8);
-    } else if len <= u32::MAX as u64 {
+    } else if u32::try_from(len).is_ok() {
         out.push(RDB_32BITLEN);
         out.extend_from_slice(&(len as u32).to_be_bytes());
     } else {
@@ -157,23 +157,22 @@ fn try_integer_encoding(s: &[u8]) -> Option<Vec<u8>> {
 /// `SaveLongLongAsString`: an integer-encoded string, falling back to a length
 /// plus decimal bytes (never an int64 encoding).
 fn save_long_long_as_string(out: &mut Vec<u8>, value: i64) {
-    match encode_integer(value) {
-        Some(enc) => out.extend_from_slice(&enc),
-        None => {
-            let bytes = crate::util::itoa(value);
-            write_len(out, bytes.len() as u64);
-            out.extend_from_slice(&bytes);
-        }
+    if let Some(enc) = encode_integer(value) {
+        out.extend_from_slice(&enc);
+    } else {
+        let bytes = crate::util::itoa(value);
+        write_len(out, bytes.len() as u64);
+        out.extend_from_slice(&bytes);
     }
 }
 
-/// `SaveBinaryDouble`: a raw little-endian binary64 (RDB_VERSION >= 8).
+/// `SaveBinaryDouble`: a raw little-endian binary64 (`RDB_VERSION` >= 8).
 fn save_binary_double(out: &mut Vec<u8>, val: f64) {
     out.extend_from_slice(&val.to_bits().to_le_bytes());
 }
 
 /// `SaveString`: integer encoding for short canonical ints, LZF compression in
-/// SINGLE_ENTRY mode when it saves enough bytes, otherwise length + verbatim.
+/// `SINGLE_ENTRY` mode when it saves enough bytes, otherwise length + verbatim.
 fn save_string(out: &mut Vec<u8>, s: &[u8]) {
     if s.len() <= 11
         && let Some(enc) = try_integer_encoding(s)
@@ -306,7 +305,7 @@ fn save_hash(out: &mut Vec<u8>, h: &Hash, typ: u8) {
 
 fn save_zset(out: &mut Vec<u8>, z: &ZSet) {
     write_len(out, z.len() as u64);
-    for (member, score) in z.iter() {
+    for (member, score) in z {
         save_string(out, member.as_bytes());
         save_binary_double(out, score);
     }
@@ -396,7 +395,7 @@ fn save_stream(out: &mut Vec<u8>, s: &Stream) {
     // limits, otherwise start a new node keyed by the entry's full ID.
     let mut nodes: Vec<(StreamId, Vec<u8>)> = Vec::new();
     let mut cur: Option<PendingNode> = None;
-    for (id, entry) in s.entries.iter() {
+    for (id, entry) in &s.entries {
         let id = *id;
         let totelelen: usize = entry.fields.iter().map(|(f, v)| f.len() + v.len()).sum();
         let make_new = match &cur {
@@ -496,6 +495,7 @@ fn save_value(out: &mut Vec<u8>, pv: &PrimeValue) {
 
 /// Serialize a value as a full DUMP payload (type byte + value + version +
 /// CRC64), mirroring `RdbSerializer::DumpValue` with `ignore_crc=false`.
+#[must_use]
 pub fn dump_value(pv: &PrimeValue) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(rdb_object_type(pv));
@@ -508,10 +508,11 @@ pub fn dump_value(pv: &PrimeValue) -> Vec<u8> {
 
 /// Serialize a whole DB to a standalone RDB snapshot, mirroring
 /// `RdbSerializer::SaveSnapshot` (`rdb_save.cc`): `REDIS0012` magic, SELECTDB
-/// 0, RESIZEDB with key/expiry counts, then per key: optional EXPIRETIME_MS
+/// 0, RESIZEDB with key/expiry counts, then per key: optional `EXPIRETIME_MS`
 /// opcode (u64 LE milliseconds), the RDB type byte, the key, the value, and a
 /// trailing EOF opcode plus LE CRC64 over all preceding bytes. Keys are emitted
 /// in sorted order so the output is deterministic.
+#[must_use]
 pub fn save_db(slice: &DbSlice) -> Vec<u8> {
     const MAGIC: &[u8] = b"REDIS";
     const VERSION: &[u8] = b"0012";
@@ -650,15 +651,18 @@ impl<'a> Reader<'a> {
     fn read_len(&mut self) -> Result<(u64, bool), RestoreError> {
         let b = self.read_u8()?;
         match b >> 6 {
-            0 => Ok(((b & 0x3f) as u64, false)),
+            0 => Ok((u64::from(b & 0x3f), false)),
             1 => {
-                let lo = self.read_u8()? as u64;
-                Ok(((((b & 0x3f) as u64) << 8) | lo, false))
+                let lo = u64::from(self.read_u8()?);
+                Ok(((u64::from(b & 0x3f) << 8) | lo, false))
             }
             2 => match b {
                 0x80 => {
                     let s = self.read_exact(4)?;
-                    Ok((u32::from_be_bytes([s[0], s[1], s[2], s[3]]) as u64, false))
+                    Ok((
+                        u64::from(u32::from_be_bytes([s[0], s[1], s[2], s[3]])),
+                        false,
+                    ))
                 }
                 0x81 => {
                     let s = self.read_exact(8)?;
@@ -669,7 +673,7 @@ impl<'a> Reader<'a> {
                 }
                 _ => Err(RestoreError::BadDataFormat),
             },
-            _ => Ok(((b & 0x3f) as u64, true)),
+            _ => Ok((u64::from(b & 0x3f), true)),
         }
     }
 
@@ -682,17 +686,17 @@ impl<'a> Reader<'a> {
         }
         match len as u8 {
             RDB_ENC_INT8 => {
-                let b = self.read_exact(1)?[0] as i8 as i64;
+                let b = i64::from(self.read_exact(1)?[0] as i8);
                 Ok(crate::util::itoa(b))
             }
             RDB_ENC_INT16 => {
                 let s = self.read_exact(2)?;
-                let v = i16::from_le_bytes([s[0], s[1]]) as i64;
+                let v = i64::from(i16::from_le_bytes([s[0], s[1]]));
                 Ok(crate::util::itoa(v))
             }
             RDB_ENC_INT32 => {
                 let s = self.read_exact(4)?;
-                let v = i32::from_le_bytes([s[0], s[1], s[2], s[3]]) as i64;
+                let v = i64::from(i32::from_le_bytes([s[0], s[1], s[2], s[3]]));
                 Ok(crate::util::itoa(v))
             }
             RDB_ENC_LZF => {
@@ -1254,7 +1258,7 @@ pub fn restore_value(payload: &[u8], now_ms: u64) -> Result<RestoreOutcome, Rest
     }
     let footer = &payload[payload.len() - FOOTER..];
     let version = u16::from_le_bytes([footer[0], footer[1]]);
-    if version as u64 > RDB_VERSION {
+    if u64::from(version) > RDB_VERSION {
         return Err(RestoreError::BadDataFormat);
     }
     let expected_crc = u64::from_le_bytes([
@@ -1577,7 +1581,7 @@ mod tests {
     fn restore_value_ok(payload: &[u8]) -> PrimeValue {
         match restore_value(payload, now_ms()) {
             Ok(RestoreOutcome::Value(v)) => v,
-            other => panic!("expected Value, got {:?}", other),
+            other => panic!("expected Value, got {other:?}"),
         }
     }
 
@@ -1598,7 +1602,7 @@ mod tests {
         ];
         match restore_value(&payload, now_ms()) {
             Ok(RestoreOutcome::Value(PrimeValue::Str(s))) => assert_eq!(s.as_bytes(), b"1234"),
-            other => panic!("unexpected {:?}", other),
+            other => panic!("unexpected {other:?}"),
         }
         // Re-dumping yields the exact same bytes (int16 encoding round-trips).
         let v = restore_value_ok(&payload);
@@ -1616,7 +1620,7 @@ mod tests {
                 assert_eq!(s.len(), 1);
                 assert!(s.contains(b"acme"));
             }
-            other => panic!("unexpected {:?}", other),
+            other => panic!("unexpected {other:?}"),
         }
     }
 
@@ -1631,7 +1635,7 @@ mod tests {
                 assert_eq!(z.len(), 1);
                 assert_eq!(z.iter().collect::<Vec<_>>(), vec![(cs("elon"), 1.0)]);
             }
-            other => panic!("unexpected {:?}", other),
+            other => panic!("unexpected {other:?}"),
         }
     }
 
@@ -1838,7 +1842,7 @@ mod tests {
             p.extend_from_slice(&crc64::crc64(&p).to_le_bytes());
             match restore_value(&p, now_ms()) {
                 Ok(RestoreOutcome::Value(PrimeValue::Str(s))) => {
-                    assert_eq!(s.as_bytes(), *expected)
+                    assert_eq!(s.as_bytes(), *expected);
                 }
                 other => panic!(
                     "expected Str({}), got {:?}",
@@ -1861,7 +1865,7 @@ mod tests {
         p.extend_from_slice(&crc64::crc64(&p).to_le_bytes());
         match restore_value(&p, now_ms()) {
             Ok(RestoreOutcome::Value(PrimeValue::Str(s))) => assert_eq!(s.as_bytes(), data),
-            other => panic!("unexpected {:?}", other),
+            other => panic!("unexpected {other:?}"),
         }
     }
 
@@ -1960,7 +1964,7 @@ mod tests {
                 // Re-dump yields identical bytes.
                 assert_eq!(dump_value(&PrimeValue::Set(restored)), dump);
             }
-            other => panic!("unexpected {:?}", other),
+            other => panic!("unexpected {other:?}"),
         }
     }
 
@@ -1986,7 +1990,7 @@ mod tests {
                 assert_eq!(restored.len(), 1);
                 assert!(restored.contains(b"alive"));
             }
-            other => panic!("unexpected {:?}", other),
+            other => panic!("unexpected {other:?}"),
         }
     }
 
@@ -2002,14 +2006,16 @@ mod tests {
             Ok(RestoreOutcome::Value(PrimeValue::Hash(restored))) => {
                 assert_eq!(restored.len(), 2);
                 assert_eq!(
-                    restored.get(b"f1").map(|v| v.as_bytes()),
+                    restored
+                        .get(b"f1")
+                        .map(super::super::compact::CompactString::as_bytes),
                     Some(b"v1".as_slice())
                 );
                 assert_eq!(restored.field_expire_ms(b"f1"), Some(expire));
                 assert_eq!(restored.field_expire_ms(b"f2"), None);
                 assert_eq!(dump_value(&PrimeValue::Hash(restored)), dump);
             }
-            other => panic!("unexpected {:?}", other),
+            other => panic!("unexpected {other:?}"),
         }
     }
 
@@ -2030,7 +2036,7 @@ mod tests {
     fn restore_roundtrip_string() {
         for s in ["19", "1234", "hello world", "0", "-9223372036854775808"] {
             let dump = dump_value(&PrimeValue::Str(cs(s)));
-            assert_eq!(dump_value(&restore_value_ok(&dump)), dump, "string {:?}", s);
+            assert_eq!(dump_value(&restore_value_ok(&dump)), dump, "string {s:?}");
         }
     }
 
@@ -2048,7 +2054,7 @@ mod tests {
                 assert!(restored.contains(b"-100"));
                 assert!(restored.contains(b"70000"));
             }
-            other => panic!("unexpected {:?}", other),
+            other => panic!("unexpected {other:?}"),
         }
         assert_eq!(dump_value(&restore_value_ok(&dump)), dump);
     }
@@ -2082,22 +2088,25 @@ mod tests {
         let mut h = Hash::new();
         for i in 0..200 {
             h.set(
-                CompactString::from_bytes(format!("f{}", i).as_bytes()),
-                CompactString::from_bytes(format!("v{}", i).as_bytes()),
+                CompactString::from_bytes(format!("f{i}").as_bytes()),
+                CompactString::from_bytes(format!("v{i}").as_bytes()),
             );
         }
         let dump = dump_value(&PrimeValue::Hash(h.clone()));
         assert_eq!(dump[0], RDB_TYPE_HASH);
         let restored = match restore_value(&dump, now_ms()) {
             Ok(RestoreOutcome::Value(PrimeValue::Hash(h))) => h,
-            other => panic!("unexpected {:?}", other),
+            other => panic!("unexpected {other:?}"),
         };
         assert_eq!(restored.len(), 200);
         for i in 0..200 {
-            let f = CompactString::from_bytes(format!("f{}", i).as_bytes());
+            let f = CompactString::from_bytes(format!("f{i}").as_bytes());
             assert_eq!(
-                restored.get(f.as_bytes()).map(|v| v.as_bytes()),
-                h.get(f.as_bytes()).map(|v| v.as_bytes())
+                restored
+                    .get(f.as_bytes())
+                    .map(super::super::compact::CompactString::as_bytes),
+                h.get(f.as_bytes())
+                    .map(super::super::compact::CompactString::as_bytes)
             );
         }
     }
@@ -2167,7 +2176,7 @@ mod tests {
                 StreamId { ms: 1, seq: i },
                 vec![(
                     cs("k"),
-                    CompactString::from_bytes(format!("v{}", i).as_bytes()),
+                    CompactString::from_bytes(format!("v{i}").as_bytes()),
                 )],
             );
         }
@@ -2235,7 +2244,7 @@ mod tests {
                     assert_eq!(v.type_name(), pv.type_name());
                     assert_eq!(dump_value(&v), dump);
                 }
-                other => panic!("expected Value, got {:?}", other),
+                other => panic!("expected Value, got {other:?}"),
             }
         }
 
@@ -2243,18 +2252,21 @@ mod tests {
         let cms = Cms::new(100, 5);
         let mut bad = dump_value(&PrimeValue::Cms(cms));
         bad.truncate(bad.len() - 1);
-        assert!(matches!(restore_value(&bad, now_ms()), Err(RestoreError::BadDataFormat)));
+        assert!(matches!(
+            restore_value(&bad, now_ms()),
+            Err(RestoreError::BadDataFormat)
+        ));
     }
 
     #[test]
     fn snapshot_roundtrip() {
         let mut slice = DbSlice::new(0);
-        slice.insert(cs("name"), PrimeValue::Str(cs("dragonfly")));
-        slice.insert(cs("count"), PrimeValue::Str(cs("19")));
+        slice.insert(b"name", PrimeValue::Str(cs("dragonfly")));
+        slice.insert(b"count", PrimeValue::Str(cs("19")));
         let mut h = Hash::new();
         h.set(cs("f1"), cs("v1"));
         h.set(cs("f2"), cs("v2"));
-        slice.insert(cs("hash"), PrimeValue::Hash(h));
+        slice.insert(b"hash", PrimeValue::Hash(h));
         slice.set_expiry(b"count", 4_000_000_000_000, now_ms());
 
         let data = save_db(&slice);

@@ -23,6 +23,30 @@ simd-json = { version = "0.17", default-features = false, features = [
 ] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Intentional `as` casts: byte codec uses bounded casts (e.g. usize -> u32) where
+# try_from would add unwrap() noise without improving safety.
+cast_lossless = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+# Internal server: no public API to document, so mandatory-doc lints are noise.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+# Opinionated structural/style lints; refactoring for these has no functional value.
+too_many_lines = "allow"
+type_complexity = "allow"
+similar_names = "allow"
+many_single_char_names = "allow"
+struct_excessive_bools = "allow"
+large_stack_arrays = "allow"
+# Exact float comparisons are intentional: hll convergence checks (z_prime == z),
+# exact zset score equality, and JSON number equality.
+float_cmp = "allow"
+
 [profile.release]
 lto = true
 codegen-units = 1

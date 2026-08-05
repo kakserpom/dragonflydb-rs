@@ -12,7 +12,7 @@ use xxhash_rust::xxh3::xxh3_128;
 /// The offset into the flat counter array for `row`/`col`, mirroring the C++
 /// `Offset` helper (unsigned wraparound included).
 fn offset(h1: u64, h2: u64, row: u32, width: u32) -> usize {
-    let idx = h1.wrapping_add((row as u64).wrapping_mul(h2)) % width as u64;
+    let idx = h1.wrapping_add(u64::from(row).wrapping_mul(h2)) % u64::from(width);
     (row as usize) * (width as usize) + idx as usize
 }
 
@@ -34,6 +34,7 @@ pub struct Cms {
 
 impl Cms {
     /// Create a CMS with the given dimensions (`CMS(width, depth, mr)`).
+    #[must_use]
     pub fn new(width: u32, depth: u32) -> Self {
         Cms {
             width,
@@ -49,6 +50,7 @@ impl Cms {
     /// The caller validates that `error`/`probability` are in (0, 1) and that
     /// the derived dimensions fit (the command layer mirrors
     /// `ComputeCmsDimensions`).
+    #[must_use]
     pub fn new_by_error(error: f64, probability: f64) -> Self {
         let width = (std::f64::consts::E / error).ceil() as u32;
         let depth = (1.0 / probability).ln().ceil() as u32;
@@ -69,6 +71,7 @@ impl Cms {
     }
 
     /// Query the estimated count for an item.
+    #[must_use]
     pub fn query(&self, item: &[u8]) -> i64 {
         let (h1, h2) = hash_fp(item);
         let mut min_count = i64::MAX;
@@ -106,29 +109,35 @@ impl Cms {
         self.counters.copy_from_slice(data);
     }
 
+    #[must_use]
     pub fn width(&self) -> u32 {
         self.width
     }
 
+    #[must_use]
     pub fn depth(&self) -> u32 {
         self.depth
     }
 
     /// Total count of all `incr_by` operations (used by CMS.INFO).
+    #[must_use]
     pub fn total_count(&self) -> i64 {
         self.count
     }
 
     /// Memory usage in bytes (`MallocUsed`).
+    #[must_use]
     pub fn malloc_used(&self) -> usize {
         self.num_counters() * std::mem::size_of::<i64>()
     }
 
+    #[must_use]
     pub fn num_counters(&self) -> usize {
         (self.width as usize) * (self.depth as usize)
     }
 
     /// The flat counter array (`Data`).
+    #[must_use]
     pub fn data(&self) -> &[i64] {
         &self.counters
     }
@@ -136,6 +145,7 @@ impl Cms {
     /// Serialize the sketch as a single blob: width(4) + depth(4) + count(8) +
     /// counter values (8 LE each). Port-local wire format (the reference does
     /// not persist CMS values in RDB); used by the RDB save/load paths.
+    #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.malloc_used() + 16);
         out.extend_from_slice(&self.width.to_le_bytes());
@@ -149,6 +159,7 @@ impl Cms {
 
     /// Deserialize a blob written by `serialize`. Returns `None` on a malformed
     /// or truncated payload.
+    #[must_use]
     pub fn deserialize(bytes: &[u8]) -> Option<Cms> {
         if bytes.len() < 16 {
             return None;
@@ -165,7 +176,12 @@ impl Cms {
         for chunk in bytes[16..need].chunks_exact(8) {
             counters.push(i64::from_le_bytes(chunk.try_into().ok()?));
         }
-        Some(Cms { width, depth, count, counters })
+        Some(Cms {
+            width,
+            depth,
+            count,
+            counters,
+        })
     }
 }
 

@@ -61,6 +61,7 @@ impl std::fmt::Debug for ZSet {
 }
 
 impl ZSet {
+    #[must_use]
     pub fn new() -> Self {
         let header = ZNode {
             member: CompactString::new(),
@@ -74,16 +75,18 @@ impl ZSet {
             level: 1,
             len: 0,
             index: HashMap::new(),
-            rng_state: 0x9E3779B97F4A7C15,
+            rng_state: 0x9E37_79B9_7F4A_7C15,
         };
         s.level = 1;
         s
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -94,7 +97,7 @@ impl ZSet {
         self.rng_state ^= self.rng_state << 17;
         let mut level = 1;
         let mut r = self.rng_state;
-        while (r & 3) == 0 && level < ZSKIPLIST_MAXLEVEL {
+        while r.trailing_zeros() >= 2 && level < ZSKIPLIST_MAXLEVEL {
             level += 1;
             r >>= 2;
         }
@@ -144,11 +147,14 @@ impl ZSet {
             next: vec![None; new_level],
             // The first node has no backward node; the header must never appear
             // as a member (ZRevIter walks the backward chain).
-            backward: if update[0] == self.header { None } else { Some(update[0]) },
+            backward: if update[0] == self.header {
+                None
+            } else {
+                Some(update[0])
+            },
         };
         self.nodes.push(node);
-        for i in 0..new_level {
-            let prev = update[i];
+        for (i, &prev) in update[..new_level].iter().enumerate() {
             let next_idx = self.nodes[prev].next[i];
             self.nodes[prev].next[i] = Some(node_idx);
             self.nodes[node_idx].next[i] = next_idx;
@@ -192,8 +198,7 @@ impl ZSet {
         if self.nodes[target].member.as_bytes() != member {
             return false;
         }
-        for i in 0..self.level {
-            let prev = update[i];
+        for (i, &prev) in update[..self.level].iter().enumerate() {
             if self.nodes[prev].next[i] == Some(target) {
                 self.nodes[prev].next[i] = self.nodes[target].next[i];
             }
@@ -210,15 +215,18 @@ impl ZSet {
         true
     }
 
+    #[must_use]
     pub fn score(&self, member: &[u8]) -> Option<f64> {
         self.index.get(member).copied()
     }
 
+    #[must_use]
     pub fn contains(&self, member: &[u8]) -> bool {
         self.index.contains_key(member)
     }
 
     /// Rank of member in ascending order (0-based), None if absent.
+    #[must_use]
     pub fn rank(&self, member: &[u8]) -> Option<i64> {
         if !self.index.contains_key(member) {
             return None;
@@ -261,6 +269,7 @@ impl ZSet {
     }
 
     /// Fetch (member, score) at a 0-based rank in ascending order.
+    #[must_use]
     pub fn by_rank(&self, rank: usize) -> Option<(CompactString, f64)> {
         if rank >= self.len {
             return None;
@@ -279,11 +288,16 @@ impl ZSet {
     }
 
     /// Iterate members in ascending (score, member) order.
+    #[must_use]
     pub fn iter(&self) -> ZIter<'_> {
-        ZIter { zset: self, cur: self.nodes[self.header].next[0] }
+        ZIter {
+            zset: self,
+            cur: self.nodes[self.header].next[0],
+        }
     }
 
     /// Iterate members in descending (score, member) order.
+    #[must_use]
     pub fn rev_iter(&self) -> ZRevIter<'_> {
         let mut cur = None;
         if self.len > 0 {
@@ -299,12 +313,13 @@ impl ZSet {
     }
 
     /// Collect an ascending range by Redis semantics: `start`/`stop` may be
-    /// negative (from the end). Returns (start_idx, count) normalized.
+    /// negative (from the end). Returns (`start_idx`, count) normalized.
     fn normalized_range(&self, start: i64, stop: i64) -> Option<(usize, usize)> {
         let len = self.len as i64;
         crate::util::redis_range(start, stop, len).map(|(s, c)| (s as usize, c as usize))
     }
 
+    #[must_use]
     pub fn range(&self, start: i64, stop: i64, with_scores: bool) -> Vec<(CompactString, f64)> {
         let Some((s, c)) = self.normalized_range(start, stop) else {
             return Vec::new();
@@ -321,6 +336,7 @@ impl ZSet {
         out
     }
 
+    #[must_use]
     pub fn rev_range(&self, start: i64, stop: i64) -> Vec<(CompactString, f64)> {
         let Some((s, c)) = self.normalized_range(start, stop) else {
             return Vec::new();
@@ -337,6 +353,7 @@ impl ZSet {
     }
 
     /// Range by score, inclusive of both bounds. `rev` reverses the output.
+    #[must_use]
     pub fn range_by_score(
         &self,
         min: f64,
@@ -414,6 +431,7 @@ impl ZSet {
     }
 
     /// Count elements with score in [min, max].
+    #[must_use]
     pub fn count(&self, min: f64, max: f64) -> usize {
         self.iter().filter(|(_, s)| *s >= min && *s <= max).count()
     }
@@ -442,7 +460,7 @@ pub struct ZIter<'a> {
     cur: Option<usize>,
 }
 
-impl<'a> Iterator for ZIter<'a> {
+impl Iterator for ZIter<'_> {
     type Item = (CompactString, f64);
     fn next(&mut self) -> Option<Self::Item> {
         let n = self.cur?;
@@ -453,12 +471,21 @@ impl<'a> Iterator for ZIter<'a> {
     }
 }
 
+impl<'a> IntoIterator for &'a ZSet {
+    type Item = (CompactString, f64);
+    type IntoIter = ZIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 pub struct ZRevIter<'a> {
     zset: &'a ZSet,
     cur: Option<usize>,
 }
 
-impl<'a> Iterator for ZRevIter<'a> {
+impl Iterator for ZRevIter<'_> {
     type Item = (CompactString, f64);
     fn next(&mut self) -> Option<Self::Item> {
         let n = self.cur?;
@@ -481,8 +508,14 @@ mod tests {
         z.insert(CompactString::from("c"), 2.0);
         assert_eq!(z.len(), 3);
         assert_eq!(z.score(b"b"), Some(3.0));
-        assert_eq!(z.by_rank(0).map(|(m, _)| m.as_bytes().to_vec()), Some(b"a".to_vec()));
-        assert_eq!(z.by_rank(2).map(|(m, _)| m.as_bytes().to_vec()), Some(b"b".to_vec()));
+        assert_eq!(
+            z.by_rank(0).map(|(m, _)| m.as_bytes().to_vec()),
+            Some(b"a".to_vec())
+        );
+        assert_eq!(
+            z.by_rank(2).map(|(m, _)| m.as_bytes().to_vec()),
+            Some(b"b".to_vec())
+        );
         assert!(z.delete(&CompactString::from("c")));
         assert_eq!(z.len(), 2);
     }
@@ -518,6 +551,9 @@ mod tests {
         z.insert(CompactString::from("apple"), 1.0);
         z.insert(CompactString::from("cherry"), 1.0);
         let order: Vec<Vec<u8>> = z.iter().map(|(m, _)| m.as_bytes().to_vec()).collect();
-        assert_eq!(order, vec![b"apple".to_vec(), b"banana".to_vec(), b"cherry".to_vec()]);
+        assert_eq!(
+            order,
+            vec![b"apple".to_vec(), b"banana".to_vec(), b"cherry".to_vec()]
+        );
     }
 }

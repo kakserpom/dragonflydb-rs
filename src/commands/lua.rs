@@ -5,8 +5,8 @@
 //! interpreter, a SHA-1 keyed script cache with flags, and strict-global
 //! enforcement installed exactly once per Lua state.
 
-use std::collections::HashMap;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::os::raw::c_char;
 
 use mlua::chunk::ChunkMode;
@@ -33,7 +33,13 @@ pub const ARG_TYPE_ERR: &str = "Lua redis() command arguments must be strings or
 
 /// Compute a SHA-1 digest. Pure Rust, no new dependencies (mirrors `EVP_Digest`).
 fn sha1(data: &[u8]) -> [u8; 20] {
-    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let mut h: [u32; 5] = [
+        0x6745_2301,
+        0xEFCD_AB89,
+        0x98BA_DCFE,
+        0x1032_5476,
+        0xC3D2_E1F0,
+    ];
 
     let mut msg = Vec::with_capacity(data.len() + 72);
     msg.extend_from_slice(data);
@@ -52,14 +58,13 @@ fn sha1(data: &[u8]) -> [u8; 20] {
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
         }
-        let (mut a, mut b, mut c, mut d, mut e) =
-            (h[0], h[1], h[2], h[3], h[4]);
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
         for (i, &wi) in w.iter().enumerate() {
             let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
-                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
-                _ => (b ^ c ^ d, 0xCA62C1D6),
+                0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999_u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
+                _ => (b ^ c ^ d, 0xCA62_C1D6),
             };
             let tmp = a
                 .rotate_left(5)
@@ -88,6 +93,7 @@ fn sha1(data: &[u8]) -> [u8; 20] {
 }
 
 /// Lowercase hex SHA-1 of `data` (`Interpreter::FuncSha1` + `ToHex`).
+#[must_use]
 pub fn sha1_hex(data: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(40);
@@ -115,7 +121,11 @@ pub struct ScriptParams {
 
 impl Default for ScriptParams {
     fn default() -> Self {
-        ScriptParams { atomic: true, undeclared_keys: false, float_as_int: false }
+        ScriptParams {
+            atomic: true,
+            undeclared_keys: false,
+            float_as_int: false,
+        }
     }
 }
 
@@ -168,6 +178,7 @@ const HARDCODED_UNDECLARED: &[&str] = &[
 ];
 
 impl ScriptMgr {
+    #[must_use]
     pub fn new() -> Self {
         ScriptMgr::default()
     }
@@ -176,13 +187,16 @@ impl ScriptMgr {
     /// (`DeduceParams` in `script_mgr.cc`). `Ok(None)` when the prefix is
     /// absent or the flags line has no trailing whitespace.
     pub fn deduce_params(body: &[u8]) -> Result<Option<ScriptParams>, String> {
-        let body = trim_ascii_start(body);
         const PREFIX: &[u8] = b"--!df flags=";
+        let body = trim_ascii_start(body);
         if !body.starts_with(PREFIX) {
             return Ok(None);
         }
         let rest = &body[PREFIX.len()..];
-        let len = rest.iter().position(|&b| b.is_ascii_whitespace()).unwrap_or(rest.len());
+        let len = rest
+            .iter()
+            .position(|&b| b.is_ascii_whitespace())
+            .unwrap_or(rest.len());
         if len == rest.len() {
             return Ok(None);
         }
@@ -196,23 +210,37 @@ impl ScriptMgr {
     /// compiled the body (through an interpreter) so a compile error never
     /// leaves a cache entry, mirroring `ScriptMgr::Insert`.
     pub fn store(&mut self, sha: String, body: Vec<u8>, params: ScriptParams) {
-        self.scripts.insert(sha.clone(), Script { sha: sha.clone(), body, params });
+        self.scripts.insert(
+            sha.clone(),
+            Script {
+                sha: sha.clone(),
+                body,
+                params,
+            },
+        );
         self.params.insert(sha, params);
     }
 
+    #[must_use]
     pub fn exists(&self, sha: &str) -> bool {
         self.scripts.contains_key(sha)
     }
 
+    #[must_use]
     pub fn find(&self, sha: &str) -> Option<&Script> {
         self.scripts.get(sha)
     }
 
+    #[must_use]
     pub fn params(&self, sha: &str) -> Option<ScriptParams> {
-        self.scripts.get(sha).map(|s| s.params).or_else(|| self.params.get(sha).copied())
+        self.scripts
+            .get(sha)
+            .map(|s| s.params)
+            .or_else(|| self.params.get(sha).copied())
     }
 
     /// `(sha, body)` for every cached script, unordered (`ScriptMgr::GetAll`).
+    #[must_use]
     pub fn get_all(&self) -> Vec<(String, Vec<u8>)> {
         self.scripts
             .iter()
@@ -283,7 +311,7 @@ function __redis__err__handler(err)\n\
   end\n\
 end\n";
 
-/// The strict-global enforcement chunk from `interpreter.cc:453` (`@enable_strict_lua`).
+/// The strict-global enforcement chunk from `interpreter.cc:453` (`@enable_strictlua`).
 const STRICT: &str = r#"
 local dbg=debug
 local mt = {}
@@ -403,11 +431,17 @@ impl SandboxedInterpreter {
 
     fn bootstrap(&self) -> Result<(), String> {
         self.exec(ERR_HANDLER, "@err_handler_def")?;
-        self.exec(STRICT, "@enable_strict_lua")?;
+        self.exec(STRICT, "@enable_strictlua")?;
         self.install_protected_funcs()?;
         // `loadfile`/`dofile` are disabled (`interpreter.cc:512`).
-        self.lua.globals().set("loadfile", Value::Nil).map_err(|e| e.to_string())?;
-        self.lua.globals().set("dofile", Value::Nil).map_err(|e| e.to_string())?;
+        self.lua
+            .globals()
+            .set("loadfile", Value::Nil)
+            .map_err(|e| e.to_string())?;
+        self.lua
+            .globals()
+            .set("dofile", Value::Nil)
+            .map_err(|e| e.to_string())?;
         self.exec(POLYFILLS, "@dfly_polyfills")?;
         self.exec(RUNNER, "@dfly_runner")?;
         self.setup_redis_table()?;
@@ -430,9 +464,13 @@ impl SandboxedInterpreter {
             .lua
             .create_function(|lua, args: MultiValue| -> mlua::Result<Value> {
                 if args.len() != 3 || !matches!(&args[0], Value::Table(_)) {
-                    return Err(mlua::Error::runtime("rawset requires a table and two arguments"));
+                    return Err(mlua::Error::runtime(
+                        "rawset requires a table and two arguments",
+                    ));
                 }
-                let Value::Table(t) = &args[0] else { unreachable!() };
+                let Value::Table(t) = &args[0] else {
+                    unreachable!()
+                };
                 if is_global_table_or_metatable(lua, &args[0])? {
                     return Err(mlua::Error::runtime(
                         "Script attempted to access rawset with global environment",
@@ -450,7 +488,9 @@ impl SandboxedInterpreter {
                         "setmetatable requires a table and one argument",
                     ));
                 }
-                let Value::Table(t) = &args[0] else { unreachable!() };
+                let Value::Table(t) = &args[0] else {
+                    unreachable!()
+                };
                 if is_global_table_or_metatable(lua, &args[0])? {
                     return Err(mlua::Error::runtime(
                         "Script attempted to set metatable of global environment",
@@ -467,7 +507,9 @@ impl SandboxedInterpreter {
             .map_err(|e| e.to_string())?;
         let globals = self.lua.globals();
         globals.set("rawset", rawset).map_err(|e| e.to_string())?;
-        globals.set("setmetatable", setmetatable).map_err(|e| e.to_string())?;
+        globals
+            .set("setmetatable", setmetatable)
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -492,20 +534,23 @@ impl SandboxedInterpreter {
 
         let error_reply = self
             .lua
-            .create_function(|lua, args: MultiValue| single_field_table(lua, "err", args))
+            .create_function(|lua, args: MultiValue| single_field_table(lua, "err", &args))
             .map_err(|e| e.to_string())?;
         let status_reply = self
             .lua
-            .create_function(|lua, args: MultiValue| single_field_table(lua, "ok", args))
+            .create_function(|lua, args: MultiValue| single_field_table(lua, "ok", &args))
             .map_err(|e| e.to_string())?;
-        t.raw_set("error_reply", error_reply).map_err(|e| e.to_string())?;
-        t.raw_set("status_reply", status_reply).map_err(|e| e.to_string())?;
+        t.raw_set("error_reply", error_reply)
+            .map_err(|e| e.to_string())?;
+        t.raw_set("status_reply", status_reply)
+            .map_err(|e| e.to_string())?;
 
         let replicate = self
             .lua
-            .create_function(|_, _: ()| -> mlua::Result<i64> { Ok(1) })
+            .create_function(|_, (): ()| -> mlua::Result<i64> { Ok(1) })
             .map_err(|e| e.to_string())?;
-        t.raw_set("replicate_commands", replicate).map_err(|e| e.to_string())?;
+        t.raw_set("replicate_commands", replicate)
+            .map_err(|e| e.to_string())?;
 
         let log = self
             .lua
@@ -530,7 +575,10 @@ impl SandboxedInterpreter {
         t.raw_set("LOG_NOTICE", 2).map_err(|e| e.to_string())?;
         t.raw_set("LOG_WARNING", 3).map_err(|e| e.to_string())?;
 
-        self.lua.globals().set("redis", t).map_err(|e| e.to_string())?;
+        self.lua
+            .globals()
+            .set("redis", t)
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -571,9 +619,8 @@ impl SandboxedInterpreter {
         let dispatch = &cell;
         let result = lua.scope(|scope| {
             let call = scope.create_function_mut(move |lua, args: MultiValue| {
-                let cmd_args = match prepare_args(args) {
-                    Ok(a) => a,
-                    Err(_) => raise_string_error(lua, ARG_TYPE_ERR.into()),
+                let Ok(cmd_args) = prepare_args(&args) else {
+                    raise_string_error(lua, ARG_TYPE_ERR.into())
                 };
                 // Drop the RefCell guard before raising: `lua_error` longjmps
                 // past this frame, skipping its destructor.
@@ -587,7 +634,7 @@ impl SandboxedInterpreter {
                 }
             })?;
             let pcall = scope.create_function_mut(move |lua, args: MultiValue| {
-                let cmd_args = prepare_args(args)?;
+                let cmd_args = prepare_args(&args)?;
                 match dispatch.borrow_mut().dispatch(cmd_args) {
                     Ok(v) => resp_to_lua(lua, v),
                     Err(msg) => {
@@ -602,7 +649,7 @@ impl SandboxedInterpreter {
             redis.set("pcall", pcall)?;
             let runner: Function = lua.globals().get("__dfly__run")?;
             let v: Value = runner.call(sha)?;
-            serialize_value(lua, v, float_as_int, 0)
+            serialize_value(v, float_as_int, 0)
         });
         result.map_err(|e| clean_script_error(&e.to_string()))
     }
@@ -617,7 +664,7 @@ impl SandboxedInterpreter {
 fn raise_string_error(lua: &Lua, msg: String) -> ! {
     lua.exec_raw_lua(|raw| unsafe {
         let len = msg.len();
-        ffi::lua_pushlstring(raw.state(), msg.as_ptr() as *const c_char, len);
+        ffi::lua_pushlstring(raw.state(), msg.as_ptr().cast::<c_char>(), len);
         std::mem::drop(msg);
         ffi::lua_error(raw.state())
     })
@@ -628,7 +675,10 @@ fn raise_string_error(lua: &Lua, msg: String) -> ! {
 /// error:` and appends a `stack traceback:` block.
 fn clean_script_error(msg: &str) -> String {
     let msg = msg.strip_prefix("runtime error: ").unwrap_or(msg);
-    msg.split("\nstack traceback:").next().unwrap_or(msg).to_string()
+    msg.split("\nstack traceback:")
+        .next()
+        .unwrap_or(msg)
+        .to_string()
 }
 
 /// True when `v` is `_G`, `_G`'s metatable, or any table stored as a global
@@ -657,10 +707,13 @@ fn is_global_table_or_metatable(lua: &Lua, v: &Value) -> mlua::Result<bool> {
 
 /// `SingleFieldTable`: build `{field = <string>}`, erroring with a `{err=...}`
 /// table on bad arguments (the reference returns the table, not a raise).
-fn single_field_table(lua: &Lua, field: &str, args: MultiValue) -> mlua::Result<Value> {
+fn single_field_table(lua: &Lua, field: &str, args: &MultiValue) -> mlua::Result<Value> {
     if args.len() != 1 || !matches!(&args[0], Value::String(_)) {
         let t = lua.create_table()?;
-        t.raw_set("err", lua.create_string("wrong number or type of arguments")?)?;
+        t.raw_set(
+            "err",
+            lua.create_string("wrong number or type of arguments")?,
+        )?;
         return Ok(Value::Table(t));
     }
     let t = lua.create_table()?;
@@ -677,9 +730,9 @@ pub trait ScriptDispatch {
 
 /// Convert `redis.call` args to command argument bytes
 /// (`Interpreter::PrepareArgs`). Only strings and numbers are accepted.
-fn prepare_args(args: MultiValue) -> mlua::Result<Vec<Vec<u8>>> {
+fn prepare_args(args: &MultiValue) -> mlua::Result<Vec<Vec<u8>>> {
     let mut out = Vec::with_capacity(args.len());
-    for v in args.iter() {
+    for v in args {
         match v {
             Value::String(s) => out.push(s.as_bytes().to_vec()),
             Value::Integer(i) => out.push(itoa(*i)),
@@ -734,7 +787,10 @@ fn resp_to_lua(lua: &Lua, r: RespValue) -> mlua::Result<Value> {
 }
 
 fn strip_crlf(b: &[u8]) -> String {
-    b.iter().filter(|&&c| c != b'\r' && c != b'\n').map(|&c| c as char).collect()
+    b.iter()
+        .filter(|&&c| c != b'\r' && c != b'\n')
+        .map(|&c| c as char)
+        .collect()
 }
 
 /// Format a Lua error table value for the wire: the reference's
@@ -742,24 +798,21 @@ fn strip_crlf(b: &[u8]) -> String {
 /// when missing.
 fn fmt_error(b: &[u8]) -> String {
     let s = strip_crlf(b);
-    if s.starts_with('-') { s } else { format!("-{s}") }
+    if s.starts_with('-') {
+        s
+    } else {
+        format!("-{s}")
+    }
 }
 
 /// Serialize a script return value to RESP (`SerializeResult` +
 /// `EvalSerializer`). Depth is capped at 128 like `IsResultSafe`.
-fn serialize_value(
-    _lua: &Lua,
-    v: Value,
-    float_as_int: bool,
-    depth: usize,
-) -> mlua::Result<RespValue> {
+fn serialize_value(v: Value, float_as_int: bool, depth: usize) -> mlua::Result<RespValue> {
     if depth > 128 {
         return Err(mlua::Error::runtime("reached lua stack limit"));
     }
     Ok(match v {
-        Value::Nil => RespValue::Nil,
         Value::Boolean(true) => RespValue::Integer(1),
-        Value::Boolean(false) => RespValue::Nil,
         Value::Integer(i) => RespValue::Integer(i),
         Value::Number(d) => {
             if float_as_int {
@@ -782,8 +835,8 @@ fn serialize_value(
                 for pair in m.pairs::<Value, Value>() {
                     let (k, val) = pair?;
                     pairs.push((
-                        serialize_value(_lua, k, float_as_int, depth + 1)?,
-                        serialize_value(_lua, val, float_as_int, depth + 1)?,
+                        serialize_value(k, float_as_int, depth + 1)?,
+                        serialize_value(val, float_as_int, depth + 1)?,
                     ));
                 }
                 return Ok(RespValue::Map(pairs));
@@ -791,7 +844,11 @@ fn serialize_value(
             let len = t.raw_len();
             let mut items = Vec::with_capacity(len);
             for i in 1..=len {
-                items.push(serialize_value(_lua, t.raw_get::<Value>(i)?, float_as_int, depth + 1)?);
+                items.push(serialize_value(
+                    t.raw_get::<Value>(i)?,
+                    float_as_int,
+                    depth + 1,
+                )?);
             }
             RespValue::Array(items)
         }
@@ -802,6 +859,14 @@ fn serialize_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Noop;
+
+    impl ScriptDispatch for Noop {
+        fn dispatch(&mut self, _: Vec<Vec<u8>>) -> Result<RespValue, String> {
+            Err("ERR noop".into())
+        }
+    }
 
     #[test]
     fn sha1_known_vectors() {
@@ -823,21 +888,34 @@ mod tests {
         assert_eq!(
             ScriptMgr::deduce_params(b"--!df flags=legacy-float,disable-atomicity\nreturn 1")
                 .unwrap(),
-            Some(ScriptParams { atomic: false, undeclared_keys: false, float_as_int: true })
+            Some(ScriptParams {
+                atomic: false,
+                undeclared_keys: false,
+                float_as_int: true
+            })
         );
         assert_eq!(
             ScriptMgr::deduce_params(b"--!df flags=allow-undeclared-keys  return 1").unwrap(),
-            Some(ScriptParams { undeclared_keys: true, ..Default::default() })
+            Some(ScriptParams {
+                undeclared_keys: true,
+                ..Default::default()
+            })
         );
         // Flags line running to EOF is treated as absent.
-        assert_eq!(ScriptMgr::deduce_params(b"--!df flags=legacy-float").unwrap(), None);
+        assert_eq!(
+            ScriptMgr::deduce_params(b"--!df flags=legacy-float").unwrap(),
+            None
+        );
         assert!(ScriptMgr::deduce_params(b"--!df flags=bogus\nreturn 1").is_err());
     }
 
     #[test]
     fn apply_flags_errors() {
         let mut p = ScriptParams::default();
-        assert_eq!(p.apply_flags("allow-undeclared-keys;disable-atomicity"), Ok(()));
+        assert_eq!(
+            p.apply_flags("allow-undeclared-keys;disable-atomicity"),
+            Ok(())
+        );
         assert!(!p.atomic && p.undeclared_keys);
         assert_eq!(p.apply_flags("no-writes"), Ok(()));
         assert_eq!(p.apply_flags("bogus"), Err("Invalid flag: bogus".into()));
@@ -848,27 +926,33 @@ mod tests {
         let interp = SandboxedInterpreter::new().unwrap();
         let run = |body: &str| {
             interp.define("aaaa", body.as_bytes()).unwrap();
-            struct Noop;
-            impl ScriptDispatch for Noop {
-                fn dispatch(&mut self, _: Vec<Vec<u8>>) -> Result<RespValue, String> {
-                    Err("ERR noop".into())
-                }
-            }
             interp.run("aaaa", &mut Noop, false)
         };
         assert_eq!(run("return 1 + 2").unwrap(), RespValue::Integer(3));
         // Missing global read -> strict error.
         let err = run("return no_such").unwrap_err();
-        assert!(err.contains("Script attempted to access nonexistent global variable 'no_such'"), "{err}");
+        assert!(
+            err.contains("Script attempted to access nonexistent global variable 'no_such'"),
+            "{err}"
+        );
         // Global write from inside a function -> strict error.
         let err = run("x = 5 return x").unwrap_err();
-        assert!(err.contains("Script attempted to create global variable 'x'"), "{err}");
+        assert!(
+            err.contains("Script attempted to create global variable 'x'"),
+            "{err}"
+        );
         // debug is hidden.
         let err = run("return debug").unwrap_err();
-        assert!(err.contains("Script attempted to access nonexistent global variable 'debug'"), "{err}");
+        assert!(
+            err.contains("Script attempted to access nonexistent global variable 'debug'"),
+            "{err}"
+        );
         // loadfile/dofile are nilled, so reading them trips the strict guard.
         let err = run("return loadfile").unwrap_err();
-        assert!(err.contains("nonexistent global variable 'loadfile'"), "{err}");
+        assert!(
+            err.contains("nonexistent global variable 'loadfile'"),
+            "{err}"
+        );
         // Error handler prefixes @user_script:<line>.
         let err = run("error('boom')").unwrap_err();
         assert!(err.starts_with("@user_script:"), "{err}");
@@ -894,12 +978,9 @@ mod tests {
         let interp = SandboxedInterpreter::new().unwrap();
         // Re-define of another script in the same state must not trip the strict chunk.
         interp.define("bbbb", b"return 42").unwrap();
-        struct Noop;
-        impl ScriptDispatch for Noop {
-            fn dispatch(&mut self, _: Vec<Vec<u8>>) -> Result<RespValue, String> {
-                Err("ERR noop".into())
-            }
-        }
-        assert_eq!(interp.run("bbbb", &mut Noop, false).unwrap(), RespValue::Integer(42));
+        assert_eq!(
+            interp.run("bbbb", &mut Noop, false).unwrap(),
+            RespValue::Integer(42)
+        );
     }
 }

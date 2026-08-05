@@ -4,13 +4,12 @@
 //! The BF family is a Rust `PrimeValue::Sbf` backed by `core::bloom::SBF`.
 
 use crate::commands::{
-    integer, ok, Command, OpContext, KeyRange, FLAG_DENYOOM, FLAG_FAST, FLAG_READONLY, FLAG_WRITE,
+    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext, integer, ok,
 };
-use crate::core::bloom::{
-    load_sbf_chunk, load_sbf_header, SbfDumpIterator, SBF, K_DEFAULT_FP_PROB, K_DEFAULT_GROW_FACTOR,
-};
-use crate::core::compact::CompactString;
 use crate::core::PrimeValue;
+use crate::core::bloom::{
+    K_DEFAULT_FP_PROB, K_DEFAULT_GROW_FACTOR, SBF, SbfDumpIterator, load_sbf_chunk, load_sbf_header,
+};
 use crate::error::{CmdResult, RespError, RespValue};
 use crate::util::{parse_double, parse_i64, parse_u64};
 
@@ -32,10 +31,7 @@ fn no_such_key() -> RespError {
 
 /// Find the SBF for `key`, creating a default filter when the key is missing
 /// (port of `OpAdd`'s `AddOrFind` + `SetSBF(0, kDefaultFpProb, kDefaultGrowFactor)`).
-fn get_or_create_sbf<'c>(
-    ctx: &'c mut OpContext<'_>,
-    key: &[u8],
-) -> Result<&'c mut SBF, RespError> {
+fn get_or_create_sbf<'c>(ctx: &'c mut OpContext<'_>, key: &[u8]) -> Result<&'c mut SBF, RespError> {
     let exists = match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::Sbf(_)) => true,
         Some(_) => return Err(RespError::wrong_type()),
@@ -43,7 +39,7 @@ fn get_or_create_sbf<'c>(
     };
     if !exists {
         ctx.db.insert(
-            CompactString::from_bytes(key),
+            key,
             PrimeValue::Sbf(SBF::new(0, K_DEFAULT_FP_PROB, K_DEFAULT_GROW_FACTOR)),
         );
     }
@@ -62,12 +58,11 @@ fn get_or_create_sbf<'c>(
 fn exec_bf_reserve(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let error = match parse_double(&ctx.args[key_idx + 1]) {
-        Some(e) => e,
-        None => return CmdResult::Err(RespError::syntax()),
+    let Some(error) = parse_double(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::syntax());
     };
     let capacity = match parse_u64(&ctx.args[key_idx + 2]) {
-        Some(c) if c <= u32::MAX as u64 => c,
+        Some(c) if u32::try_from(c).is_ok() => c,
         _ => return CmdResult::Err(RespError::syntax()),
     };
     if !(error > 0.0 && error < 0.5) {
@@ -77,7 +72,7 @@ fn exec_bf_reserve(ctx: &mut OpContext) -> CmdResult {
         return CmdResult::Err(RespError::new("ERR item exists"));
     }
     ctx.db.insert(
-        CompactString::from_bytes(key),
+        key,
         PrimeValue::Sbf(SBF::new(capacity, error, K_DEFAULT_GROW_FACTOR)),
     );
     CmdResult::Ok(ok())
@@ -104,10 +99,10 @@ fn add_or_madd(ctx: &mut OpContext, multi: bool) -> CmdResult {
     }
     if multi {
         CmdResult::Ok(RespValue::Array(
-            results.into_iter().map(|b| integer(b as i64)).collect(),
+            results.into_iter().map(|b| integer(i64::from(b))).collect(),
         ))
     } else {
-        CmdResult::Ok(integer(results[0] as i64))
+        CmdResult::Ok(integer(i64::from(results[0])))
     }
 }
 
@@ -144,10 +139,10 @@ fn exists_or_mexists(ctx: &mut OpContext, multi: bool) -> CmdResult {
             let results: Vec<bool> = items.iter().map(|it| sbf.exists(it)).collect();
             if multi {
                 CmdResult::Ok(RespValue::Array(
-                    results.into_iter().map(|b| integer(b as i64)).collect(),
+                    results.into_iter().map(|b| integer(i64::from(b))).collect(),
                 ))
             } else {
-                CmdResult::Ok(integer(results[0] as i64))
+                CmdResult::Ok(integer(i64::from(results[0])))
             }
         }
         Some(_) | None => CmdResult::Ok(zeros()),
@@ -255,13 +250,10 @@ fn exec_bf_loadchunk(ctx: &mut OpContext) -> CmdResult {
 
     if cursor == 1 {
         // Init phase: overwrite the key (of any type) with the parsed SBF.
-        let sbf = match load_sbf_header(blob) {
-            Ok(s) => s,
-            Err(_) => {
-                return CmdResult::Err(RespError::new("ERR INVALIDOBJ invalid bloom dump payload"))
-            }
+        let Ok(sbf) = load_sbf_header(blob) else {
+            return CmdResult::Err(RespError::new("ERR INVALIDOBJ invalid bloom dump payload"));
         };
-        ctx.db.insert(CompactString::from_bytes(key), PrimeValue::Sbf(sbf));
+        ctx.db.insert(key, PrimeValue::Sbf(sbf));
         ctx.db.clear_expiry(key);
         return CmdResult::Ok(ok());
     }
@@ -350,6 +342,7 @@ pub static CMD_BF_LOADCHUNK: Command = Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::compact::CompactString;
     use crate::core::db::DbSlice;
 
     fn dispatch(db: &mut DbSlice, argv: &[Vec<u8>]) -> CmdResult {
@@ -365,7 +358,13 @@ mod tests {
                 b"BF.LOADCHUNK" => (exec_bf_loadchunk, 1, vec![1]),
                 _ => panic!("unhandled command {:?}", argv[0]),
             };
-        let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx, now_ms: 0 };
+        let mut ctx = OpContext {
+            db,
+            args: argv,
+            owned_keys: &owned,
+            first_key_idx,
+            now_ms: 0,
+        };
         exec(&mut ctx)
     }
 
@@ -376,10 +375,7 @@ mod tests {
     }
 
     fn set(db: &mut DbSlice, key: &str, value: &str) {
-        db.insert(
-            CompactString::from_bytes(key.as_bytes()),
-            PrimeValue::Str(CompactString::from(value)),
-        );
+        db.insert(key.as_bytes(), PrimeValue::Str(CompactString::from(value)));
     }
 
     fn int(r: CmdResult) -> i64 {
@@ -424,7 +420,12 @@ mod tests {
     }
 
     fn scandump_raw(db: &mut DbSlice, key: &str, cursor: i64) -> (i64, Vec<u8>) {
-        let r = run!(db, b"BF.SCANDUMP", key.as_bytes(), cursor.to_string().as_bytes());
+        let r = run!(
+            db,
+            b"BF.SCANDUMP",
+            key.as_bytes(),
+            cursor.to_string().as_bytes()
+        );
         match r.into_resp_value() {
             RespValue::Array(v) => {
                 let c = match &v[0] {
@@ -444,7 +445,7 @@ mod tests {
     /// Single-shard fast path of COPY (both keys on this shard).
     fn copy_key(db: &mut DbSlice, src: &str, dst: &str) {
         let val = db.find(src.as_bytes(), 0).expect("source exists").clone();
-        db.insert(CompactString::from_bytes(dst.as_bytes()), val);
+        db.insert(dst.as_bytes(), val);
     }
 
     #[test]
@@ -467,19 +468,34 @@ mod tests {
     #[test]
     fn multiple() {
         let mut db = DbSlice::new(0);
-        assert_eq!(vec![0, 0, 0], ints(run!(&mut db, b"BF.MEXISTS", b"bf1", b"a", b"b", b"c")));
+        assert_eq!(
+            vec![0, 0, 0],
+            ints(run!(&mut db, b"BF.MEXISTS", b"bf1", b"a", b"b", b"c"))
+        );
 
         set(&mut db, "str", "foo");
-        assert_eq!(vec![0, 0, 0], ints(run!(&mut db, b"BF.MEXISTS", b"str", b"a", b"b", b"c")));
+        assert_eq!(
+            vec![0, 0, 0],
+            ints(run!(&mut db, b"BF.MEXISTS", b"str", b"a", b"b", b"c"))
+        );
 
         assert!(
             err(run!(&mut db, b"BF.MADD", b"str", b"a")).contains("WRONGTYPE"),
             "madd on string key"
         );
 
-        assert_eq!(vec![1, 1, 1], ints(run!(&mut db, b"BF.MADD", b"bf1", b"a", b"b", b"c")));
-        assert_eq!(vec![0, 0, 0], ints(run!(&mut db, b"BF.MADD", b"bf1", b"a", b"b", b"c")));
-        assert_eq!(vec![1, 1, 1], ints(run!(&mut db, b"BF.MEXISTS", b"bf1", b"a", b"b", b"c")));
+        assert_eq!(
+            vec![1, 1, 1],
+            ints(run!(&mut db, b"BF.MADD", b"bf1", b"a", b"b", b"c"))
+        );
+        assert_eq!(
+            vec![0, 0, 0],
+            ints(run!(&mut db, b"BF.MADD", b"bf1", b"a", b"b", b"c"))
+        );
+        assert_eq!(
+            vec![1, 1, 1],
+            ints(run!(&mut db, b"BF.MEXISTS", b"bf1", b"a", b"b", b"c"))
+        );
     }
 
     #[test]
@@ -544,7 +560,15 @@ mod tests {
         }
 
         for i in 0..TOTAL_ITEMS {
-            assert_eq!(1, int(run!(&mut db, b"BF.EXISTS", b"b2", format!("item{i}").as_bytes())));
+            assert_eq!(
+                1,
+                int(run!(
+                    &mut db,
+                    b"BF.EXISTS",
+                    b"b2",
+                    format!("item{i}").as_bytes()
+                ))
+            );
         }
     }
 
@@ -554,7 +578,7 @@ mod tests {
         ok_res(run!(&mut db, b"BF.RESERVE", b"b1", b"0.01", b"100"));
         run!(&mut db, b"BF.ADD", b"b1", b"x");
 
-        let (cursor, data) = scandump_raw(&mut db, "b1", 999999);
+        let (cursor, data) = scandump_raw(&mut db, "b1", 999_999);
         assert_eq!(cursor, 0);
         assert!(data.is_empty());
     }
@@ -604,9 +628,7 @@ mod tests {
         }
         assert_eq!(10, int(run!(&mut db, b"BF.INFO", b"b1", b"items")));
         assert_eq!(1, int(run!(&mut db, b"BF.INFO", b"b1", b"filters")));
-        assert!(
-            err(run!(&mut db, b"BF.INFO", b"b1", b"bogus")).contains("Invalid info arguments")
-        );
+        assert!(err(run!(&mut db, b"BF.INFO", b"b1", b"bogus")).contains("Invalid info arguments"));
 
         set(&mut db, "str", "foo");
         assert!(
@@ -628,7 +650,15 @@ mod tests {
         assert_eq!(type_of(&mut db, "b2"), "MBbloom--");
 
         for i in 0..TOTAL_ITEMS {
-            assert_eq!(1, int(run!(&mut db, b"BF.EXISTS", b"b2", format!("item{i}").as_bytes())));
+            assert_eq!(
+                1,
+                int(run!(
+                    &mut db,
+                    b"BF.EXISTS",
+                    b"b2",
+                    format!("item{i}").as_bytes()
+                ))
+            );
         }
     }
 

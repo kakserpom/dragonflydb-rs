@@ -1,10 +1,13 @@
 use hashbrown::{HashMap, HashSet};
 
 use crate::commands::exec::keys::glob_match;
-use crate::commands::{bulk, integer, Command, OpContext, ShardPart, KeyRange, FLAG_BLOCKING, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_NOSCRIPT, FLAG_READONLY, FLAG_WRITE};
+use crate::commands::{
+    Command, FLAG_BLOCKING, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_NOSCRIPT, FLAG_READONLY,
+    FLAG_WRITE, KeyRange, OpContext, ShardPart, bulk, integer,
+};
+use crate::core::PrimeValue;
 use crate::core::compact::CompactString;
 use crate::core::zset::ZSet;
-use crate::core::PrimeValue;
 use crate::error::{CmdResult, RespError, RespValue};
 use crate::util::{
     format_double, itoa, parse_double, parse_i64, parse_list_timeout, parse_u64, redis_range,
@@ -21,7 +24,7 @@ fn zset_mut<'a>(ctx: &'a mut OpContext, key: &[u8]) -> Result<&'a mut ZSet, Resp
 
 fn ensure_zset<'a>(ctx: &'a mut OpContext, key: &[u8]) -> Result<&'a mut ZSet, RespError> {
     if ctx.db.find(key, ctx.now_ms).is_none() {
-        ctx.db.insert(CompactString::from_bytes(key), PrimeValue::ZSet(ZSet::new()));
+        ctx.db.insert(key, PrimeValue::ZSet(ZSet::new()));
     }
     zset_mut(ctx, key)
 }
@@ -35,7 +38,12 @@ fn build_range_output(items: Vec<(CompactString, f64)>, with_scores: bool) -> Re
         }
         RespValue::Array(out)
     } else {
-        RespValue::Array(items.into_iter().map(|(m, _)| RespValue::Bulk(m.as_bytes().to_vec())).collect())
+        RespValue::Array(
+            items
+                .into_iter()
+                .map(|(m, _)| RespValue::Bulk(m.as_bytes().to_vec()))
+                .collect(),
+        )
     }
 }
 
@@ -55,37 +63,51 @@ fn exec_zadd(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
     let mut i = key_idx + 1;
-    let (mut nx, mut xx, mut gt, mut lt, mut ch, mut incr) = (false, false, false, false, false, false);
+    let (mut nx, mut xx, mut gt, mut lt, mut ch, mut incr) =
+        (false, false, false, false, false, false);
     loop {
         if i >= ctx.args.len() {
             return CmdResult::Err(RespError::syntax());
         }
         match ctx.args[i].to_ascii_uppercase().as_slice() {
-            b"NX" => { nx = true; }
-            b"XX" => { xx = true; }
-            b"GT" => { gt = true; }
-            b"LT" => { lt = true; }
-            b"CH" => { ch = true; }
-            b"INCR" => { incr = true; }
+            b"NX" => {
+                nx = true;
+            }
+            b"XX" => {
+                xx = true;
+            }
+            b"GT" => {
+                gt = true;
+            }
+            b"LT" => {
+                lt = true;
+            }
+            b"CH" => {
+                ch = true;
+            }
+            b"INCR" => {
+                incr = true;
+            }
             _ => break,
         }
         i += 1;
     }
     let pairs = &ctx.args[i..];
-    if pairs.is_empty() || pairs.len() % 2 != 0 {
+    if pairs.is_empty() || !pairs.len().is_multiple_of(2) {
         return CmdResult::Err(RespError::syntax());
     }
     if incr && pairs.len() != 2 {
-        return CmdResult::Err(RespError::new("ERR INCR option supports a single increment-element pair"));
+        return CmdResult::Err(RespError::new(
+            "ERR INCR option supports a single increment-element pair",
+        ));
     }
     if nx && (gt || lt) {
         return CmdResult::Err(RespError::syntax());
     }
     let mut parsed: Vec<(f64, CompactString)> = Vec::with_capacity(pairs.len() / 2);
     for p in pairs.chunks(2) {
-        let score = match parse_double(&p[0]) {
-            Some(v) => v,
-            None => return CmdResult::Err(err_float()),
+        let Some(score) = parse_double(&p[0]) else {
+            return CmdResult::Err(err_float());
         };
         if score.is_nan() {
             return CmdResult::Err(err_nan());
@@ -102,7 +124,7 @@ fn exec_zadd(ctx: &mut OpContext) -> CmdResult {
     for (score, member) in parsed {
         let existing = z.score(member.as_bytes());
         let should_update = match existing {
-            Some(old) => !nx && !(gt && score <= old) && !(lt && score >= old),
+            Some(old) => !nx && (!gt || score > old) && (!lt || score < old),
             None => !xx,
         };
         if !should_update {
@@ -152,7 +174,10 @@ fn exec_zadd(ctx: &mut OpContext) -> CmdResult {
 fn exec_zrem(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let members: Vec<CompactString> = ctx.args[key_idx + 1..].iter().map(|m| CompactString::from_bytes(m)).collect();
+    let members: Vec<CompactString> = ctx.args[key_idx + 1..]
+        .iter()
+        .map(|m| CompactString::from_bytes(m))
+        .collect();
     let z = match zset_mut(ctx, key) {
         Ok(z) => z,
         Err(e) => {
@@ -203,7 +228,10 @@ fn exec_zmscore(ctx: &mut OpContext) -> CmdResult {
             CmdResult::Ok(RespValue::Array(out))
         }
         Some(_) => CmdResult::Err(RespError::wrong_type()),
-        None => CmdResult::Ok(RespValue::Array(vec![RespValue::Nil; ctx.args.len() - key_idx - 1])),
+        None => CmdResult::Ok(RespValue::Array(vec![
+            RespValue::Nil;
+            ctx.args.len() - key_idx - 1
+        ])),
     }
 }
 
@@ -219,9 +247,8 @@ fn exec_zcard(ctx: &mut OpContext) -> CmdResult {
 fn exec_zincrby(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let incr = match parse_double(&ctx.args[key_idx + 1]) {
-        Some(v) => v,
-        None => return CmdResult::Err(err_float()),
+    let Some(incr) = parse_double(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(err_float());
     };
     let member = CompactString::from_bytes(&ctx.args[key_idx + 2]);
     let z = match ensure_zset(ctx, key) {
@@ -249,14 +276,21 @@ fn rank_common(ctx: &mut OpContext, rev: bool) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
     let member = &ctx.args[key_idx + 1];
-    let with_score = ctx.args.len() > key_idx + 2
-        && ctx.args[key_idx + 2].eq_ignore_ascii_case(b"WITHSCORE");
+    let with_score =
+        ctx.args.len() > key_idx + 2 && ctx.args[key_idx + 2].eq_ignore_ascii_case(b"WITHSCORE");
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::ZSet(z)) => match z.score(member) {
             Some(s) => {
-                let rank = if rev { z.len() as i64 - 1 - z.rank(member).unwrap() } else { z.rank(member).unwrap() };
+                let rank = if rev {
+                    z.len() as i64 - 1 - z.rank(member).unwrap()
+                } else {
+                    z.rank(member).unwrap()
+                };
                 if with_score {
-                    CmdResult::Ok(RespValue::Array(vec![integer(rank), bulk(format_double(s).into_bytes())]))
+                    CmdResult::Ok(RespValue::Array(vec![
+                        integer(rank),
+                        bulk(format_double(s).into_bytes()),
+                    ]))
                 } else {
                     CmdResult::Ok(integer(rank))
                 }
@@ -295,7 +329,11 @@ struct RangeOpts {
 /// handlers (ZRANGEBYSCORE/ZREVRANGEBYSCORE/ZRANGEBYLEX/ZREVRANGEBYLEX); a BY*
 /// option that flips it is rejected with the reference error. The unified ZRANGE
 /// passes `None` and only enforces the BYSCORE/BYLEX mutual exclusion.
-fn parse_range_opts(args: &[Vec<u8>], start: usize, fixed: Option<RangeType>) -> Result<RangeOpts, RespError> {
+fn parse_range_opts(
+    args: &[Vec<u8>],
+    start: usize,
+    fixed: Option<RangeType>,
+) -> Result<RangeOpts, RespError> {
     let mut o = RangeOpts::default();
     let mut i = start;
     while i < args.len() {
@@ -315,7 +353,10 @@ fn parse_range_opts(args: &[Vec<u8>], start: usize, fixed: Option<RangeType>) ->
                 }
                 // A negative count acts as an unlimited cap (UINT32_MAX upstream).
                 o.limit = if off >= 0 {
-                    Some((off as usize, if cnt < 0 { usize::MAX } else { cnt as usize }))
+                    Some((
+                        off as usize,
+                        if cnt < 0 { usize::MAX } else { cnt as usize },
+                    ))
                 } else {
                     None
                 };
@@ -326,7 +367,9 @@ fn parse_range_opts(args: &[Vec<u8>], start: usize, fixed: Option<RangeType>) ->
         i += 1;
     }
     if o.byscore && o.bylex {
-        return Err(RespError::new("ERR BYSCORE and BYLEX options are not compatible"));
+        return Err(RespError::new(
+            "ERR BYSCORE and BYLEX options are not compatible",
+        ));
     }
     if let Some(f) = fixed {
         let flipped = match f {
@@ -335,7 +378,9 @@ fn parse_range_opts(args: &[Vec<u8>], start: usize, fixed: Option<RangeType>) ->
             RangeType::Index => false,
         };
         if flipped {
-            return Err(RespError::new("ERR BYSCORE and BYLEX options are not compatible"));
+            return Err(RespError::new(
+                "ERR BYSCORE and BYLEX options are not compatible",
+            ));
         }
     }
     Ok(o)
@@ -373,7 +418,11 @@ fn score_in_range(score: f64, bound: f64, exclusive: bool, is_lower: bool) -> bo
 /// `key min max [BYSCORE|BYLEX] [REV] [LIMIT offset count]` argument layout,
 /// where `key_idx` is the index of the key argument. A missing key yields an
 /// empty range; a wrong-type key is an error.
-fn zrange_items_with(ctx: &mut OpContext, key_idx: usize, opts: &RangeOpts) -> Result<Vec<(CompactString, f64)>, RespError> {
+fn zrange_items_with(
+    ctx: &mut OpContext,
+    key_idx: usize,
+    opts: &RangeOpts,
+) -> Result<Vec<(CompactString, f64)>, RespError> {
     if opts.empty_offset {
         return Ok(vec![]);
     }
@@ -384,22 +433,33 @@ fn zrange_items_with(ctx: &mut OpContext, key_idx: usize, opts: &RangeOpts) -> R
                 let min = parse_score_bound(&ctx.args[key_idx + 1])?;
                 let max = parse_score_bound(&ctx.args[key_idx + 2])?;
                 let (lo, hi) = if opts.rev { (max, min) } else { (min, max) };
-                z.range_by_score_filtered(|score| {
-                    score_in_range(score, lo.0, lo.1, true) && score_in_range(score, hi.0, hi.1, false)
-                }, opts.rev, opts.limit)
+                z.range_by_score_filtered(
+                    |score| {
+                        score_in_range(score, lo.0, lo.1, true)
+                            && score_in_range(score, hi.0, hi.1, false)
+                    },
+                    opts.rev,
+                    opts.limit,
+                )
             } else if opts.bylex {
-                let (lo, lo_incl, hi, hi_incl) = parse_lex_range(&ctx.args[key_idx + 1], &ctx.args[key_idx + 2])?;
-                z.range_by_member_filtered(|m| {
-                    lex_ge(m.as_bytes(), &lo, lo_incl) && lex_le(m.as_bytes(), &hi, hi_incl)
-                }, opts.rev, opts.limit)
+                let (lo, lo_incl, hi, hi_incl) =
+                    parse_lex_range(&ctx.args[key_idx + 1], &ctx.args[key_idx + 2])?;
+                z.range_by_member_filtered(
+                    |m| lex_ge(m.as_bytes(), &lo, lo_incl) && lex_le(m.as_bytes(), &hi, hi_incl),
+                    opts.rev,
+                    opts.limit,
+                )
             } else {
                 let start = parse_i64(&ctx.args[key_idx + 1]).ok_or_else(RespError::integer)?;
                 let stop = parse_i64(&ctx.args[key_idx + 2]).ok_or_else(RespError::integer)?;
-                let (s, c) = match redis_range(start, stop, z.len() as i64) {
-                    Some(x) => x,
-                    None => return Ok(vec![]),
+                let Some((s, c)) = redis_range(start, stop, z.len() as i64) else {
+                    return Ok(vec![]);
                 };
-                let mut items = if opts.rev { z.rev_range(s, s + c as i64 - 1) } else { z.range(s, s + c as i64 - 1, opts.withscores) };
+                let mut items = if opts.rev {
+                    z.rev_range(s, s + c - 1)
+                } else {
+                    z.range(s, s + c - 1, opts.withscores)
+                };
                 if let Some((off, cnt)) = opts.limit {
                     items = if off < items.len() {
                         items.into_iter().skip(off).take(cnt).collect()
@@ -416,7 +476,10 @@ fn zrange_items_with(ctx: &mut OpContext, key_idx: usize, opts: &RangeOpts) -> R
     }
 }
 
-fn zrange_items(ctx: &mut OpContext, key_idx: usize) -> Result<Vec<(CompactString, f64)>, RespError> {
+fn zrange_items(
+    ctx: &mut OpContext,
+    key_idx: usize,
+) -> Result<Vec<(CompactString, f64)>, RespError> {
     let opts = parse_range_opts(ctx.args, key_idx + 3, None)?;
     zrange_items_with(ctx, key_idx, &opts)
 }
@@ -480,10 +543,7 @@ fn exec_zrangestore(ctx: &mut OpContext) -> CmdResult {
         }
         let count = zs.len() as i64;
         if ctx.owned_keys.contains(&dest_idx) {
-            ctx.db.insert(
-                CompactString::from_bytes(&ctx.args[dest_idx]),
-                PrimeValue::ZSet(zs),
-            );
+            ctx.db.insert(&ctx.args[dest_idx], PrimeValue::ZSet(zs));
             CmdResult::Ok(integer(count))
         } else {
             CmdResult::deferred_store(
@@ -495,7 +555,12 @@ fn exec_zrangestore(ctx: &mut OpContext) -> CmdResult {
     }
 }
 
-fn merge_zrangestore(parts: &[ShardPart], _args: &[Vec<u8>], keys: &[usize], _now_ms: u64) -> CmdResult {
+fn merge_zrangestore(
+    parts: &[ShardPart],
+    _args: &[Vec<u8>],
+    keys: &[usize],
+    _now_ms: u64,
+) -> CmdResult {
     for p in parts {
         if let CmdResult::Err(e) = &p.result {
             return CmdResult::Err(e.clone());
@@ -512,7 +577,12 @@ fn merge_zrangestore(parts: &[ShardPart], _args: &[Vec<u8>], keys: &[usize], _no
 // ---------------------------------------------------------------------------
 
 fn member_array(members: HashSet<CompactString>) -> RespValue {
-    RespValue::Array(members.into_iter().map(|m| RespValue::Bulk(m.as_bytes().to_vec())).collect())
+    RespValue::Array(
+        members
+            .into_iter()
+            .map(|m| RespValue::Bulk(m.as_bytes().to_vec()))
+            .collect(),
+    )
 }
 
 fn parts_to_members(p: &ShardPart) -> Result<HashSet<CompactString>, RespError> {
@@ -548,7 +618,9 @@ fn exec_zintercard(ctx: &mut OpContext) -> CmdResult {
         _ => return CmdResult::Err(RespError::integer()),
     };
     if numkeys == 0 {
-        return CmdResult::Err(RespError::new("ERR at least 1 input key is needed for this command"));
+        return CmdResult::Err(RespError::new(
+            "ERR at least 1 input key is needed for this command",
+        ));
     }
     let key_end = 2usize.saturating_add(numkeys);
     if ctx.args.len() < key_end {
@@ -561,7 +633,9 @@ fn exec_zintercard(ctx: &mut OpContext) -> CmdResult {
         }
         match parse_i64(&ctx.args[key_end + 1]) {
             Some(v) if v >= 0 => limit = v,
-            _ => return CmdResult::Err(RespError::new("ERR limit value is not a positive integer")),
+            _ => {
+                return CmdResult::Err(RespError::new("ERR limit value is not a positive integer"));
+            }
         }
     }
 
@@ -583,12 +657,20 @@ fn exec_zintercard(ctx: &mut OpContext) -> CmdResult {
             None => acc = Some(members),
             Some(a) => a.retain(|m| members.contains(m)),
         }
-        if acc.as_ref().is_some_and(|a| a.is_empty()) {
+        if acc.as_ref().is_some_and(hashbrown::HashSet::is_empty) {
             break;
         }
     }
-    let members = if any_missing { HashSet::new() } else { acc.unwrap_or_default() };
-    let count = if limit > 0 { (members.len() as i64).min(limit) } else { members.len() as i64 };
+    let members = if any_missing {
+        HashSet::new()
+    } else {
+        acc.unwrap_or_default()
+    };
+    let count = if limit > 0 {
+        (members.len() as i64).min(limit)
+    } else {
+        members.len() as i64
+    };
 
     if ctx.owned_keys.len() == numkeys {
         // Single shard holds every input key: reply with the final count.
@@ -597,7 +679,12 @@ fn exec_zintercard(ctx: &mut OpContext) -> CmdResult {
     CmdResult::Ok(member_array(members))
 }
 
-fn merge_zintercard(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64) -> CmdResult {
+fn merge_zintercard(
+    parts: &[ShardPart],
+    args: &[Vec<u8>],
+    _keys: &[usize],
+    _now: u64,
+) -> CmdResult {
     for p in parts {
         if let CmdResult::Err(e) = &p.result {
             return CmdResult::Err(e.clone());
@@ -610,7 +697,10 @@ fn merge_zintercard(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now
     let key_end = 2usize.saturating_add(numkeys);
     let mut limit: i64 = 0;
     if args.len() > key_end && args[key_end].eq_ignore_ascii_case(b"LIMIT") {
-        limit = args.get(key_end + 1).and_then(|a| parse_i64(a)).unwrap_or(0);
+        limit = args
+            .get(key_end + 1)
+            .and_then(|a| parse_i64(a))
+            .unwrap_or(0);
     }
     let mut acc: Option<HashSet<CompactString>> = None;
     for p in parts {
@@ -626,7 +716,7 @@ fn merge_zintercard(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now
             Some(a) => a.retain(|m| members.contains(m)),
         }
     }
-    let n = acc.map(|a| a.len()).unwrap_or(0) as i64;
+    let n = acc.map_or(0, |a| a.len()) as i64;
     CmdResult::Ok(integer(if limit > 0 { n.min(limit) } else { n }))
 }
 
@@ -649,11 +739,7 @@ fn agg(v1: f64, v2: f64, atype: AggType) -> f64 {
     match atype {
         AggType::Sum => {
             let v = v1 + v2;
-            if v.is_nan() {
-                0.0
-            } else {
-                v
-            }
+            if v.is_nan() { 0.0 } else { v }
         }
         AggType::Min => v1.min(v2),
         AggType::Max => v1.max(v2),
@@ -729,17 +815,23 @@ fn parse_setop_args(
 /// A key as a scored map: a zset uses its own scores multiplied by `weight`
 /// (NaN becomes 0), a set contributes every member with score `weight`.
 /// Mirrors `FromObject`/`ScoreMapFromSet`. `None` for a missing key.
-fn weighted_map_of(ctx: &mut OpContext, key: &[u8], weight: f64) -> Result<Option<ScoredMap>, RespError> {
+fn weighted_map_of(
+    ctx: &mut OpContext,
+    key: &[u8],
+    weight: f64,
+) -> Result<Option<ScoredMap>, RespError> {
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::ZSet(z)) => {
             let mut map = HashMap::with_capacity(z.len());
-            for (m, s) in z.iter() {
+            for (m, s) in z {
                 let score = s * weight;
                 map.insert(m.clone(), if score.is_nan() { 0.0 } else { score });
             }
             Ok(Some(map))
         }
-        Some(PrimeValue::Set(s)) => Ok(Some(s.members().into_iter().map(|m| (m, weight)).collect())),
+        Some(PrimeValue::Set(s)) => {
+            Ok(Some(s.members().into_iter().map(|m| (m, weight)).collect()))
+        }
         Some(_) => Err(RespError::wrong_type()),
         None => Ok(None),
     }
@@ -786,12 +878,9 @@ fn union_inter(
             continue;
         }
         let w = weights[ki - (numkeys_idx + 1)];
-        let map = match weighted_map_of(ctx, &ctx.args[ki], w)? {
-            Some(m) => m,
-            None => {
-                any_missing = true;
-                continue;
-            }
+        let Some(map) = weighted_map_of(ctx, &ctx.args[ki], w)? else {
+            any_missing = true;
+            continue;
         };
         match &mut acc {
             None => acc = Some(map),
@@ -803,7 +892,7 @@ fn union_inter(
                 }
             }
         }
-        if is_inter && acc.as_ref().is_some_and(|a| a.is_empty()) {
+        if is_inter && acc.as_ref().is_some_and(hashbrown::HashMap::is_empty) {
             break;
         }
     }
@@ -820,7 +909,12 @@ fn exec_union_inter(ctx: &mut OpContext, is_inter: bool, store: bool, cmd: &str)
     };
     let numkeys_idx = if store { 2 } else { 1 };
     let key_end = numkeys_idx + 1 + numkeys;
-    if store && !ctx.owned_keys.iter().any(|&ki| ki > numkeys_idx && ki < key_end) {
+    if store
+        && !ctx
+            .owned_keys
+            .iter()
+            .any(|&ki| ki > numkeys_idx && ki < key_end)
+    {
         // Shard holding only the destination key contributes nothing.
         return CmdResult::Ok(RespValue::Nil);
     }
@@ -902,7 +996,7 @@ fn write_zset_or_delete(ctx: &mut OpContext, dest: &[u8], map: ScoredMap) {
     match zset_value(map) {
         Some(v) => {
             ctx.db.clear_expiry(dest);
-            ctx.db.insert(CompactString::from_bytes(dest), v);
+            ctx.db.insert(dest, v);
         }
         None => {
             ctx.db.remove(dest);
@@ -916,9 +1010,8 @@ fn parts_to_scored(p: &ShardPart) -> Result<Option<ScoredMap>, RespError> {
         CmdResult::Ok(RespValue::Array(arr)) => {
             let mut map = ScoredMap::with_capacity(arr.len() / 2);
             for chunk in arr.chunks_exact(2) {
-                let (m, s) = match chunk {
-                    [RespValue::Bulk(m), RespValue::Bulk(s)] => (m, s),
-                    _ => continue,
+                let [RespValue::Bulk(m), RespValue::Bulk(s)] = chunk else {
+                    continue;
                 };
                 if let Some(score) = parse_double(s) {
                     map.insert(CompactString::from_bytes(m), score);
@@ -963,7 +1056,7 @@ fn merge_zinter(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u6
                     None => acc = Some(map),
                     Some(a) => intersect_scored_map(a, &map, atype),
                 }
-                if acc.as_ref().is_some_and(|a| a.is_empty()) {
+                if acc.as_ref().is_some_and(hashbrown::HashMap::is_empty) {
                     break;
                 }
             }
@@ -974,7 +1067,12 @@ fn merge_zinter(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u6
     CmdResult::Ok(scored_reply(acc.unwrap_or_default(), with_scores))
 }
 
-fn merge_zunionstore(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u64) -> CmdResult {
+fn merge_zunionstore(
+    parts: &[ShardPart],
+    args: &[Vec<u8>],
+    keys: &[usize],
+    _now: u64,
+) -> CmdResult {
     let (_, _, atype, _) = match parse_setop_args(args, true, "zunionstore") {
         Ok(v) => v,
         Err(e) => return CmdResult::Err(e),
@@ -992,7 +1090,12 @@ fn merge_zunionstore(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now
     CmdResult::deferred_store(dest.clone(), zset_value(acc), integer(count))
 }
 
-fn merge_zinterstore(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u64) -> CmdResult {
+fn merge_zinterstore(
+    parts: &[ShardPart],
+    args: &[Vec<u8>],
+    keys: &[usize],
+    _now: u64,
+) -> CmdResult {
     let (_, _, atype, _) = match parse_setop_args(args, true, "zinterstore") {
         Ok(v) => v,
         Err(e) => return CmdResult::Err(e),
@@ -1009,7 +1112,7 @@ fn merge_zinterstore(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now
                     None => acc = Some(map),
                     Some(a) => intersect_scored_map(a, &map, atype),
                 }
-                if acc.as_ref().is_some_and(|a| a.is_empty()) {
+                if acc.as_ref().is_some_and(hashbrown::HashMap::is_empty) {
                     break;
                 }
             }
@@ -1036,14 +1139,17 @@ fn parse_diff_args(args: &[Vec<u8>], store: bool) -> Result<(usize, bool), RespE
         _ => return Err(RespError::integer()),
     };
     if numkeys == 0 {
-        return Err(RespError::new("ERR at least 1 input key is needed for zdiff"));
+        return Err(RespError::new(
+            "ERR at least 1 input key is needed for zdiff",
+        ));
     }
     let key_end = key_start.saturating_add(numkeys);
     if args.len() < key_end {
         return Err(RespError::syntax());
     }
     if args.len() > key_end {
-        if store || args.len() != key_end + 1 || !args[key_end].eq_ignore_ascii_case(b"WITHSCORES") {
+        if store || args.len() != key_end + 1 || !args[key_end].eq_ignore_ascii_case(b"WITHSCORES")
+        {
             return Err(RespError::syntax());
         }
         return Ok((numkeys, true));
@@ -1071,7 +1177,7 @@ fn diff_local(
         }
         match ctx.db.find(&ctx.args[ki], ctx.now_ms) {
             Some(PrimeValue::ZSet(z)) => {
-                for (m, _) in z.iter() {
+                for (m, _) in z {
                     base.remove(&m);
                 }
             }
@@ -1089,7 +1195,12 @@ fn exec_zdiff(ctx: &mut OpContext, store: bool) -> CmdResult {
     };
     let key_start: usize = if store { 3 } else { 2 };
     let key_end = key_start.saturating_add(numkeys);
-    if store && !ctx.owned_keys.iter().any(|&ki| ki >= key_start && ki < key_end) {
+    if store
+        && !ctx
+            .owned_keys
+            .iter()
+            .any(|&ki| ki >= key_start && ki < key_end)
+    {
         // Shard holding only the destination key contributes nothing.
         return CmdResult::Ok(RespValue::Nil);
     }
@@ -1119,7 +1230,9 @@ fn exec_zdiff(ctx: &mut OpContext, store: bool) -> CmdResult {
             continue;
         }
         let map = match ctx.db.find(&ctx.args[ki], ctx.now_ms) {
-            Some(PrimeValue::ZSet(z)) => z.iter().map(|(m, s)| (m.clone(), s)).collect::<ScoredMap>(),
+            Some(PrimeValue::ZSet(z)) => {
+                z.iter().map(|(m, s)| (m.clone(), s)).collect::<ScoredMap>()
+            }
             Some(_) => return CmdResult::Err(RespError::wrong_type()),
             None => ScoredMap::new(),
         };
@@ -1147,9 +1260,8 @@ fn parts_to_maps(p: &ShardPart) -> Result<Option<Vec<ScoredMap>>, RespError> {
                 if let RespValue::Array(inner) = v {
                     let mut map = ScoredMap::new();
                     for chunk in inner.chunks_exact(2) {
-                        let (m, s) = match chunk {
-                            [RespValue::Bulk(m), RespValue::Bulk(s)] => (m, s),
-                            _ => continue,
+                        let [RespValue::Bulk(m), RespValue::Bulk(s)] = chunk else {
+                            continue;
                         };
                         if let Some(score) = parse_double(s) {
                             map.insert(CompactString::from_bytes(m), score);
@@ -1167,10 +1279,7 @@ fn parts_to_maps(p: &ShardPart) -> Result<Option<Vec<ScoredMap>>, RespError> {
 
 /// The base shard's first map is the base; the base shard's remaining maps and
 /// every other shard's maps remove members from it (mirrors `ZDiffOp`).
-fn diff_from_parts(
-    parts: &[ShardPart],
-    base_idx: usize,
-) -> Result<Option<ScoredMap>, RespError> {
+fn diff_from_parts(parts: &[ShardPart], base_idx: usize) -> Result<Option<ScoredMap>, RespError> {
     let mut base: Option<ScoredMap> = None;
     let mut others: Vec<ScoredMap> = Vec::new();
     for p in parts {
@@ -1189,9 +1298,8 @@ fn diff_from_parts(
             Err(e) => return Err(e),
         }
     }
-    let mut base = match base {
-        Some(b) => b,
-        None => return Ok(None),
+    let Some(mut base) = base else {
+        return Ok(None);
     };
     for map in others {
         for m in map.keys() {
@@ -1217,14 +1325,16 @@ fn merge_zdiffstore(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now:
     match parse_diff_args(args, true) {
         Ok(_) => {}
         Err(e) => return CmdResult::Err(e),
-    };
+    }
     let dest = &args[keys[0]];
     match diff_from_parts(parts, keys[1]) {
         Ok(Some(base)) => {
             let count = base.len() as i64;
             CmdResult::deferred_store(dest.clone(), zset_value(base), integer(count))
         }
-        Ok(None) => CmdResult::Err(RespError::new("ERR internal: ZDIFFSTORE base shard missing")),
+        Ok(None) => CmdResult::Err(RespError::new(
+            "ERR internal: ZDIFFSTORE base shard missing",
+        )),
         Err(e) => CmdResult::Err(e),
     }
 }
@@ -1281,7 +1391,10 @@ fn zrange_by_score_common(ctx: &mut OpContext, rev: bool) -> CmdResult {
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::ZSet(z)) => {
             let items = z.range_by_score_filtered(
-                |score| score_in_range(score, lo.0, lo.1, true) && score_in_range(score, hi.0, hi.1, false),
+                |score| {
+                    score_in_range(score, lo.0, lo.1, true)
+                        && score_in_range(score, hi.0, hi.1, false)
+                },
                 opts.rev || rev,
                 opts.limit,
             );
@@ -1305,8 +1418,12 @@ fn exec_zcount(ctx: &mut OpContext) -> CmdResult {
     };
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::ZSet(z)) => {
-            let count = z.iter()
-                .filter(|(_, s)| score_in_range(*s, min.0, min.1, true) && score_in_range(*s, max.0, max.1, false))
+            let count = z
+                .iter()
+                .filter(|(_, s)| {
+                    score_in_range(*s, min.0, min.1, true)
+                        && score_in_range(*s, max.0, max.1, false)
+                })
                 .count();
             CmdResult::Ok(integer(count as i64))
         }
@@ -1318,13 +1435,11 @@ fn exec_zcount(ctx: &mut OpContext) -> CmdResult {
 fn exec_zremrangebyrank(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let start = match parse_i64(&ctx.args[key_idx + 1]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(start) = parse_i64(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::integer());
     };
-    let stop = match parse_i64(&ctx.args[key_idx + 2]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(stop) = parse_i64(&ctx.args[key_idx + 2]) else {
+        return CmdResult::Err(RespError::integer());
     };
     let z = match zset_mut(ctx, key) {
         Ok(z) => z,
@@ -1335,11 +1450,14 @@ fn exec_zremrangebyrank(ctx: &mut OpContext) -> CmdResult {
             return CmdResult::Ok(integer(0));
         }
     };
-    let (s, c) = match redis_range(start, stop, z.len() as i64) {
-        Some(x) => x,
-        None => return CmdResult::Ok(integer(0)),
+    let Some((s, c)) = redis_range(start, stop, z.len() as i64) else {
+        return CmdResult::Ok(integer(0));
     };
-    let to_remove: Vec<CompactString> = z.range(s, s + c as i64 - 1, false).into_iter().map(|(m, _)| m).collect();
+    let to_remove: Vec<CompactString> = z
+        .range(s, s + c - 1, false)
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect();
     let mut removed = 0i64;
     for m in to_remove {
         z.delete(&m);
@@ -1373,7 +1491,9 @@ fn exec_zremrangebyscore(ctx: &mut OpContext) -> CmdResult {
     };
     let to_remove: Vec<CompactString> = z
         .iter()
-        .filter(|(_, s)| score_in_range(*s, min.0, min.1, true) && score_in_range(*s, max.0, max.1, false))
+        .filter(|(_, s)| {
+            score_in_range(*s, min.0, min.1, true) && score_in_range(*s, max.0, max.1, false)
+        })
         .map(|(m, _)| m)
         .collect();
     let mut removed = 0i64;
@@ -1392,12 +1512,13 @@ fn exec_zpopminmax(ctx: &mut OpContext, max: bool) -> CmdResult {
     let key = &ctx.args[key_idx];
     let with_count = ctx.args.len() > key_idx + 1;
     let count = if with_count {
-        let c = match parse_i64(&ctx.args[key_idx + 1]) {
-            Some(v) => v,
-            None => return CmdResult::Err(RespError::integer()),
+        let Some(c) = parse_i64(&ctx.args[key_idx + 1]) else {
+            return CmdResult::Err(RespError::integer());
         };
         if c < 0 {
-            return CmdResult::Err(RespError::new("ERR value is out of range, must be positive"));
+            return CmdResult::Err(RespError::new(
+                "ERR value is out of range, must be positive",
+            ));
         }
         c as usize
     } else {
@@ -1461,7 +1582,11 @@ fn parse_zmpop_numkeys(args: &[Vec<u8>], numkeys_idx: usize) -> Result<usize, Re
 
 /// Parse `MIN|MAX [COUNT n]` after the `numkeys` keys. Returns `(is_max, count)`;
 /// errors mirror the `CmdArgParser` in `ZMPopGeneric`.
-fn parse_zmpop_tail(args: &[Vec<u8>], numkeys_idx: usize, numkeys: usize) -> Result<(bool, usize), RespError> {
+fn parse_zmpop_tail(
+    args: &[Vec<u8>],
+    numkeys_idx: usize,
+    numkeys: usize,
+) -> Result<(bool, usize), RespError> {
     let dir_idx = numkeys_idx + 1 + numkeys;
     let Some(dir_arg) = args.get(dir_idx) else {
         return Err(RespError::syntax());
@@ -1482,9 +1607,8 @@ fn parse_zmpop_tail(args: &[Vec<u8>], numkeys_idx: usize, numkeys: usize) -> Res
         let Some(count_arg) = args.get(i + 1) else {
             return Err(RespError::syntax());
         };
-        let c = match parse_i64(count_arg) {
-            Some(v) => v,
-            None => return Err(RespError::integer()),
+        let Some(c) = parse_i64(count_arg) else {
+            return Err(RespError::integer());
         };
         if c < 0 {
             return Err(RespError::integer());
@@ -1500,7 +1624,11 @@ fn parse_zmpop_tail(args: &[Vec<u8>], numkeys_idx: usize, numkeys: usize) -> Res
 
 /// Split `z` into the `count` lowest (`is_max` false) or highest members and the
 /// remainder, without mutating the set. Members are returned in pop order.
-fn peek_pop(z: &ZSet, is_max: bool, count: usize) -> (Vec<(CompactString, f64)>, Vec<(CompactString, f64)>) {
+fn peek_pop(
+    z: &ZSet,
+    is_max: bool,
+    count: usize,
+) -> (Vec<(CompactString, f64)>, Vec<(CompactString, f64)>) {
     let total = z.len();
     let take = count.min(total);
     let mut popped = Vec::with_capacity(take);
@@ -1538,12 +1666,11 @@ fn pop_inplace_first(
         let key = &ctx.args[ki];
         let z = match ctx.db.find_mut(key, ctx.now_ms) {
             Some(PrimeValue::ZSet(z)) if !z.is_empty() => z,
-            Some(PrimeValue::ZSet(_)) => continue,
+            Some(PrimeValue::ZSet(_)) | None => continue,
             Some(_) => match wrong {
                 Wrong::Skip => continue,
                 Wrong::Error => return Err(RespError::wrong_type()),
             },
-            None => continue,
         };
         let mut pairs = Vec::new();
         for _ in 0..count {
@@ -1578,12 +1705,11 @@ fn peek_first(
         let key = &ctx.args[ki];
         let z = match ctx.db.find(key, ctx.now_ms) {
             Some(PrimeValue::ZSet(z)) if !z.is_empty() => z,
-            Some(PrimeValue::ZSet(_)) => continue,
+            Some(PrimeValue::ZSet(_)) | None => continue,
             Some(_) => match wrong {
                 Wrong::Skip => continue,
                 Wrong::Error => return Err(RespError::wrong_type()),
             },
-            None => continue,
         };
         let (popped, remaining) = peek_pop(z, is_max, count);
         let mut pairs = Vec::with_capacity(popped.len() * 2);
@@ -1603,7 +1729,10 @@ fn peek_first(
 
 /// `[key, [[member, score], ...]]` as `SendLabeledScoredArray` produces.
 fn labeled_scored_array(key: &[u8], flat_pairs: &[RespValue]) -> RespValue {
-    let pairs: Vec<RespValue> = flat_pairs.chunks_exact(2).map(|c| RespValue::Array(c.to_vec())).collect();
+    let pairs: Vec<RespValue> = flat_pairs
+        .chunks_exact(2)
+        .map(|c| RespValue::Array(c.to_vec()))
+        .collect();
     RespValue::Array(vec![RespValue::Bulk(key.to_vec()), RespValue::Array(pairs)])
 }
 
@@ -1639,14 +1768,20 @@ fn exec_zmpop(ctx: &mut OpContext, blocking: bool) -> CmdResult {
         Ok(v) => v,
         Err(e) => return CmdResult::Err(e),
     };
-    let none = if blocking { CmdResult::Blocked } else { CmdResult::Ok(RespValue::Nil) };
+    let none = if blocking {
+        CmdResult::Blocked
+    } else {
+        CmdResult::Ok(RespValue::Nil)
+    };
     if ctx.owned_keys.len() == numkeys {
         // All keys on this shard: pop in place and reply directly.
         let found = match pop_inplace_first(ctx, is_max, count, Wrong::Skip) {
             Ok(f) => f,
             Err(e) => return CmdResult::Err(e),
         };
-        let Some((ki, pairs)) = found else { return none };
+        let Some((ki, pairs)) = found else {
+            return none;
+        };
         return CmdResult::Ok(labeled_scored_array(&ctx.args[ki], &pairs));
     }
     // Multi-shard: report the candidate `[key_idx, pairs, remaining]`; the merge
@@ -1655,7 +1790,9 @@ fn exec_zmpop(ctx: &mut OpContext, blocking: bool) -> CmdResult {
         Ok(f) => f,
         Err(e) => return CmdResult::Err(e),
     };
-    let Some((ki, pairs, rem)) = found else { return none };
+    let Some((ki, pairs, rem)) = found else {
+        return none;
+    };
     CmdResult::Ok(RespValue::Array(vec![
         integer(ki as i64),
         RespValue::Array(pairs),
@@ -1695,7 +1832,6 @@ fn merge_zmpop(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64
                     }
                 }
             }
-            CmdResult::Ok(RespValue::Nil) => {}
             CmdResult::Err(e) => return CmdResult::Err(e.clone()),
             _ => {}
         }
@@ -1727,7 +1863,9 @@ fn exec_bzpop(ctx: &mut OpContext, is_max: bool) -> CmdResult {
             Ok(f) => f,
             Err(e) => return CmdResult::Err(e),
         };
-        let Some((ki, pairs)) = found else { return CmdResult::Blocked };
+        let Some((ki, pairs)) = found else {
+            return CmdResult::Blocked;
+        };
         return CmdResult::Ok(bzpop_reply(&ctx.args[ki], &pairs));
     }
     // Multi-shard: report the candidate for the merge.
@@ -1735,7 +1873,9 @@ fn exec_bzpop(ctx: &mut OpContext, is_max: bool) -> CmdResult {
         Ok(f) => f,
         Err(e) => return CmdResult::Err(e),
     };
-    let Some((ki, pairs, rem)) = found else { return CmdResult::Blocked };
+    let Some((ki, pairs, rem)) = found else {
+        return CmdResult::Blocked;
+    };
     CmdResult::Ok(RespValue::Array(vec![
         integer(ki as i64),
         RespValue::Array(pairs),
@@ -1811,10 +1951,11 @@ fn lex_range_common(ctx: &mut OpContext, rev: bool) -> CmdResult {
     if opts.empty_offset {
         return CmdResult::Ok(RespValue::Array(vec![]));
     }
-    let (lo, lo_incl, hi, hi_incl) = match parse_lex_range(&ctx.args[key_idx + 1], &ctx.args[key_idx + 2]) {
-        Ok(x) => x,
-        Err(e) => return CmdResult::Err(e),
-    };
+    let (lo, lo_incl, hi, hi_incl) =
+        match parse_lex_range(&ctx.args[key_idx + 1], &ctx.args[key_idx + 2]) {
+            Ok(x) => x,
+            Err(e) => return CmdResult::Err(e),
+        };
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::ZSet(z)) => {
             let items = z.range_by_member_filtered(
@@ -1832,10 +1973,11 @@ fn lex_range_common(ctx: &mut OpContext, rev: bool) -> CmdResult {
 fn exec_zlexcount(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let (lo, lo_incl, hi, hi_incl) = match parse_lex_range(&ctx.args[key_idx + 1], &ctx.args[key_idx + 2]) {
-        Ok(x) => x,
-        Err(e) => return CmdResult::Err(e),
-    };
+    let (lo, lo_incl, hi, hi_incl) =
+        match parse_lex_range(&ctx.args[key_idx + 1], &ctx.args[key_idx + 2]) {
+            Ok(x) => x,
+            Err(e) => return CmdResult::Err(e),
+        };
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::ZSet(z)) => {
             let count = z
@@ -1855,10 +1997,11 @@ fn exec_zlexcount(ctx: &mut OpContext) -> CmdResult {
 fn exec_zremrangebylex(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let (lo, lo_incl, hi, hi_incl) = match parse_lex_range(&ctx.args[key_idx + 1], &ctx.args[key_idx + 2]) {
-        Ok(x) => x,
-        Err(e) => return CmdResult::Err(e),
-    };
+    let (lo, lo_incl, hi, hi_incl) =
+        match parse_lex_range(&ctx.args[key_idx + 1], &ctx.args[key_idx + 2]) {
+            Ok(x) => x,
+            Err(e) => return CmdResult::Err(e),
+        };
     let z = match zset_mut(ctx, key) {
         Ok(z) => z,
         Err(e) => {
@@ -1888,7 +2031,7 @@ fn exec_zremrangebylex(ctx: &mut OpContext) -> CmdResult {
 // ZRANDMEMBER / ZSCAN
 // ---------------------------------------------------------------------------
 
-/// SplitMix64: deterministic pseudo-random source for ZRANDMEMBER (seeded from
+/// `SplitMix64`: deterministic pseudo-random source for ZRANDMEMBER (seeded from
 /// the key, mirroring the hash family's sampling approach).
 struct ZRandRng(u64);
 
@@ -1919,14 +2062,18 @@ fn zrand_unique(z: &ZSet, n: usize, rng: &mut ZRandRng) -> Vec<(CompactString, f
         all.swap(i, j);
     }
     all.truncate(n);
-    all.into_iter().map(|rank| z.by_rank(rank).expect("valid rank")).collect()
+    all.into_iter()
+        .map(|rank| z.by_rank(rank).expect("valid rank"))
+        .collect()
 }
 
 /// ZRANDMEMBER key [count [WITHSCORES]]
 fn exec_zrandmember(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     if ctx.args.len() > key_idx + 3 {
-        return CmdResult::Err(RespError::new("ERR wrong number of arguments for 'zrandmember' command"));
+        return CmdResult::Err(RespError::new(
+            "ERR wrong number of arguments for 'zrandmember' command",
+        ));
     }
     let key = &ctx.args[key_idx];
     let with_count = ctx.args.len() > key_idx + 1;
@@ -1957,17 +2104,24 @@ fn exec_zrandmember(ctx: &mut OpContext) -> CmdResult {
             } else {
                 let n = (-count) as usize;
                 (0..n)
-                    .map(|_| z.by_rank((rng.next() as usize) % len).expect("non-empty zset"))
+                    .map(|_| {
+                        z.by_rank((rng.next() as usize) % len)
+                            .expect("non-empty zset")
+                    })
                     .collect()
             };
             CmdResult::Ok(zrandmember_reply(picked, with_scores))
         }
         Some(_) => CmdResult::Err(RespError::wrong_type()),
-        None => CmdResult::Ok(if with_count { RespValue::Array(vec![]) } else { RespValue::Nil }),
+        None => CmdResult::Ok(if with_count {
+            RespValue::Array(vec![])
+        } else {
+            RespValue::Nil
+        }),
     }
 }
 
-/// `[member, score, ...]` flat shape for with_scores (RESP2 SendScoredArray).
+/// `[member, score, ...]` flat shape for `with_scores` (RESP2 `SendScoredArray`).
 fn zrandmember_reply(picked: Vec<(CompactString, f64)>, with_scores: bool) -> RespValue {
     if with_scores {
         let mut out = Vec::with_capacity(picked.len() * 2);
@@ -1977,7 +2131,12 @@ fn zrandmember_reply(picked: Vec<(CompactString, f64)>, with_scores: bool) -> Re
         }
         RespValue::Array(out)
     } else {
-        RespValue::Array(picked.into_iter().map(|(m, _)| RespValue::Bulk(m.as_bytes().to_vec())).collect())
+        RespValue::Array(
+            picked
+                .into_iter()
+                .map(|(m, _)| RespValue::Bulk(m.as_bytes().to_vec()))
+                .collect(),
+        )
     }
 }
 
@@ -1985,13 +2144,12 @@ fn zrandmember_reply(picked: Vec<(CompactString, f64)>, with_scores: bool) -> Re
 ///
 /// Members iterate in ascending (score, member) order, the cursor doubling as a
 /// position marker (like SSCAN). `count` budgets flat entries (member, score),
-/// matching the reference OpScan loop.
+/// matching the reference `OpScan` loop.
 fn exec_zscan(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let cursor = match parse_u64(&ctx.args[key_idx + 1]) {
-        Some(c) => c,
-        None => return CmdResult::Err(RespError::new("ERR invalid cursor")),
+    let Some(cursor) = parse_u64(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::new("ERR invalid cursor"));
     };
     let opts = &ctx.args[key_idx + 2..];
     if opts.len() > 4 {
@@ -2037,7 +2195,11 @@ fn exec_zscan(ctx: &mut OpContext) -> CmdResult {
                     out.push(bulk(format_double(*s).into_bytes()));
                 }
             }
-            let next = if pos >= members.len() { 0u64 } else { pos as u64 };
+            let next = if pos >= members.len() {
+                0u64
+            } else {
+                pos as u64
+            };
             CmdResult::Ok(zscan_reply(next, out))
         }
         Some(_) => CmdResult::Err(RespError::wrong_type()),
@@ -2137,7 +2299,11 @@ pub static CMD_ZINTERCARD: Command = Command {
     name: "ZINTERCARD",
     arity: -3,
     flags: FLAG_READONLY | FLAG_MULTI_KEY,
-    key_range: KeyRange { first: 2, last: 0, step: 1 },
+    key_range: KeyRange {
+        first: 2,
+        last: 0,
+        step: 1,
+    },
     exec: exec_zintercard,
     merge: Some(merge_zintercard),
 };
@@ -2145,7 +2311,11 @@ pub static CMD_ZUNION: Command = Command {
     name: "ZUNION",
     arity: -3,
     flags: FLAG_READONLY | FLAG_MULTI_KEY,
-    key_range: KeyRange { first: 2, last: 0, step: 1 },
+    key_range: KeyRange {
+        first: 2,
+        last: 0,
+        step: 1,
+    },
     exec: exec_zunion,
     merge: Some(merge_zunion),
 };
@@ -2153,7 +2323,11 @@ pub static CMD_ZUNIONSTORE: Command = Command {
     name: "ZUNIONSTORE",
     arity: -4,
     flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY,
-    key_range: KeyRange { first: 1, last: 0, step: 1 },
+    key_range: KeyRange {
+        first: 1,
+        last: 0,
+        step: 1,
+    },
     exec: exec_zunionstore,
     merge: Some(merge_zunionstore),
 };
@@ -2161,7 +2335,11 @@ pub static CMD_ZINTER: Command = Command {
     name: "ZINTER",
     arity: -3,
     flags: FLAG_READONLY | FLAG_MULTI_KEY,
-    key_range: KeyRange { first: 2, last: 0, step: 1 },
+    key_range: KeyRange {
+        first: 2,
+        last: 0,
+        step: 1,
+    },
     exec: exec_zinter,
     merge: Some(merge_zinter),
 };
@@ -2169,7 +2347,11 @@ pub static CMD_ZINTERSTORE: Command = Command {
     name: "ZINTERSTORE",
     arity: -4,
     flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY,
-    key_range: KeyRange { first: 1, last: 0, step: 1 },
+    key_range: KeyRange {
+        first: 1,
+        last: 0,
+        step: 1,
+    },
     exec: exec_zinterstore,
     merge: Some(merge_zinterstore),
 };
@@ -2177,7 +2359,11 @@ pub static CMD_ZDIFF: Command = Command {
     name: "ZDIFF",
     arity: -3,
     flags: FLAG_READONLY | FLAG_MULTI_KEY,
-    key_range: KeyRange { first: 2, last: 0, step: 1 },
+    key_range: KeyRange {
+        first: 2,
+        last: 0,
+        step: 1,
+    },
     exec: exec_zdiff_cmd,
     merge: Some(merge_zdiff),
 };
@@ -2185,7 +2371,11 @@ pub static CMD_ZDIFFSTORE: Command = Command {
     name: "ZDIFFSTORE",
     arity: -4,
     flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY,
-    key_range: KeyRange { first: 1, last: 0, step: 1 },
+    key_range: KeyRange {
+        first: 1,
+        last: 0,
+        step: 1,
+    },
     exec: exec_zdiffstore,
     merge: Some(merge_zdiffstore),
 };
@@ -2249,7 +2439,11 @@ pub static CMD_ZMPOP: Command = Command {
     name: "ZMPOP",
     arity: -4,
     flags: FLAG_WRITE | FLAG_MULTI_KEY,
-    key_range: KeyRange { first: 2, last: 0, step: 1 },
+    key_range: KeyRange {
+        first: 2,
+        last: 0,
+        step: 1,
+    },
     exec: exec_zmpop_cmd,
     merge: Some(merge_zmpop),
 };
@@ -2257,7 +2451,11 @@ pub static CMD_BZMPOP: Command = Command {
     name: "BZMPOP",
     arity: -5,
     flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY,
-    key_range: KeyRange { first: 3, last: 0, step: 1 },
+    key_range: KeyRange {
+        first: 3,
+        last: 0,
+        step: 1,
+    },
     exec: exec_bzmpop_cmd,
     merge: Some(merge_zmpop),
 };
@@ -2358,17 +2556,23 @@ mod tests {
                 b"ZSCAN" => (exec_zscan, 1, vec![1]),
                 _ => panic!("unhandled command {:?}", argv[0]),
             };
-        let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx, now_ms };
+        let mut ctx = OpContext {
+            db,
+            args: argv,
+            owned_keys: &owned,
+            first_key_idx,
+            now_ms,
+        };
         let r = (exec)(&mut ctx);
         // Apply deferred stores so STORE results are visible to later commands.
         match r {
             CmdResult::DeferredStore { key, value, reply } => {
-                apply_store(db, key, value);
+                apply_store(db, &key, value);
                 CmdResult::Ok(reply)
             }
             CmdResult::DeferredStores { stores, reply } => {
                 for (key, value, _exp, _sticky) in stores {
-                    apply_store(db, key, value);
+                    apply_store(db, &key, value);
                 }
                 CmdResult::Ok(reply)
             }
@@ -2376,11 +2580,11 @@ mod tests {
         }
     }
 
-    fn apply_store(db: &mut DbSlice, key: Vec<u8>, value: Option<PrimeValue>) {
+    fn apply_store(db: &mut DbSlice, key: &[u8], value: Option<PrimeValue>) {
         match value {
-            Some(v) => db.insert(CompactString::from_bytes(&key), v),
+            Some(v) => db.insert(key, v),
             None => {
-                db.remove(&key);
+                db.remove(key);
             }
         }
     }
@@ -2429,14 +2633,48 @@ mod tests {
     #[test]
     fn zrangestore_basic() {
         let mut db = DbSlice::new(0);
-        assert_eq!(add(&mut db, "src", &[("1", "a"), ("2", "b"), ("3", "c")]), 3);
-        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZRANGESTORE", "dest", "src", "0", "-1"]))), 3);
+        assert_eq!(
+            add(&mut db, "src", &[("1", "a"), ("2", "b"), ("3", "c")]),
+            3
+        );
+        assert_eq!(
+            int(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZRANGESTORE", "dest", "src", "0", "-1"])
+            )),
+            3
+        );
         assert_eq!(range(&mut db, "dest"), ["a", "b", "c"]);
         // Partial rank range.
-        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZRANGESTORE", "p", "src", "1", "2"]))), 2);
+        assert_eq!(
+            int(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZRANGESTORE", "p", "src", "1", "2"])
+            )),
+            2
+        );
         assert_eq!(range(&mut db, "p"), ["b", "c"]);
         // REV selects the tail; the stored zset is still score-ordered.
-        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZRANGESTORE", "r", "src", "0", "-1", "REV", "LIMIT", "0", "2"]))), 2);
+        assert_eq!(
+            int(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&[
+                    "ZRANGESTORE",
+                    "r",
+                    "src",
+                    "0",
+                    "-1",
+                    "REV",
+                    "LIMIT",
+                    "0",
+                    "2"
+                ])
+            )),
+            2
+        );
         assert_eq!(range(&mut db, "r"), ["b", "c"]);
     }
 
@@ -2444,7 +2682,11 @@ mod tests {
     fn zrangestore_preserves_scores() {
         let mut db = DbSlice::new(0);
         add(&mut db, "src", &[("1", "a"), ("2", "b"), ("3", "c")]);
-        dispatch_at(&mut db, 0, &b_args(&["ZRANGESTORE", "dest", "src", "0", "-1"]));
+        dispatch_at(
+            &mut db,
+            0,
+            &b_args(&["ZRANGESTORE", "dest", "src", "0", "-1"]),
+        );
         match db.find(b"dest", 0) {
             Some(PrimeValue::ZSet(z)) => assert_eq!(z.score(b"a"), Some(1.0)),
             o => panic!("expected zset, got {o:?}"),
@@ -2455,12 +2697,33 @@ mod tests {
     fn zrangestore_empty_removes_dest() {
         let mut db = DbSlice::new(0);
         add(&mut db, "src", &[("1", "a"), ("2", "b")]);
-        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZRANGESTORE", "dest", "src", "0", "-1"]))), 2);
+        assert_eq!(
+            int(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZRANGESTORE", "dest", "src", "0", "-1"])
+            )),
+            2
+        );
         // Missing source empties the destination.
-        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZRANGESTORE", "dest", "nope", "0", "-1"]))), 0);
+        assert_eq!(
+            int(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZRANGESTORE", "dest", "nope", "0", "-1"])
+            )),
+            0
+        );
         assert!(db.find(b"dest", 0).is_none());
         // Empty range empties the destination too.
-        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZRANGESTORE", "dest", "src", "5", "9"]))), 0);
+        assert_eq!(
+            int(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZRANGESTORE", "dest", "src", "5", "9"])
+            )),
+            0
+        );
         assert!(db.find(b"dest", 0).is_none());
     }
 
@@ -2468,11 +2731,32 @@ mod tests {
     fn zrangestore_byscore_bylex() {
         let mut db = DbSlice::new(0);
         add(&mut db, "src", &[("1", "a"), ("2", "b"), ("3", "c")]);
-        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZRANGESTORE", "d", "src", "(1", "2", "BYSCORE"]))), 1);
+        assert_eq!(
+            int(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZRANGESTORE", "d", "src", "(1", "2", "BYSCORE"])
+            )),
+            1
+        );
         assert_eq!(range(&mut db, "d"), ["b"]);
-        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZRANGESTORE", "e", "src", "[a", "[c", "BYLEX"]))), 3);
+        assert_eq!(
+            int(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZRANGESTORE", "e", "src", "[a", "[c", "BYLEX"])
+            )),
+            3
+        );
         assert_eq!(range(&mut db, "e"), ["a", "b", "c"]);
-        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZRANGESTORE", "f", "src", "(a", "(c", "BYLEX"]))), 1);
+        assert_eq!(
+            int(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZRANGESTORE", "f", "src", "(a", "(c", "BYLEX"])
+            )),
+            1
+        );
         assert_eq!(range(&mut db, "f"), ["b"]);
     }
 
@@ -2481,12 +2765,33 @@ mod tests {
         let mut db = DbSlice::new(0);
         add(&mut db, "src", &[("1", "a")]);
         // Wrong type on the source.
-        db.insert(CompactString::from_bytes(b"s"), PrimeValue::Str(CompactString::from("x")));
-        assert!(err(dispatch_at(&mut db, 0, &b_args(&["ZRANGESTORE", "dest", "s", "0", "-1"]))).contains("WRONGTYPE"));
+        db.insert(b"s", PrimeValue::Str(CompactString::from("x")));
+        assert!(
+            err(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZRANGESTORE", "dest", "s", "0", "-1"])
+            ))
+            .contains("WRONGTYPE")
+        );
         // Non-integer rank bounds.
-        assert!(err(dispatch_at(&mut db, 0, &b_args(&["ZRANGESTORE", "dest", "src", "abc", "def"]))).contains("not an integer"));
+        assert!(
+            err(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZRANGESTORE", "dest", "src", "abc", "def"])
+            ))
+            .contains("not an integer")
+        );
         // Unknown option.
-        assert!(err(dispatch_at(&mut db, 0, &b_args(&["ZRANGESTORE", "dest", "src", "0", "-1", "FOO"]))).contains("syntax error"));
+        assert!(
+            err(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZRANGESTORE", "dest", "src", "0", "-1", "FOO"])
+            ))
+            .contains("syntax error")
+        );
     }
 
     #[test]
@@ -2534,15 +2839,29 @@ mod tests {
         let args = b_args(&["ZRANGESTORE", "dest", "src", "0", "-1"]);
         let keys = [1usize, 2];
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![1], result: CmdResult::Ok(RespValue::Array(vec![])) },
-            ShardPart { shard: 1, owned_key_idxs: vec![2], result: CmdResult::Err(RespError::wrong_type()) },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![1],
+                result: CmdResult::Ok(RespValue::Array(vec![])),
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: vec![2],
+                result: CmdResult::Err(RespError::wrong_type()),
+            },
         ];
         assert!(err(merge_zrangestore(&parts, &args, &keys, 0)).contains("WRONGTYPE"));
     }
 
     /// Dispatch `exec_zintercard` with `owned` as the owned key indices.
-    fn intercard_at(db: &mut DbSlice, argv: &[Vec<u8>], owned: Vec<usize>) -> CmdResult {
-        let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx: 2, now_ms: 0 };
+    fn intercard_at(db: &mut DbSlice, argv: &[Vec<u8>], owned: &[usize]) -> CmdResult {
+        let mut ctx = OpContext {
+            db,
+            args: argv,
+            owned_keys: owned,
+            first_key_idx: 2,
+            now_ms: 0,
+        };
         exec_zintercard(&mut ctx)
     }
 
@@ -2551,15 +2870,50 @@ mod tests {
         let mut db = DbSlice::new(0);
         add(&mut db, "z1", &[("1", "a"), ("2", "b"), ("3", "c")]);
         add(&mut db, "z2", &[("2", "b"), ("3", "c"), ("4", "d")]);
-        assert_eq!(int(intercard_at(&mut db, &b_args(&["ZINTERCARD", "2", "z1", "z2"]), vec![2, 3])), 2);
+        assert_eq!(
+            int(intercard_at(
+                &mut db,
+                &b_args(&["ZINTERCARD", "2", "z1", "z2"]),
+                &[2, 3]
+            )),
+            2
+        );
         // LIMIT caps the reply.
-        assert_eq!(int(intercard_at(&mut db, &b_args(&["ZINTERCARD", "2", "z1", "z2", "LIMIT", "1"]), vec![2, 3])), 1);
+        assert_eq!(
+            int(intercard_at(
+                &mut db,
+                &b_args(&["ZINTERCARD", "2", "z1", "z2", "LIMIT", "1"]),
+                &[2, 3]
+            )),
+            1
+        );
         // LIMIT 0 means no cap.
-        assert_eq!(int(intercard_at(&mut db, &b_args(&["ZINTERCARD", "2", "z1", "z2", "LIMIT", "0"]), vec![2, 3])), 2);
+        assert_eq!(
+            int(intercard_at(
+                &mut db,
+                &b_args(&["ZINTERCARD", "2", "z1", "z2", "LIMIT", "0"]),
+                &[2, 3]
+            )),
+            2
+        );
         // A single key is its own cardinality.
-        assert_eq!(int(intercard_at(&mut db, &b_args(&["ZINTERCARD", "1", "z1"]), vec![2])), 3);
+        assert_eq!(
+            int(intercard_at(
+                &mut db,
+                &b_args(&["ZINTERCARD", "1", "z1"]),
+                &[2]
+            )),
+            3
+        );
         // A missing key empties the intersection.
-        assert_eq!(int(intercard_at(&mut db, &b_args(&["ZINTERCARD", "2", "z1", "nope"]), vec![2, 3])), 0);
+        assert_eq!(
+            int(intercard_at(
+                &mut db,
+                &b_args(&["ZINTERCARD", "2", "z1", "nope"]),
+                &[2, 3]
+            )),
+            0
+        );
     }
 
     #[test]
@@ -2569,23 +2923,86 @@ mod tests {
         // Build a plain set via the Set type directly.
         let mut s = crate::core::set::Set::new();
         s.add(CompactString::from("b"));
-        db.insert(CompactString::from_bytes(b"set"), PrimeValue::Set(s));
-        assert_eq!(int(intercard_at(&mut db, &b_args(&["ZINTERCARD", "2", "z", "set"]), vec![2, 3])), 1);
+        db.insert(b"set", PrimeValue::Set(s));
+        assert_eq!(
+            int(intercard_at(
+                &mut db,
+                &b_args(&["ZINTERCARD", "2", "z", "set"]),
+                &[2, 3]
+            )),
+            1
+        );
     }
 
     #[test]
     fn zintercard_errors() {
         let mut db = DbSlice::new(0);
         add(&mut db, "z1", &[("1", "a")]);
-        assert!(err(intercard_at(&mut db, &b_args(&["ZINTERCARD", "0", "z1"]), vec![])).contains("at least 1 input key"));
-        assert!(err(intercard_at(&mut db, &b_args(&["ZINTERCARD", "-1", "z1"]), vec![])).contains("not an integer"));
-        assert!(err(intercard_at(&mut db, &b_args(&["ZINTERCARD", "abc", "z1"]), vec![])).contains("not an integer"));
-        assert!(err(intercard_at(&mut db, &b_args(&["ZINTERCARD", "2", "z1"]), vec![])).contains("syntax error"));
-        assert!(err(intercard_at(&mut db, &b_args(&["ZINTERCARD", "1", "z1", "LIMIT", "-1"]), vec![2])).contains("limit value is not a positive integer"));
-        assert!(err(intercard_at(&mut db, &b_args(&["ZINTERCARD", "1", "z1", "LIMIT", "abc"]), vec![2])).contains("limit value is not a positive integer"));
-        assert!(err(intercard_at(&mut db, &b_args(&["ZINTERCARD", "1", "z1", "FOO"]), vec![2])).contains("syntax error"));
-        db.insert(CompactString::from_bytes(b"s"), PrimeValue::Str(CompactString::from("x")));
-        assert!(err(intercard_at(&mut db, &b_args(&["ZINTERCARD", "1", "s"]), vec![2])).contains("WRONGTYPE"));
+        assert!(
+            err(intercard_at(
+                &mut db,
+                &b_args(&["ZINTERCARD", "0", "z1"]),
+                &[]
+            ))
+            .contains("at least 1 input key")
+        );
+        assert!(
+            err(intercard_at(
+                &mut db,
+                &b_args(&["ZINTERCARD", "-1", "z1"]),
+                &[]
+            ))
+            .contains("not an integer")
+        );
+        assert!(
+            err(intercard_at(
+                &mut db,
+                &b_args(&["ZINTERCARD", "abc", "z1"]),
+                &[]
+            ))
+            .contains("not an integer")
+        );
+        assert!(
+            err(intercard_at(
+                &mut db,
+                &b_args(&["ZINTERCARD", "2", "z1"]),
+                &[]
+            ))
+            .contains("syntax error")
+        );
+        assert!(
+            err(intercard_at(
+                &mut db,
+                &b_args(&["ZINTERCARD", "1", "z1", "LIMIT", "-1"]),
+                &[2]
+            ))
+            .contains("limit value is not a positive integer")
+        );
+        assert!(
+            err(intercard_at(
+                &mut db,
+                &b_args(&["ZINTERCARD", "1", "z1", "LIMIT", "abc"]),
+                &[2]
+            ))
+            .contains("limit value is not a positive integer")
+        );
+        assert!(
+            err(intercard_at(
+                &mut db,
+                &b_args(&["ZINTERCARD", "1", "z1", "FOO"]),
+                &[2]
+            ))
+            .contains("syntax error")
+        );
+        db.insert(b"s", PrimeValue::Str(CompactString::from("x")));
+        assert!(
+            err(intercard_at(
+                &mut db,
+                &b_args(&["ZINTERCARD", "1", "s"]),
+                &[2]
+            ))
+            .contains("WRONGTYPE")
+        );
     }
 
     #[test]
@@ -2593,9 +3010,21 @@ mod tests {
         let args = b_args(&["ZINTERCARD", "3", "z1", "z2", "z3"]);
         let keys = [2usize, 3, 4];
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![2], result: CmdResult::Ok(RespValue::Array(vec![bulk(b"a"), bulk(b"b")])) },
-            ShardPart { shard: 1, owned_key_idxs: vec![3], result: CmdResult::Ok(RespValue::Array(vec![bulk(b"b"), bulk(b"c")])) },
-            ShardPart { shard: 2, owned_key_idxs: vec![4], result: CmdResult::Ok(RespValue::Array(vec![bulk(b"b")])) },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![2],
+                result: CmdResult::Ok(RespValue::Array(vec![bulk(b"a"), bulk(b"b")])),
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: vec![3],
+                result: CmdResult::Ok(RespValue::Array(vec![bulk(b"b"), bulk(b"c")])),
+            },
+            ShardPart {
+                shard: 2,
+                owned_key_idxs: vec![4],
+                result: CmdResult::Ok(RespValue::Array(vec![bulk(b"b")])),
+            },
         ];
         assert_eq!(int(merge_zintercard(&parts, &args, &keys, 0)), 1);
     }
@@ -2605,8 +3034,16 @@ mod tests {
         let args = b_args(&["ZINTERCARD", "2", "z1", "z2"]);
         let keys = [2usize, 3];
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![2], result: CmdResult::Ok(RespValue::Array(vec![bulk(b"a")])) },
-            ShardPart { shard: 1, owned_key_idxs: vec![3], result: CmdResult::Ok(RespValue::Array(vec![])) },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![2],
+                result: CmdResult::Ok(RespValue::Array(vec![bulk(b"a")])),
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: vec![3],
+                result: CmdResult::Ok(RespValue::Array(vec![])),
+            },
         ];
         assert_eq!(int(merge_zintercard(&parts, &args, &keys, 0)), 0);
     }
@@ -2616,8 +3053,16 @@ mod tests {
         let args = b_args(&["ZINTERCARD", "2", "z1", "z2", "LIMIT", "1"]);
         let keys = [2usize, 3];
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![2], result: CmdResult::Ok(RespValue::Array(vec![bulk(b"a"), bulk(b"b")])) },
-            ShardPart { shard: 1, owned_key_idxs: vec![3], result: CmdResult::Ok(RespValue::Array(vec![bulk(b"b"), bulk(b"a")])) },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![2],
+                result: CmdResult::Ok(RespValue::Array(vec![bulk(b"a"), bulk(b"b")])),
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: vec![3],
+                result: CmdResult::Ok(RespValue::Array(vec![bulk(b"b"), bulk(b"a")])),
+            },
         ];
         assert_eq!(int(merge_zintercard(&parts, &args, &keys, 0)), 1);
     }
@@ -2627,8 +3072,16 @@ mod tests {
         let args = b_args(&["ZINTERCARD", "2", "z1", "z2"]);
         let keys = [2usize, 3];
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![2], result: CmdResult::Ok(RespValue::Array(vec![bulk(b"a")])) },
-            ShardPart { shard: 1, owned_key_idxs: vec![3], result: CmdResult::Err(RespError::wrong_type()) },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![2],
+                result: CmdResult::Ok(RespValue::Array(vec![bulk(b"a")])),
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: vec![3],
+                result: CmdResult::Err(RespError::wrong_type()),
+            },
         ];
         assert!(err(merge_zintercard(&parts, &args, &keys, 0)).contains("WRONGTYPE"));
     }
@@ -2636,7 +3089,7 @@ mod tests {
     /// Dispatch a set-operation command (union/inter/diff, read or store) with
     /// `owned` as the owned key indices. Applies deferred stores for the
     /// multi-shard store path.
-    fn setop(db: &mut DbSlice, argv: &[Vec<u8>], owned: Vec<usize>) -> CmdResult {
+    fn setop(db: &mut DbSlice, argv: &[Vec<u8>], owned: &[usize]) -> CmdResult {
         let (exec, first_key_idx): (fn(&mut OpContext) -> CmdResult, usize) =
             match argv[0].to_ascii_uppercase().as_slice() {
                 b"ZUNION" => (exec_zunion, 2),
@@ -2647,11 +3100,17 @@ mod tests {
                 b"ZDIFFSTORE" => (exec_zdiffstore, 1),
                 _ => panic!("unhandled command {:?}", argv[0]),
             };
-        let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx, now_ms: 0 };
+        let mut ctx = OpContext {
+            db,
+            args: argv,
+            owned_keys: owned,
+            first_key_idx,
+            now_ms: 0,
+        };
         let r = (exec)(&mut ctx);
         match r {
             CmdResult::DeferredStore { key, value, reply } => {
-                apply_store(db, key, value);
+                apply_store(db, &key, value);
                 CmdResult::Ok(reply)
             }
             other => other,
@@ -2661,7 +3120,7 @@ mod tests {
     /// Dispatch a pop-family command (ZMPOP/BZMPOP/BZPOPMIN/BZPOPMAX) with
     /// `owned` as the owned key indices, applying deferred stores so merged
     /// multi-shard results are visible to later commands.
-    fn pop_at(db: &mut DbSlice, argv: &[Vec<u8>], owned: Vec<usize>) -> CmdResult {
+    fn pop_at(db: &mut DbSlice, argv: &[Vec<u8>], owned: &[usize]) -> CmdResult {
         let (exec, first_key_idx): (fn(&mut OpContext) -> CmdResult, usize) =
             match argv[0].to_ascii_uppercase().as_slice() {
                 b"ZMPOP" => (exec_zmpop_cmd, 2),
@@ -2670,11 +3129,17 @@ mod tests {
                 b"BZPOPMAX" => (exec_bzpopmax, 1),
                 _ => panic!("unhandled command {:?}", argv[0]),
             };
-        let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx, now_ms: 0 };
+        let mut ctx = OpContext {
+            db,
+            args: argv,
+            owned_keys: owned,
+            first_key_idx,
+            now_ms: 0,
+        };
         let r = (exec)(&mut ctx);
         match r {
             CmdResult::DeferredStore { key, value, reply } => {
-                apply_store(db, key, value);
+                apply_store(db, &key, value);
                 CmdResult::Ok(reply)
             }
             other => other,
@@ -2699,7 +3164,9 @@ mod tests {
                     RespValue::Array(pairs) => pairs
                         .iter()
                         .map(|p| match p {
-                            RespValue::Array(pair) => (str_of_bulk(&pair[0]), str_of_bulk(&pair[1])),
+                            RespValue::Array(pair) => {
+                                (str_of_bulk(&pair[0]), str_of_bulk(&pair[1]))
+                            }
                             o => panic!("expected pair array, got {o:?}"),
                         })
                         .collect(),
@@ -2723,9 +3190,23 @@ mod tests {
         let mut db = DbSlice::new(0);
         add(&mut db, "z1", &[("1", "a"), ("2", "b")]);
         add(&mut db, "z2", &[("3", "b"), ("4", "c")]);
-        let owned = vec![2, 3];
-        assert_eq!(flat(setop(&mut db, &b_args(&["ZUNION", "2", "z1", "z2"]), owned.clone())), ["a", "c", "b"]);
-        assert_eq!(flat(setop(&mut db, &b_args(&["ZUNION", "2", "z1", "z2", "WITHSCORES"]), owned.clone())), ["a", "1", "c", "4", "b", "5"]);
+        let owned = [2, 3];
+        assert_eq!(
+            flat(setop(
+                &mut db,
+                &b_args(&["ZUNION", "2", "z1", "z2"]),
+                &owned
+            )),
+            ["a", "c", "b"]
+        );
+        assert_eq!(
+            flat(setop(
+                &mut db,
+                &b_args(&["ZUNION", "2", "z1", "z2", "WITHSCORES"]),
+                &owned
+            )),
+            ["a", "1", "c", "4", "b", "5"]
+        );
     }
 
     #[test]
@@ -2733,12 +3214,50 @@ mod tests {
         let mut db = DbSlice::new(0);
         add(&mut db, "z1", &[("1", "a"), ("2", "b")]);
         add(&mut db, "z2", &[("3", "b"), ("4", "c")]);
-        let owned = vec![2, 3];
-        assert_eq!(flat(setop(&mut db, &b_args(&["ZUNION", "2", "z1", "z2", "WEIGHTS", "2", "3"]), owned.clone())), ["a", "c", "b"]);
-        assert_eq!(flat(setop(&mut db, &b_args(&["ZUNION", "2", "z1", "z2", "WEIGHTS", "2", "3", "AGGREGATE", "MIN"]), owned.clone())), ["a", "b", "c"]);
-        assert_eq!(flat(setop(&mut db, &b_args(&["ZUNION", "2", "z1", "z2", "AGGREGATE", "MAX"]), owned.clone())), ["a", "b", "c"]);
+        let owned = [2, 3];
+        assert_eq!(
+            flat(setop(
+                &mut db,
+                &b_args(&["ZUNION", "2", "z1", "z2", "WEIGHTS", "2", "3"]),
+                &owned
+            )),
+            ["a", "c", "b"]
+        );
+        assert_eq!(
+            flat(setop(
+                &mut db,
+                &b_args(&[
+                    "ZUNION",
+                    "2",
+                    "z1",
+                    "z2",
+                    "WEIGHTS",
+                    "2",
+                    "3",
+                    "AGGREGATE",
+                    "MIN"
+                ]),
+                &owned
+            )),
+            ["a", "b", "c"]
+        );
+        assert_eq!(
+            flat(setop(
+                &mut db,
+                &b_args(&["ZUNION", "2", "z1", "z2", "AGGREGATE", "MAX"]),
+                &owned
+            )),
+            ["a", "b", "c"]
+        );
         // WITHSCORES after other options, score ordering with ties broken lexically.
-        assert_eq!(flat(setop(&mut db, &b_args(&["ZUNION", "2", "z1", "z2", "AGGREGATE", "MIN", "WITHSCORES"]), owned)), ["a", "1", "b", "2", "c", "4"]);
+        assert_eq!(
+            flat(setop(
+                &mut db,
+                &b_args(&["ZUNION", "2", "z1", "z2", "AGGREGATE", "MIN", "WITHSCORES"]),
+                &owned
+            )),
+            ["a", "1", "b", "2", "c", "4"]
+        );
     }
 
     #[test]
@@ -2748,11 +3267,25 @@ mod tests {
         let mut s = crate::core::set::Set::new();
         s.add(CompactString::from("b"));
         s.add(CompactString::from("c"));
-        db.insert(CompactString::from_bytes(b"set"), PrimeValue::Set(s));
+        db.insert(b"set", PrimeValue::Set(s));
         // A set contributes score 1 per member.
-        assert_eq!(flat(setop(&mut db, &b_args(&["ZUNION", "2", "z1", "set"]), vec![2, 3])), ["a", "c", "b"]);
+        assert_eq!(
+            flat(setop(
+                &mut db,
+                &b_args(&["ZUNION", "2", "z1", "set"]),
+                &[2, 3]
+            )),
+            ["a", "c", "b"]
+        );
         // A missing key contributes nothing.
-        assert_eq!(flat(setop(&mut db, &b_args(&["ZUNION", "2", "z1", "nope"]), vec![2, 3])), ["a", "b"]);
+        assert_eq!(
+            flat(setop(
+                &mut db,
+                &b_args(&["ZUNION", "2", "z1", "nope"]),
+                &[2, 3]
+            )),
+            ["a", "b"]
+        );
     }
 
     #[test]
@@ -2760,14 +3293,67 @@ mod tests {
         let mut db = DbSlice::new(0);
         add(&mut db, "z1", &[("1", "a"), ("2", "b")]);
         add(&mut db, "z2", &[("3", "b"), ("4", "c")]);
-        let owned = vec![2, 3];
-        assert_eq!(flat(setop(&mut db, &b_args(&["ZINTER", "2", "z1", "z2"]), owned.clone())), ["b"]);
-        assert_eq!(flat(setop(&mut db, &b_args(&["ZINTER", "2", "z1", "z2", "WITHSCORES"]), owned.clone())), ["b", "5"]);
-        assert_eq!(flat(setop(&mut db, &b_args(&["ZINTER", "2", "z1", "z2", "WEIGHTS", "2", "3"]), owned.clone())), ["b"]);
-        assert_eq!(flat(setop(&mut db, &b_args(&["ZINTER", "2", "z1", "z2", "WEIGHTS", "2", "3", "WITHSCORES"]), owned.clone())), ["b", "13"]);
-        assert_eq!(flat(setop(&mut db, &b_args(&["ZINTER", "2", "z1", "z2", "WEIGHTS", "2", "3", "AGGREGATE", "MIN", "WITHSCORES"]), owned.clone())), ["b", "4"]);
+        let owned = [2, 3];
+        assert_eq!(
+            flat(setop(
+                &mut db,
+                &b_args(&["ZINTER", "2", "z1", "z2"]),
+                &owned
+            )),
+            ["b"]
+        );
+        assert_eq!(
+            flat(setop(
+                &mut db,
+                &b_args(&["ZINTER", "2", "z1", "z2", "WITHSCORES"]),
+                &owned
+            )),
+            ["b", "5"]
+        );
+        assert_eq!(
+            flat(setop(
+                &mut db,
+                &b_args(&["ZINTER", "2", "z1", "z2", "WEIGHTS", "2", "3"]),
+                &owned
+            )),
+            ["b"]
+        );
+        assert_eq!(
+            flat(setop(
+                &mut db,
+                &b_args(&["ZINTER", "2", "z1", "z2", "WEIGHTS", "2", "3", "WITHSCORES"]),
+                &owned
+            )),
+            ["b", "13"]
+        );
+        assert_eq!(
+            flat(setop(
+                &mut db,
+                &b_args(&[
+                    "ZINTER",
+                    "2",
+                    "z1",
+                    "z2",
+                    "WEIGHTS",
+                    "2",
+                    "3",
+                    "AGGREGATE",
+                    "MIN",
+                    "WITHSCORES"
+                ]),
+                &owned
+            )),
+            ["b", "4"]
+        );
         // A missing key empties the intersection.
-        assert_eq!(flat(setop(&mut db, &b_args(&["ZINTER", "2", "z1", "nope"]), owned)), Vec::<String>::new());
+        assert_eq!(
+            flat(setop(
+                &mut db,
+                &b_args(&["ZINTER", "2", "z1", "nope"]),
+                &owned
+            )),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -2775,13 +3361,45 @@ mod tests {
         let mut db = DbSlice::new(0);
         add(&mut db, "z1", &[("1", "a"), ("2", "b")]);
         add(&mut db, "z2", &[("3", "b"), ("4", "c")]);
-        let owned = vec![1, 3, 4];
-        assert_eq!(int(setop(&mut db, &b_args(&["ZUNIONSTORE", "d", "2", "z1", "z2"]), owned.clone())), 3);
+        let owned = [1, 3, 4];
+        assert_eq!(
+            int(setop(
+                &mut db,
+                &b_args(&["ZUNIONSTORE", "d", "2", "z1", "z2"]),
+                &owned
+            )),
+            3
+        );
         assert_eq!(range(&mut db, "d"), ["a", "c", "b"]);
-        assert_eq!(int(setop(&mut db, &b_args(&["ZUNIONSTORE", "d", "2", "z1", "z2", "WEIGHTS", "2", "3", "AGGREGATE", "MIN"]), owned.clone())), 3);
+        assert_eq!(
+            int(setop(
+                &mut db,
+                &b_args(&[
+                    "ZUNIONSTORE",
+                    "d",
+                    "2",
+                    "z1",
+                    "z2",
+                    "WEIGHTS",
+                    "2",
+                    "3",
+                    "AGGREGATE",
+                    "MIN"
+                ]),
+                &owned
+            )),
+            3
+        );
         assert_eq!(range(&mut db, "d"), ["a", "b", "c"]);
         // An all-missing union removes the destination.
-        assert_eq!(int(setop(&mut db, &b_args(&["ZUNIONSTORE", "d", "1", "nope"]), vec![1, 3])), 0);
+        assert_eq!(
+            int(setop(
+                &mut db,
+                &b_args(&["ZUNIONSTORE", "d", "1", "nope"]),
+                &[1, 3]
+            )),
+            0
+        );
         assert!(db.find(b"d", 0).is_none());
     }
 
@@ -2790,10 +3408,24 @@ mod tests {
         let mut db = DbSlice::new(0);
         add(&mut db, "z1", &[("1", "a"), ("2", "b")]);
         add(&mut db, "z2", &[("3", "b"), ("4", "c")]);
-        assert_eq!(int(setop(&mut db, &b_args(&["ZINTERSTORE", "d", "2", "z1", "z2"]), vec![1, 3, 4])), 1);
+        assert_eq!(
+            int(setop(
+                &mut db,
+                &b_args(&["ZINTERSTORE", "d", "2", "z1", "z2"]),
+                &[1, 3, 4]
+            )),
+            1
+        );
         assert_eq!(range(&mut db, "d"), ["b"]);
         // An empty intersection removes the destination.
-        assert_eq!(int(setop(&mut db, &b_args(&["ZINTERSTORE", "d", "2", "z1", "nope"]), vec![1, 3, 4])), 0);
+        assert_eq!(
+            int(setop(
+                &mut db,
+                &b_args(&["ZINTERSTORE", "d", "2", "z1", "nope"]),
+                &[1, 3, 4]
+            )),
+            0
+        );
         assert!(db.find(b"d", 0).is_none());
     }
 
@@ -2802,13 +3434,41 @@ mod tests {
         let mut db = DbSlice::new(0);
         add(&mut db, "z1", &[("1", "a"), ("2", "b"), ("3", "c")]);
         add(&mut db, "z2", &[("4", "b")]);
-        assert_eq!(flat(setop(&mut db, &b_args(&["ZDIFF", "2", "z1", "z2"]), vec![2, 3])), ["a", "c"]);
+        assert_eq!(
+            flat(setop(
+                &mut db,
+                &b_args(&["ZDIFF", "2", "z1", "z2"]),
+                &[2, 3]
+            )),
+            ["a", "c"]
+        );
         // Result scores come from the base set only.
-        assert_eq!(flat(setop(&mut db, &b_args(&["ZDIFF", "2", "z1", "z2", "WITHSCORES"]), vec![2, 3])), ["a", "1", "c", "3"]);
+        assert_eq!(
+            flat(setop(
+                &mut db,
+                &b_args(&["ZDIFF", "2", "z1", "z2", "WITHSCORES"]),
+                &[2, 3]
+            )),
+            ["a", "1", "c", "3"]
+        );
         // A missing other set changes nothing.
-        assert_eq!(flat(setop(&mut db, &b_args(&["ZDIFF", "2", "z1", "nope"]), vec![2, 3])), ["a", "b", "c"]);
+        assert_eq!(
+            flat(setop(
+                &mut db,
+                &b_args(&["ZDIFF", "2", "z1", "nope"]),
+                &[2, 3]
+            )),
+            ["a", "b", "c"]
+        );
         // A missing base set yields an empty result.
-        assert_eq!(flat(setop(&mut db, &b_args(&["ZDIFF", "2", "nope", "z2"]), vec![2, 3])), Vec::<String>::new());
+        assert_eq!(
+            flat(setop(
+                &mut db,
+                &b_args(&["ZDIFF", "2", "nope", "z2"]),
+                &[2, 3]
+            )),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -2816,10 +3476,24 @@ mod tests {
         let mut db = DbSlice::new(0);
         add(&mut db, "z1", &[("1", "a"), ("2", "b"), ("3", "c")]);
         add(&mut db, "z2", &[("4", "b")]);
-        assert_eq!(int(setop(&mut db, &b_args(&["ZDIFFSTORE", "d", "2", "z1", "z2"]), vec![1, 3, 4])), 2);
+        assert_eq!(
+            int(setop(
+                &mut db,
+                &b_args(&["ZDIFFSTORE", "d", "2", "z1", "z2"]),
+                &[1, 3, 4]
+            )),
+            2
+        );
         assert_eq!(range(&mut db, "d"), ["a", "c"]);
         // Empty diff removes the destination.
-        assert_eq!(int(setop(&mut db, &b_args(&["ZDIFFSTORE", "d", "1", "nope"]), vec![1, 3])), 0);
+        assert_eq!(
+            int(setop(
+                &mut db,
+                &b_args(&["ZDIFFSTORE", "d", "1", "nope"]),
+                &[1, 3]
+            )),
+            0
+        );
         assert!(db.find(b"d", 0).is_none());
     }
 
@@ -2827,40 +3501,161 @@ mod tests {
     fn zsetop_errors() {
         let mut db = DbSlice::new(0);
         add(&mut db, "z1", &[("1", "a")]);
-        assert!(err(setop(&mut db, &b_args(&["ZUNION", "0", "z1"]), vec![])).contains("at least 1 input key is needed for zunion"));
-        assert!(err(setop(&mut db, &b_args(&["ZUNION", "-1", "z1"]), vec![])).contains("not an integer"));
-        assert!(err(setop(&mut db, &b_args(&["ZUNION", "abc", "z1"]), vec![])).contains("not an integer"));
-        assert!(err(setop(&mut db, &b_args(&["ZUNION", "2", "z1"]), vec![])).contains("syntax error"));
-        assert!(err(setop(&mut db, &b_args(&["ZUNION", "1", "z1", "WEIGHTS", "2", "3"]), vec![])).contains("syntax error"));
-        assert!(err(setop(&mut db, &b_args(&["ZUNION", "1", "z1", "WEIGHTS", "abc"]), vec![])).contains("weight value is not a float"));
-        assert!(err(setop(&mut db, &b_args(&["ZUNION", "1", "z1", "AGGREGATE", "foo"]), vec![])).contains("syntax error"));
-        assert!(err(setop(&mut db, &b_args(&["ZUNION", "1", "z1", "FOO"]), vec![])).contains("syntax error"));
-        assert!(err(setop(&mut db, &b_args(&["ZUNIONSTORE", "d", "1", "z1", "WITHSCORES"]), vec![])).contains("syntax error"));
-        assert!(err(setop(&mut db, &b_args(&["ZINTERSTORE", "d", "1", "z1", "WEIGHTS"]), vec![])).contains("syntax error"));
+        assert!(
+            err(setop(&mut db, &b_args(&["ZUNION", "0", "z1"]), &[]))
+                .contains("at least 1 input key is needed for zunion")
+        );
+        assert!(
+            err(setop(&mut db, &b_args(&["ZUNION", "-1", "z1"]), &[])).contains("not an integer")
+        );
+        assert!(
+            err(setop(&mut db, &b_args(&["ZUNION", "abc", "z1"]), &[])).contains("not an integer")
+        );
+        assert!(err(setop(&mut db, &b_args(&["ZUNION", "2", "z1"]), &[])).contains("syntax error"));
+        assert!(
+            err(setop(
+                &mut db,
+                &b_args(&["ZUNION", "1", "z1", "WEIGHTS", "2", "3"]),
+                &[]
+            ))
+            .contains("syntax error")
+        );
+        assert!(
+            err(setop(
+                &mut db,
+                &b_args(&["ZUNION", "1", "z1", "WEIGHTS", "abc"]),
+                &[]
+            ))
+            .contains("weight value is not a float")
+        );
+        assert!(
+            err(setop(
+                &mut db,
+                &b_args(&["ZUNION", "1", "z1", "AGGREGATE", "foo"]),
+                &[]
+            ))
+            .contains("syntax error")
+        );
+        assert!(
+            err(setop(&mut db, &b_args(&["ZUNION", "1", "z1", "FOO"]), &[]))
+                .contains("syntax error")
+        );
+        assert!(
+            err(setop(
+                &mut db,
+                &b_args(&["ZUNIONSTORE", "d", "1", "z1", "WITHSCORES"]),
+                &[]
+            ))
+            .contains("syntax error")
+        );
+        assert!(
+            err(setop(
+                &mut db,
+                &b_args(&["ZINTERSTORE", "d", "1", "z1", "WEIGHTS"]),
+                &[]
+            ))
+            .contains("syntax error")
+        );
         // ZDIFF argument validation.
-        assert!(err(setop(&mut db, &b_args(&["ZDIFF", "0", "z1"]), vec![])).contains("at least 1 input key is needed for zdiff"));
-        assert!(err(setop(&mut db, &b_args(&["ZDIFF", "2", "z1"]), vec![])).contains("syntax error"));
-        assert!(err(setop(&mut db, &b_args(&["ZDIFF", "2", "z1", "z1", "FOO"]), vec![])).contains("syntax error"));
-        assert!(err(setop(&mut db, &b_args(&["ZDIFF", "1", "z1", "WITHSCORES", "extra"]), vec![])).contains("syntax error"));
-        assert!(err(setop(&mut db, &b_args(&["ZDIFFSTORE", "d", "1", "z1", "WITHSCORES"]), vec![])).contains("syntax error"));
+        assert!(
+            err(setop(&mut db, &b_args(&["ZDIFF", "0", "z1"]), &[]))
+                .contains("at least 1 input key is needed for zdiff")
+        );
+        assert!(err(setop(&mut db, &b_args(&["ZDIFF", "2", "z1"]), &[])).contains("syntax error"));
+        assert!(
+            err(setop(
+                &mut db,
+                &b_args(&["ZDIFF", "2", "z1", "z1", "FOO"]),
+                &[]
+            ))
+            .contains("syntax error")
+        );
+        assert!(
+            err(setop(
+                &mut db,
+                &b_args(&["ZDIFF", "1", "z1", "WITHSCORES", "extra"]),
+                &[]
+            ))
+            .contains("syntax error")
+        );
+        assert!(
+            err(setop(
+                &mut db,
+                &b_args(&["ZDIFFSTORE", "d", "1", "z1", "WITHSCORES"]),
+                &[]
+            ))
+            .contains("syntax error")
+        );
         // Wrong types are reported on any source.
-        db.insert(CompactString::from_bytes(b"s"), PrimeValue::Str(CompactString::from("x")));
-        assert!(err(setop(&mut db, &b_args(&["ZUNION", "2", "z1", "s"]), vec![2, 3])).contains("WRONGTYPE"));
-        assert!(err(setop(&mut db, &b_args(&["ZINTER", "2", "z1", "s"]), vec![2, 3])).contains("WRONGTYPE"));
-        assert!(err(setop(&mut db, &b_args(&["ZDIFF", "2", "z1", "s"]), vec![2, 3])).contains("WRONGTYPE"));
-        assert!(err(setop(&mut db, &b_args(&["ZDIFF", "2", "s", "z1"]), vec![2, 3])).contains("WRONGTYPE"));
+        db.insert(b"s", PrimeValue::Str(CompactString::from("x")));
+        assert!(
+            err(setop(
+                &mut db,
+                &b_args(&["ZUNION", "2", "z1", "s"]),
+                &[2, 3]
+            ))
+            .contains("WRONGTYPE")
+        );
+        assert!(
+            err(setop(
+                &mut db,
+                &b_args(&["ZINTER", "2", "z1", "s"]),
+                &[2, 3]
+            ))
+            .contains("WRONGTYPE")
+        );
+        assert!(
+            err(setop(&mut db, &b_args(&["ZDIFF", "2", "z1", "s"]), &[2, 3])).contains("WRONGTYPE")
+        );
+        assert!(
+            err(setop(&mut db, &b_args(&["ZDIFF", "2", "s", "z1"]), &[2, 3])).contains("WRONGTYPE")
+        );
     }
 
     #[test]
     fn merge_zunion_aggregates_across_shards() {
-        let args = b_args(&["ZUNION", "3", "z1", "z2", "z3", "AGGREGATE", "MIN", "WITHSCORES"]);
+        let args = b_args(&[
+            "ZUNION",
+            "3",
+            "z1",
+            "z2",
+            "z3",
+            "AGGREGATE",
+            "MIN",
+            "WITHSCORES",
+        ]);
         let keys = [2usize, 3, 4];
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![2], result: CmdResult::Ok(RespValue::Array(vec![bulk(b"a"), bulk(b"1"), bulk(b"b"), bulk(b"2")])) },
-            ShardPart { shard: 1, owned_key_idxs: vec![3], result: CmdResult::Ok(RespValue::Array(vec![bulk(b"b"), bulk(b"3"), bulk(b"c"), bulk(b"4")])) },
-            ShardPart { shard: 2, owned_key_idxs: vec![4], result: CmdResult::Ok(RespValue::Array(vec![bulk(b"a"), bulk(b"5")])) },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![2],
+                result: CmdResult::Ok(RespValue::Array(vec![
+                    bulk(b"a"),
+                    bulk(b"1"),
+                    bulk(b"b"),
+                    bulk(b"2"),
+                ])),
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: vec![3],
+                result: CmdResult::Ok(RespValue::Array(vec![
+                    bulk(b"b"),
+                    bulk(b"3"),
+                    bulk(b"c"),
+                    bulk(b"4"),
+                ])),
+            },
+            ShardPart {
+                shard: 2,
+                owned_key_idxs: vec![4],
+                result: CmdResult::Ok(RespValue::Array(vec![bulk(b"a"), bulk(b"5")])),
+            },
         ];
-        assert_eq!(flat(merge_zunion(&parts, &args, &keys, 0)), ["a", "1", "b", "2", "c", "4"]);
+        assert_eq!(
+            flat(merge_zunion(&parts, &args, &keys, 0)),
+            ["a", "1", "b", "2", "c", "4"]
+        );
     }
 
     #[test]
@@ -2868,16 +3663,45 @@ mod tests {
         let args = b_args(&["ZINTER", "2", "z1", "z2", "WITHSCORES"]);
         let keys = [2usize, 3];
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![2], result: CmdResult::Ok(RespValue::Array(vec![bulk(b"a"), bulk(b"1"), bulk(b"b"), bulk(b"2")])) },
-            ShardPart { shard: 1, owned_key_idxs: vec![3], result: CmdResult::Ok(RespValue::Array(vec![bulk(b"b"), bulk(b"3"), bulk(b"c"), bulk(b"4")])) },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![2],
+                result: CmdResult::Ok(RespValue::Array(vec![
+                    bulk(b"a"),
+                    bulk(b"1"),
+                    bulk(b"b"),
+                    bulk(b"2"),
+                ])),
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: vec![3],
+                result: CmdResult::Ok(RespValue::Array(vec![
+                    bulk(b"b"),
+                    bulk(b"3"),
+                    bulk(b"c"),
+                    bulk(b"4"),
+                ])),
+            },
         ];
         assert_eq!(flat(merge_zinter(&parts, &args, &keys, 0)), ["b", "5"]);
         // An empty partial short-circuits the intersection.
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![2], result: CmdResult::Ok(RespValue::Array(vec![bulk(b"a")])) },
-            ShardPart { shard: 1, owned_key_idxs: vec![3], result: CmdResult::Ok(RespValue::Array(vec![])) },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![2],
+                result: CmdResult::Ok(RespValue::Array(vec![bulk(b"a")])),
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: vec![3],
+                result: CmdResult::Ok(RespValue::Array(vec![])),
+            },
         ];
-        assert_eq!(flat(merge_zinter(&parts, &args, &keys, 0)), Vec::<String>::new());
+        assert_eq!(
+            flat(merge_zinter(&parts, &args, &keys, 0)),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -2885,9 +3709,21 @@ mod tests {
         let args = b_args(&["ZUNIONSTORE", "d", "2", "z1", "z2"]);
         let keys = [1usize, 3, 4];
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![1], result: CmdResult::Ok(RespValue::Nil) },
-            ShardPart { shard: 1, owned_key_idxs: vec![3], result: CmdResult::Ok(RespValue::Array(vec![bulk(b"a"), bulk(b"1")])) },
-            ShardPart { shard: 2, owned_key_idxs: vec![4], result: CmdResult::Ok(RespValue::Array(vec![bulk(b"b"), bulk(b"2")])) },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![1],
+                result: CmdResult::Ok(RespValue::Nil),
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: vec![3],
+                result: CmdResult::Ok(RespValue::Array(vec![bulk(b"a"), bulk(b"1")])),
+            },
+            ShardPart {
+                shard: 2,
+                owned_key_idxs: vec![4],
+                result: CmdResult::Ok(RespValue::Array(vec![bulk(b"b"), bulk(b"2")])),
+            },
         ];
         match merge_zunionstore(&parts, &args, &keys, 0) {
             CmdResult::DeferredStore { key, value, reply } => {
@@ -2907,8 +3743,16 @@ mod tests {
         // An empty intersection deletes the destination.
         let args = b_args(&["ZINTERSTORE", "d", "2", "z1", "z2"]);
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![1], result: CmdResult::Ok(RespValue::Nil) },
-            ShardPart { shard: 1, owned_key_idxs: vec![3], result: CmdResult::Ok(RespValue::Array(vec![])) },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![1],
+                result: CmdResult::Ok(RespValue::Nil),
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: vec![3],
+                result: CmdResult::Ok(RespValue::Array(vec![])),
+            },
         ];
         match merge_zinterstore(&parts, &args, &keys, 0) {
             CmdResult::DeferredStore { key, value, reply } => {
@@ -2926,13 +3770,29 @@ mod tests {
         let keys = [2usize, 3, 4];
         // The base shard also owns a second source; its first map is the base.
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![2, 3], result: CmdResult::Ok(RespValue::Array(vec![
-                RespValue::Array(vec![bulk(b"a"), bulk(b"1"), bulk(b"b"), bulk(b"2"), bulk(b"c"), bulk(b"3")]),
-                RespValue::Array(vec![bulk(b"b"), bulk(b"9")]),
-            ])) },
-            ShardPart { shard: 1, owned_key_idxs: vec![4], result: CmdResult::Ok(RespValue::Array(vec![
-                RespValue::Array(vec![bulk(b"c"), bulk(b"8")]),
-            ])) },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![2, 3],
+                result: CmdResult::Ok(RespValue::Array(vec![
+                    RespValue::Array(vec![
+                        bulk(b"a"),
+                        bulk(b"1"),
+                        bulk(b"b"),
+                        bulk(b"2"),
+                        bulk(b"c"),
+                        bulk(b"3"),
+                    ]),
+                    RespValue::Array(vec![bulk(b"b"), bulk(b"9")]),
+                ])),
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: vec![4],
+                result: CmdResult::Ok(RespValue::Array(vec![RespValue::Array(vec![
+                    bulk(b"c"),
+                    bulk(b"8"),
+                ])])),
+            },
         ];
         assert_eq!(flat(merge_zdiff(&parts, &args, &keys, 0)), ["a", "1"]);
 
@@ -2940,13 +3800,29 @@ mod tests {
         let args = b_args(&["ZDIFFSTORE", "d", "2", "z1", "z2"]);
         let keys = [1usize, 3, 4];
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![1], result: CmdResult::Ok(RespValue::Nil) },
-            ShardPart { shard: 1, owned_key_idxs: vec![3], result: CmdResult::Ok(RespValue::Array(vec![
-                RespValue::Array(vec![bulk(b"a"), bulk(b"1"), bulk(b"b"), bulk(b"2")]),
-            ])) },
-            ShardPart { shard: 2, owned_key_idxs: vec![4], result: CmdResult::Ok(RespValue::Array(vec![
-                RespValue::Array(vec![bulk(b"b"), bulk(b"5")]),
-            ])) },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![1],
+                result: CmdResult::Ok(RespValue::Nil),
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: vec![3],
+                result: CmdResult::Ok(RespValue::Array(vec![RespValue::Array(vec![
+                    bulk(b"a"),
+                    bulk(b"1"),
+                    bulk(b"b"),
+                    bulk(b"2"),
+                ])])),
+            },
+            ShardPart {
+                shard: 2,
+                owned_key_idxs: vec![4],
+                result: CmdResult::Ok(RespValue::Array(vec![RespValue::Array(vec![
+                    bulk(b"b"),
+                    bulk(b"5"),
+                ])])),
+            },
         ];
         match merge_zdiffstore(&parts, &args, &keys, 0) {
             CmdResult::DeferredStore { key, value, reply } => {
@@ -2969,8 +3845,16 @@ mod tests {
         let args = b_args(&["ZUNION", "2", "z1", "z2"]);
         let keys = [2usize, 3];
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![2], result: CmdResult::Ok(RespValue::Array(vec![bulk(b"a"), bulk(b"1")])) },
-            ShardPart { shard: 1, owned_key_idxs: vec![3], result: CmdResult::Err(RespError::wrong_type()) },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![2],
+                result: CmdResult::Ok(RespValue::Array(vec![bulk(b"a"), bulk(b"1")])),
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: vec![3],
+                result: CmdResult::Err(RespError::wrong_type()),
+            },
         ];
         assert!(err(merge_zunion(&parts, &args, &keys, 0)).contains("WRONGTYPE"));
         assert!(err(merge_zdiff(&parts, &args, &keys, 0)).contains("WRONGTYPE"));
@@ -2986,36 +3870,52 @@ mod tests {
         let mut db = DbSlice::new(0);
         add(&mut db, "a", &[("1", "a1"), ("2", "a2")]);
         // MIN pops the lowest member.
-        let (key, pairs) = labeled(pop_at(&mut db, &b_args(&["ZMPOP", "1", "a", "MIN"]), vec![2])).unwrap();
+        let (key, pairs) =
+            labeled(pop_at(&mut db, &b_args(&["ZMPOP", "1", "a", "MIN"]), &[2])).unwrap();
         assert_eq!(key, "a");
         assert_eq!(pairs, [("a1".into(), "1".into())]);
         assert_eq!(range(&mut db, "a"), ["a2"]);
         // COUNT > 1; MAX pops from the top.
         add(&mut db, "b", &[("1", "b1"), ("2", "b2"), ("3", "b3")]);
-        let (key, pairs) =
-            labeled(pop_at(&mut db, &b_args(&["ZMPOP", "1", "b", "MAX", "COUNT", "2"]), vec![2])).unwrap();
+        let (key, pairs) = labeled(pop_at(
+            &mut db,
+            &b_args(&["ZMPOP", "1", "b", "MAX", "COUNT", "2"]),
+            &[2],
+        ))
+        .unwrap();
         assert_eq!(key, "b");
-        assert_eq!(pairs, [("b3".into(), "3".into()), ("b2".into(), "2".into())]);
+        assert_eq!(
+            pairs,
+            [("b3".into(), "3".into()), ("b2".into(), "2".into())]
+        );
         assert_eq!(range(&mut db, "b"), ["b1"]);
         // No zset at all -> nil.
-        let r = pop_at(&mut db, &b_args(&["ZMPOP", "1", "none", "MIN"]), vec![1]);
+        let r = pop_at(&mut db, &b_args(&["ZMPOP", "1", "none", "MIN"]), &[1]);
         assert!(matches!(r.into_resp_value(), RespValue::Nil));
         // The first non-empty key in command order wins.
         add(&mut db, "x", &[("1", "x1")]);
-        let (key, pairs) =
-            labeled(pop_at(&mut db, &b_args(&["ZMPOP", "3", "none", "a", "x", "MAX"]), vec![2, 3, 4])).unwrap();
+        let (key, pairs) = labeled(pop_at(
+            &mut db,
+            &b_args(&["ZMPOP", "3", "none", "a", "x", "MAX"]),
+            &[2, 3, 4],
+        ))
+        .unwrap();
         assert_eq!(key, "a");
         assert_eq!(pairs, [("a2".into(), "2".into())]);
         // COUNT 0 returns the key with an empty array, leaving the zset intact.
         add(&mut db, "k", &[("5", "m1")]);
-        let (key, pairs) =
-            labeled(pop_at(&mut db, &b_args(&["ZMPOP", "1", "k", "MIN", "COUNT", "0"]), vec![2])).unwrap();
+        let (key, pairs) = labeled(pop_at(
+            &mut db,
+            &b_args(&["ZMPOP", "1", "k", "MIN", "COUNT", "0"]),
+            &[2],
+        ))
+        .unwrap();
         assert_eq!(key, "k");
         assert!(pairs.is_empty());
         assert_eq!(range(&mut db, "k"), ["m1"]);
         // Wrong-type keys are skipped, not errors (dragonfly GetFirstNonEmptyKeyFound).
-        db.insert(CompactString::from_bytes(b"s"), PrimeValue::Str(CompactString::from("x")));
-        let r = pop_at(&mut db, &b_args(&["ZMPOP", "1", "s", "MIN"]), vec![2]);
+        db.insert(b"s", PrimeValue::Str(CompactString::from("x")));
+        let r = pop_at(&mut db, &b_args(&["ZMPOP", "1", "s", "MIN"]), &[2]);
         assert!(matches!(r.into_resp_value(), RespValue::Nil));
     }
 
@@ -3024,19 +3924,53 @@ mod tests {
         let mut db = DbSlice::new(0);
         add(&mut db, "a", &[("1", "a1")]);
         // Missing MIN/MAX.
-        assert!(err(pop_at(&mut db, &b_args(&["ZMPOP", "1", "a"]), vec![1])).contains("syntax error"));
+        assert!(err(pop_at(&mut db, &b_args(&["ZMPOP", "1", "a"]), &[1])).contains("syntax error"));
         // Numkeys not an integer.
-        assert!(err(pop_at(&mut db, &b_args(&["ZMPOP", "x", "a", "MIN"]), vec![])).contains("not an integer"));
+        assert!(
+            err(pop_at(&mut db, &b_args(&["ZMPOP", "x", "a", "MIN"]), &[]))
+                .contains("not an integer")
+        );
         // Zero keys.
-        assert!(err(pop_at(&mut db, &b_args(&["ZMPOP", "0", "MIN"]), vec![])).contains("at least 1 input key is needed"));
+        assert!(
+            err(pop_at(&mut db, &b_args(&["ZMPOP", "0", "MIN"]), &[]))
+                .contains("at least 1 input key is needed")
+        );
         // Wrong number of keys.
-        assert!(err(pop_at(&mut db, &b_args(&["ZMPOP", "1", "a", "b", "MAX"]), vec![1])).contains("syntax error"));
+        assert!(
+            err(pop_at(
+                &mut db,
+                &b_args(&["ZMPOP", "1", "a", "b", "MAX"]),
+                &[1]
+            ))
+            .contains("syntax error")
+        );
         // COUNT without a number.
-        assert!(err(pop_at(&mut db, &b_args(&["ZMPOP", "1", "a", "MIN", "COUNT"]), vec![1])).contains("syntax error"));
+        assert!(
+            err(pop_at(
+                &mut db,
+                &b_args(&["ZMPOP", "1", "a", "MIN", "COUNT"]),
+                &[1]
+            ))
+            .contains("syntax error")
+        );
         // COUNT not an integer.
-        assert!(err(pop_at(&mut db, &b_args(&["ZMPOP", "1", "a", "MIN", "COUNT", "boo"]), vec![1])).contains("not an integer"));
+        assert!(
+            err(pop_at(
+                &mut db,
+                &b_args(&["ZMPOP", "1", "a", "MIN", "COUNT", "boo"]),
+                &[1]
+            ))
+            .contains("not an integer")
+        );
         // Trailing arguments.
-        assert!(err(pop_at(&mut db, &b_args(&["ZMPOP", "1", "a", "MIN", "COUNT", "2", "foo"]), vec![1])).contains("syntax error"));
+        assert!(
+            err(pop_at(
+                &mut db,
+                &b_args(&["ZMPOP", "1", "a", "MIN", "COUNT", "2", "foo"]),
+                &[1]
+            ))
+            .contains("syntax error")
+        );
     }
 
     #[test]
@@ -3044,20 +3978,39 @@ mod tests {
         let mut db = DbSlice::new(0);
         add(&mut db, "a", &[("1", "a1"), ("2", "a2")]);
         // Ready data pops immediately, reply shaped like ZMPOP.
-        let (key, pairs) = labeled(pop_at(&mut db, &b_args(&["BZMPOP", "0", "1", "a", "MIN"]), vec![3])).unwrap();
+        let (key, pairs) = labeled(pop_at(
+            &mut db,
+            &b_args(&["BZMPOP", "0", "1", "a", "MIN"]),
+            &[3],
+        ))
+        .unwrap();
         assert_eq!(key, "a");
         assert_eq!(pairs, [("a1".to_string(), "1".to_string())]);
         assert_eq!(range(&mut db, "a"), ["a2"]);
         // Nothing to pop -> Blocked.
-        let r = pop_at(&mut db, &b_args(&["BZMPOP", "0", "1", "none", "MIN"]), vec![3]);
+        let r = pop_at(&mut db, &b_args(&["BZMPOP", "0", "1", "none", "MIN"]), &[3]);
         assert!(matches!(r, CmdResult::Blocked));
         // Wrong-type keys block rather than error (key_checker -> kNotReady).
-        db.insert(CompactString::from_bytes(b"s"), PrimeValue::Str(CompactString::from("x")));
-        let r = pop_at(&mut db, &b_args(&["BZMPOP", "0", "1", "s", "MIN"]), vec![3]);
+        db.insert(b"s", PrimeValue::Str(CompactString::from("x")));
+        let r = pop_at(&mut db, &b_args(&["BZMPOP", "0", "1", "s", "MIN"]), &[3]);
         assert!(matches!(r, CmdResult::Blocked));
         // Timeout validation.
-        assert!(err(pop_at(&mut db, &b_args(&["BZMPOP", "-1", "1", "a", "MIN"]), vec![3])).contains("timeout is negative"));
-        assert!(err(pop_at(&mut db, &b_args(&["BZMPOP", "abc", "1", "a", "MIN"]), vec![3])).contains("timeout is not a float"));
+        assert!(
+            err(pop_at(
+                &mut db,
+                &b_args(&["BZMPOP", "-1", "1", "a", "MIN"]),
+                &[3]
+            ))
+            .contains("timeout is negative")
+        );
+        assert!(
+            err(pop_at(
+                &mut db,
+                &b_args(&["BZMPOP", "abc", "1", "a", "MIN"]),
+                &[3]
+            ))
+            .contains("timeout is not a float")
+        );
     }
 
     #[test]
@@ -3065,22 +4018,31 @@ mod tests {
         let mut db = DbSlice::new(0);
         add(&mut db, "z", &[("1", "a"), ("2", "b")]);
         // Pops the min member: [key, member, score].
-        let r = pop_at(&mut db, &b_args(&["BZPOPMIN", "z", "0"]), vec![1]);
+        let r = pop_at(&mut db, &b_args(&["BZPOPMIN", "z", "0"]), &[1]);
         assert_eq!(triple(&r), ("z".into(), "a".into(), "1".into()));
         assert_eq!(range(&mut db, "z"), ["b"]);
         // MAX pops the top member.
-        let r = pop_at(&mut db, &b_args(&["BZPOPMAX", "z", "0"]), vec![1]);
-        assert_eq!(triple(&r), ("z".to_string(), "b".to_string(), "2".to_string()));
+        let r = pop_at(&mut db, &b_args(&["BZPOPMAX", "z", "0"]), &[1]);
+        assert_eq!(
+            triple(&r),
+            ("z".to_string(), "b".to_string(), "2".to_string())
+        );
         assert!(range(&mut db, "z").is_empty());
         // No data -> Blocked.
-        let r = pop_at(&mut db, &b_args(&["BZPOPMIN", "none", "0"]), vec![1]);
+        let r = pop_at(&mut db, &b_args(&["BZPOPMIN", "none", "0"]), &[1]);
         assert!(matches!(r, CmdResult::Blocked));
         // Wrong type -> WRONGTYPE (FindFirstReadOnly aborts).
-        db.insert(CompactString::from_bytes(b"s"), PrimeValue::Str(CompactString::from("x")));
-        assert!(err(pop_at(&mut db, &b_args(&["BZPOPMIN", "s", "0"]), vec![1])).contains("WRONGTYPE"));
+        db.insert(b"s", PrimeValue::Str(CompactString::from("x")));
+        assert!(err(pop_at(&mut db, &b_args(&["BZPOPMIN", "s", "0"]), &[1])).contains("WRONGTYPE"));
         // Timeout validation.
-        assert!(err(pop_at(&mut db, &b_args(&["BZPOPMIN", "z", "-1"]), vec![1])).contains("timeout is negative"));
-        assert!(err(pop_at(&mut db, &b_args(&["BZPOPMIN", "z", "abc"]), vec![1])).contains("timeout is not a float"));
+        assert!(
+            err(pop_at(&mut db, &b_args(&["BZPOPMIN", "z", "-1"]), &[1]))
+                .contains("timeout is negative")
+        );
+        assert!(
+            err(pop_at(&mut db, &b_args(&["BZPOPMIN", "z", "abc"]), &[1]))
+                .contains("timeout is not a float")
+        );
     }
 
     #[test]
@@ -3089,12 +4051,20 @@ mod tests {
         let keys = [1usize, 2, 3];
         // Shard 0 owns "e" (empty), shard 1 owns "x" and "y" (data).
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![1], result: CmdResult::Ok(RespValue::Nil) },
-            ShardPart { shard: 1, owned_key_idxs: vec![2, 3], result: CmdResult::Ok(RespValue::Array(vec![
-                integer(3),
-                RespValue::Array(vec![bulk(b"x1"), bulk(b"1")]),
-                RespValue::Array(vec![bulk(b"x2"), bulk(b"2")]),
-            ])) },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![1],
+                result: CmdResult::Ok(RespValue::Nil),
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: vec![2, 3],
+                result: CmdResult::Ok(RespValue::Array(vec![
+                    integer(3),
+                    RespValue::Array(vec![bulk(b"x1"), bulk(b"1")]),
+                    RespValue::Array(vec![bulk(b"x2"), bulk(b"2")]),
+                ])),
+            },
         ];
         match merge_zmpop(&parts, &args, &keys, 0) {
             CmdResult::DeferredStore { key, value, reply } => {
@@ -3119,16 +4089,24 @@ mod tests {
         let args = b_args(&["BZMPOP", "0", "3", "x", "y", "z", "MAX"]);
         let keys = [1usize, 2, 3];
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![1], result: CmdResult::Ok(RespValue::Array(vec![
-                integer(3),
-                RespValue::Array(vec![bulk(b"x1"), bulk(b"1")]),
-                RespValue::Array(vec![]),
-            ])) },
-            ShardPart { shard: 1, owned_key_idxs: vec![2, 3], result: CmdResult::Ok(RespValue::Array(vec![
-                integer(4),
-                RespValue::Array(vec![bulk(b"y1"), bulk(b"2")]),
-                RespValue::Array(vec![]),
-            ])) },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![1],
+                result: CmdResult::Ok(RespValue::Array(vec![
+                    integer(3),
+                    RespValue::Array(vec![bulk(b"x1"), bulk(b"1")]),
+                    RespValue::Array(vec![]),
+                ])),
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: vec![2, 3],
+                result: CmdResult::Ok(RespValue::Array(vec![
+                    integer(4),
+                    RespValue::Array(vec![bulk(b"y1"), bulk(b"2")]),
+                    RespValue::Array(vec![]),
+                ])),
+            },
         ];
         // "x" (index 1) wins; y's peek is read-only so only x is stored (deleted).
         match merge_zmpop(&parts, &args, &keys, 0) {
@@ -3148,17 +4126,28 @@ mod tests {
         let args = b_args(&["BZPOPMIN", "x", "y", "1"]);
         let keys = [1usize, 2];
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![1], result: CmdResult::Blocked },
-            ShardPart { shard: 1, owned_key_idxs: vec![2], result: CmdResult::Ok(RespValue::Array(vec![
-                integer(2),
-                RespValue::Array(vec![bulk(b"y1"), bulk(b"9")]),
-                RespValue::Array(vec![bulk(b"y2"), bulk(b"8")]),
-            ])) },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![1],
+                result: CmdResult::Blocked,
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: vec![2],
+                result: CmdResult::Ok(RespValue::Array(vec![
+                    integer(2),
+                    RespValue::Array(vec![bulk(b"y1"), bulk(b"9")]),
+                    RespValue::Array(vec![bulk(b"y2"), bulk(b"8")]),
+                ])),
+            },
         ];
         match merge_bzpop(&parts, &args, &keys, 0) {
             CmdResult::DeferredStore { key, value, reply } => {
                 assert_eq!(key, b"y");
-                assert_eq!(triple(&CmdResult::Ok(reply)), ("y".into(), "y1".into(), "9".into()));
+                assert_eq!(
+                    triple(&CmdResult::Ok(reply)),
+                    ("y".into(), "y1".into(), "9".into())
+                );
                 match value {
                     Some(PrimeValue::ZSet(z)) => {
                         assert_eq!(z.len(), 1);
@@ -3172,8 +4161,16 @@ mod tests {
 
         // A wrong-type part aborts the whole pop.
         let parts = [
-            ShardPart { shard: 0, owned_key_idxs: vec![1], result: CmdResult::Err(RespError::wrong_type()) },
-            ShardPart { shard: 1, owned_key_idxs: vec![2], result: CmdResult::Blocked },
+            ShardPart {
+                shard: 0,
+                owned_key_idxs: vec![1],
+                result: CmdResult::Err(RespError::wrong_type()),
+            },
+            ShardPart {
+                shard: 1,
+                owned_key_idxs: vec![2],
+                result: CmdResult::Blocked,
+            },
         ];
         assert!(err(merge_bzpop(&parts, &args, &keys, 0)).contains("WRONGTYPE"));
     }
@@ -3185,11 +4182,24 @@ mod tests {
         let mut db = DbSlice::new(0);
         add(&mut db, "z", &[("1", "a"), ("2", "b")]);
         let argv = b_args(&["BZPOPMIN", "z", "0"]);
-        let mut ctx = OpContext { db: &mut db, args: &argv, owned_keys: &[1usize], first_key_idx: 1, now_ms: 0 };
+        let mut ctx = OpContext {
+            db: &mut db,
+            args: &argv,
+            owned_keys: &[1usize],
+            first_key_idx: 1,
+            now_ms: 0,
+        };
         let exec_r = exec_bzpopmin(&mut ctx);
-        let part = ShardPart { shard: 0, owned_key_idxs: vec![1], result: exec_r };
+        let part = ShardPart {
+            shard: 0,
+            owned_key_idxs: vec![1],
+            result: exec_r,
+        };
         let r = merge_bzpop(&[part], &argv, &[1usize], 0);
-        assert_eq!(triple(&r), ("z".to_string(), "a".to_string(), "1".to_string()));
+        assert_eq!(
+            triple(&r),
+            ("z".to_string(), "a".to_string(), "1".to_string())
+        );
         assert_eq!(range(&mut db, "z"), ["b"]);
     }
 
@@ -3198,81 +4208,305 @@ mod tests {
         let mut db = DbSlice::new(0);
         add(&mut db, "z", &[("1", "a"), ("2", "b"), ("3", "c")]);
         // Descending rank order within the range (index 0 is the highest score).
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "z", "0", "-1"]))), ["c", "b", "a"]);
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "z", "0", "1"]))), ["c", "b"]);
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "z", "2", "2"]))), ["a"]);
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "z", "-1", "-1"]))), ["a"]);
+        assert_eq!(
+            flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREVRANGE", "z", "0", "-1"])
+            )),
+            ["c", "b", "a"]
+        );
+        assert_eq!(
+            flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREVRANGE", "z", "0", "1"])
+            )),
+            ["c", "b"]
+        );
+        assert_eq!(
+            flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREVRANGE", "z", "2", "2"])
+            )),
+            ["a"]
+        );
+        assert_eq!(
+            flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREVRANGE", "z", "-1", "-1"])
+            )),
+            ["a"]
+        );
         // WITHSCORES flattens member/score pairs.
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "z", "0", "-1", "WITHSCORES"]))), ["c", "3", "b", "2", "a", "1"]);
+        assert_eq!(
+            flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREVRANGE", "z", "0", "-1", "WITHSCORES"])
+            )),
+            ["c", "3", "b", "2", "a", "1"]
+        );
         // LIMIT applies after reversing.
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "z", "0", "-1", "LIMIT", "1", "1"]))), ["b"]);
+        assert_eq!(
+            flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREVRANGE", "z", "0", "-1", "LIMIT", "1", "1"])
+            )),
+            ["b"]
+        );
         // Missing key and empty range.
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "nope", "0", "-1"]))), Vec::<String>::new());
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "z", "5", "9"]))), Vec::<String>::new());
+        assert_eq!(
+            flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREVRANGE", "nope", "0", "-1"])
+            )),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREVRANGE", "z", "5", "9"])
+            )),
+            Vec::<String>::new()
+        );
         // A negative LIMIT offset empties the whole reply.
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "z", "0", "-1", "LIMIT", "-1", "1"]))), Vec::<String>::new());
+        assert_eq!(
+            flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREVRANGE", "z", "0", "-1", "LIMIT", "-1", "1"])
+            )),
+            Vec::<String>::new()
+        );
         // Wrong type.
-        db.insert(CompactString::from_bytes(b"s"), PrimeValue::Str(CompactString::from("x")));
-        assert!(err(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGE", "s", "0", "-1"]))).contains("WRONGTYPE"));
+        db.insert(b"s", PrimeValue::Str(CompactString::from("x")));
+        assert!(
+            err(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREVRANGE", "s", "0", "-1"])
+            ))
+            .contains("WRONGTYPE")
+        );
     }
 
     #[test]
     fn zrevrangebylex_legacy() {
         let mut db = DbSlice::new(0);
-        add(&mut db, "z", &[("1", "a"), ("2", "b"), ("3", "c"), ("4", "d")]);
+        add(
+            &mut db,
+            "z",
+            &[("1", "a"), ("2", "b"), ("3", "c"), ("4", "d")],
+        );
         // Descending lex order within the range.
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGEBYLEX", "z", "-", "+"]))), ["d", "c", "b", "a"]);
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGEBYLEX", "z", "[b", "+"]))), ["d", "c", "b"]);
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGEBYLEX", "z", "(b", "[d"]))), ["d", "c"]);
+        assert_eq!(
+            flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREVRANGEBYLEX", "z", "-", "+"])
+            )),
+            ["d", "c", "b", "a"]
+        );
+        assert_eq!(
+            flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREVRANGEBYLEX", "z", "[b", "+"])
+            )),
+            ["d", "c", "b"]
+        );
+        assert_eq!(
+            flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREVRANGEBYLEX", "z", "(b", "[d"])
+            )),
+            ["d", "c"]
+        );
         // REV keeps the legacy direction (it only re-asserts the flag upstream).
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGEBYLEX", "z", "[b", "+", "REV"]))), ["d", "c", "b"]);
+        assert_eq!(
+            flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREVRANGEBYLEX", "z", "[b", "+", "REV"])
+            )),
+            ["d", "c", "b"]
+        );
         // WITHSCORES + LIMIT.
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGEBYLEX", "z", "-", "+", "WITHSCORES", "LIMIT", "0", "2"]))), ["d", "4", "c", "3"]);
+        assert_eq!(
+            flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&[
+                    "ZREVRANGEBYLEX",
+                    "z",
+                    "-",
+                    "+",
+                    "WITHSCORES",
+                    "LIMIT",
+                    "0",
+                    "2"
+                ])
+            )),
+            ["d", "4", "c", "3"]
+        );
         // Negative LIMIT offset empties the reply.
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGEBYLEX", "z", "-", "+", "LIMIT", "-1", "1"]))), Vec::<String>::new());
+        assert_eq!(
+            flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREVRANGEBYLEX", "z", "-", "+", "LIMIT", "-1", "1"])
+            )),
+            Vec::<String>::new()
+        );
         // The fixed LEX interval type rejects a BYSCORE flip.
-        assert_eq!(err(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGEBYLEX", "z", "1", "2", "BYSCORE"]))), "ERR BYSCORE and BYLEX options are not compatible");
+        assert_eq!(
+            err(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREVRANGEBYLEX", "z", "1", "2", "BYSCORE"])
+            )),
+            "ERR BYSCORE and BYLEX options are not compatible"
+        );
         // Invalid lex bounds.
-        assert_eq!(err(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGEBYLEX", "z", "a", "b"]))), "ERR min or max not valid string range item");
+        assert_eq!(
+            err(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREVRANGEBYLEX", "z", "a", "b"])
+            )),
+            "ERR min or max not valid string range item"
+        );
         // Missing key yields an empty array.
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZREVRANGEBYLEX", "nope", "-", "+"]))), Vec::<String>::new());
+        assert_eq!(
+            flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREVRANGEBYLEX", "nope", "-", "+"])
+            )),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
     fn zlexcount_and_zremrangebylex() {
         let mut db = DbSlice::new(0);
-        add(&mut db, "z", &[("1", "a"), ("2", "b"), ("3", "c"), ("4", "d")]);
-        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZLEXCOUNT", "z", "-", "+"]))), 4);
-        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZLEXCOUNT", "z", "[b", "[d"]))), 3);
-        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZLEXCOUNT", "z", "(b", "[c"]))), 1);
-        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZLEXCOUNT", "z", "(b", "(d"]))), 1);
+        add(
+            &mut db,
+            "z",
+            &[("1", "a"), ("2", "b"), ("3", "c"), ("4", "d")],
+        );
+        assert_eq!(
+            int(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZLEXCOUNT", "z", "-", "+"])
+            )),
+            4
+        );
+        assert_eq!(
+            int(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZLEXCOUNT", "z", "[b", "[d"])
+            )),
+            3
+        );
+        assert_eq!(
+            int(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZLEXCOUNT", "z", "(b", "[c"])
+            )),
+            1
+        );
+        assert_eq!(
+            int(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZLEXCOUNT", "z", "(b", "(d"])
+            )),
+            1
+        );
         // Missing key counts 0.
-        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZLEXCOUNT", "nope", "-", "+"]))), 0);
+        assert_eq!(
+            int(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZLEXCOUNT", "nope", "-", "+"])
+            )),
+            0
+        );
         // Invalid bound errors.
-        assert_eq!(err(dispatch_at(&mut db, 0, &b_args(&["ZLEXCOUNT", "z", "x", "+"]))), "ERR min or max not valid string range item");
+        assert_eq!(
+            err(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZLEXCOUNT", "z", "x", "+"])
+            )),
+            "ERR min or max not valid string range item"
+        );
         // Remove by lex: (a .. [c removes b and c.
-        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZREMRANGEBYLEX", "z", "(a", "[c"]))), 2);
+        assert_eq!(
+            int(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREMRANGEBYLEX", "z", "(a", "[c"])
+            )),
+            2
+        );
         assert_eq!(range(&mut db, "z"), ["a", "d"]);
         // Removing everything deletes the key.
-        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZREMRANGEBYLEX", "z", "-", "+"]))), 2);
+        assert_eq!(
+            int(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREMRANGEBYLEX", "z", "-", "+"])
+            )),
+            2
+        );
         assert!(db.find(b"z", 0).is_none());
         // Missing key removes 0.
-        assert_eq!(int(dispatch_at(&mut db, 0, &b_args(&["ZREMRANGEBYLEX", "nope", "-", "+"]))), 0);
+        assert_eq!(
+            int(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZREMRANGEBYLEX", "nope", "-", "+"])
+            )),
+            0
+        );
     }
 
     #[test]
     fn zrandmember_basic() {
         let mut db = DbSlice::new(0);
-        add(&mut db, "z", &[("1", "a"), ("2", "b"), ("3", "c"), ("4", "d")]);
+        add(
+            &mut db,
+            "z",
+            &[("1", "a"), ("2", "b"), ("3", "c"), ("4", "d")],
+        );
         let members = ["a", "b", "c", "d"];
 
         // No count: a single member.
         let r = dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z"]));
         assert_eq!(flat(r).len(), 1);
-        assert!(members.contains(&flat(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z"])))[0].as_str()));
+        assert!(
+            members.contains(
+                &flat(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z"])))[0].as_str()
+            )
+        );
 
         // count 0 yields an empty array.
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "0"]))), Vec::<String>::new());
+        assert_eq!(
+            flat(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "0"]))),
+            Vec::<String>::new()
+        );
 
         // Positive count returns distinct members.
         let picked = flat(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "2"])));
@@ -3282,10 +4516,22 @@ mod tests {
         assert!(picked.iter().all(|m| members.contains(&m.as_str())));
 
         // Negative count returns exactly |count| draws (repetition allowed).
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "-3"]))).len(), 3);
+        assert_eq!(
+            flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZRANDMEMBER", "z", "-3"])
+            ))
+            .len(),
+            3
+        );
 
         // WITHSCORES flattens member/score pairs with matching scores.
-        let r = flat(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "2", "WITHSCORES"])));
+        let r = flat(dispatch_at(
+            &mut db,
+            0,
+            &b_args(&["ZRANDMEMBER", "z", "2", "WITHSCORES"]),
+        ));
         assert_eq!(r.len(), 4);
         for pair in r.chunks(2) {
             let score = pair[1].parse::<f64>().unwrap();
@@ -3304,21 +4550,57 @@ mod tests {
             RespValue::Nil => {}
             o => panic!("expected null, got {o:?}"),
         }
-        assert_eq!(flat(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "nope", "2"]))), Vec::<String>::new());
+        assert_eq!(
+            flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZRANDMEMBER", "nope", "2"])
+            )),
+            Vec::<String>::new()
+        );
 
         // Deterministic for a fixed key (seeded from the key).
-        let first = flat(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "2", "WITHSCORES"])));
-        let second = flat(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "2", "WITHSCORES"])));
+        let first = flat(dispatch_at(
+            &mut db,
+            0,
+            &b_args(&["ZRANDMEMBER", "z", "2", "WITHSCORES"]),
+        ));
+        let second = flat(dispatch_at(
+            &mut db,
+            0,
+            &b_args(&["ZRANDMEMBER", "z", "2", "WITHSCORES"]),
+        ));
         assert_eq!(first, second);
 
         // Unsupported trailing option.
-        assert_eq!(err(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "1", "FOO"]))), "ERR Unsupported option:FOO");
+        assert_eq!(
+            err(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZRANDMEMBER", "z", "1", "FOO"])
+            )),
+            "ERR Unsupported option:FOO"
+        );
         // Non-integer count.
-        assert!(err(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "abc"]))).contains("not an integer"));
+        assert!(
+            err(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZRANDMEMBER", "z", "abc"])
+            ))
+            .contains("not an integer")
+        );
         // More than 3 extra args.
-        assert_eq!(err(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "z", "1", "WITHSCORES", "x"]))), "ERR wrong number of arguments for 'zrandmember' command");
+        assert_eq!(
+            err(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZRANDMEMBER", "z", "1", "WITHSCORES", "x"])
+            )),
+            "ERR wrong number of arguments for 'zrandmember' command"
+        );
         // Wrong type.
-        db.insert(CompactString::from_bytes(b"s"), PrimeValue::Str(CompactString::from("x")));
+        db.insert(b"s", PrimeValue::Str(CompactString::from("x")));
         assert!(err(dispatch_at(&mut db, 0, &b_args(&["ZRANDMEMBER", "s"]))).contains("WRONGTYPE"));
     }
 
@@ -3349,14 +4631,22 @@ mod tests {
     #[test]
     fn zscan_basic() {
         let mut db = DbSlice::new(0);
-        add(&mut db, "z", &[("1", "a"), ("2", "b"), ("3", "c"), ("4", "d")]);
+        add(
+            &mut db,
+            "z",
+            &[("1", "a"), ("2", "b"), ("3", "c"), ("4", "d")],
+        );
         // Full scan returns every member with its score.
         let (cur, members) = scan_flat(dispatch_at(&mut db, 0, &b_args(&["ZSCAN", "z", "0"])));
         assert_eq!(cur, 0);
         assert_eq!(members, ["a", "1", "b", "2", "c", "3", "d", "4"]);
 
         // MATCH filters members but still emits the matching scores.
-        let (cur, members) = scan_flat(dispatch_at(&mut db, 0, &b_args(&["ZSCAN", "z", "0", "MATCH", "a*"])));
+        let (cur, members) = scan_flat(dispatch_at(
+            &mut db,
+            0,
+            &b_args(&["ZSCAN", "z", "0", "MATCH", "a*"]),
+        ));
         assert_eq!(cur, 0);
         assert_eq!(members, ["a", "1"]);
 
@@ -3364,7 +4654,11 @@ mod tests {
         let mut cur = 0u64;
         let mut seen = Vec::new();
         loop {
-            let (c, page) = scan_flat(dispatch_at(&mut db, 0, &b_args(&["ZSCAN", "z", &cur.to_string(), "COUNT", "2"])));
+            let (c, page) = scan_flat(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZSCAN", "z", &cur.to_string(), "COUNT", "2"]),
+            ));
             seen.extend(page);
             cur = c;
             if c == 0 {
@@ -3379,11 +4673,35 @@ mod tests {
         assert!(members.is_empty());
 
         // Invalid cursor.
-        assert!(err(dispatch_at(&mut db, 0, &b_args(&["ZSCAN", "z", "abc"]))).contains("invalid cursor"));
+        assert!(
+            err(dispatch_at(&mut db, 0, &b_args(&["ZSCAN", "z", "abc"])))
+                .contains("invalid cursor")
+        );
         // Invalid COUNT.
-        assert!(err(dispatch_at(&mut db, 0, &b_args(&["ZSCAN", "z", "0", "COUNT", "0"]))).contains("syntax error"));
-        assert!(err(dispatch_at(&mut db, 0, &b_args(&["ZSCAN", "z", "0", "COUNT", "x"]))).contains("syntax error"));
+        assert!(
+            err(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZSCAN", "z", "0", "COUNT", "0"])
+            ))
+            .contains("syntax error")
+        );
+        assert!(
+            err(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZSCAN", "z", "0", "COUNT", "x"])
+            ))
+            .contains("syntax error")
+        );
         // Unknown option.
-        assert!(err(dispatch_at(&mut db, 0, &b_args(&["ZSCAN", "z", "0", "FOO", "bar"]))).contains("syntax error"));
+        assert!(
+            err(dispatch_at(
+                &mut db,
+                0,
+                &b_args(&["ZSCAN", "z", "0", "FOO", "bar"])
+            ))
+            .contains("syntax error")
+        );
     }
 }

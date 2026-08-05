@@ -1,6 +1,9 @@
-use crate::commands::{bulk, integer, ok, Command, OpContext, ShardPart, KeyRange, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE};
-use crate::core::compact::CompactString;
+use crate::commands::{
+    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE, KeyRange,
+    OpContext, ShardPart, bulk, integer, ok,
+};
 use crate::core::PrimeValue;
+use crate::core::compact::CompactString;
 use crate::error::{CmdResult, RespError, RespValue};
 use crate::util::{format_double, parse_double, parse_i64, parse_u64, redis_range};
 use xxhash_rust::xxh3::xxh3_64;
@@ -96,7 +99,8 @@ fn exec_set(ctx: &mut OpContext) -> CmdResult {
     if !opts.keepttl {
         ctx.db.clear_expiry(key);
     }
-    ctx.db.insert(CompactString::from_bytes(key), PrimeValue::Str(CompactString::from_bytes(value)));
+    ctx.db
+        .insert(key, PrimeValue::Str(CompactString::from_bytes(value)));
 
     if let Some(ms) = opts.expire_ms {
         let at = ctx.now_ms as i64 + ms;
@@ -149,7 +153,7 @@ fn exec_getset(ctx: &mut OpContext) -> CmdResult {
         Some(_) => return CmdResult::Err(RespError::wrong_type()),
         None => None,
     };
-    ctx.db.insert(CompactString::from_bytes(key), PrimeValue::Str(new_val));
+    ctx.db.insert(key, PrimeValue::Str(new_val));
     CmdResult::Ok(match old {
         Some(v) => RespValue::Bulk(v),
         None => RespValue::Nil,
@@ -160,24 +164,30 @@ fn exec_setnx(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
     let value = CompactString::from_bytes(&ctx.args[key_idx + 1]);
-    let inserted = ctx.db.insert_if_absent(CompactString::from_bytes(key), PrimeValue::Str(value), ctx.now_ms);
-    CmdResult::Ok(integer(inserted as i64))
+    let inserted = ctx
+        .db
+        .insert_if_absent(key, PrimeValue::Str(value), ctx.now_ms);
+    CmdResult::Ok(integer(i64::from(inserted)))
 }
 
 fn exec_setex_common(ctx: &mut OpContext, unit_ms: bool) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let ttl = match parse_i64(&ctx.args[key_idx + 1]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(ttl) = parse_i64(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::integer());
     };
     if ttl <= 0 {
         return CmdResult::Err(RespError::new("ERR invalid expire time in 'setex' command"));
     }
-    let ms = if unit_ms { ttl } else { ttl.saturating_mul(1000) };
+    let ms = if unit_ms {
+        ttl
+    } else {
+        ttl.saturating_mul(1000)
+    };
     let value = CompactString::from_bytes(&ctx.args[key_idx + 2]);
-    ctx.db.insert(CompactString::from_bytes(key), PrimeValue::Str(value));
-    ctx.db.set_expiry(key, (ctx.now_ms as i64 + ms) as u64, ctx.now_ms);
+    ctx.db.insert(key, PrimeValue::Str(value));
+    ctx.db
+        .set_expiry(key, (ctx.now_ms as i64 + ms) as u64, ctx.now_ms);
     CmdResult::Ok(ok())
 }
 
@@ -207,9 +217,10 @@ fn exec_append(ctx: &mut OpContext) -> CmdResult {
         }
         Some(_) => return CmdResult::Err(RespError::wrong_type()),
         None => {
-            let v = suffix.to_vec();
+            let v = suffix.clone();
             let len = v.len();
-            ctx.db.insert(CompactString::from_bytes(key), PrimeValue::Str(CompactString::from_bytes(&v)));
+            ctx.db
+                .insert(key, PrimeValue::Str(CompactString::from_bytes(&v)));
             len
         }
     };
@@ -228,24 +239,24 @@ fn exec_strlen(ctx: &mut OpContext) -> CmdResult {
 fn exec_getrange(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let start = match parse_i64(&ctx.args[key_idx + 1]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(start) = parse_i64(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::integer());
     };
-    let stop = match parse_i64(&ctx.args[key_idx + 2]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(stop) = parse_i64(&ctx.args[key_idx + 2]) else {
+        return CmdResult::Err(RespError::integer());
     };
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::Str(value)) => {
             let len = value.len() as i64;
             match redis_range(start, stop, len) {
-                Some((rs, rc)) => CmdResult::Ok(bulk(&value.as_bytes()[rs as usize..(rs + rc) as usize])),
-                None => CmdResult::Ok(bulk(&[])),
+                Some((rs, rc)) => {
+                    CmdResult::Ok(bulk(&value.as_bytes()[rs as usize..(rs + rc) as usize]))
+                }
+                None => CmdResult::Ok(bulk([])),
             }
         }
         Some(_) => CmdResult::Err(RespError::wrong_type()),
-        None => CmdResult::Ok(bulk(&[])),
+        None => CmdResult::Ok(bulk([])),
     }
 }
 
@@ -291,7 +302,7 @@ fn parse_getex_args(args: &[Vec<u8>], now_ms: u64) -> Result<Option<GetExOpt>, R
 
 /// Absolute expiry (ms) for a GETEX option, mirroring `DbSlice::ExpireParams`
 /// plus `UpdateExpire`'s range checks: values that overflow or exceed the max
-/// expire deadline surface OUT_OF_RANGE ("index out of range").
+/// expire deadline surface `OUT_OF_RANGE` ("index out of range").
 fn getex_expiry_at(unit: &[u8], value: i64, now_ms: u64) -> Result<u64, ()> {
     const K_OVERFLOW: i64 = i64::MAX;
     const K_MAX_DEADLINE_MS: i64 = 268_435_455_000;
@@ -359,7 +370,7 @@ fn exec_prepend(ctx: &mut OpContext) -> CmdResult {
     let prefix = &ctx.args[key_idx + 1];
     let new_len = match ctx.db.find_mut(key, ctx.now_ms) {
         Some(PrimeValue::Str(s)) => {
-            let mut v = prefix.to_vec();
+            let mut v = prefix.clone();
             v.extend_from_slice(s.as_bytes());
             let len = v.len();
             *s = CompactString::from_bytes(&v);
@@ -368,10 +379,8 @@ fn exec_prepend(ctx: &mut OpContext) -> CmdResult {
         Some(_) => return CmdResult::Err(RespError::wrong_type()),
         None => {
             let len = prefix.len();
-            ctx.db.insert(
-                CompactString::from_bytes(key),
-                PrimeValue::Str(CompactString::from_bytes(prefix)),
-            );
+            ctx.db
+                .insert(key, PrimeValue::Str(CompactString::from_bytes(prefix)));
             len
         }
     };
@@ -386,9 +395,8 @@ fn exec_gat(_ctx: &mut OpContext) -> CmdResult {
 fn exec_setrange(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let offset = match parse_i64(&ctx.args[key_idx + 1]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(offset) = parse_i64(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::integer());
     };
     if offset < 0 {
         return CmdResult::Err(RespError::new("ERR offset is out of range"));
@@ -411,7 +419,8 @@ fn exec_setrange(ctx: &mut OpContext) -> CmdResult {
             let mut v = vec![0u8; offset as usize + val.len()];
             v[offset as usize..].copy_from_slice(val);
             let len = v.len();
-            ctx.db.insert(CompactString::from_bytes(key), PrimeValue::Str(CompactString::from_bytes(&v)));
+            ctx.db
+                .insert(key, PrimeValue::Str(CompactString::from_bytes(&v)));
             len
         }
     };
@@ -427,7 +436,7 @@ fn incr_by(ctx: &mut OpContext, delta: i64) -> CmdResult {
     let key = &ctx.args[key_idx];
     let cur = match ctx.db.find_mut(key, ctx.now_ms) {
         Some(PrimeValue::Str(s)) => {
-            if s.len() == 0 {
+            if s.is_empty() {
                 0
             } else {
                 match parse_i64(s.as_bytes()) {
@@ -439,12 +448,12 @@ fn incr_by(ctx: &mut OpContext, delta: i64) -> CmdResult {
         Some(_) => return CmdResult::Err(RespError::wrong_type()),
         None => 0,
     };
-    let new_val = match cur.checked_add(delta) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(new_val) = cur.checked_add(delta) else {
+        return CmdResult::Err(RespError::integer());
     };
     let s = crate::util::itoa(new_val);
-    ctx.db.insert(CompactString::from_bytes(key), PrimeValue::Str(CompactString::from_bytes(&s)));
+    ctx.db
+        .insert(key, PrimeValue::Str(CompactString::from_bytes(&s)));
     CmdResult::Ok(integer(new_val))
 }
 
@@ -453,9 +462,8 @@ fn exec_incr(ctx: &mut OpContext) -> CmdResult {
 }
 fn exec_incrby(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
-    let delta = match parse_i64(&ctx.args[key_idx + 1]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(delta) = parse_i64(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::integer());
     };
     incr_by(ctx, delta)
 }
@@ -464,9 +472,8 @@ fn exec_decr(ctx: &mut OpContext) -> CmdResult {
 }
 fn exec_decrby(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
-    let delta = match parse_i64(&ctx.args[key_idx + 1]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(delta) = parse_i64(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::integer());
     };
     incr_by(ctx, -delta)
 }
@@ -474,13 +481,12 @@ fn exec_decrby(ctx: &mut OpContext) -> CmdResult {
 fn exec_incrbyfloat(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let delta = match parse_double(&ctx.args[key_idx + 1]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::float()),
+    let Some(delta) = parse_double(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::float());
     };
     let cur = match ctx.db.find_mut(key, ctx.now_ms) {
         Some(PrimeValue::Str(s)) => {
-            if s.len() == 0 {
+            if s.is_empty() {
                 0.0
             } else {
                 match parse_double(s.as_bytes()) {
@@ -494,10 +500,15 @@ fn exec_incrbyfloat(ctx: &mut OpContext) -> CmdResult {
     };
     let new_val = cur + delta;
     if !new_val.is_finite() {
-        return CmdResult::Err(RespError::new("ERR increment would produce NaN or Infinity"));
+        return CmdResult::Err(RespError::new(
+            "ERR increment would produce NaN or Infinity",
+        ));
     }
     let s = format_double(new_val);
-    ctx.db.insert(CompactString::from_bytes(key), PrimeValue::Str(CompactString::from_bytes(s.as_bytes())));
+    ctx.db.insert(
+        key,
+        PrimeValue::Str(CompactString::from_bytes(s.as_bytes())),
+    );
     CmdResult::Ok(RespValue::Bulk(s.into_bytes()))
 }
 
@@ -509,7 +520,7 @@ fn exec_mset(ctx: &mut OpContext) -> CmdResult {
     for &ki in ctx.owned_keys {
         let key = CompactString::from_bytes(&ctx.args[ki]);
         let value = CompactString::from_bytes(&ctx.args[ki + 1]);
-        ctx.db.insert(key, PrimeValue::Str(value));
+        ctx.db.insert(&key, PrimeValue::Str(value));
     }
     CmdResult::Ok(ok())
 }
@@ -535,7 +546,7 @@ fn exec_msetnx(ctx: &mut OpContext) -> CmdResult {
         let key = &ctx.args[ki];
         if ctx.db.find(key, ctx.now_ms).is_none() {
             let value = CompactString::from_bytes(&ctx.args[ki + 1]);
-            ctx.db.insert(CompactString::from_bytes(key), PrimeValue::Str(value));
+            ctx.db.insert(key, PrimeValue::Str(value));
         }
     }
     CmdResult::Ok(integer(set as i64))
@@ -550,7 +561,7 @@ fn merge_msetnx(parts: &[ShardPart], _args: &[Vec<u8>], keys: &[usize], _now: u6
             _ => return CmdResult::Err(RespError::new("ERR internal: bad MSETNX shard result")),
         }
     }
-    CmdResult::Ok(integer(if total == keys.len() as i64 { 1 } else { 0 }))
+    CmdResult::Ok(integer(i64::from(total == keys.len() as i64)))
 }
 
 fn exec_mget(ctx: &mut OpContext) -> CmdResult {
@@ -572,7 +583,9 @@ fn merge_mget(parts: &[ShardPart], _args: &[Vec<u8>], keys: &[usize], _now: u64)
         match &p.result {
             CmdResult::Ok(RespValue::Array(arr)) => {
                 if arr.len() != p.owned_key_idxs.len() {
-                    return CmdResult::Err(RespError::new("ERR internal: MGET array length mismatch"));
+                    return CmdResult::Err(RespError::new(
+                        "ERR internal: MGET array length mismatch",
+                    ));
                 }
                 for (j, &ki) in p.owned_key_idxs.iter().enumerate() {
                     if let Some(pos) = keys.iter().position(|&k| k == ki) {
@@ -585,7 +598,10 @@ fn merge_mget(parts: &[ShardPart], _args: &[Vec<u8>], keys: &[usize], _now: u64)
         }
     }
     CmdResult::Ok(RespValue::Array(
-        result.into_iter().map(|v| v.unwrap_or(RespValue::Nil)).collect(),
+        result
+            .into_iter()
+            .map(|v| v.unwrap_or(RespValue::Nil))
+            .collect(),
     ))
 }
 
@@ -780,7 +796,7 @@ struct ThrottleOut {
     new_tat_ns: Option<i64>,
 }
 
-/// Overflow guard mirroring `IsValueWithinBounds` in string_family.cc.
+/// Overflow guard mirroring `IsValueWithinBounds` in `string_family.cc`.
 fn throttle_within_bounds(value: i64, bound: i64) -> bool {
     if bound >= 0 {
         value >= i64::MIN + bound
@@ -789,7 +805,7 @@ fn throttle_within_bounds(value: i64, bound: i64) -> bool {
     }
 }
 
-/// Port of Dragonfly's `OpThrottle` (string_family.cc): a token bucket whose
+/// Port of Dragonfly's `OpThrottle` (`string_family.cc)`: a token bucket whose
 /// entire state is a single "theoretical arrival time" (tat). The caller
 /// guarantees `limit > 0` and `emission_interval_ns > 0`.
 fn op_throttle(
@@ -852,18 +868,20 @@ fn op_throttle(
     let reset_after_ms = ttl_ns.saturating_add(THROTTLE_MS_TO_NS - 1) / THROTTLE_MS_TO_NS;
     let new_tat_ns = if limited { None } else { Some(new_tat_ns) };
 
-    Ok(ThrottleOut { limited, remaining, retry_after_ms, reset_after_ms, new_tat_ns })
+    Ok(ThrottleOut {
+        limited,
+        remaining,
+        retry_after_ms,
+        reset_after_ms,
+        new_tat_ns,
+    })
 }
 
 /// Round a duration in ms up to whole seconds; negatives pass through as-is.
 /// Mirrors the ms→s conversion in `CmdClThrottle` (array[3]/array[4]).
 fn throttle_seconds_from_ms(ms: i64) -> i64 {
     let s = ms / THROTTLE_SEC_TO_MS;
-    if ms > 0 {
-        s + 1
-    } else {
-        s
-    }
+    if ms > 0 { s + 1 } else { s }
 }
 
 /// CL.THROTTLE <key> <max_burst> <count per period> <period> [<quantity>]
@@ -871,9 +889,8 @@ fn exec_cl_throttle(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
     let parse = |i: usize| parse_u64(&ctx.args[key_idx + i]);
-    let (max_burst, count, period) = match (parse(1), parse(2), parse(3)) {
-        (Some(mb), Some(c), Some(p)) => (mb, c, p),
-        _ => return CmdResult::Err(RespError::integer()),
+    let (Some(max_burst), Some(count), Some(period)) = (parse(1), parse(2), parse(3)) else {
+        return CmdResult::Err(RespError::integer());
     };
     let quantity = match ctx.args.get(key_idx + 4) {
         Some(s) => match parse_u64(s) {
@@ -934,13 +951,13 @@ fn exec_cl_throttle(ctx: &mut OpContext) -> CmdResult {
             }
             ctx.db.set_expiry(key, expire_at_ms, ctx.now_ms);
         } else {
-            ctx.db.insert(CompactString::from_bytes(key), value);
+            ctx.db.insert(key, value);
             ctx.db.set_expiry(key, expire_at_ms, ctx.now_ms);
         }
     }
 
     CmdResult::Ok(RespValue::Array(vec![
-        integer(if out.limited { 1 } else { 0 }),
+        integer(i64::from(out.limited)),
         integer(limit),
         integer(out.remaining),
         integer(throttle_seconds_from_ms(out.retry_after_ms)),
@@ -1008,7 +1025,7 @@ mod tests {
             *tat = Some(new_tat_ns);
         }
         vec![
-            if out.limited { 1 } else { 0 },
+            i64::from(out.limited),
             limit,
             out.remaining,
             throttle_seconds_from_ms(out.retry_after_ms),
@@ -1025,39 +1042,84 @@ mod tests {
         let mut now_ms: i64 = 0;
 
         // A request larger than the bucket is always limited and never consumed.
-        assert_eq!(run(&mut tat, now_ms, LIMIT, EMISSION_NS, 6), vec![1, 5, 5, -1, 0]);
+        assert_eq!(
+            run(&mut tat, now_ms, LIMIT, EMISSION_NS, 6),
+            vec![1, 5, 5, -1, 0]
+        );
 
         // Normal requests drain the bucket one token at a time.
-        assert_eq!(run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1), vec![0, 5, 4, -1, 11]);
-        assert_eq!(run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1), vec![0, 5, 3, -1, 21]);
-        assert_eq!(run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1), vec![0, 5, 2, -1, 31]);
-        assert_eq!(run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1), vec![0, 5, 1, -1, 41]);
-        assert_eq!(run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1), vec![0, 5, 0, -1, 51]);
-        assert_eq!(run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1), vec![1, 5, 0, 11, 51]);
+        assert_eq!(
+            run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1),
+            vec![0, 5, 4, -1, 11]
+        );
+        assert_eq!(
+            run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1),
+            vec![0, 5, 3, -1, 21]
+        );
+        assert_eq!(
+            run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1),
+            vec![0, 5, 2, -1, 31]
+        );
+        assert_eq!(
+            run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1),
+            vec![0, 5, 1, -1, 41]
+        );
+        assert_eq!(
+            run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1),
+            vec![0, 5, 0, -1, 51]
+        );
+        assert_eq!(
+            run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1),
+            vec![1, 5, 0, 11, 51]
+        );
 
         now_ms += 30_000;
-        assert_eq!(run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1), vec![0, 5, 2, -1, 31]);
+        assert_eq!(
+            run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1),
+            vec![0, 5, 2, -1, 31]
+        );
 
         now_ms += 1_000;
-        assert_eq!(run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1), vec![0, 5, 1, -1, 40]);
+        assert_eq!(
+            run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1),
+            vec![0, 5, 1, -1, 40]
+        );
 
         now_ms += 9_000;
-        assert_eq!(run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1), vec![0, 5, 1, -1, 41]);
+        assert_eq!(
+            run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1),
+            vec![0, 5, 1, -1, 41]
+        );
 
         now_ms += 40_000;
-        assert_eq!(run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1), vec![0, 5, 4, -1, 11]);
+        assert_eq!(
+            run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1),
+            vec![0, 5, 4, -1, 11]
+        );
 
         now_ms += 15_000;
-        assert_eq!(run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1), vec![0, 5, 4, -1, 11]);
+        assert_eq!(
+            run(&mut tat, now_ms, LIMIT, EMISSION_NS, 1),
+            vec![0, 5, 4, -1, 11]
+        );
 
         // Zero-volume requests only peek at the state.
-        assert_eq!(run(&mut tat, now_ms, LIMIT, EMISSION_NS, 0), vec![0, 5, 4, -1, 11]);
+        assert_eq!(
+            run(&mut tat, now_ms, LIMIT, EMISSION_NS, 0),
+            vec![0, 5, 4, -1, 11]
+        );
 
         // High-volume requests use up more of the limit.
-        assert_eq!(run(&mut tat, now_ms, LIMIT, EMISSION_NS, 2), vec![0, 5, 2, -1, 31]);
+        assert_eq!(
+            run(&mut tat, now_ms, LIMIT, EMISSION_NS, 2),
+            vec![0, 5, 2, -1, 31]
+        );
 
         // A large-but-legal request can still be limited.
-        assert_eq!(run(&mut tat, now_ms, LIMIT, EMISSION_NS, 5), vec![1, 5, 2, 31, 31]);
+        assert_eq!(
+            run(&mut tat, now_ms, LIMIT, EMISSION_NS, 5),
+            vec![1, 5, 2, 31, 31]
+        );
 
         // emission interval of 2us with cost 2 consumes 2 tokens per request.
         let mut tat2: Option<i64> = None;
@@ -1088,7 +1150,7 @@ mod tests {
         }
     }
 
-    fn nil_of(r: CmdResult) -> bool {
+    fn nil_of(r: &CmdResult) -> bool {
         matches!(r, CmdResult::Ok(RespValue::Nil))
     }
 
@@ -1113,14 +1175,19 @@ mod tests {
                 b"GET" => (exec_get, 1, (1..2).collect()),
                 b"APPEND" => (exec_append, 1, (1..2).collect()),
                 b"PREPEND" => (exec_prepend, 1, (1..2).collect()),
-                b"GETRANGE" => (exec_getrange, 1, (1..2).collect()),
-                b"SUBSTR" => (exec_getrange, 1, (1..2).collect()),
+                b"GETRANGE" | b"SUBSTR" => (exec_getrange, 1, (1..2).collect()),
                 b"GETEX" => (exec_getex, 1, (1..2).collect()),
                 b"DIGEST" => (exec_digest, 1, (1..2).collect()),
                 b"GAT" => (exec_gat, 1, (1..2).collect()),
                 _ => panic!("unhandled command {:?}", argv[0]),
             };
-        let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx, now_ms };
+        let mut ctx = OpContext {
+            db,
+            args: argv,
+            owned_keys: &owned,
+            first_key_idx,
+            now_ms,
+        };
         exec(&mut ctx)
     }
 
@@ -1129,14 +1196,15 @@ mod tests {
     }
 
     fn cmd_at(db: &mut DbSlice, now_ms: u64, args: &[&[u8]]) -> CmdResult {
-        dispatch_at(db, now_ms, &args.iter().map(|a| a.to_vec()).collect::<Vec<_>>())
+        dispatch_at(
+            db,
+            now_ms,
+            &args.iter().map(|a| a.to_vec()).collect::<Vec<_>>(),
+        )
     }
 
     fn str_of(db: &mut DbSlice, key: &str, value: &str) {
-        db.insert(
-            CompactString::from_bytes(key.as_bytes()),
-            PrimeValue::Str(CompactString::from(value)),
-        );
+        db.insert(key.as_bytes(), PrimeValue::Str(CompactString::from(value)));
     }
 
     #[test]
@@ -1147,12 +1215,21 @@ mod tests {
         assert_eq!(bulk_of(cmd(&mut db, &[b"GETEX", b"k"])), b"hello");
         assert_eq!(db.ttl_ms(b"k", 0), -1);
 
-        assert_eq!(bulk_of(cmd(&mut db, &[b"GETEX", b"k", b"EX", b"100"])), b"hello");
+        assert_eq!(
+            bulk_of(cmd(&mut db, &[b"GETEX", b"k", b"EX", b"100"])),
+            b"hello"
+        );
         assert_eq!(db.ttl_ms(b"k", 0), 100_000);
-        assert_eq!(bulk_of(cmd(&mut db, &[b"GETEX", b"k", b"PX", b"500"])), b"hello");
+        assert_eq!(
+            bulk_of(cmd(&mut db, &[b"GETEX", b"k", b"PX", b"500"])),
+            b"hello"
+        );
         assert_eq!(db.ttl_ms(b"k", 0), 500);
 
-        assert_eq!(bulk_of(cmd(&mut db, &[b"GETEX", b"k", b"PERSIST"])), b"hello");
+        assert_eq!(
+            bulk_of(cmd(&mut db, &[b"GETEX", b"k", b"PERSIST"])),
+            b"hello"
+        );
         assert_eq!(db.ttl_ms(b"k", 0), -1);
     }
 
@@ -1162,16 +1239,25 @@ mod tests {
         str_of(&mut db, "k", "v");
 
         // PXAT 2000 (absolute ms) at now=0 sets a 2s expiry.
-        assert_eq!(bulk_of(cmd(&mut db, &[b"GETEX", b"k", b"PXAT", b"2000"])), b"v");
+        assert_eq!(
+            bulk_of(cmd(&mut db, &[b"GETEX", b"k", b"PXAT", b"2000"])),
+            b"v"
+        );
         assert_eq!(db.ttl_ms(b"k", 0), 2000);
 
         // A past absolute expiry returns the value but deletes the key.
         str_of(&mut db, "k2", "v");
-        assert_eq!(bulk_of(cmd_at(&mut db, 5000, &[b"GETEX", b"k2", b"PXAT", b"1"])), b"v");
+        assert_eq!(
+            bulk_of(cmd_at(&mut db, 5000, &[b"GETEX", b"k2", b"PXAT", b"1"])),
+            b"v"
+        );
         assert_eq!(db.ttl_ms(b"k2", 5000), -2);
 
         str_of(&mut db, "k3", "v");
-        assert_eq!(bulk_of(cmd_at(&mut db, 5000, &[b"GETEX", b"k3", b"EXAT", b"1"])), b"v");
+        assert_eq!(
+            bulk_of(cmd_at(&mut db, 5000, &[b"GETEX", b"k3", b"EXAT", b"1"])),
+            b"v"
+        );
         assert_eq!(db.ttl_ms(b"k3", 5000), -2);
     }
 
@@ -1180,14 +1266,26 @@ mod tests {
         let mut db = DbSlice::new(0);
         str_of(&mut db, "k", "v");
 
-        assert_eq!(err_of(cmd(&mut db, &[b"GETEX", b"k", b"EX", b"0"])), K_GETEX_EXPIRY_ERR);
-        assert_eq!(err_of(cmd(&mut db, &[b"GETEX", b"k", b"PX", b"-1"])), K_GETEX_EXPIRY_ERR);
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"GETEX", b"k", b"EX", b"0"])),
+            K_GETEX_EXPIRY_ERR
+        );
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"GETEX", b"k", b"PX", b"-1"])),
+            K_GETEX_EXPIRY_ERR
+        );
         assert_eq!(
             err_of(cmd(&mut db, &[b"GETEX", b"k", b"EX", b"abc"])),
             "ERR value is not an integer or out of range"
         );
-        assert_eq!(err_of(cmd(&mut db, &[b"GETEX", b"k", b"EX"])), "ERR syntax error");
-        assert_eq!(err_of(cmd(&mut db, &[b"GETEX", b"k", b"BOGUS"])), "ERR syntax error");
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"GETEX", b"k", b"EX"])),
+            "ERR syntax error"
+        );
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"GETEX", b"k", b"BOGUS"])),
+            "ERR syntax error"
+        );
         assert_eq!(
             err_of(cmd(&mut db, &[b"GETEX", b"k", b"EX", b"10", b"EX", b"20"])),
             "ERR syntax error"
@@ -1205,12 +1303,14 @@ mod tests {
     #[test]
     fn getex_missing_and_wrong_type() {
         let mut db = DbSlice::new(0);
-        assert!(nil_of(cmd(&mut db, &[b"GETEX", b"missing"])));
-        assert!(nil_of(cmd(&mut db, &[b"GETEX", b"missing", b"EX", b"10"])));
+        assert!(nil_of(&cmd(&mut db, &[b"GETEX", b"missing"])));
+        assert!(nil_of(&cmd(&mut db, &[b"GETEX", b"missing", b"EX", b"10"])));
 
         let mut l = crate::core::quicklist::QuickList::new();
-        l.push_back(crate::core::quicklist::ListItem::Str(CompactString::from("x")));
-        db.insert(CompactString::from("l"), PrimeValue::List(l));
+        l.push_back(crate::core::quicklist::ListItem::Str(CompactString::from(
+            "x",
+        )));
+        db.insert(b"l", PrimeValue::List(l));
         assert!(err_of(cmd(&mut db, &[b"GETEX", b"l"])).starts_with("WRONGTYPE"));
     }
 
@@ -1218,9 +1318,12 @@ mod tests {
     fn digest_matches_reference() {
         let mut db = DbSlice::new(0);
         str_of(&mut db, "key", "value");
-        assert_eq!(bulk_of(cmd(&mut db, &[b"DIGEST", b"key"])), b"87d57e269b9df0f0");
+        assert_eq!(
+            bulk_of(cmd(&mut db, &[b"DIGEST", b"key"])),
+            b"87d57e269b9df0f0"
+        );
 
-        assert!(nil_of(cmd(&mut db, &[b"DIGEST", b"nonexistent"])));
+        assert!(nil_of(&cmd(&mut db, &[b"DIGEST", b"nonexistent"])));
 
         str_of(&mut db, "key1", "testvalue");
         str_of(&mut db, "key2", "testvalue");
@@ -1238,8 +1341,10 @@ mod tests {
         assert_eq!(bulk_of(cmd(&mut db, &[b"DIGEST", b"empty"])).len(), 16);
 
         let mut list = crate::core::quicklist::QuickList::new();
-        list.push_back(crate::core::quicklist::ListItem::Str(CompactString::from("item")));
-        db.insert(CompactString::from("list"), PrimeValue::List(list));
+        list.push_back(crate::core::quicklist::ListItem::Str(CompactString::from(
+            "item",
+        )));
+        db.insert(b"list", PrimeValue::List(list));
         assert!(err_of(cmd(&mut db, &[b"DIGEST", b"list"])).starts_with("WRONGTYPE"));
     }
 
@@ -1254,8 +1359,10 @@ mod tests {
         assert_eq!(bulk_of(cmd(&mut db, &[b"GET", b"new"])), b"abc");
 
         let mut l = crate::core::quicklist::QuickList::new();
-        l.push_back(crate::core::quicklist::ListItem::Str(CompactString::from("x")));
-        db.insert(CompactString::from("l"), PrimeValue::List(l));
+        l.push_back(crate::core::quicklist::ListItem::Str(CompactString::from(
+            "x",
+        )));
+        db.insert(b"l", PrimeValue::List(l));
         assert!(err_of(cmd(&mut db, &[b"PREPEND", b"l", b"x"])).starts_with("WRONGTYPE"));
     }
 
@@ -1263,16 +1370,25 @@ mod tests {
     fn substr_is_getrange_alias() {
         let mut db = DbSlice::new(0);
         str_of(&mut db, "foo", "");
-        assert_eq!(bulk_of(cmd(&mut db, &[b"SUBSTR", b"foo", b"0", b"-1"])), b"");
+        assert_eq!(
+            bulk_of(cmd(&mut db, &[b"SUBSTR", b"foo", b"0", b"-1"])),
+            b""
+        );
 
         str_of(&mut db, "bar", "hello");
-        assert_eq!(bulk_of(cmd(&mut db, &[b"SUBSTR", b"bar", b"1", b"3"])), b"ell");
+        assert_eq!(
+            bulk_of(cmd(&mut db, &[b"SUBSTR", b"bar", b"1", b"3"])),
+            b"ell"
+        );
     }
 
     #[test]
     fn gat_via_resp_errors() {
         let mut db = DbSlice::new(0);
         str_of(&mut db, "key", "val");
-        assert_eq!(err_of(cmd(&mut db, &[b"GAT", b"key"])), "ERR GAT is a memcache-only command");
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"GAT", b"key"])),
+            "ERR GAT is a memcache-only command"
+        );
     }
 }

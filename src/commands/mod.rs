@@ -33,15 +33,40 @@ pub struct KeyRange {
 }
 
 impl KeyRange {
-    pub const NONE: KeyRange = KeyRange { first: 0, last: 0, step: 0 };
-    pub const ONE: KeyRange = KeyRange { first: 1, last: 1, step: 1 };
-    pub const ALL: KeyRange = KeyRange { first: 1, last: 0, step: 1 };
-    pub const PAIRS: KeyRange = KeyRange { first: 1, last: 0, step: 2 };
-    pub const TWO: KeyRange = KeyRange { first: 1, last: 2, step: 1 };
+    pub const NONE: KeyRange = KeyRange {
+        first: 0,
+        last: 0,
+        step: 0,
+    };
+    pub const ONE: KeyRange = KeyRange {
+        first: 1,
+        last: 1,
+        step: 1,
+    };
+    pub const ALL: KeyRange = KeyRange {
+        first: 1,
+        last: 0,
+        step: 1,
+    };
+    pub const PAIRS: KeyRange = KeyRange {
+        first: 1,
+        last: 0,
+        step: 2,
+    };
+    pub const TWO: KeyRange = KeyRange {
+        first: 1,
+        last: 2,
+        step: 1,
+    };
     /// `<key>... <timeout>`: every argument except the last one (BLPOP/BRPOP).
-    pub const ALL_BUT_LAST: KeyRange = KeyRange { first: 1, last: LAST_BUT_ONE, step: 1 };
+    pub const ALL_BUT_LAST: KeyRange = KeyRange {
+        first: 1,
+        last: LAST_BUT_ONE,
+        step: 1,
+    };
 
     /// Return indices into args that are keys.
+    #[must_use]
     pub fn keys(&self, argc: usize) -> Vec<usize> {
         if self.first == 0 || argc <= self.first {
             return Vec::new();
@@ -82,7 +107,8 @@ pub struct ShardPart {
 }
 
 pub type ExecFn = fn(&mut OpContext) -> CmdResult;
-pub type MergeFn = fn(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], now_ms: u64) -> CmdResult;
+pub type MergeFn =
+    fn(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], now_ms: u64) -> CmdResult;
 
 #[derive(Clone, Copy)]
 pub struct Command {
@@ -95,6 +121,7 @@ pub struct Command {
 }
 
 impl Command {
+    #[must_use]
     pub fn check_arity(&self, argc: usize) -> Option<String> {
         let ok = if self.arity >= 0 {
             argc == self.arity as usize
@@ -111,21 +138,9 @@ impl Command {
         }
     }
 
+    #[must_use]
     pub fn has_flag(&self, flag: u32) -> bool {
         self.flags & flag != 0
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn registry_has_no_duplicate_names() {
-        let mut seen = std::collections::HashSet::new();
-        for cmd in exec::ALL_COMMANDS {
-            assert!(seen.insert(cmd.name), "duplicate command name {}", cmd.name);
-        }
     }
 }
 
@@ -154,14 +169,30 @@ pub fn bulk<B: AsRef<[u8]>>(s: B) -> RespValue {
     RespValue::Bulk(s.as_ref().to_vec())
 }
 
+#[must_use]
 pub fn simple(s: &str) -> RespValue {
     RespValue::Simple(s.to_string())
 }
 
+#[must_use]
 pub fn integer(i: i64) -> RespValue {
     RespValue::Integer(i)
 }
 
+#[must_use]
 pub fn ok() -> RespValue {
     RespValue::Simple("OK".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_has_no_duplicate_names() {
+        let mut seen = std::collections::HashSet::new();
+        for cmd in exec::ALL_COMMANDS {
+            assert!(seen.insert(cmd.name), "duplicate command name {}", cmd.name);
+        }
+    }
 }

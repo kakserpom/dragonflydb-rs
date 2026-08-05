@@ -7,12 +7,11 @@
 //! into a `DeferredStore`.
 
 use crate::commands::{
-    integer, ok, Command, OpContext, ShardPart, KeyRange, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY,
-    FLAG_READONLY, FLAG_WRITE,
+    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE, KeyRange,
+    OpContext, ShardPart, integer, ok,
 };
-use crate::core::cms::Cms;
-use crate::core::compact::CompactString;
 use crate::core::PrimeValue;
+use crate::core::cms::Cms;
 use crate::error::{CmdResult, RespError, RespValue};
 use crate::util::{parse_double, parse_i64, parse_u64};
 
@@ -58,8 +57,7 @@ fn cms_dim_zero() -> RespError {
 
 fn cms_dim_too_large() -> RespError {
     RespError::new(format!(
-        "ERR CMS: width must not exceed {} and depth must not exceed {}",
-        K_MAX_CMS_WIDTH, K_MAX_CMS_DEPTH
+        "ERR CMS: width must not exceed {K_MAX_CMS_WIDTH} and depth must not exceed {K_MAX_CMS_DEPTH}"
     ))
 }
 
@@ -99,8 +97,8 @@ fn compute_cms_dimensions(error: f64, probability: f64) -> Result<(u32, u32), Re
         || !computed_depth.is_finite()
         || computed_width <= 0.0
         || computed_depth <= 0.0
-        || computed_width > u32::MAX as f64
-        || computed_depth > u32::MAX as f64
+        || computed_width > f64::from(u32::MAX)
+        || computed_depth > f64::from(u32::MAX)
     {
         return Err(cms_invalid_error_probability());
     }
@@ -112,13 +110,11 @@ fn compute_cms_dimensions(error: f64, probability: f64) -> Result<(u32, u32), Re
 fn exec_cms_initbydim(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let width = match parse_u64(&ctx.args[key_idx + 1]).and_then(|v| u32::try_from(v).ok()) {
-        Some(w) => w,
-        None => return CmdResult::Err(RespError::syntax()),
+    let Some(width) = parse_u64(&ctx.args[key_idx + 1]).and_then(|v| u32::try_from(v).ok()) else {
+        return CmdResult::Err(RespError::syntax());
     };
-    let depth = match parse_u64(&ctx.args[key_idx + 2]).and_then(|v| u32::try_from(v).ok()) {
-        Some(d) => d,
-        None => return CmdResult::Err(RespError::syntax()),
+    let Some(depth) = parse_u64(&ctx.args[key_idx + 2]).and_then(|v| u32::try_from(v).ok()) else {
+        return CmdResult::Err(RespError::syntax());
     };
     if let Err(e) = validate_cms_dimensions(width, depth) {
         return CmdResult::Err(e);
@@ -126,23 +122,18 @@ fn exec_cms_initbydim(ctx: &mut OpContext) -> CmdResult {
     if ctx.db.contains(key, ctx.now_ms) {
         return CmdResult::Err(item_exists());
     }
-    ctx.db.insert(
-        CompactString::from_bytes(key),
-        PrimeValue::Cms(Cms::new(width, depth)),
-    );
+    ctx.db.insert(key, PrimeValue::Cms(Cms::new(width, depth)));
     CmdResult::Ok(ok())
 }
 
 fn exec_cms_initbyprob(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let error = match parse_double(&ctx.args[key_idx + 1]) {
-        Some(e) => e,
-        None => return CmdResult::Err(RespError::syntax()),
+    let Some(error) = parse_double(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::syntax());
     };
-    let probability = match parse_double(&ctx.args[key_idx + 2]) {
-        Some(p) => p,
-        None => return CmdResult::Err(RespError::syntax()),
+    let Some(probability) = parse_double(&ctx.args[key_idx + 2]) else {
+        return CmdResult::Err(RespError::syntax());
     };
     if !(error > 0.0 && error < 1.0) {
         return CmdResult::Err(cms_err_range());
@@ -157,10 +148,7 @@ fn exec_cms_initbyprob(ctx: &mut OpContext) -> CmdResult {
     if ctx.db.contains(key, ctx.now_ms) {
         return CmdResult::Err(item_exists());
     }
-    ctx.db.insert(
-        CompactString::from_bytes(key),
-        PrimeValue::Cms(Cms::new(width, depth)),
-    );
+    ctx.db.insert(key, PrimeValue::Cms(Cms::new(width, depth)));
     CmdResult::Ok(ok())
 }
 
@@ -179,9 +167,8 @@ fn parse_incr_items(args: &[Vec<u8>], key_idx: usize) -> Result<Vec<(Vec<u8>, i6
             return Err(RespError::syntax());
         }
         let item = args[i].clone();
-        let incr = match parse_i64(&args[i + 1]) {
-            Some(v) => v,
-            None => return Err(cms_cannot_parse_number()),
+        let Some(incr) = parse_i64(&args[i + 1]) else {
+            return Err(cms_cannot_parse_number());
         };
         if incr <= 0 {
             return Err(cms_positive_increment());
@@ -203,7 +190,10 @@ fn exec_cms_incrby(ctx: &mut OpContext) -> CmdResult {
         Some(_) => return CmdResult::Err(RespError::wrong_type()),
         None => return CmdResult::Err(cms_not_found()),
     };
-    let results: Vec<i64> = items.iter().map(|(it, inc)| cms.incr_by(it, *inc)).collect();
+    let results: Vec<i64> = items
+        .iter()
+        .map(|(it, inc)| cms.incr_by(it, *inc))
+        .collect();
     CmdResult::Ok(RespValue::Array(results.into_iter().map(integer).collect()))
 }
 
@@ -232,9 +222,9 @@ fn exec_cms_info(ctx: &mut OpContext) -> CmdResult {
     };
     CmdResult::Ok(RespValue::Array(vec![
         RespValue::Bulk(b"width".to_vec()),
-        integer(cms.width() as i64),
+        integer(i64::from(cms.width())),
         RespValue::Bulk(b"depth".to_vec()),
-        integer(cms.depth() as i64),
+        integer(i64::from(cms.depth())),
         RespValue::Bulk(b"count".to_vec()),
         integer(cms.total_count()),
     ]))
@@ -287,7 +277,7 @@ fn parse_merge_args(args: &[Vec<u8>]) -> Result<MergeArgs, RespError> {
 fn merge_sources(
     ctx: &mut OpContext,
     dest_idx: usize,
-    dest: Cms,
+    dest: &Cms,
     srcs: &[(usize, Cms)],
     weights: &[i64],
 ) -> CmdResult {
@@ -307,10 +297,7 @@ fn merge_sources(
     for (i, (_, c)) in srcs.iter().enumerate() {
         merged.merge_from(c, weights[i]);
     }
-    ctx.db.insert(
-        CompactString::from_bytes(&ctx.args[dest_idx]),
-        PrimeValue::Cms(merged),
-    );
+    ctx.db.insert(&ctx.args[dest_idx], PrimeValue::Cms(merged));
     CmdResult::Ok(ok())
 }
 
@@ -354,19 +341,19 @@ fn exec_cms_merge(ctx: &mut OpContext) -> CmdResult {
     // Single-shard fast path: every key is on this shard.
     if dest_owned && owned_srcs.len() == src_idxs.len() {
         let dest = dest.expect("dest owned means dest read");
-        return merge_sources(ctx, dest_idx, dest, &owned_srcs, &parsed.weights);
+        return merge_sources(ctx, dest_idx, &dest, &owned_srcs, &parsed.weights);
     }
 
     // Partial report for the coordinator.
     let mut reply = Vec::new();
-    reply.push(integer(dest_owned as i64));
-    reply.push(integer(dest.is_some() as i64));
+    reply.push(integer(i64::from(dest_owned)));
+    reply.push(integer(i64::from(dest.is_some())));
     let (dw, dd) = match &dest {
         Some(c) => (c.width(), c.depth()),
         None => (0, 0),
     };
-    reply.push(integer(dw as i64));
-    reply.push(integer(dd as i64));
+    reply.push(integer(i64::from(dw)));
+    reply.push(integer(i64::from(dd)));
     for (i, c) in &owned_srcs {
         reply.push(integer(*i as i64));
         reply.push(RespValue::Bulk(c.serialize()));
@@ -388,13 +375,8 @@ fn merge_cms_merge(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: 
         if let CmdResult::Err(e) = &p.result {
             return CmdResult::Err(e.clone());
         }
-        let arr = match &p.result {
-            CmdResult::Ok(RespValue::Array(arr)) => arr,
-            _ => {
-                return CmdResult::Err(RespError::new(
-                    "ERR internal: unexpected CMS shard result",
-                ))
-            }
+        let CmdResult::Ok(RespValue::Array(arr)) = &p.result else {
+            return CmdResult::Err(RespError::new("ERR internal: unexpected CMS shard result"));
         };
         let dest_owned = matches!(&arr[0], RespValue::Integer(1));
         if dest_owned {
@@ -411,20 +393,16 @@ fn merge_cms_merge(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: 
         }
         for pair in arr[4..].chunks_exact(2) {
             match pair {
-                [RespValue::Integer(i), RespValue::Bulk(blob)] => {
-                    match Cms::deserialize(blob) {
-                        Some(c) => srcs.push((*i as usize, c)),
-                        None => {
-                            return CmdResult::Err(RespError::new(
-                                "ERR internal: bad CMS shard blob",
-                            ))
-                        }
+                [RespValue::Integer(i), RespValue::Bulk(blob)] => match Cms::deserialize(blob) {
+                    Some(c) => srcs.push((*i as usize, c)),
+                    None => {
+                        return CmdResult::Err(RespError::new("ERR internal: bad CMS shard blob"));
                     }
-                }
+                },
                 _ => {
                     return CmdResult::Err(RespError::new(
                         "ERR internal: unexpected CMS shard element",
-                    ))
+                    ));
                 }
             }
         }
@@ -505,7 +483,11 @@ pub static CMD_CMS_MERGE: Command = Command {
     name: "CMS.MERGE",
     arity: -4,
     flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_MULTI_KEY,
-    key_range: KeyRange { first: 1, last: 0, step: 1 },
+    key_range: KeyRange {
+        first: 1,
+        last: 0,
+        step: 1,
+    },
     exec: exec_cms_merge,
     merge: Some(merge_cms_merge),
 };
@@ -531,7 +513,13 @@ mod tests {
                 }
                 _ => panic!("unhandled command {:?}", argv[0]),
             };
-        let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx, now_ms: 0 };
+        let mut ctx = OpContext {
+            db,
+            args: argv,
+            owned_keys: &owned,
+            first_key_idx,
+            now_ms: 0,
+        };
         exec(&mut ctx)
     }
 
@@ -581,25 +569,39 @@ mod tests {
         ok_res(run!(&mut db, b"CMS.INITBYDIM", b"cms1", b"1000", b"5"));
         assert_eq!(type_of(&mut db, "cms1"), "CMSk-TYPE");
 
-        assert!(err(run!(&mut db, b"CMS.INITBYDIM", b"cms1", b"100", b"5"))
-            .contains("item exists"));
-        assert!(err(run!(&mut db, b"CMS.INITBYDIM", b"cms2", b"0", b"5"))
-            .contains("width and depth must be greater than 0"));
-        assert!(err(run!(&mut db, b"CMS.INITBYDIM", b"cms3", b"5", b"0"))
-            .contains("width and depth must be greater than 0"));
+        assert!(
+            err(run!(&mut db, b"CMS.INITBYDIM", b"cms1", b"100", b"5")).contains("item exists")
+        );
+        assert!(
+            err(run!(&mut db, b"CMS.INITBYDIM", b"cms2", b"0", b"5"))
+                .contains("width and depth must be greater than 0")
+        );
+        assert!(
+            err(run!(&mut db, b"CMS.INITBYDIM", b"cms3", b"5", b"0"))
+                .contains("width and depth must be greater than 0")
+        );
     }
 
     #[test]
     fn init_by_dim_rejects_oversized_dimensions_and_preserves_state() {
         let mut db = DbSlice::new(0);
-        let r = run!(&mut db, b"CMS.INITBYDIM", b"k", b"2147483648", b"1073741824");
+        let r = run!(
+            &mut db,
+            b"CMS.INITBYDIM",
+            b"k",
+            b"2147483648",
+            b"1073741824"
+        );
         assert!(err(r).contains("width must not exceed"));
 
         let r = run!(&mut db, b"CMS.INCRBY", b"k", b"a", b"1");
         assert!(err(r).contains("CMS: key does not exist"));
 
         ok_res(run!(&mut db, b"CMS.INITBYDIM", b"safe", b"100", b"5"));
-        assert_eq!(ints(run!(&mut db, b"CMS.INCRBY", b"safe", b"a", b"1")), vec![1]);
+        assert_eq!(
+            ints(run!(&mut db, b"CMS.INCRBY", b"safe", b"a", b"1")),
+            vec![1]
+        );
         assert_eq!(ints(run!(&mut db, b"CMS.QUERY", b"safe", b"a")), vec![1]);
     }
 
@@ -608,12 +610,18 @@ mod tests {
         let mut db = DbSlice::new(0);
         ok_res(run!(&mut db, b"CMS.INITBYPROB", b"cms1", b"0.01", b"0.01"));
 
-        assert!(err(run!(&mut db, b"CMS.INITBYPROB", b"cms1", b"0.01", b"0.01"))
-            .contains("item exists"));
-        assert!(err(run!(&mut db, b"CMS.INITBYPROB", b"cms2", b"2", b"0.01"))
-            .contains("error must be between 0 and 1"));
-        assert!(err(run!(&mut db, b"CMS.INITBYPROB", b"cms3", b"0.01", b"0"))
-            .contains("probability must be between 0 and 1"));
+        assert!(
+            err(run!(&mut db, b"CMS.INITBYPROB", b"cms1", b"0.01", b"0.01"))
+                .contains("item exists")
+        );
+        assert!(
+            err(run!(&mut db, b"CMS.INITBYPROB", b"cms2", b"2", b"0.01"))
+                .contains("error must be between 0 and 1")
+        );
+        assert!(
+            err(run!(&mut db, b"CMS.INITBYPROB", b"cms3", b"0.01", b"0"))
+                .contains("probability must be between 0 and 1")
+        );
     }
 
     #[test]
@@ -628,20 +636,39 @@ mod tests {
         let mut db = DbSlice::new(0);
         ok_res(run!(&mut db, b"CMS.INITBYDIM", b"cms", b"100", b"5"));
 
-        assert_eq!(ints(run!(&mut db, b"CMS.INCRBY", b"cms", b"foo", b"3")), vec![3]);
         assert_eq!(
-            ints(run!(&mut db, b"CMS.INCRBY", b"cms", b"foo", b"4", b"bar", b"1")),
+            ints(run!(&mut db, b"CMS.INCRBY", b"cms", b"foo", b"3")),
+            vec![3]
+        );
+        assert_eq!(
+            ints(run!(
+                &mut db,
+                b"CMS.INCRBY",
+                b"cms",
+                b"foo",
+                b"4",
+                b"bar",
+                b"1"
+            )),
             vec![7, 1]
         );
 
-        assert!(err(run!(&mut db, b"CMS.INCRBY", b"noexist", b"foo", b"1"))
-            .contains("CMS: key does not exist"));
-        assert!(err(run!(&mut db, b"CMS.INCRBY", b"cms", b"foo", b"notanumber"))
-            .contains("CMS: Cannot parse number"));
-        assert!(err(run!(&mut db, b"CMS.INCRBY", b"cms", b"foo", b"0"))
-            .contains("increment must be a positive integer"));
-        assert!(err(run!(&mut db, b"CMS.INCRBY", b"cms", b"foo", b"1", b"bar"))
-            .contains("syntax error"));
+        assert!(
+            err(run!(&mut db, b"CMS.INCRBY", b"noexist", b"foo", b"1"))
+                .contains("CMS: key does not exist")
+        );
+        assert!(
+            err(run!(&mut db, b"CMS.INCRBY", b"cms", b"foo", b"notanumber"))
+                .contains("CMS: Cannot parse number")
+        );
+        assert!(
+            err(run!(&mut db, b"CMS.INCRBY", b"cms", b"foo", b"0"))
+                .contains("increment must be a positive integer")
+        );
+        assert!(
+            err(run!(&mut db, b"CMS.INCRBY", b"cms", b"foo", b"1", b"bar"))
+                .contains("syntax error")
+        );
     }
 
     #[test]
@@ -655,16 +682,31 @@ mod tests {
             ints(run!(&mut db, b"CMS.QUERY", b"cms", b"foo", b"bar")),
             vec![5, 3]
         );
-        assert_eq!(ints(run!(&mut db, b"CMS.QUERY", b"cms", b"noexist")), vec![0]);
-        assert!(err(run!(&mut db, b"CMS.QUERY", b"noexist", b"foo"))
-            .contains("CMS: key does not exist"));
+        assert_eq!(
+            ints(run!(&mut db, b"CMS.QUERY", b"cms", b"noexist")),
+            vec![0]
+        );
+        assert!(
+            err(run!(&mut db, b"CMS.QUERY", b"noexist", b"foo"))
+                .contains("CMS: key does not exist")
+        );
     }
 
     #[test]
     fn info() {
         let mut db = DbSlice::new(0);
         ok_res(run!(&mut db, b"CMS.INITBYDIM", b"cms", b"1000", b"5"));
-        let _ = run!(&mut db, b"CMS.INCRBY", b"cms", b"foo", b"5", b"bar", b"3", b"baz", b"9");
+        let _ = run!(
+            &mut db,
+            b"CMS.INCRBY",
+            b"cms",
+            b"foo",
+            b"5",
+            b"bar",
+            b"3",
+            b"baz",
+            b"9"
+        );
 
         let r = run!(&mut db, b"CMS.INFO", b"cms");
         let arr = match r.into_resp_value() {
@@ -689,8 +731,28 @@ mod tests {
         ok_res(run!(&mut db, b"CMS.INITBYDIM", b"B", b"100", b"5"));
         ok_res(run!(&mut db, b"CMS.INITBYDIM", b"C", b"100", b"5"));
 
-        let _ = run!(&mut db, b"CMS.INCRBY", b"A", b"foo", b"5", b"bar", b"3", b"baz", b"9");
-        let _ = run!(&mut db, b"CMS.INCRBY", b"B", b"foo", b"2", b"foobar", b"3", b"baz", b"1");
+        let _ = run!(
+            &mut db,
+            b"CMS.INCRBY",
+            b"A",
+            b"foo",
+            b"5",
+            b"bar",
+            b"3",
+            b"baz",
+            b"9"
+        );
+        let _ = run!(
+            &mut db,
+            b"CMS.INCRBY",
+            b"B",
+            b"foo",
+            b"2",
+            b"foobar",
+            b"3",
+            b"baz",
+            b"1"
+        );
 
         assert_eq!(
             ints(run!(&mut db, b"CMS.QUERY", b"A", b"foo", b"bar", b"baz")),
@@ -703,22 +765,60 @@ mod tests {
 
         ok_res(run!(&mut db, b"CMS.MERGE", b"C", b"2", b"A", b"B"));
         assert_eq!(
-            ints(run!(&mut db, b"CMS.QUERY", b"C", b"foo", b"bar", b"baz", b"foobar")),
+            ints(run!(
+                &mut db,
+                b"CMS.QUERY",
+                b"C",
+                b"foo",
+                b"bar",
+                b"baz",
+                b"foobar"
+            )),
             vec![7, 3, 10, 3]
         );
 
-        assert!(err(run!(&mut db, b"CMS.MERGE", b"noexist", b"1", b"A"))
-            .contains("CMS: key does not exist"));
-        assert!(err(run!(&mut db, b"CMS.MERGE", b"C", b"0", b"A"))
-            .contains("CMS: wrong number of keys"));
-        assert!(err(run!(&mut db, b"CMS.MERGE", b"A", b"1", b"B", b"WEIGHTS", b"4", b"3"))
-            .contains("CMS: wrong number of keys/weights"));
-        assert!(err(run!(&mut db, b"CMS.MERGE", b"A", b"2", b"B", b"noexist", b"WEIGHTS", b"4", b"3"))
-            .contains("CMS: key does not exist"));
+        assert!(
+            err(run!(&mut db, b"CMS.MERGE", b"noexist", b"1", b"A"))
+                .contains("CMS: key does not exist")
+        );
+        assert!(
+            err(run!(&mut db, b"CMS.MERGE", b"C", b"0", b"A"))
+                .contains("CMS: wrong number of keys")
+        );
+        assert!(
+            err(run!(
+                &mut db,
+                b"CMS.MERGE",
+                b"A",
+                b"1",
+                b"B",
+                b"WEIGHTS",
+                b"4",
+                b"3"
+            ))
+            .contains("CMS: wrong number of keys/weights")
+        );
+        assert!(
+            err(run!(
+                &mut db,
+                b"CMS.MERGE",
+                b"A",
+                b"2",
+                b"B",
+                b"noexist",
+                b"WEIGHTS",
+                b"4",
+                b"3"
+            ))
+            .contains("CMS: key does not exist")
+        );
 
         // Merge A into B: the destination is reset, so B takes A's values.
         ok_res(run!(&mut db, b"CMS.MERGE", b"B", b"1", b"A"));
-        assert_eq!(ints(run!(&mut db, b"CMS.QUERY", b"B", b"foo", b"bar", b"baz")), vec![5, 3, 9]);
+        assert_eq!(
+            ints(run!(&mut db, b"CMS.QUERY", b"B", b"foo", b"bar", b"baz")),
+            vec![5, 3, 9]
+        );
     }
 
     #[test]
@@ -728,10 +828,40 @@ mod tests {
         ok_res(run!(&mut db, b"CMS.INITBYDIM", b"B", b"100", b"5"));
         ok_res(run!(&mut db, b"CMS.INITBYDIM", b"C", b"100", b"5"));
 
-        let _ = run!(&mut db, b"CMS.INCRBY", b"A", b"foo", b"5", b"bar", b"3", b"baz", b"9");
-        let _ = run!(&mut db, b"CMS.INCRBY", b"B", b"foo", b"2", b"bar", b"3", b"baz", b"1");
+        let _ = run!(
+            &mut db,
+            b"CMS.INCRBY",
+            b"A",
+            b"foo",
+            b"5",
+            b"bar",
+            b"3",
+            b"baz",
+            b"9"
+        );
+        let _ = run!(
+            &mut db,
+            b"CMS.INCRBY",
+            b"B",
+            b"foo",
+            b"2",
+            b"bar",
+            b"3",
+            b"baz",
+            b"1"
+        );
 
-        ok_res(run!(&mut db, b"CMS.MERGE", b"C", b"2", b"A", b"B", b"WEIGHTS", b"2", b"3"));
+        ok_res(run!(
+            &mut db,
+            b"CMS.MERGE",
+            b"C",
+            b"2",
+            b"A",
+            b"B",
+            b"WEIGHTS",
+            b"2",
+            b"3"
+        ));
         assert_eq!(
             ints(run!(&mut db, b"CMS.QUERY", b"C", b"foo", b"bar", b"baz")),
             vec![16, 15, 21]
@@ -746,8 +876,21 @@ mod tests {
 
         let _ = run!(&mut db, b"CMS.INCRBY", b"A", b"foo", b"2", b"bar", b"4");
 
-        ok_res(run!(&mut db, b"CMS.MERGE", b"C", b"2", b"A", b"A", b"WEIGHTS", b"1", b"3"));
-        assert_eq!(ints(run!(&mut db, b"CMS.QUERY", b"C", b"foo", b"bar")), vec![8, 16]);
+        ok_res(run!(
+            &mut db,
+            b"CMS.MERGE",
+            b"C",
+            b"2",
+            b"A",
+            b"A",
+            b"WEIGHTS",
+            b"1",
+            b"3"
+        ));
+        assert_eq!(
+            ints(run!(&mut db, b"CMS.QUERY", b"C", b"foo", b"bar")),
+            vec![8, 16]
+        );
 
         let r = run!(&mut db, b"CMS.INFO", b"C");
         let arr = match r.into_resp_value() {
@@ -764,8 +907,28 @@ mod tests {
         ok_res(run!(&mut db, b"CMS.INITBYDIM", b"B", b"1000", b"5"));
         ok_res(run!(&mut db, b"CMS.INITBYDIM", b"C", b"1000", b"5"));
 
-        let _ = run!(&mut db, b"CMS.INCRBY", b"A", b"foo", b"5", b"bar", b"3", b"baz", b"9");
-        let _ = run!(&mut db, b"CMS.INCRBY", b"B", b"foo", b"2", b"bar", b"3", b"baz", b"1");
+        let _ = run!(
+            &mut db,
+            b"CMS.INCRBY",
+            b"A",
+            b"foo",
+            b"5",
+            b"bar",
+            b"3",
+            b"baz",
+            b"9"
+        );
+        let _ = run!(
+            &mut db,
+            b"CMS.INCRBY",
+            b"B",
+            b"foo",
+            b"2",
+            b"bar",
+            b"3",
+            b"baz",
+            b"1"
+        );
 
         ok_res(run!(&mut db, b"CMS.MERGE", b"C", b"2", b"A", b"B"));
         assert_eq!(
@@ -773,13 +936,33 @@ mod tests {
             vec![7, 6, 10]
         );
 
-        ok_res(run!(&mut db, b"CMS.MERGE", b"C", b"2", b"A", b"B", b"WEIGHTS", b"1", b"2"));
+        ok_res(run!(
+            &mut db,
+            b"CMS.MERGE",
+            b"C",
+            b"2",
+            b"A",
+            b"B",
+            b"WEIGHTS",
+            b"1",
+            b"2"
+        ));
         assert_eq!(
             ints(run!(&mut db, b"CMS.QUERY", b"C", b"foo", b"bar", b"baz")),
             vec![9, 9, 11]
         );
 
-        ok_res(run!(&mut db, b"CMS.MERGE", b"C", b"2", b"A", b"B", b"WEIGHTS", b"2", b"3"));
+        ok_res(run!(
+            &mut db,
+            b"CMS.MERGE",
+            b"C",
+            b"2",
+            b"A",
+            b"B",
+            b"WEIGHTS",
+            b"2",
+            b"3"
+        ));
         assert_eq!(
             ints(run!(&mut db, b"CMS.QUERY", b"C", b"foo", b"bar", b"baz")),
             vec![16, 15, 21]
@@ -802,8 +985,9 @@ mod tests {
         ok_res(run!(&mut db, b"CMS.INITBYDIM", b"B", b"200", b"5"));
         ok_res(run!(&mut db, b"CMS.INITBYDIM", b"C", b"100", b"5"));
 
-        assert!(err(run!(&mut db, b"CMS.MERGE", b"C", b"2", b"A", b"B"))
-            .contains("dimension mismatch"));
+        assert!(
+            err(run!(&mut db, b"CMS.MERGE", b"C", b"2", b"A", b"B")).contains("dimension mismatch")
+        );
     }
 
     #[test]
@@ -814,7 +998,7 @@ mod tests {
         let mut b = Cms::new(100, 5);
         b.incr_by(b"foo", 2);
         b.incr_by(b"baz", 1);
-        let dest = Cms::new(100, 5);
+        let _dest = Cms::new(100, 5);
 
         let args = vec![
             b"CMS.MERGE".to_vec(),

@@ -1,4 +1,4 @@
-//! JSONPath v2 evaluation engine, ported from `dragonfly/src/core/json/`.
+//! `JSONPath` v2 evaluation engine, ported from `dragonfly/src/core/json/`.
 //!
 //! This mirrors three pieces of the reference implementation:
 //!
@@ -30,7 +30,7 @@ use crate::core::json::Json;
 /// `"Path too long"` (mirrors the reference `kMaxJsonPathLen`).
 pub const MAX_PATH_LEN: usize = 128;
 
-/// Error produced when a JSONPath cannot be parsed.
+/// Error produced when a `JSONPath` cannot be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonPathError {
     msg: String,
@@ -63,6 +63,7 @@ pub struct IndexExpr {
 
 impl IndexExpr {
     /// A single-index expression (`first == second`).
+    #[must_use]
     pub fn single(index: i64) -> IndexExpr {
         IndexExpr {
             first: index,
@@ -72,6 +73,7 @@ impl IndexExpr {
 
     /// A range `[a:b)` from the path syntax, stored as the closed range
     /// `[a, b-1]` (mirrors `IndexExpr::HalfOpen`).
+    #[must_use]
     pub fn range(first: i64, second: i64) -> IndexExpr {
         IndexExpr {
             first,
@@ -80,6 +82,7 @@ impl IndexExpr {
     }
 
     /// The `[*]` wildcard expression (mirrors `IndexExpr::All`).
+    #[must_use]
     pub fn all() -> IndexExpr {
         IndexExpr {
             first: 0,
@@ -93,6 +96,7 @@ impl IndexExpr {
     ///
     /// The result is a closed, inclusive range clamped into the array bounds,
     /// with negative indices wrapping from the end.
+    #[must_use]
     pub fn normalize(&self, array_len: usize) -> Option<(usize, usize)> {
         if array_len == 0 {
             return None;
@@ -153,11 +157,11 @@ pub enum Segment {
     Function(Agg),
 }
 
-/// A parsed JSONPath - the root `$` plus a sequence of [`Segment`]s. The empty
+/// A parsed `JSONPath` - the root `$` plus a sequence of [`Segment`]s. The empty
 /// path matches the root document.
 pub type Path = Vec<Segment>;
 
-/// Parse a JSONPath (`$...`) or function expression (`max($.a[*])`) into a
+/// Parse a `JSONPath` (`$...`) or function expression (`max($.a[*])`) into a
 /// [`Path`]. Returns `Err` on a syntax error or when the path is too long.
 pub fn parse_path(path: &str) -> Result<Path, JsonPathError> {
     let chars: Vec<char> = path.chars().collect();
@@ -195,7 +199,7 @@ pub fn parse_path(path: &str) -> Result<Path, JsonPathError> {
     }
 
     if pos != chars.len() {
-        return Err(JsonPathError::new(format!("Syntax error near {}", pos)));
+        return Err(JsonPathError::new(format!("Syntax error near {pos}")));
     }
 
     Ok(result)
@@ -286,7 +290,7 @@ fn is_name_char(c: char) -> bool {
 /// `min($.a[*])`.
 fn parse_bracket(chars: &[char], pos: &mut usize, result: &mut Path) -> Result<(), JsonPathError> {
     match chars.get(*pos) {
-        Some('\'') | Some('"') => {
+        Some('\'' | '"') => {
             let name = parse_quoted_string(chars, pos)?;
             expect(chars, pos, ']')?;
             push_segment(result, Segment::Identifier(name))
@@ -403,7 +407,7 @@ fn expect(chars: &[char], pos: &mut usize, c: char) -> Result<(), JsonPathError>
         *pos += 1;
         Ok(())
     } else {
-        Err(JsonPathError::new(format!("Expected '{}'", c)))
+        Err(JsonPathError::new(format!("Expected '{c}'")))
     }
 }
 
@@ -688,14 +692,12 @@ where
                             seg_idx: next_seg_id,
                         });
                         continue;
-                    } else {
-                        matches += on_terminal(child);
                     }
+                    matches += on_terminal(child);
                 }
             }
             Advance::Mismatch | Advance::Exhausted => {
                 stack.pop();
-                continue;
             }
         }
     }
@@ -857,14 +859,7 @@ impl AggState {
     /// invalidated by a non-numeric value.
     fn result(&self) -> Option<Json> {
         match self {
-            AggState::Max { current, valid } => {
-                if *valid {
-                    current.clone()
-                } else {
-                    None
-                }
-            }
-            AggState::Min { current, valid } => {
+            AggState::Max { current, valid } | AggState::Min { current, valid } => {
                 if *valid {
                     current.clone()
                 } else {
@@ -895,8 +890,8 @@ fn value_greater(a: &Json, b: &Json) -> bool {
     match (a, b) {
         (Json::Int(x), Json::Int(y)) => x > y,
         (Json::Uint(x), Json::Uint(y)) => x > y,
-        (Json::Int(x), Json::Uint(y)) => *x as i128 > *y as i128,
-        (Json::Uint(x), Json::Int(y)) => *x as i128 > *y as i128,
+        (Json::Int(x), Json::Uint(y)) => i128::from(*x) > i128::from(*y),
+        (Json::Uint(x), Json::Int(y)) => i128::from(*x) > i128::from(*y),
         _ => match (as_f64_number(a), as_f64_number(b)) {
             (Some(x), Some(y)) => x > y,
             _ => false,
@@ -908,8 +903,8 @@ fn value_less(a: &Json, b: &Json) -> bool {
     match (a, b) {
         (Json::Int(x), Json::Int(y)) => x < y,
         (Json::Uint(x), Json::Uint(y)) => x < y,
-        (Json::Int(x), Json::Uint(y)) => (*x as i128) < (*y as i128),
-        (Json::Uint(x), Json::Int(y)) => (*x as i128) < (*y as i128),
+        (Json::Int(x), Json::Uint(y)) => i128::from(*x) < i128::from(*y),
+        (Json::Uint(x), Json::Int(y)) => i128::from(*x) < i128::from(*y),
         _ => match (as_f64_number(a), as_f64_number(b)) {
             (Some(x), Some(y)) => x < y,
             _ => false,
@@ -1148,10 +1143,6 @@ where
 }
 
 fn collect_terminals(path: &[Segment], root: &Json, out: &mut Vec<Vec<Step>>) {
-    if path.is_empty() {
-        return;
-    }
-
     fn walk(path: &[Segment], root: &Json, out: &mut Vec<Vec<Step>>) {
         let mut stack = Vec::new();
         stack.push(Frame {
@@ -1184,11 +1175,11 @@ fn collect_terminals(path: &[Segment], root: &Json, out: &mut Vec<Vec<Step>>) {
                 } => {
                     if child.is_object() || child.is_array() {
                         let next_seg_id = seg_idx;
+                        let mut child_loc = frame.loc.clone();
+                        if let Some(step) = &step {
+                            child_loc.push(step.clone());
+                        }
                         if next_seg_id + 1 < path.len() {
-                            let mut child_loc = frame.loc.clone();
-                            if let Some(step) = &step {
-                                child_loc.push(step.clone());
-                            }
                             stack.push(Frame {
                                 node: child,
                                 loc: child_loc,
@@ -1197,23 +1188,20 @@ fn collect_terminals(path: &[Segment], root: &Json, out: &mut Vec<Vec<Step>>) {
                                 seg_idx: next_seg_id,
                             });
                             continue;
-                        } else {
-                            let mut child_loc = frame.loc.clone();
-                            if let Some(step) = &step {
-                                child_loc.push(step.clone());
-                            }
-                            out.push(child_loc);
                         }
+                        out.push(child_loc);
                     }
                 }
                 Advance::Mismatch | Advance::Exhausted => {
                     stack.pop();
-                    continue;
                 }
             }
         }
     }
 
+    if path.is_empty() {
+        return;
+    }
     walk(path, root, out);
 }
 
@@ -1236,28 +1224,13 @@ where
             if let Json::Array(items) = node
                 && let Some((first, second)) = expr.normalize(items.len())
             {
-                for value in items[first..=second].iter_mut() {
+                for value in &mut items[first..=second] {
                     let new_value = callback(None, value);
                     *value = new_value;
                 }
             }
         }
-        Segment::Wildcard => match node {
-            Json::Object(members) => {
-                for (key, value) in members.iter_mut() {
-                    let new_value = callback(Some(key), value);
-                    *value = new_value;
-                }
-            }
-            Json::Array(items) => {
-                for value in items.iter_mut() {
-                    let new_value = callback(None, value);
-                    *value = new_value;
-                }
-            }
-            _ => {}
-        },
-        Segment::Descent => match node {
+        Segment::Wildcard | Segment::Descent => match node {
             Json::Object(members) => {
                 for (key, value) in members.iter_mut() {
                     let new_value = callback(Some(key), value);
@@ -1281,12 +1254,6 @@ where
 /// matched through a recursive descent deletes the nearest matching ancestor
 /// and stops (so `$..a` on `{"a":{"a":1}}` deletes the root `a` once).
 pub fn delete_path(path: &[Segment], root: &mut Json) -> usize {
-    if path.is_empty() {
-        return 0;
-    }
-
-    let mut deleted = 0;
-
     fn walk(path: &[Segment], root: &mut Json, deleted: &mut usize) {
         let mut stack = Vec::new();
         stack.push(FrameMut {
@@ -1331,19 +1298,21 @@ pub fn delete_path(path: &[Segment], root: &mut Json) -> usize {
                                 seg_idx: next_seg_id,
                             });
                             continue;
-                        } else {
-                            *deleted += delete_step(&path[next_seg_id], child);
                         }
+                        *deleted += delete_step(&path[next_seg_id], child);
                     }
                 }
                 AdvanceMut::Mismatch | AdvanceMut::Exhausted => {
                     stack.pop();
-                    continue;
                 }
             }
         }
     }
 
+    if path.is_empty() {
+        return 0;
+    }
+    let mut deleted = 0;
     walk(path, root, &mut deleted);
 
     deleted
@@ -1384,20 +1353,7 @@ fn delete_step(segment: &Segment, node: &mut Json) -> usize {
             }
             _ => 0,
         },
-        Segment::Wildcard => match node {
-            Json::Object(members) => {
-                let count = members.len();
-                members.clear();
-                count
-            }
-            Json::Array(items) => {
-                let count = items.len();
-                items.clear();
-                count
-            }
-            _ => 0,
-        },
-        Segment::Descent => match node {
+        Segment::Wildcard | Segment::Descent => match node {
             Json::Object(members) => {
                 let count = members.len();
                 members.clear();

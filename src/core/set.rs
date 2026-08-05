@@ -29,8 +29,12 @@ impl Default for Set {
 }
 
 impl Set {
+    #[must_use]
     pub fn new() -> Self {
-        Set { repr: SetRepr::Small(Vec::new()), expiry: None }
+        Set {
+            repr: SetRepr::Small(Vec::new()),
+            expiry: None,
+        }
     }
 
     /// Add a member with an absolute expiry `expire_ms`. When the member is
@@ -50,7 +54,9 @@ impl Set {
     }
 
     fn set_expiry(&mut self, member: CompactString, expire_ms: u64) {
-        self.expiry.get_or_insert_with(HashMap::new).insert(member, expire_ms);
+        self.expiry
+            .get_or_insert_with(HashMap::new)
+            .insert(member, expire_ms);
     }
 
     /// Lazily remove all members expired before `now_ms`.
@@ -78,6 +84,7 @@ impl Set {
 
     /// Remaining time-to-live in ms for `member`, or -1 when the member is
     /// not present or has no expiry.
+    #[must_use]
     pub fn member_ttl_ms(&self, member: &[u8], now_ms: u64) -> i64 {
         match &self.expiry {
             Some(exp) => match exp.get(member) {
@@ -89,16 +96,21 @@ impl Set {
     }
 
     /// Absolute expiry (in ms) of `member`, if it carries one.
+    #[must_use]
     pub fn member_expire_ms(&self, member: &[u8]) -> Option<u64> {
-        self.expiry.as_ref().and_then(|exp| exp.get(member).copied())
+        self.expiry
+            .as_ref()
+            .and_then(|exp| exp.get(member).copied())
     }
 
     /// Whether any member carries an expiry (SADDEX sets are never compacted
     /// into the "intset" form in the reference; no impact here).
+    #[must_use]
     pub fn has_expiry(&self) -> bool {
         self.expiry.is_some()
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         match &self.repr {
             SetRepr::Small(v) => v.len(),
@@ -106,10 +118,12 @@ impl Set {
         }
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    #[must_use]
     pub fn contains(&self, member: &[u8]) -> bool {
         match &self.repr {
             SetRepr::Small(v) => v.iter().any(|m| m.as_bytes() == member),
@@ -149,6 +163,7 @@ impl Set {
         }
     }
 
+    #[must_use]
     pub fn members(&self) -> Vec<CompactString> {
         match &self.repr {
             SetRepr::Small(v) => v.clone(),
@@ -157,6 +172,7 @@ impl Set {
     }
 
     /// Return a random member (for SRANDMEMBER).
+    #[must_use]
     pub fn rand_member(&self) -> Option<&CompactString> {
         let len = self.len();
         if len == 0 {
@@ -165,14 +181,18 @@ impl Set {
         let idx = (crate::util::shard_hash(&self.sample_seed()) as usize) % len;
         match &self.repr {
             SetRepr::Small(v) => v.get(idx),
-            SetRepr::Large(s) => s.iter().skip(idx).next(),
+            SetRepr::Large(s) => s.iter().nth(idx),
         }
     }
 
     fn sample_seed(&self) -> Vec<u8> {
         match &self.repr {
             SetRepr::Small(v) => v.first().map(|m| m.as_bytes().to_vec()).unwrap_or_default(),
-            SetRepr::Large(s) => s.iter().next().map(|m| m.as_bytes().to_vec()).unwrap_or_default(),
+            SetRepr::Large(s) => s
+                .iter()
+                .next()
+                .map(|m| m.as_bytes().to_vec())
+                .unwrap_or_default(),
         }
     }
 
@@ -187,7 +207,7 @@ impl Set {
         match &mut self.repr {
             SetRepr::Small(v) => Some(v.swap_remove(idx)),
             SetRepr::Large(s) => {
-                let member = s.iter().skip(idx).next().cloned()?;
+                let member = s.iter().nth(idx).cloned()?;
                 s.remove(&member);
                 Some(member)
             }
@@ -236,7 +256,7 @@ mod tests {
     fn promotes_to_large() {
         let mut s = Set::new();
         for i in 0..200 {
-            s.add(CompactString::from_bytes(format!("m{}", i).as_bytes()));
+            s.add(CompactString::from_bytes(format!("m{i}").as_bytes()));
         }
         assert_eq!(s.len(), 200);
         assert!(matches!(s.repr, SetRepr::Large(_)));

@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 
-use crate::commands::{integer, ok, Command, OpContext, ShardPart, KeyRange, FLAG_DENYOOM, FLAG_FAST, FLAG_GLOBAL, FLAG_MOVABLEKEYS, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE};
+use crate::commands::{
+    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_GLOBAL, FLAG_MOVABLEKEYS, FLAG_MULTI_KEY, FLAG_READONLY,
+    FLAG_WRITE, KeyRange, OpContext, ShardPart, integer, ok,
+};
+use crate::core::PrimeValue;
 use crate::core::compact::CompactString;
 use crate::core::db::DbSlice;
 use crate::core::quicklist::{ListItem, QuickList};
-use crate::core::rdb::{dump_value, restore_value, RestoreError, RestoreOutcome};
+use crate::core::rdb::{RestoreError, RestoreOutcome, dump_value, restore_value};
 use crate::core::value::ObjType;
-use crate::core::PrimeValue;
 use crate::error::{CmdResult, RespError, RespValue};
 use crate::util::{parse_double, parse_i64, parse_u64, shard_hash};
 use xxhash_rust::xxh3::xxh3_64;
@@ -47,7 +50,7 @@ fn exec_delex(ctx: &mut OpContext) -> CmdResult {
 
     // `DELEX key` with no condition behaves like DEL.
     if ctx.args.len() == 2 {
-        return CmdResult::Ok(integer(if ctx.db.remove_if_exists(key) { 1 } else { 0 }));
+        return CmdResult::Ok(integer(i64::from(ctx.db.remove_if_exists(key))));
     }
     // Otherwise the syntax is `DELEX key <cond> <value>` exactly.
     if ctx.args.len() != 4 {
@@ -60,10 +63,7 @@ fn exec_delex(ctx: &mut OpContext) -> CmdResult {
     let compare_value = &ctx.args[3];
     let digest_mode = opt.eq_ignore_ascii_case(b"IFDEQ") || opt.eq_ignore_ascii_case(b"IFDNE");
     let negate = opt.eq_ignore_ascii_case(b"IFNE") || opt.eq_ignore_ascii_case(b"IFDNE");
-    if !opt.eq_ignore_ascii_case(b"IFEQ")
-        && !opt.eq_ignore_ascii_case(b"IFNE")
-        && !digest_mode
-    {
+    if !opt.eq_ignore_ascii_case(b"IFEQ") && !opt.eq_ignore_ascii_case(b"IFNE") && !digest_mode {
         return CmdResult::Err(RespError::new(format!(
             "ERR Unknown subcommand or wrong number of arguments for '{}'. Try DELEX HELP.",
             String::from_utf8_lossy(opt)
@@ -95,7 +95,8 @@ fn exec_exists(ctx: &mut OpContext) -> CmdResult {
         if ctx.db.contains(&ctx.args[ki], ctx.now_ms) {
             count += 1;
         }
-    }    CmdResult::Ok(integer(count))
+    }
+    CmdResult::Ok(integer(count))
 }
 
 // ---------------------------------------------------------------------------
@@ -105,9 +106,8 @@ fn exec_exists(ctx: &mut OpContext) -> CmdResult {
 fn expire_common(ctx: &mut OpContext, unit_ms: bool, is_at: bool) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let t = match parse_i64(&ctx.args[key_idx + 1]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(t) = parse_i64(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::integer());
     };
     // condition flags: NX XX GT LT
     let mut cond = None;
@@ -122,11 +122,7 @@ fn expire_common(ctx: &mut OpContext, unit_ms: bool, is_at: bool) -> CmdResult {
         };
     }
     let expire_at_ms: i64 = if is_at {
-        if unit_ms {
-            t
-        } else {
-            t.saturating_mul(1000)
-        }
+        if unit_ms { t } else { t.saturating_mul(1000) }
     } else {
         let delta = if unit_ms { t } else { t.saturating_mul(1000) };
         (ctx.now_ms as i64).saturating_add(delta)
@@ -166,7 +162,8 @@ fn expire_common(ctx: &mut OpContext, unit_ms: bool, is_at: bool) -> CmdResult {
             _ => unreachable!(),
         }
     }
-    ctx.db.set_expiry(key, expire_at_ms.max(0) as u64, ctx.now_ms);
+    ctx.db
+        .set_expiry(key, expire_at_ms.max(0) as u64, ctx.now_ms);
     CmdResult::Ok(integer(1))
 }
 
@@ -208,8 +205,6 @@ fn exec_persist(ctx: &mut OpContext) -> CmdResult {
     if ctx.db.has_expiry(key, ctx.now_ms) {
         ctx.db.clear_expiry(key);
         CmdResult::Ok(integer(1))
-    } else if ctx.db.contains(key, ctx.now_ms) {
-        CmdResult::Ok(integer(0))
     } else {
         CmdResult::Ok(integer(0))
     }
@@ -242,9 +237,8 @@ fn exec_dump(ctx: &mut OpContext) -> CmdResult {
 fn exec_restore(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let ttl = match parse_i64(&ctx.args[key_idx + 1]) {
-        Some(v) => v,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(ttl) = parse_i64(&ctx.args[key_idx + 1]) else {
+        return CmdResult::Err(RespError::integer());
     };
     if ttl < 0 {
         return CmdResult::Err(RespError::new("ERR Invalid TTL value, must be >= 0"));
@@ -267,22 +261,22 @@ fn exec_restore(ctx: &mut OpContext) -> CmdResult {
 
     let value = match restore_value(payload, ctx.now_ms) {
         Ok(RestoreOutcome::Value(v)) => v,
-        Ok(RestoreOutcome::Expired) => return CmdResult::Ok(ok()),
-        Err(RestoreError::Expired) => return CmdResult::Ok(ok()),
+        Ok(RestoreOutcome::Expired) | Err(RestoreError::Expired) => return CmdResult::Ok(ok()),
         Err(RestoreError::BadDataFormat) => {
             return CmdResult::Err(RespError::new("ERR Bad data format"));
         }
     };
 
     let key_cs = CompactString::from_bytes(key);
-    ctx.db.insert(key_cs.clone(), value);
+    ctx.db.insert(&key_cs, value);
     if ttl > 0 {
         let expire_at_ms = if absttl {
             ttl
         } else {
             (ctx.now_ms as i64).saturating_add(ttl)
         };
-        ctx.db.set_expiry(&key_cs, expire_at_ms.max(0) as u64, ctx.now_ms);
+        ctx.db
+            .set_expiry(&key_cs, expire_at_ms.max(0) as u64, ctx.now_ms);
     }
     CmdResult::Ok(ok())
 }
@@ -316,6 +310,7 @@ fn merge_concat(parts: &[ShardPart], _args: &[Vec<u8>], _keys: &[usize], _now: u
 
 /// Glob-style pattern matching compatible with Redis KEYS semantics
 /// (`*`, `?`, `[...]`, `[^...]`, escapes with `\`).
+#[must_use]
 pub fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
     let mut p = 0usize;
     let mut s = 0usize;
@@ -370,7 +365,7 @@ pub fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
 }
 
 /// Match `ch` against a character class at pattern[p] == '['.
-/// Returns Some((matched, new_pattern_pos)) or None if malformed.
+/// Returns Some((matched, `new_pattern_pos`)) or None if malformed.
 fn match_class(pattern: &[u8], p: usize, ch: u8) -> Option<(bool, usize)> {
     let mut i = p + 1;
     let mut negate = false;
@@ -438,7 +433,7 @@ fn rename_common(ctx: &mut OpContext, destination_should_not_exist: bool) -> Cmd
     if !owns_src {
         // Destination shard: report whether the destination exists.
         let dst_exists = ctx.db.contains(dst, ctx.now_ms);
-        return CmdResult::Ok(integer(dst_exists as i64));
+        return CmdResult::Ok(integer(i64::from(dst_exists)));
     }
 
     if !ctx.db.contains(src, ctx.now_ms) {
@@ -461,7 +456,7 @@ fn rename_common(ctx: &mut OpContext, destination_should_not_exist: bool) -> Cmd
         let exp = ctx.db.expire_at(src);
         let sticky = ctx.db.is_sticky(src);
         let val = ctx.db.remove(src).expect("key exists");
-        ctx.db.insert(CompactString::from_bytes(dst), val);
+        ctx.db.insert(dst, val);
         match exp {
             Some(at) => ctx.db.set_expiry(dst, at, ctx.now_ms),
             None => ctx.db.clear_expiry(dst),
@@ -481,9 +476,16 @@ fn rename_common(ctx: &mut OpContext, destination_should_not_exist: bool) -> Cmd
     let exp = ctx.db.expire_at(src);
     let sticky = ctx.db.is_sticky(src);
     let val = ctx.db.find(src, ctx.now_ms).expect("key exists").clone();
-    let reply = if destination_should_not_exist { integer(1) } else { ok() };
+    let reply = if destination_should_not_exist {
+        integer(1)
+    } else {
+        ok()
+    };
     CmdResult::deferred_stores(
-        vec![(src.to_vec(), None, None, false), (dst.to_vec(), Some(val), exp, sticky)],
+        vec![
+            (src.clone(), None, None, false),
+            (dst.clone(), Some(val), exp, sticky),
+        ],
         reply,
     )
 }
@@ -526,10 +528,10 @@ fn merge_rename(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u64
     if let Some(s) = stores {
         return s;
     }
-    parts
-        .first()
-        .map(|p| p.result.clone())
-        .unwrap_or_else(|| CmdResult::err("ERR internal: rename merge"))
+    parts.first().map_or_else(
+        || CmdResult::err("ERR internal: rename merge"),
+        |p| p.result.clone(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -554,7 +556,9 @@ fn exec_copy(ctx: &mut OpContext) -> CmdResult {
     }
 
     if src == dst {
-        return CmdResult::Err(RespError::new("source and destination objects are the same"));
+        return CmdResult::Err(RespError::new(
+            "source and destination objects are the same",
+        ));
     }
 
     let owns_src = ctx.owned_keys.contains(&src_idx);
@@ -563,7 +567,7 @@ fn exec_copy(ctx: &mut OpContext) -> CmdResult {
     if !owns_src {
         // Destination shard: report whether the destination exists.
         let dst_exists = ctx.db.contains(dst, ctx.now_ms);
-        return CmdResult::Ok(integer(dst_exists as i64));
+        return CmdResult::Ok(integer(i64::from(dst_exists)));
     }
 
     if !ctx.db.contains(src, ctx.now_ms) {
@@ -578,7 +582,7 @@ fn exec_copy(ctx: &mut OpContext) -> CmdResult {
         let exp = ctx.db.expire_at(src);
         let sticky = ctx.db.is_sticky(src);
         let val = ctx.db.find(src, ctx.now_ms).expect("key exists").clone();
-        ctx.db.insert(CompactString::from_bytes(dst), val);
+        ctx.db.insert(dst, val);
         match exp {
             Some(at) => ctx.db.set_expiry(dst, at, ctx.now_ms),
             None => ctx.db.clear_expiry(dst),
@@ -592,7 +596,7 @@ fn exec_copy(ctx: &mut OpContext) -> CmdResult {
     let exp = ctx.db.expire_at(src);
     let sticky = ctx.db.is_sticky(src);
     let val = ctx.db.find(src, ctx.now_ms).expect("key exists").clone();
-    CmdResult::deferred_stores(vec![(dst.to_vec(), Some(val), exp, sticky)], integer(1))
+    CmdResult::deferred_stores(vec![(dst.clone(), Some(val), exp, sticky)], integer(1))
 }
 
 fn merge_copy(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u64) -> CmdResult {
@@ -631,10 +635,10 @@ fn merge_copy(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u64) 
     if let Some(s) = stores {
         return s;
     }
-    parts
-        .first()
-        .map(|p| p.result.clone())
-        .unwrap_or_else(|| CmdResult::err("ERR internal: copy merge"))
+    parts.first().map_or_else(
+        || CmdResult::err("ERR internal: copy merge"),
+        |p| p.result.clone(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -702,7 +706,7 @@ pub fn move_key(src: &mut DbSlice, dst: &mut DbSlice, key: &[u8], now_ms: u64) -
     let Some((value, expire_at, sticky)) = src.take(key, now_ms) else {
         return 0;
     };
-    dst.insert(CompactString::from_bytes(key), value);
+    dst.insert(key, value);
     if let Some(at) = expire_at {
         dst.set_expiry(key, at, now_ms);
     }
@@ -734,7 +738,11 @@ pub fn exec_move_on_dbs(
     if dbs.len() <= db_idx || dbs.len() <= target {
         return CmdResult::err("ERR internal: MOVE target DB not active");
     }
-    let (lo, hi) = if db_idx < target { (db_idx, target) } else { (target, db_idx) };
+    let (lo, hi) = if db_idx < target {
+        (db_idx, target)
+    } else {
+        (target, db_idx)
+    };
     let (left, right) = dbs.split_at_mut(hi);
     let (src, dst) = if db_idx < target {
         (&mut left[lo], &mut right[0])
@@ -805,7 +813,11 @@ fn parse_scan_opts(args: &[Vec<u8>]) -> Result<ScanOpts, RespError> {
     let mut i = 2;
     while i < args.len() {
         let opt = args[i].to_ascii_uppercase();
-        let next = || args.get(i + 1).ok_or_else(RespError::syntax).map(|a| a.as_slice());
+        let next = || {
+            args.get(i + 1)
+                .ok_or_else(RespError::syntax)
+                .map(std::vec::Vec::as_slice)
+        };
         match opt.as_slice() {
             b"COUNT" => {
                 let n = parse_u64(next()?).ok_or_else(RespError::integer)? as usize;
@@ -820,7 +832,8 @@ fn parse_scan_opts(args: &[Vec<u8>]) -> Result<ScanOpts, RespError> {
                 i += 2;
             }
             b"TYPE" => {
-                opts.type_filter = Some(scan_type_from_name(next()?).ok_or_else(RespError::syntax)?);
+                opts.type_filter =
+                    Some(scan_type_from_name(next()?).ok_or_else(RespError::syntax)?);
                 i += 2;
             }
             b"BUCKET" => {
@@ -908,12 +921,14 @@ const SCAN_HELP: &[&str] = &[
 fn exec_scan(ctx: &mut OpContext) -> CmdResult {
     if ctx.args[1].eq_ignore_ascii_case(b"HELP") {
         return CmdResult::Ok(RespValue::Array(
-            SCAN_HELP.iter().map(|s| RespValue::Simple(s.to_string())).collect(),
+            SCAN_HELP
+                .iter()
+                .map(|s| RespValue::Simple(s.to_string()))
+                .collect(),
         ));
     }
-    let cursor = match parse_u64(&ctx.args[1]) {
-        Some(c) => c,
-        None => return CmdResult::err("ERR invalid cursor"),
+    let Some(cursor) = parse_u64(&ctx.args[1]) else {
+        return CmdResult::err("ERR invalid cursor");
     };
     let opts = match parse_scan_opts(ctx.args) {
         Ok(o) => o,
@@ -925,7 +940,11 @@ fn exec_scan(ctx: &mut OpContext) -> CmdResult {
     if shard_id < sid {
         return CmdResult::Ok(scan_reply(0, Vec::new()));
     }
-    let start_pos = if sid == shard_id { (cursor >> SCAN_SHARD_BITS) as usize } else { 0 };
+    let start_pos = if sid == shard_id {
+        (cursor >> SCAN_SHARD_BITS) as usize
+    } else {
+        0
+    };
 
     let db = &*ctx.db;
     let mut matched: Vec<(u64, Vec<u8>)> = db
@@ -982,9 +1001,8 @@ fn merge_scan(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64)
     if args[1].eq_ignore_ascii_case(b"HELP") {
         return parts[0].result.clone();
     }
-    let cursor = match parse_u64(&args[1]) {
-        Some(c) => c,
-        None => return CmdResult::err("ERR invalid cursor"),
+    let Some(cursor) = parse_u64(&args[1]) else {
+        return CmdResult::err("ERR invalid cursor");
     };
     let opts = match parse_scan_opts(args) {
         Ok(o) => o,
@@ -1018,7 +1036,11 @@ fn merge_scan(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64)
             Ok(t) => t,
             Err(e) => return CmdResult::Err(e),
         };
-        let pos_start = if s == sid { (cursor >> SCAN_SHARD_BITS) as usize } else { 0 };
+        let pos_start = if s == sid {
+            (cursor >> SCAN_SHARD_BITS) as usize
+        } else {
+            0
+        };
         let take = keys_s.len().min(remaining);
         result.extend(keys_s[..take].iter().cloned());
         remaining -= take;
@@ -1072,12 +1094,14 @@ fn rm_reply(cursor: u64, deleted: u64) -> RespValue {
 fn exec_rm(ctx: &mut OpContext) -> CmdResult {
     if ctx.args[1].eq_ignore_ascii_case(b"HELP") {
         return CmdResult::Ok(RespValue::Array(
-            RM_HELP.iter().map(|s| RespValue::Simple(s.to_string())).collect(),
+            RM_HELP
+                .iter()
+                .map(|s| RespValue::Simple(s.to_string()))
+                .collect(),
         ));
     }
-    let cursor = match parse_u64(&ctx.args[1]) {
-        Some(c) => c,
-        None => return CmdResult::err("ERR invalid cursor"),
+    let Some(cursor) = parse_u64(&ctx.args[1]) else {
+        return CmdResult::err("ERR invalid cursor");
     };
     let opts = match parse_scan_opts(ctx.args) {
         Ok(o) => o,
@@ -1147,9 +1171,8 @@ fn merge_rm(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64) -
     if args[1].eq_ignore_ascii_case(b"HELP") {
         return parts[0].result.clone();
     }
-    let cursor = match parse_u64(&args[1]) {
-        Some(c) => c,
-        None => return CmdResult::err("ERR invalid cursor"),
+    let Some(cursor) = parse_u64(&args[1]) else {
+        return CmdResult::err("ERR invalid cursor");
     };
     let _opts = match parse_scan_opts(args) {
         Ok(o) => o,
@@ -1191,7 +1214,7 @@ fn merge_rm(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64) -
 // SORT / SORT_RO
 // ---------------------------------------------------------------------------
 
-/// Options parsed from a SORT/SORT_RO argument list, mirroring the reference
+/// Options parsed from a `SORT/SORT_RO` argument list, mirroring the reference
 /// `SortParams`.
 struct SortOpts {
     alpha: bool,
@@ -1206,7 +1229,7 @@ struct SortOpts {
 /// Parse SORT options from `args[2..]`. Mirrors the reference grammar
 /// (Options(ALPHA, DESC/ASC, LIMIT, STORE, BY, GET)): options may appear in
 /// any order and repeat (last one wins), unknown options are a syntax error,
-/// and STORE is rejected for SORT_RO. LIMIT values must fit in u32; anything
+/// and STORE is rejected for `SORT_RO`. LIMIT values must fit in u32; anything
 /// else (including negatives) is an integer error.
 fn parse_sort_opts(args: &[Vec<u8>], is_ro: bool) -> Result<SortOpts, RespError> {
     let mut opts = SortOpts {
@@ -1249,11 +1272,11 @@ fn parse_sort_opts(args: &[Vec<u8>], is_ro: bool) -> Result<SortOpts, RespError>
                 i += 2;
             }
             b"BY" => {
-                opts.by_pattern = Some(next()?.to_vec());
+                opts.by_pattern = Some(next()?.clone());
                 i += 2;
             }
             b"GET" => {
-                opts.get_patterns.push(next()?.to_vec());
+                opts.get_patterns.push(next()?.clone());
                 i += 2;
             }
             _ => return Err(RespError::syntax()),
@@ -1261,7 +1284,7 @@ fn parse_sort_opts(args: &[Vec<u8>], is_ro: bool) -> Result<SortOpts, RespError>
     }
     // "nosort" (BY with no '*') disables sorting; 2+ '*' is a syntax error.
     if let Some(p) = &opts.by_pattern {
-        let stars = p.iter().filter(|&&b| b == b'*').count();
+        let stars = p.iter().fold(0usize, |n, &b| n + usize::from(b == b'*'));
         if stars == 0 {
             opts.to_sort = false;
             opts.by_pattern = None;
@@ -1271,7 +1294,7 @@ fn parse_sort_opts(args: &[Vec<u8>], is_ro: bool) -> Result<SortOpts, RespError>
     }
     // Each GET pattern must be "#" or contain at most one '*'.
     for p in &opts.get_patterns {
-        if p != b"#" && p.iter().filter(|&&b| b == b'*').count() > 1 {
+        if p != b"#" && p.iter().fold(0usize, |n, &b| n + usize::from(b == b'*')) > 1 {
             return Err(RespError::syntax());
         }
     }
@@ -1280,7 +1303,7 @@ fn parse_sort_opts(args: &[Vec<u8>], is_ro: bool) -> Result<SortOpts, RespError>
 
 fn parse_limit_u32(s: &[u8]) -> Result<usize, RespError> {
     match parse_i64(s) {
-        Some(v) if (0..=u32::MAX as i64).contains(&v) => Ok(v as usize),
+        Some(v) if (0..=i64::from(u32::MAX)).contains(&v) => Ok(v as usize),
         _ => Err(RespError::integer()),
     }
 }
@@ -1310,11 +1333,7 @@ fn sort_entry_cmp(l: &SortEntry, r: &SortEntry, alpha: bool, reversed: bool) -> 
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| l.key.cmp(&r.key))
     };
-    if reversed {
-        ord.reverse()
-    } else {
-        ord
-    }
+    if reversed { ord.reverse() } else { ord }
 }
 
 /// Parse one sort key. In alpha mode the raw bytes are kept as-is; in numeric
@@ -1352,10 +1371,17 @@ fn fetch_container_elements(
 ) -> Result<Vec<Vec<u8>>, RespError> {
     match db.find_mut(key, now_ms) {
         None => Ok(Vec::new()),
-        Some(PrimeValue::List(l)) => Ok(l.iter().map(|it| it.as_bytes()).collect()),
+        Some(PrimeValue::List(l)) => Ok(l
+            .iter()
+            .map(crate::core::quicklist::ListItem::as_bytes)
+            .collect()),
         Some(PrimeValue::Set(s)) => {
             s.prune_expired(now_ms);
-            let elems = s.members().into_iter().map(|m| m.as_bytes().to_vec()).collect();
+            let elems = s
+                .members()
+                .into_iter()
+                .map(|m| m.as_bytes().to_vec())
+                .collect();
             if s.is_empty() {
                 db.remove(key);
             }
@@ -1385,7 +1411,7 @@ fn expand_pattern(pattern: &[u8], element: &[u8]) -> Vec<u8> {
 /// The reference error for a non-numeric element under numeric SORT.
 const SORT_SCORE_ERR: &str = "One or more scores can't be converted into double";
 
-/// Shared executor for SORT and SORT_RO. On a multi-shard STORE the shard that
+/// Shared executor for SORT and `SORT_RO`. On a multi-shard STORE the shard that
 /// owns the source key returns the computed list via `DeferredStore` and the
 /// merge forwards it; the shard owning only the destination returns an empty
 /// array and is ignored.
@@ -1431,7 +1457,12 @@ fn exec_sort(ctx: &mut OpContext) -> CmdResult {
                 Ok(k) => k,
                 Err(e) => return CmdResult::Err(e),
             };
-            entries.push(SortEntry { key, score, result: el.clone(), get_values: Vec::new() });
+            entries.push(SortEntry {
+                key,
+                score,
+                result: el.clone(),
+                get_values: Vec::new(),
+            });
         }
     } else {
         // Sort the elements themselves.
@@ -1440,7 +1471,12 @@ fn exec_sort(ctx: &mut OpContext) -> CmdResult {
                 Ok(k) => k,
                 Err(e) => return CmdResult::Err(e),
             };
-            entries.push(SortEntry { key, score, result: el.clone(), get_values: Vec::new() });
+            entries.push(SortEntry {
+                key,
+                score,
+                result: el.clone(),
+                get_values: Vec::new(),
+            });
         }
     }
 
@@ -1455,11 +1491,11 @@ fn exec_sort(ctx: &mut OpContext) -> CmdResult {
 
     // Fetch GET pattern values for the entries in range.
     if !opts.get_patterns.is_empty() {
-        for e in entries.iter_mut() {
+        for e in &mut entries {
             e.get_values.resize(opts.get_patterns.len(), Vec::new());
         }
         for (pi, pattern) in opts.get_patterns.iter().enumerate() {
-            for e in entries.iter_mut() {
+            for e in &mut entries {
                 let value = if pattern == b"#" {
                     e.result.clone()
                 } else {
@@ -1480,7 +1516,10 @@ fn exec_sort(ctx: &mut OpContext) -> CmdResult {
         }
         out
     } else {
-        entries[start..end].iter().map(|e| e.result.clone()).collect()
+        entries[start..end]
+            .iter()
+            .map(|e| e.result.clone())
+            .collect()
     };
     let count = stored.len() as i64;
 
@@ -1501,7 +1540,7 @@ fn exec_sort(ctx: &mut OpContext) -> CmdResult {
             match value {
                 Some(v) => {
                     ctx.db.clear_expiry(dest);
-                    ctx.db.insert(CompactString::from_bytes(dest), v);
+                    ctx.db.insert(dest, v);
                 }
                 None => {
                     ctx.db.remove(dest);
@@ -1512,7 +1551,9 @@ fn exec_sort(ctx: &mut OpContext) -> CmdResult {
         return CmdResult::deferred_store(dest.clone(), value, integer(count));
     }
 
-    CmdResult::Ok(RespValue::Array(stored.into_iter().map(RespValue::Bulk).collect()))
+    CmdResult::Ok(RespValue::Array(
+        stored.into_iter().map(RespValue::Bulk).collect(),
+    ))
 }
 
 /// Merge for SORT: forward the source shard's result (an array, or a
@@ -1538,7 +1579,7 @@ fn merge_sort(parts: &[ShardPart], _args: &[Vec<u8>], keys: &[usize], _now: u64)
 /// `kMaxExpireDeadlineSec` (dragonfly/src/server/common.h).
 const MAX_EXPIRE_SEC: i64 = (1u64 << 28) as i64 - 1;
 
-/// FIELDEXPIRE key ttl_sec field [field ...]
+/// FIELDEXPIRE key `ttl_sec` field [field ...]
 ///
 /// Sets the per-member/field TTL of a set or hash. Replies an integer per
 /// field: 1 on success, -2 for a missing key, field or wrong type (mirroring
@@ -1578,7 +1619,10 @@ fn exec_fieldexpire(ctx: &mut OpContext) -> CmdResult {
             let mut out = Vec::with_capacity(fields.len());
             for f in fields {
                 if h.contains(f) {
-                    let v = h.get(f).cloned().unwrap_or_else(|| CompactString::from_bytes(f));
+                    let v = h
+                        .get(f)
+                        .cloned()
+                        .unwrap_or_else(|| CompactString::from_bytes(f));
                     h.add_expirable(CompactString::from_bytes(f), v, Some(expire_ms), false);
                     out.push(1);
                 } else {
@@ -1886,9 +1930,9 @@ pub static CMD_FIELDTTL: Command = Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::PrimeValue;
     use crate::core::db::DbSlice;
     use crate::core::set::Set;
-    use crate::core::PrimeValue;
     use crate::core::zset::ZSet;
 
     macro_rules! bvecs {
@@ -1922,11 +1966,10 @@ mod tests {
         let cmd = argv[0].to_ascii_uppercase();
         let (exec, first_key_idx, owned): (crate::commands::ExecFn, usize, Vec<usize>) =
             match cmd.as_slice() {
-                b"DEL" => (exec_del, 1, (1..argv.len()).collect()),
+                b"DEL" | b"UNLINK" => (exec_del, 1, (1..argv.len()).collect()),
                 b"DELEX" => (exec_delex, 1, (1..2).collect()),
                 b"STICK" => (exec_stick, 1, (1..argv.len()).collect()),
-                b"UNLINK" => (exec_del, 1, (1..argv.len()).collect()),
-                b"TOUCH" => (exec_exists, 1, (1..argv.len()).collect()),
+                b"TOUCH" | b"EXISTS" => (exec_exists, 1, (1..argv.len()).collect()),
                 b"RENAME" => (exec_rename, 1, (1..3).collect()),
                 b"RENAMENX" => (exec_renamenx, 1, (1..3).collect()),
                 b"COPY" => (exec_copy, 1, (1..3).collect()),
@@ -1938,23 +1981,53 @@ mod tests {
                 b"SORT" | b"SORT_RO" => (exec_sort, 1, (1..argv.len()).collect()),
                 b"FIELDEXPIRE" => (exec_fieldexpire, 1, (1..2).collect()),
                 b"FIELDTTL" => (exec_fieldttl, 1, (1..2).collect()),
-                b"SADD" => (crate::commands::exec::sets::CMD_SADD.exec, 1, (1..2).collect()),
-                b"SMEMBERS" => (crate::commands::exec::sets::CMD_SMEMBERS.exec, 1, (1..2).collect()),
-                b"SADDEX" => (crate::commands::exec::sets::CMD_SADDEX.exec, 1, (1..2).collect()),
-                b"HSET" => (crate::commands::exec::hashes::CMD_HSET.exec, 1, (1..2).collect()),
-                b"HGETALL" => (crate::commands::exec::hashes::CMD_HGETALL.exec, 1, (1..2).collect()),
-                b"HSETEX" => (crate::commands::exec::hashes::CMD_HSETEX.exec, 1, (1..2).collect()),
+                b"SADD" => (
+                    crate::commands::exec::sets::CMD_SADD.exec,
+                    1,
+                    (1..2).collect(),
+                ),
+                b"SMEMBERS" => (
+                    crate::commands::exec::sets::CMD_SMEMBERS.exec,
+                    1,
+                    (1..2).collect(),
+                ),
+                b"SADDEX" => (
+                    crate::commands::exec::sets::CMD_SADDEX.exec,
+                    1,
+                    (1..2).collect(),
+                ),
+                b"HSET" => (
+                    crate::commands::exec::hashes::CMD_HSET.exec,
+                    1,
+                    (1..2).collect(),
+                ),
+                b"HGETALL" => (
+                    crate::commands::exec::hashes::CMD_HGETALL.exec,
+                    1,
+                    (1..2).collect(),
+                ),
+                b"HSETEX" => (
+                    crate::commands::exec::hashes::CMD_HSETEX.exec,
+                    1,
+                    (1..2).collect(),
+                ),
                 b"TTL" => (exec_ttl, 1, (1..2).collect()),
                 b"PTTL" => (exec_pttl, 1, (1..2).collect()),
                 b"EXPIRE" => (exec_expire, 1, (1..2).collect()),
                 b"KEYS" => (exec_keys, 1, vec![]),
-                b"EXISTS" => (exec_exists, 1, (1..argv.len()).collect()),
+
                 b"PEXPIREAT" => (exec_pexpireat, 1, (1..2).collect()),
                 b"DUMP" => (exec_dump, 1, (1..2).collect()),
                 b"RESTORE" => (exec_restore, 1, (1..2).collect()),
                 _ => panic!("unhandled command {:?}", argv[0]),
             };
-        let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx, now_ms };
+        let mut ctx = OpContext {
+            db,
+            args: argv,
+            owned_keys: &owned,
+            first_key_idx,
+            now_ms,
+        };
         exec(&mut ctx)
     }
 
@@ -1963,7 +2036,11 @@ mod tests {
     }
 
     fn cmd_at(db: &mut DbSlice, now_ms: u64, args: &[&[u8]]) -> CmdResult {
-        dispatch_at(db, now_ms, &args.iter().map(|a| a.to_vec()).collect::<Vec<_>>())
+        dispatch_at(
+            db,
+            now_ms,
+            &args.iter().map(|a| a.to_vec()).collect::<Vec<_>>(),
+        )
     }
 
     fn array_keys(r: CmdResult) -> Vec<Vec<u8>> {
@@ -1972,28 +2049,29 @@ mod tests {
                 .iter()
                 .map(|v| match v {
                     RespValue::Bulk(b) => b.clone(),
-                    o => panic!("expected bulk key, got {:?}", o),
+                    o => panic!("expected bulk key, got {o:?}"),
                 })
                 .collect(),
-            o => panic!("expected array, got {:?}", o),
+            o => panic!("expected array, got {o:?}"),
         }
     }
 
     /// Run a SCAN/KEYS-ish command and return its key list. For SCAN the reply
     /// is `[cursor, keys]`; for KEYS it is a plain key array.
     fn scan_keys(db: &mut DbSlice, now_ms: u64, args: &[&[u8]]) -> Vec<Vec<u8>> {
-        let r = dispatch_at(db, now_ms, &args.iter().map(|a| a.to_vec()).collect::<Vec<_>>());
+        let r = dispatch_at(
+            db,
+            now_ms,
+            &args.iter().map(|a| a.to_vec()).collect::<Vec<_>>(),
+        );
         match val(r) {
             RespValue::Array(a) if a.len() == 2 => array_keys(CmdResult::Ok(a[1].clone())),
-            o => panic!("expected scan reply [cursor, keys], got {:?}", o),
+            o => panic!("expected scan reply [cursor, keys], got {o:?}"),
         }
     }
 
     fn str_of(db: &mut DbSlice, key: &str, value: &str) {
-        db.insert(
-            CompactString::from_bytes(key.as_bytes()),
-            PrimeValue::Str(CompactString::from(value)),
-        );
+        db.insert(key.as_bytes(), PrimeValue::Str(CompactString::from(value)));
     }
 
     /// Port of `GenericFamilyTest.Touch`.
@@ -2014,7 +2092,7 @@ mod tests {
 
         let dump = match val(cmd(&mut db, &[b"DUMP", b"src"])) {
             RespValue::Bulk(b) => b,
-            o => panic!("expected bulk dump, got {:?}", o),
+            o => panic!("expected bulk dump, got {o:?}"),
         };
         assert_eq!(&dump[0..1], &[0]); // RDB_TYPE_STRING
 
@@ -2022,8 +2100,12 @@ mod tests {
         assert_eq!(val(cmd(&mut db, &[b"DUMP", b"nope"])), RespValue::Nil);
 
         // RESTORE into a fresh key.
-        let payload: Vec<Vec<u8>> =
-            vec![b"RESTORE".to_vec(), b"dst".to_vec(), b"0".to_vec(), dump.clone()];
+        let payload: Vec<Vec<u8>> = vec![
+            b"RESTORE".to_vec(),
+            b"dst".to_vec(),
+            b"0".to_vec(),
+            dump.clone(),
+        ];
         let mut argv = vec![b"RESTORE".to_vec()];
         argv.extend_from_slice(&payload[1..]);
         assert_eq!(
@@ -2032,7 +2114,7 @@ mod tests {
         );
         match db.find(b"dst", 0) {
             Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"hello"),
-            o => panic!("expected restored string, got {:?}", o),
+            o => panic!("expected restored string, got {o:?}"),
         }
         assert_eq!(int_of(cmd(&mut db, &[b"TTL", b"dst"])), -1);
 
@@ -2096,14 +2178,20 @@ mod tests {
         str_of(&mut db, "x", "xxx");
         str_of(&mut db, "b", "bbb");
 
-        assert_eq!(err_of(cmd(&mut db, &[b"RENAME", b"z", b"b"])), "ERR no such key");
-        assert_eq!(val(cmd(&mut db, &[b"RENAME", b"x", b"b"])), val(CmdResult::Ok(ok())));
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"RENAME", b"z", b"b"])),
+            "ERR no such key"
+        );
+        assert_eq!(
+            val(cmd(&mut db, &[b"RENAME", b"x", b"b"])),
+            val(CmdResult::Ok(ok()))
+        );
 
         // x no longer exists, b holds the old value of x.
         assert_eq!(int_of(cmd(&mut db, &[b"EXISTS", b"x", b"b"])), 1);
         match db.find(b"b", 0) {
             Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"xxx"),
-            o => panic!("expected string, got {:?}", o),
+            o => panic!("expected string, got {o:?}"),
         }
         assert!(!db.contains(b"x", 0));
     }
@@ -2113,11 +2201,18 @@ mod tests {
     fn rename_binary() {
         let mut db = DbSlice::new(0);
         str_of(&mut db, "\u{1}\u{2}\u{3}\u{4}", "bar");
-        cmd(&mut db, &[b"RENAME", "\u{1}\u{2}\u{3}\u{4}".as_bytes(), "\u{5}\u{6}\u{7}\u{8}".as_bytes()]);
+        cmd(
+            &mut db,
+            &[
+                b"RENAME",
+                "\u{1}\u{2}\u{3}\u{4}".as_bytes(),
+                "\u{5}\u{6}\u{7}\u{8}".as_bytes(),
+            ],
+        );
         assert!(!db.contains("\u{1}\u{2}\u{3}\u{4}".as_bytes(), 0));
         match db.find("\u{5}\u{6}\u{7}\u{8}".as_bytes(), 0) {
             Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"bar"),
-            o => panic!("expected string, got {:?}", o),
+            o => panic!("expected string, got {o:?}"),
         }
     }
 
@@ -2128,12 +2223,15 @@ mod tests {
         str_of(&mut db, "x", "xxx");
         str_of(&mut db, "b", "bbb");
 
-        assert_eq!(err_of(cmd(&mut db, &[b"RENAMENX", b"z", b"b"])), "ERR no such key");
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"RENAMENX", b"z", b"b"])),
+            "ERR no such key"
+        );
         assert_eq!(int_of(cmd(&mut db, &[b"RENAMENX", b"x", b"b"])), 0); // b exists
         assert_eq!(int_of(cmd(&mut db, &[b"RENAMENX", b"x", b"y"])), 1);
         match db.find(b"y", 0) {
             Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"xxx"),
-            o => panic!("expected string, got {:?}", o),
+            o => panic!("expected string, got {o:?}"),
         }
         assert_eq!(int_of(cmd(&mut db, &[b"RENAMENX", b"y", b"y"])), 0);
     }
@@ -2142,10 +2240,16 @@ mod tests {
     #[test]
     fn rename_same_name() {
         let mut db = DbSlice::new(0);
-        assert_eq!(err_of(cmd(&mut db, &[b"RENAME", b"key", b"key"])), "ERR no such key");
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"RENAME", b"key", b"key"])),
+            "ERR no such key"
+        );
 
         str_of(&mut db, "key", "value");
-        assert_eq!(val(cmd(&mut db, &[b"RENAME", b"key", b"key"])), val(CmdResult::Ok(ok())));
+        assert_eq!(
+            val(cmd(&mut db, &[b"RENAME", b"key", b"key"])),
+            val(CmdResult::Ok(ok()))
+        );
     }
 
     /// Port of `GenericFamilyTest.Copy`.
@@ -2159,7 +2263,7 @@ mod tests {
         assert_eq!(int_of(cmd(&mut db, &[b"COPY", b"b", b"c"])), 1);
         match db.find(b"c", 0) {
             Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"bbb"),
-            o => panic!("expected string, got {:?}", o),
+            o => panic!("expected string, got {o:?}"),
         }
 
         assert_eq!(int_of(cmd(&mut db, &[b"COPY", b"x", b"b", b"REPLACE"])), 1);
@@ -2167,11 +2271,11 @@ mod tests {
         assert_eq!(int_of(cmd(&mut db, &[b"EXISTS", b"x", b"b"])), 2);
         match db.find(b"x", 0) {
             Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"xxx"),
-            o => panic!("expected string, got {:?}", o),
+            o => panic!("expected string, got {o:?}"),
         }
         match db.find(b"b", 0) {
             Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"xxx"),
-            o => panic!("expected string, got {:?}", o),
+            o => panic!("expected string, got {o:?}"),
         }
     }
 
@@ -2179,7 +2283,10 @@ mod tests {
     #[test]
     fn copy_non_string() {
         let mut db = DbSlice::new(0);
-        db.insert(CompactString::from("x"), PrimeValue::List(crate::core::quicklist::QuickList::default()));
+        db.insert(
+            b"x",
+            PrimeValue::List(crate::core::quicklist::QuickList::default()),
+        );
         assert_eq!(int_of(cmd(&mut db, &[b"COPY", b"x", b"b"])), 1);
         assert!(db.contains(b"b", 0));
         assert_eq!(int_of(cmd(&mut db, &[b"DEL", b"x"])), 1);
@@ -2230,16 +2337,25 @@ mod tests {
         str_of(&mut db, "source", "value1");
         str_of(&mut db, "destination", "value2");
 
-        assert_eq!(int_of(cmd(&mut db, &[b"COPY", b"source", b"destination"])), 0);
-        assert_eq!(int_of(cmd(&mut db, &[b"COPY", b"source", b"destination", b"REPLACE"])), 1);
+        assert_eq!(
+            int_of(cmd(&mut db, &[b"COPY", b"source", b"destination"])),
+            0
+        );
+        assert_eq!(
+            int_of(cmd(
+                &mut db,
+                &[b"COPY", b"source", b"destination", b"REPLACE"]
+            )),
+            1
+        );
         match db.find(b"destination", 0) {
             Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"value1"),
-            o => panic!("expected string, got {:?}", o),
+            o => panic!("expected string, got {o:?}"),
         }
         // Source is untouched.
         match db.find(b"source", 0) {
             Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"value1"),
-            o => panic!("expected string, got {:?}", o),
+            o => panic!("expected string, got {o:?}"),
         }
     }
 
@@ -2252,7 +2368,7 @@ mod tests {
         str_of(&mut db, "k1", "1");
         match val(cmd(&mut db, &[b"RANDOMKEY"])) {
             RespValue::Bulk(b) => assert_eq!(b, b"k1"),
-            o => panic!("expected bulk, got {:?}", o),
+            o => panic!("expected bulk, got {o:?}"),
         }
     }
 
@@ -2293,7 +2409,10 @@ mod tests {
         str_of(&mut db, "dst", "old");
         db.set_expiry(b"dst", 99_000, 0);
 
-        assert_eq!(val(cmd(&mut db, &[b"RENAME", b"src", b"dst"])), val(CmdResult::Ok(ok())));
+        assert_eq!(
+            val(cmd(&mut db, &[b"RENAME", b"src", b"dst"])),
+            val(CmdResult::Ok(ok()))
+        );
         assert_eq!(db.ttl_ms(b"dst", 0), 10_000);
         assert!(!db.contains(b"src", 0));
     }
@@ -2313,44 +2432,86 @@ mod tests {
 
         // IFEQ deletes when values match, not otherwise.
         str_of(&mut db, "key2", "value2");
-        assert_eq!(int_of(cmd(&mut db, &[b"DELEX", b"key2", b"IFEQ", b"value2"])), 1);
+        assert_eq!(
+            int_of(cmd(&mut db, &[b"DELEX", b"key2", b"IFEQ", b"value2"])),
+            1
+        );
         assert!(!db.contains(b"key2", 0));
 
         str_of(&mut db, "key3", "value3");
-        assert_eq!(int_of(cmd(&mut db, &[b"DELEX", b"key3", b"IFEQ", b"wrongvalue"])), 0);
+        assert_eq!(
+            int_of(cmd(&mut db, &[b"DELEX", b"key3", b"IFEQ", b"wrongvalue"])),
+            0
+        );
         assert!(db.contains(b"key3", 0));
 
         // IFNE deletes when values differ, not otherwise.
         str_of(&mut db, "key4", "value4");
-        assert_eq!(int_of(cmd(&mut db, &[b"DELEX", b"key4", b"IFNE", b"differentvalue"])), 1);
+        assert_eq!(
+            int_of(cmd(
+                &mut db,
+                &[b"DELEX", b"key4", b"IFNE", b"differentvalue"]
+            )),
+            1
+        );
         assert!(!db.contains(b"key4", 0));
 
         str_of(&mut db, "key5", "value5");
-        assert_eq!(int_of(cmd(&mut db, &[b"DELEX", b"key5", b"IFNE", b"value5"])), 0);
+        assert_eq!(
+            int_of(cmd(&mut db, &[b"DELEX", b"key5", b"IFNE", b"value5"])),
+            0
+        );
         assert!(db.contains(b"key5", 0));
 
         // IFDEQ uses the same digest as DIGEST.
         str_of(&mut db, "key6", "value6");
         let digest = format!("{:016x}", xxh3_64(b"value6"));
-        assert_eq!(int_of(cmd(&mut db, &[b"DELEX", b"key6", b"IFDEQ", digest.as_bytes()])), 1);
+        assert_eq!(
+            int_of(cmd(
+                &mut db,
+                &[b"DELEX", b"key6", b"IFDEQ", digest.as_bytes()]
+            )),
+            1
+        );
         assert!(!db.contains(b"key6", 0));
 
         str_of(&mut db, "key7", "value7");
-        assert_eq!(int_of(cmd(&mut db, &[b"DELEX", b"key7", b"IFDEQ", b"0000000000000000"])), 0);
+        assert_eq!(
+            int_of(cmd(
+                &mut db,
+                &[b"DELEX", b"key7", b"IFDEQ", b"0000000000000000"]
+            )),
+            0
+        );
         assert!(db.contains(b"key7", 0));
 
         // IFDNE deletes when digests differ, not when they match.
         str_of(&mut db, "key8", "value8");
-        assert_eq!(int_of(cmd(&mut db, &[b"DELEX", b"key8", b"IFDNE", b"0000000000000000"])), 1);
+        assert_eq!(
+            int_of(cmd(
+                &mut db,
+                &[b"DELEX", b"key8", b"IFDNE", b"0000000000000000"]
+            )),
+            1
+        );
         assert!(!db.contains(b"key8", 0));
 
         str_of(&mut db, "key9", "value9");
         let digest9 = format!("{:016x}", xxh3_64(b"value9"));
-        assert_eq!(int_of(cmd(&mut db, &[b"DELEX", b"key9", b"IFDNE", digest9.as_bytes()])), 0);
+        assert_eq!(
+            int_of(cmd(
+                &mut db,
+                &[b"DELEX", b"key9", b"IFDNE", digest9.as_bytes()]
+            )),
+            0
+        );
         assert!(db.contains(b"key9", 0));
 
         // Condition against a non-string key is WRONGTYPE.
-        db.insert(CompactString::from("list1"), PrimeValue::List(crate::core::quicklist::QuickList::default()));
+        db.insert(
+            b"list1",
+            PrimeValue::List(crate::core::quicklist::QuickList::default()),
+        );
         assert_eq!(
             err_of(cmd(&mut db, &[b"DELEX", b"list1", b"IFEQ", b"item"])),
             "WRONGTYPE Operation against a key holding the wrong kind of value"
@@ -2358,16 +2519,23 @@ mod tests {
 
         // Invalid option is an unknown-subcommand error.
         str_of(&mut db, "key10", "value10");
-        assert!(err_of(cmd(&mut db, &[b"DELEX", b"key10", b"INVALID", b"value"]))
-            .contains("Unknown subcommand"));
+        assert!(
+            err_of(cmd(&mut db, &[b"DELEX", b"key10", b"INVALID", b"value"]))
+                .contains("Unknown subcommand")
+        );
 
         // Wrong number of arguments in several shapes.
         str_of(&mut db, "key11", "v");
         assert!(err_of(cmd(&mut db, &[b"DELEX", b"key11", b"randomarg"])).contains("wrong number"));
         assert!(err_of(cmd(&mut db, &[b"DELEX", b"key12", b"IFEQ"])).contains("wrong number"));
         assert!(err_of(cmd(&mut db, &[b"DELEX", b"key13", b"xyz"])).contains("wrong number"));
-        assert!(err_of(cmd(&mut db, &[b"DELEX", b"key14", b"IFEQ", b"val", b"extra"]))
-            .contains("wrong number"));
+        assert!(
+            err_of(cmd(
+                &mut db,
+                &[b"DELEX", b"key14", b"IFEQ", b"val", b"extra"]
+            ))
+            .contains("wrong number")
+        );
     }
 
     /// Port of `GenericFamilyTest.Stick`.
@@ -2394,7 +2562,10 @@ mod tests {
         assert_eq!(int_of(cmd(&mut db, &[b"STICK", b"a"])), 0);
 
         // RENAME moves stickiness (single-shard path here).
-        assert_eq!(val(cmd(&mut db, &[b"RENAME", b"a", b"k"])), val(CmdResult::Ok(ok())));
+        assert_eq!(
+            val(cmd(&mut db, &[b"RENAME", b"a", b"k"])),
+            val(CmdResult::Ok(ok()))
+        );
         assert_eq!(int_of(cmd(&mut db, &[b"STICK", b"k"])), 0);
         assert_eq!(db.ttl_ms(b"k", 0), -1);
     }
@@ -2435,7 +2606,10 @@ mod tests {
         let mut dbs = vec![DbSlice::new(0), DbSlice::new(1)];
 
         // Missing key: 0.
-        assert_eq!(int_of(move_dbs(&mut dbs, 0, now, &[b"MOVE", b"a", b"1"])), 0);
+        assert_eq!(
+            int_of(move_dbs(&mut dbs, 0, now, &[b"MOVE", b"a", b"1"])),
+            0
+        );
 
         // Non-existent DB indices.
         assert_eq!(
@@ -2455,22 +2629,28 @@ mod tests {
         str_of(&mut dbs[0], "a", "test");
         dbs[0].set_expiry(b"a", now + 1000, now);
         dbs[0].set_sticky_flag(b"a", true);
-        assert_eq!(int_of(move_dbs(&mut dbs, 0, now, &[b"MOVE", b"a", b"1"])), 1);
+        assert_eq!(
+            int_of(move_dbs(&mut dbs, 0, now, &[b"MOVE", b"a", b"1"])),
+            1
+        );
         assert!(!dbs[0].contains(b"a", now));
         assert_eq!(dbs[1].ttl_ms(b"a", now), 1000);
         assert!(dbs[1].is_sticky(b"a"));
         match dbs[1].find(b"a", now) {
             Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"test"),
-            o => panic!("expected string, got {:?}", o),
+            o => panic!("expected string, got {o:?}"),
         }
 
         // MOVE doesn't move if the destination key exists.
         str_of(&mut dbs[1], "a", "existing");
         str_of(&mut dbs[0], "a", "other");
-        assert_eq!(int_of(move_dbs(&mut dbs, 0, now, &[b"MOVE", b"a", b"1"])), 0);
+        assert_eq!(
+            int_of(move_dbs(&mut dbs, 0, now, &[b"MOVE", b"a", b"1"])),
+            0
+        );
         match dbs[1].find(b"a", now) {
             Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"existing"),
-            o => panic!("expected string, got {:?}", o),
+            o => panic!("expected string, got {o:?}"),
         }
         assert!(dbs[0].contains(b"a", now));
     }
@@ -2488,39 +2668,53 @@ mod tests {
             str_of(&mut db, &format!("str{i}"), "bar");
         }
         for i in 0..10 {
-            db.insert(
-                CompactString::from_bytes(format!("set{i}").as_bytes()),
-                PrimeValue::Set(Set::new()),
-            );
+            db.insert(format!("set{i}").as_bytes(), PrimeValue::Set(Set::new()));
         }
         for i in 0..10 {
-            db.insert(
-                CompactString::from_bytes(format!("zset{i}").as_bytes()),
-                PrimeValue::ZSet(ZSet::new()),
-            );
+            db.insert(format!("zset{i}").as_bytes(), PrimeValue::ZSet(ZSet::new()));
         }
 
-        let keys = scan_keys(&mut db, 0, &[b"SCAN", b"0", b"COUNT", b"20", b"TYPE", b"string"]);
+        let keys = scan_keys(
+            &mut db,
+            0,
+            &[b"SCAN", b"0", b"COUNT", b"20", b"TYPE", b"string"],
+        );
         assert!(keys.len() > 10);
-        assert!(keys.iter().all(|k| k.starts_with(b"str") || k.starts_with(b"key")));
+        assert!(
+            keys.iter()
+                .all(|k| k.starts_with(b"str") || k.starts_with(b"key"))
+        );
 
-        let keys = scan_keys(&mut db, 0, &[b"SCAN", b"0", b"COUNT", b"20", b"MATCH", b"zset*"]);
+        let keys = scan_keys(
+            &mut db,
+            0,
+            &[b"SCAN", b"0", b"COUNT", b"20", b"MATCH", b"zset*"],
+        );
         assert_eq!(keys.len(), 10);
         assert!(keys.iter().all(|k| k.starts_with(b"zset")));
 
-        assert_eq!(err_of(cmd(&mut db, &[b"SCAN", b"0", b"COUNT"])), "ERR syntax error");
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"SCAN", b"0", b"COUNT"])),
+            "ERR syntax error"
+        );
         assert_eq!(
             err_of(cmd(&mut db, &[b"SCAN", b"0", b"COUNT", b"not-a-number"])),
             "ERR value is not an integer or out of range"
         );
-        assert_eq!(err_of(cmd(&mut db, &[b"SCAN", b"0", b"TYPE", b"not-a-type"])), "ERR syntax error");
-        assert_eq!(err_of(cmd(&mut db, &[b"SCAN", b"0", b"NOVALUES"])), "ERR syntax error");
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"SCAN", b"0", b"TYPE", b"not-a-type"])),
+            "ERR syntax error"
+        );
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"SCAN", b"0", b"NOVALUES"])),
+            "ERR syntax error"
+        );
 
         // COUNT is a size_t hint: values above UINT32_MAX must still parse.
         let resp = val(cmd(&mut db, &[b"SCAN", b"0", b"COUNT", b"5000000000"]));
         match resp {
             RespValue::Array(a) => assert_eq!(a.len(), 2),
-            o => panic!("expected scan reply array, got {:?}", o),
+            o => panic!("expected scan reply array, got {o:?}"),
         }
     }
 
@@ -2535,7 +2729,10 @@ mod tests {
         keys.sort();
         assert_eq!(keys, vec![Vec::<u8>::new(), b"bar".to_vec()]);
 
-        assert_eq!(array_keys(cmd(&mut db, &[b"KEYS", b""])), vec![Vec::<u8>::new()]);
+        assert_eq!(
+            array_keys(cmd(&mut db, &[b"KEYS", b""])),
+            vec![Vec::<u8>::new()]
+        );
     }
 
     /// Port of `GenericFamilyTest.ScanWithAttr`: ATTR filters by TTL
@@ -2551,20 +2748,38 @@ mod tests {
         // expire hello 1000 -> PEXPIREAT (ms) in the future.
         cmd_at(&mut db, now, &[b"PEXPIREAT", b"hello", b"1000000"]);
 
-        assert_eq!(scan_keys(&mut db, now, &[b"SCAN", b"0", b"ATTR", b"v"]), vec![b"hello".to_vec()]);
-        assert_eq!(scan_keys(&mut db, now, &[b"SCAN", b"0", b"ATTR", b"p"]), vec![b"foo".to_vec()]);
+        assert_eq!(
+            scan_keys(&mut db, now, &[b"SCAN", b"0", b"ATTR", b"v"]),
+            vec![b"hello".to_vec()]
+        );
+        assert_eq!(
+            scan_keys(&mut db, now, &[b"SCAN", b"0", b"ATTR", b"p"]),
+            vec![b"foo".to_vec()]
+        );
         // Before the GET, only "hello" was touched (by the expire lookup).
-        assert_eq!(scan_keys(&mut db, now, &[b"SCAN", b"0", b"ATTR", b"a"]), vec![b"hello".to_vec()]);
-        assert_eq!(scan_keys(&mut db, now, &[b"SCAN", b"0", b"ATTR", b"u"]), vec![b"foo".to_vec()]);
+        assert_eq!(
+            scan_keys(&mut db, now, &[b"SCAN", b"0", b"ATTR", b"a"]),
+            vec![b"hello".to_vec()]
+        );
+        assert_eq!(
+            scan_keys(&mut db, now, &[b"SCAN", b"0", b"ATTR", b"u"]),
+            vec![b"foo".to_vec()]
+        );
 
         // GET "foo" is a read: it marks "foo" as touched.
         match db.find(b"foo", now) {
             Some(PrimeValue::Str(s)) => assert_eq!(s.as_bytes(), b"bar"),
-            o => panic!("expected string, got {:?}", o),
+            o => panic!("expected string, got {o:?}"),
         }
 
-        assert_eq!(scan_keys(&mut db, now, &[b"SCAN", b"0", b"ATTR", b"a"]).len(), 2);
-        assert_eq!(scan_keys(&mut db, now, &[b"SCAN", b"0", b"ATTR", b"u"]).len(), 0);
+        assert_eq!(
+            scan_keys(&mut db, now, &[b"SCAN", b"0", b"ATTR", b"a"]).len(),
+            2
+        );
+        assert_eq!(
+            scan_keys(&mut db, now, &[b"SCAN", b"0", b"ATTR", b"u"]).len(),
+            0
+        );
     }
 
     /// Port of `GenericFamilyTest.ScanMallocSize`: MINMSZ filters by the
@@ -2584,7 +2799,10 @@ mod tests {
         keys.sort();
         assert_eq!(keys, vec![b"k1".to_vec(), b"k2".to_vec()]);
 
-        assert_eq!(scan_keys(&mut db, 0, &[b"SCAN", b"0", b"MINMSZ", b"500"]), vec![b"k1".to_vec()]);
+        assert_eq!(
+            scan_keys(&mut db, 0, &[b"SCAN", b"0", b"MINMSZ", b"500"]),
+            vec![b"k1".to_vec()]
+        );
     }
 
     /// Run one RM call and return (next_cursor, deleted).
@@ -2648,7 +2866,14 @@ mod tests {
         zset_of(&mut db, "zset1", &["a"]);
 
         // MATCH filters by glob.
-        let argv = vec![b"RM".to_vec(), b"0".to_vec(), b"COUNT".to_vec(), b"10".to_vec(), b"MATCH".to_vec(), b"str*".to_vec()];
+        let argv = vec![
+            b"RM".to_vec(),
+            b"0".to_vec(),
+            b"COUNT".to_vec(),
+            b"10".to_vec(),
+            b"MATCH".to_vec(),
+            b"str*".to_vec(),
+        ];
         match val(dispatch_at(&mut db, 0, &argv)) {
             RespValue::Array(a) if a.len() == 2 => {
                 assert_eq!(a[0], RespValue::Bulk(b"0".to_vec()));
@@ -2661,7 +2886,14 @@ mod tests {
         assert!(db.find(b"list1", 0).is_some());
 
         // TYPE filters by value type (list).
-        let argv = vec![b"RM".to_vec(), b"0".to_vec(), b"COUNT".to_vec(), b"10".to_vec(), b"TYPE".to_vec(), b"list".to_vec()];
+        let argv = vec![
+            b"RM".to_vec(),
+            b"0".to_vec(),
+            b"COUNT".to_vec(),
+            b"10".to_vec(),
+            b"TYPE".to_vec(),
+            b"list".to_vec(),
+        ];
         match val(dispatch_at(&mut db, 0, &argv)) {
             RespValue::Array(a) if a.len() == 2 => {
                 assert_eq!(a[0], RespValue::Bulk(b"0".to_vec()));
@@ -2680,14 +2912,31 @@ mod tests {
         let argv = bvecs!["RM", "HELP"];
         match val(dispatch_at(&mut db, 0, &argv)) {
             RespValue::Array(help) => {
-                assert!(help.iter().any(|v| matches!(v, RespValue::Simple(s) if s.contains("RM cursor"))));
+                assert!(
+                    help.iter()
+                        .any(|v| matches!(v, RespValue::Simple(s) if s.contains("RM cursor")))
+                );
             }
             o => panic!("expected help array, got {o:?}"),
         }
-        assert_eq!(err_of(dispatch_at(&mut db, 0, &bvecs!["RM", "abc"])), "ERR invalid cursor");
+        assert_eq!(
+            err_of(dispatch_at(&mut db, 0, &[b"RM".to_vec(), b"abc".to_vec()])),
+            "ERR invalid cursor"
+        );
         // Invalid COUNT is an integer error.
-        assert!(err_of(dispatch_at(&mut db, 0, &bvecs!["RM", "0", "COUNT", "x"]))
-            .contains("not an integer"));
+        assert!(
+            err_of(dispatch_at(
+                &mut db,
+                0,
+                &[
+                    b"RM".to_vec(),
+                    b"0".to_vec(),
+                    b"COUNT".to_vec(),
+                    b"x".to_vec()
+                ]
+            ))
+            .contains("not an integer")
+        );
     }
 
     #[test]
@@ -2717,32 +2966,56 @@ mod tests {
                 o => panic!("expected rm reply, got {o:?}"),
             }
         };
-        let args = vec![b"RM".to_vec(), b"0".to_vec(), b"COUNT".to_vec(), b"10".to_vec()];
+        let args = vec![
+            b"RM".to_vec(),
+            b"0".to_vec(),
+            b"COUNT".to_vec(),
+            b"10".to_vec(),
+        ];
 
         // Shard 0 is mid-scan: its token is forwarded unchanged.
-        assert_eq!(decode(&args, &[(0, (2 << 10) | 0, 10), (1, 0, 0)]), ((2 << 10) | 0, 10));
+        assert_eq!(
+            decode(&args, &[(0, (2 << 10), 10), (1, 0, 0)]),
+            ((2 << 10), 10)
+        );
 
         // Shard 0 exhausted: resume at shard 1.
         assert_eq!(decode(&args, &[(0, 0, 8), (1, (2 << 10) | 1, 10)]), (1, 8));
         assert_eq!(decode(&args, &[(0, 0, 10), (1, 0, 3)]), (1, 10));
 
         // Cursor already in shard 1, which still has more keys.
-        let args1 = vec![b"RM".to_vec(), b"1".to_vec(), b"COUNT".to_vec(), b"10".to_vec()];
-        assert_eq!(decode(&args1, &[(0, 0, 0), (1, (3 << 10) | 1, 10)]), ((3 << 10) | 1, 10));
+        let args1 = vec![
+            b"RM".to_vec(),
+            b"1".to_vec(),
+            b"COUNT".to_vec(),
+            b"10".to_vec(),
+        ];
+        assert_eq!(
+            decode(&args1, &[(0, 0, 0), (1, (3 << 10) | 1, 10)]),
+            ((3 << 10) | 1, 10)
+        );
 
         // Last shard exhausted: the whole scan is finished.
         assert_eq!(decode(&args1, &[(0, 0, 0), (1, 0, 10)]), (0, 10));
 
         // Cursor past the last shard: empty reply.
-        let args2 = vec![b"RM".to_vec(), b"9".to_vec(), b"COUNT".to_vec(), b"10".to_vec()];
+        let args2 = vec![
+            b"RM".to_vec(),
+            b"9".to_vec(),
+            b"COUNT".to_vec(),
+            b"10".to_vec(),
+        ];
         assert_eq!(decode(&args2, &[(0, 0, 0), (1, 0, 0)]), (0, 0));
     }
 
     fn list_of(db: &mut DbSlice, key: &str, items: &[&str]) {
         let ql = QuickList::from_items(
-            items.iter().map(|s| ListItem::Str(CompactString::from(*s))).collect(),
+            items
+                .iter()
+                .map(|s| ListItem::Str(CompactString::from(*s)))
+                .collect(),
         );
-        db.insert(CompactString::from_bytes(key.as_bytes()), PrimeValue::List(ql));
+        db.insert(key.as_bytes(), PrimeValue::List(ql));
     }
 
     fn set_of(db: &mut DbSlice, key: &str, members: &[&str]) {
@@ -2750,7 +3023,7 @@ mod tests {
         for &m in members {
             s.add(CompactString::from(m));
         }
-        db.insert(CompactString::from_bytes(key.as_bytes()), PrimeValue::Set(s));
+        db.insert(key.as_bytes(), PrimeValue::Set(s));
     }
 
     fn zset_of(db: &mut DbSlice, key: &str, members: &[&str]) {
@@ -2758,7 +3031,7 @@ mod tests {
         for &m in members {
             z.insert(CompactString::from(m), 0.0);
         }
-        db.insert(CompactString::from_bytes(key.as_bytes()), PrimeValue::ZSet(z));
+        db.insert(key.as_bytes(), PrimeValue::ZSet(z));
     }
 
     /// Reply values as bulk strings.
@@ -2768,18 +3041,21 @@ mod tests {
                 .iter()
                 .map(|v| match v {
                     RespValue::Bulk(b) => b.clone(),
-                    o => panic!("expected bulk, got {:?}", o),
+                    o => panic!("expected bulk, got {o:?}"),
                 })
                 .collect(),
             RespValue::Bulk(b) => vec![b.clone()],
-            o => panic!("expected array, got {:?}", o),
+            o => panic!("expected array, got {o:?}"),
         }
     }
 
     fn lrange_of(db: &mut DbSlice, key: &str) -> Vec<Vec<u8>> {
         match db.find(key.as_bytes(), 0) {
-            Some(PrimeValue::List(l)) => l.iter().map(|it| it.as_bytes()).collect(),
-            o => panic!("expected list, got {:?}", o),
+            Some(PrimeValue::List(l)) => l
+                .iter()
+                .map(crate::core::quicklist::ListItem::as_bytes)
+                .collect(),
+            o => panic!("expected list, got {o:?}"),
         }
     }
 
@@ -2789,39 +3065,126 @@ mod tests {
     fn sort() {
         let mut db = DbSlice::new(0);
         list_of(&mut db, "list-1", &["3.5", "1.2", "10.1", "2.20", "200"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1"])), bvecs!["1.2", "2.20", "3.5", "10.1", "200"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"ALPHA"])), bvecs!["1.2", "10.1", "2.20", "200", "3.5"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"DESC"])), bvecs!["200", "10.1", "3.5", "2.20", "1.2"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"DESC", b"ALPHA"])), bvecs!["3.5", "200", "2.20", "10.1", "1.2"]);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"list-1"])),
+            bvecs!["1.2", "2.20", "3.5", "10.1", "200"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"list-1", b"ALPHA"])),
+            bvecs!["1.2", "10.1", "2.20", "200", "3.5"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"list-1", b"DESC"])),
+            bvecs!["200", "10.1", "3.5", "2.20", "1.2"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"list-1", b"DESC", b"ALPHA"])),
+            bvecs!["3.5", "200", "2.20", "10.1", "1.2"]
+        );
         // ASC/DESC last-one-wins.
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"DESC", b"ASC"])), bvecs!["1.2", "2.20", "3.5", "10.1", "200"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"ASC", b"DESC"])), bvecs!["200", "10.1", "3.5", "2.20", "1.2"]);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"list-1", b"DESC", b"ASC"])),
+            bvecs!["1.2", "2.20", "3.5", "10.1", "200"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"list-1", b"ASC", b"DESC"])),
+            bvecs!["200", "10.1", "3.5", "2.20", "1.2"]
+        );
         // Limits.
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"0", b"5"])), bvecs!["1.2", "2.20", "3.5", "10.1", "200"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"0", b"10"])), bvecs!["1.2", "2.20", "3.5", "10.1", "200"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"2", b"2"])), bvecs!["3.5", "10.1"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"1", b"1"])), bvecs!["2.20"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"4", b"2"])), bvecs!["200"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"5", b"2"])), bvecs![]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"DESC", b"LIMIT", b"0", b"5"])), bvecs!["200", "10.1", "3.5", "2.20", "1.2"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"DESC", b"LIMIT", b"2", b"2"])), bvecs!["3.5", "2.20"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"DESC", b"LIMIT", b"1", b"1"])), bvecs!["10.1"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"DESC", b"LIMIT", b"5", b"2"])), bvecs![]);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"0", b"5"])),
+            bvecs!["1.2", "2.20", "3.5", "10.1", "200"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"0", b"10"])),
+            bvecs!["1.2", "2.20", "3.5", "10.1", "200"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"2", b"2"])),
+            bvecs!["3.5", "10.1"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"1", b"1"])),
+            bvecs!["2.20"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"4", b"2"])),
+            bvecs!["200"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"5", b"2"])),
+            bvecs![]
+        );
+        assert_eq!(
+            bulks(cmd(
+                &mut db,
+                &[b"SORT", b"list-1", b"DESC", b"LIMIT", b"0", b"5"]
+            )),
+            bvecs!["200", "10.1", "3.5", "2.20", "1.2"]
+        );
+        assert_eq!(
+            bulks(cmd(
+                &mut db,
+                &[b"SORT", b"list-1", b"DESC", b"LIMIT", b"2", b"2"]
+            )),
+            bvecs!["3.5", "2.20"]
+        );
+        assert_eq!(
+            bulks(cmd(
+                &mut db,
+                &[b"SORT", b"list-1", b"DESC", b"LIMIT", b"1", b"1"]
+            )),
+            bvecs!["10.1"]
+        );
+        assert_eq!(
+            bulks(cmd(
+                &mut db,
+                &[b"SORT", b"list-1", b"DESC", b"LIMIT", b"5", b"2"]
+            )),
+            bvecs![]
+        );
 
         set_of(&mut db, "set-1", &["5.3", "4.4", "60", "99.9", "100", "9"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"set-1"])), bvecs!["4.4", "5.3", "9", "60", "99.9", "100"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"set-1", b"ALPHA"])), bvecs!["100", "4.4", "5.3", "60", "9", "99.9"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"set-1", b"DESC"])), bvecs!["100", "99.9", "60", "9", "5.3", "4.4"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"set-1", b"DESC", b"ALPHA"])), bvecs!["99.9", "9", "60", "5.3", "4.4", "100"]);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"set-1"])),
+            bvecs!["4.4", "5.3", "9", "60", "99.9", "100"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"set-1", b"ALPHA"])),
+            bvecs!["100", "4.4", "5.3", "60", "9", "99.9"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"set-1", b"DESC"])),
+            bvecs!["100", "99.9", "60", "9", "5.3", "4.4"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"set-1", b"DESC", b"ALPHA"])),
+            bvecs!["99.9", "9", "60", "5.3", "4.4", "100"]
+        );
 
         set_of(&mut db, "intset-1", &["5", "4", "3", "2", "1"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"intset-1"])), bvecs!["1", "2", "3", "4", "5"]);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"intset-1"])),
+            bvecs!["1", "2", "3", "4", "5"]
+        );
 
         zset_of(&mut db, "zset-1", &["3.3", "30.1", "8.2"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"zset-1"])), bvecs!["3.3", "8.2", "30.1"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"zset-1", b"ALPHA"])), bvecs!["3.3", "30.1", "8.2"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"zset-1", b"DESC"])), bvecs!["30.1", "8.2", "3.3"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"zset-1", b"DESC", b"ALPHA"])), bvecs!["8.2", "30.1", "3.3"]);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"zset-1"])),
+            bvecs!["3.3", "8.2", "30.1"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"zset-1", b"ALPHA"])),
+            bvecs!["3.3", "30.1", "8.2"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"zset-1", b"DESC"])),
+            bvecs!["30.1", "8.2", "3.3"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"zset-1", b"DESC", b"ALPHA"])),
+            bvecs!["8.2", "30.1", "3.3"]
+        );
 
         // Missing key -> empty array.
         assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-2"])), bvecs![]);
@@ -2830,17 +3193,30 @@ mod tests {
         list_of(&mut db, "list-2", &["NOTADOUBLE"]);
         assert_eq!(err_of(cmd(&mut db, &[b"SORT", b"list-2"])), SORT_SCORE_ERR);
         list_of(&mut db, "NANvalue", &["nan"]);
-        assert_eq!(err_of(cmd(&mut db, &[b"SORT", b"NANvalue"])), SORT_SCORE_ERR);
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"SORT", b"NANvalue"])),
+            SORT_SCORE_ERR
+        );
 
         // Wrong type.
         str_of(&mut db, "foo", "bar");
-        assert_eq!(err_of(cmd(&mut db, &[b"SORT", b"foo"])), "WRONGTYPE Operation against a key holding the wrong kind of value");
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"SORT", b"foo"])),
+            "WRONGTYPE Operation against a key holding the wrong kind of value"
+        );
 
         // Empty string parses to 0 and ties are broken lexicographically.
         list_of(&mut db, "list-3", &[""]);
         assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-3"])), vec![vec![]]);
-        list_of(&mut db, "list-3", &["", "2", "0", "", "-0.14", "0.12", "-0", "-123123", "7654"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-3"])), bvecs!["-123123", "-0.14", "", "", "-0", "0", "0.12", "2", "7654"]);
+        list_of(
+            &mut db,
+            "list-3",
+            &["", "2", "0", "", "-0.14", "0.12", "-0", "-123123", "7654"],
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"list-3"])),
+            bvecs!["-123123", "-0.14", "", "", "-0", "0", "0.12", "2", "7654"]
+        );
     }
 
     /// Port of `GenericFamilyTest.SortBug3636`: alpha sort of floats with a
@@ -2852,13 +3228,29 @@ mod tests {
             &mut db,
             "foo",
             &[
-                "1.100000023841858", "1.100000023841858", "1.100000023841858", "-15710",
-                "1.100000023841858", "1.100000023841858", "1.100000023841858", "-15710", "-15710",
-                "1.100000023841858", "-15710", "-15710", "-15710", "-15710", "1.100000023841858",
-                "-15710", "-15710",
+                "1.100000023841858",
+                "1.100000023841858",
+                "1.100000023841858",
+                "-15710",
+                "1.100000023841858",
+                "1.100000023841858",
+                "1.100000023841858",
+                "-15710",
+                "-15710",
+                "1.100000023841858",
+                "-15710",
+                "-15710",
+                "-15710",
+                "-15710",
+                "1.100000023841858",
+                "-15710",
+                "-15710",
             ],
         );
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"foo", b"desc", b"alpha"])).len(), 17);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"foo", b"desc", b"alpha"])).len(),
+            17
+        );
     }
 
     /// Port of `GenericFamilyTest.SortStore`.
@@ -2866,34 +3258,106 @@ mod tests {
     fn sort_store() {
         let mut db = DbSlice::new(0);
         list_of(&mut db, "list-1", &["3.5", "1.2", "10.1", "2.20", "200"]);
-        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-1", b"store", b"list-2"])), 5);
-        assert_eq!(lrange_of(&mut db, "list-2"), bvecs!["1.2", "2.20", "3.5", "10.1", "200"]);
-        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-1", b"ALPHA", b"store", b"list-2"])), 5);
-        assert_eq!(lrange_of(&mut db, "list-2"), bvecs!["1.2", "10.1", "2.20", "200", "3.5"]);
-        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-1", b"DESC", b"store", b"list-2"])), 5);
-        assert_eq!(lrange_of(&mut db, "list-2"), bvecs!["200", "10.1", "3.5", "2.20", "1.2"]);
-        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-1", b"ALPHA", b"DESC", b"store", b"list-2"])), 5);
-        assert_eq!(lrange_of(&mut db, "list-2"), bvecs!["3.5", "200", "2.20", "10.1", "1.2"]);
+        assert_eq!(
+            int_of(cmd(&mut db, &[b"SORT", b"list-1", b"store", b"list-2"])),
+            5
+        );
+        assert_eq!(
+            lrange_of(&mut db, "list-2"),
+            bvecs!["1.2", "2.20", "3.5", "10.1", "200"]
+        );
+        assert_eq!(
+            int_of(cmd(
+                &mut db,
+                &[b"SORT", b"list-1", b"ALPHA", b"store", b"list-2"]
+            )),
+            5
+        );
+        assert_eq!(
+            lrange_of(&mut db, "list-2"),
+            bvecs!["1.2", "10.1", "2.20", "200", "3.5"]
+        );
+        assert_eq!(
+            int_of(cmd(
+                &mut db,
+                &[b"SORT", b"list-1", b"DESC", b"store", b"list-2"]
+            )),
+            5
+        );
+        assert_eq!(
+            lrange_of(&mut db, "list-2"),
+            bvecs!["200", "10.1", "3.5", "2.20", "1.2"]
+        );
+        assert_eq!(
+            int_of(cmd(
+                &mut db,
+                &[b"SORT", b"list-1", b"ALPHA", b"DESC", b"store", b"list-2"]
+            )),
+            5
+        );
+        assert_eq!(
+            lrange_of(&mut db, "list-2"),
+            bvecs!["3.5", "200", "2.20", "10.1", "1.2"]
+        );
 
-        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"2", b"2", b"store", b"list-2"])), 2);
+        assert_eq!(
+            int_of(cmd(
+                &mut db,
+                &[
+                    b"SORT", b"list-1", b"LIMIT", b"2", b"2", b"store", b"list-2"
+                ]
+            )),
+            2
+        );
         assert_eq!(lrange_of(&mut db, "list-2"), bvecs!["3.5", "10.1"]);
-        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"1", b"1", b"store", b"list-2"])), 1);
+        assert_eq!(
+            int_of(cmd(
+                &mut db,
+                &[
+                    b"SORT", b"list-1", b"LIMIT", b"1", b"1", b"store", b"list-2"
+                ]
+            )),
+            1
+        );
         assert_eq!(lrange_of(&mut db, "list-2"), bvecs!["2.20"]);
-        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-1", b"LIMIT", b"5", b"2", b"store", b"list-2"])), 0);
+        assert_eq!(
+            int_of(cmd(
+                &mut db,
+                &[
+                    b"SORT", b"list-1", b"LIMIT", b"5", b"2", b"store", b"list-2"
+                ]
+            )),
+            0
+        );
         assert_eq!(int_of(cmd(&mut db, &[b"EXISTS", b"list-2"])), 0);
 
         set_of(&mut db, "set-1", &["5.3", "4.4", "60", "99.9", "100", "9"]);
-        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"set-1", b"store", b"list-3"])), 6);
-        assert_eq!(lrange_of(&mut db, "list-3"), bvecs!["4.4", "5.3", "9", "60", "99.9", "100"]);
+        assert_eq!(
+            int_of(cmd(&mut db, &[b"SORT", b"set-1", b"store", b"list-3"])),
+            6
+        );
+        assert_eq!(
+            lrange_of(&mut db, "list-3"),
+            bvecs!["4.4", "5.3", "9", "60", "99.9", "100"]
+        );
 
         zset_of(&mut db, "zset-1", &["3.3", "30.1", "8.2"]);
-        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"zset-1", b"store", b"list-4"])), 3);
+        assert_eq!(
+            int_of(cmd(&mut db, &[b"SORT", b"zset-1", b"store", b"list-4"])),
+            3
+        );
         assert_eq!(lrange_of(&mut db, "list-4"), bvecs!["3.3", "8.2", "30.1"]);
 
         // Same key overwrite.
         list_of(&mut db, "list-1", &["3.5", "1.2", "10.1", "2.20", "200"]);
-        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-1", b"store", b"list-1"])), 5);
-        assert_eq!(lrange_of(&mut db, "list-1"), bvecs!["1.2", "2.20", "3.5", "10.1", "200"]);
+        assert_eq!(
+            int_of(cmd(&mut db, &[b"SORT", b"list-1", b"store", b"list-1"])),
+            5
+        );
+        assert_eq!(
+            lrange_of(&mut db, "list-1"),
+            bvecs!["1.2", "2.20", "3.5", "10.1", "200"]
+        );
     }
 
     /// Port of `GenericFamilyTest.SortStoreEmptyResult`: an empty stored result
@@ -2902,11 +3366,39 @@ mod tests {
     fn sort_store_empty_result() {
         let mut db = DbSlice::new(0);
         list_of(&mut db, "list-src", &["3", "1", "2"]);
-        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-src", b"LIMIT", b"10", b"5", b"store", b"dest"])), 0);
+        assert_eq!(
+            int_of(cmd(
+                &mut db,
+                &[
+                    b"SORT",
+                    b"list-src",
+                    b"LIMIT",
+                    b"10",
+                    b"5",
+                    b"store",
+                    b"dest"
+                ]
+            )),
+            0
+        );
         assert_eq!(int_of(cmd(&mut db, &[b"EXISTS", b"dest"])), 0);
 
         str_of(&mut db, "dest", "old");
-        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"list-src", b"LIMIT", b"0", b"0", b"store", b"dest"])), 0);
+        assert_eq!(
+            int_of(cmd(
+                &mut db,
+                &[
+                    b"SORT",
+                    b"list-src",
+                    b"LIMIT",
+                    b"0",
+                    b"0",
+                    b"store",
+                    b"dest"
+                ]
+            )),
+            0
+        );
         assert_eq!(int_of(cmd(&mut db, &[b"EXISTS", b"dest"])), 0);
     }
 
@@ -2920,14 +3412,23 @@ mod tests {
         cmd_at(&mut db, 0, &[b"EXPIRE", b"dest", b"100"]);
         assert!(int_of(cmd_at(&mut db, 0, &[b"TTL", b"dest"])) > 0);
 
-        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"src", b"store", b"dest"])), 3);
+        assert_eq!(
+            int_of(cmd(&mut db, &[b"SORT", b"src", b"store", b"dest"])),
+            3
+        );
         assert_eq!(int_of(cmd_at(&mut db, 0, &[b"TTL", b"dest"])), -1);
         assert_eq!(lrange_of(&mut db, "dest"), bvecs!["1", "2", "3"]);
 
         set_of(&mut db, "myset", &["c", "a", "b"]);
         cmd_at(&mut db, 0, &[b"EXPIRE", b"myset", b"100"]);
         assert!(int_of(cmd_at(&mut db, 0, &[b"TTL", b"myset"])) > 0);
-        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"myset", b"ALPHA", b"store", b"myset"])), 3);
+        assert_eq!(
+            int_of(cmd(
+                &mut db,
+                &[b"SORT", b"myset", b"ALPHA", b"store", b"myset"]
+            )),
+            3
+        );
         assert_eq!(int_of(cmd_at(&mut db, 0, &[b"TTL", b"myset"])), -1);
         assert_eq!(lrange_of(&mut db, "myset"), bvecs!["a", "b", "c"]);
     }
@@ -2937,35 +3438,90 @@ mod tests {
     fn sort_ro() {
         let mut db = DbSlice::new(0);
         list_of(&mut db, "list-1", &["3.5", "1.2", "10.1", "2.20", "200"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"list-1"])), bvecs!["1.2", "2.20", "3.5", "10.1", "200"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"list-1", b"ALPHA"])), bvecs!["1.2", "10.1", "2.20", "200", "3.5"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"list-1", b"DESC"])), bvecs!["200", "10.1", "3.5", "2.20", "1.2"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"list-1", b"DESC", b"ALPHA"])), bvecs!["3.5", "200", "2.20", "10.1", "1.2"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"list-1", b"LIMIT", b"2", b"2"])), bvecs!["3.5", "10.1"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"list-1", b"DESC", b"LIMIT", b"1", b"1"])), bvecs!["10.1"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"list-1", b"LIMIT", b"5", b"2"])), bvecs![]);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT_RO", b"list-1"])),
+            bvecs!["1.2", "2.20", "3.5", "10.1", "200"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT_RO", b"list-1", b"ALPHA"])),
+            bvecs!["1.2", "10.1", "2.20", "200", "3.5"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT_RO", b"list-1", b"DESC"])),
+            bvecs!["200", "10.1", "3.5", "2.20", "1.2"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT_RO", b"list-1", b"DESC", b"ALPHA"])),
+            bvecs!["3.5", "200", "2.20", "10.1", "1.2"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT_RO", b"list-1", b"LIMIT", b"2", b"2"])),
+            bvecs!["3.5", "10.1"]
+        );
+        assert_eq!(
+            bulks(cmd(
+                &mut db,
+                &[b"SORT_RO", b"list-1", b"DESC", b"LIMIT", b"1", b"1"]
+            )),
+            bvecs!["10.1"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT_RO", b"list-1", b"LIMIT", b"5", b"2"])),
+            bvecs![]
+        );
 
         set_of(&mut db, "set-1", &["5.3", "4.4", "60", "99.9", "100", "9"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"set-1"])), bvecs!["4.4", "5.3", "9", "60", "99.9", "100"]);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT_RO", b"set-1"])),
+            bvecs!["4.4", "5.3", "9", "60", "99.9", "100"]
+        );
         set_of(&mut db, "intset-1", &["5", "4", "3", "2", "1"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"intset-1"])), bvecs!["1", "2", "3", "4", "5"]);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT_RO", b"intset-1"])),
+            bvecs!["1", "2", "3", "4", "5"]
+        );
         zset_of(&mut db, "zset-1", &["3.3", "30.1", "8.2"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"zset-1"])), bvecs!["3.3", "8.2", "30.1"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"zset-1", b"ALPHA"])), bvecs!["3.3", "30.1", "8.2"]);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT_RO", b"zset-1"])),
+            bvecs!["3.3", "8.2", "30.1"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT_RO", b"zset-1", b"ALPHA"])),
+            bvecs!["3.3", "30.1", "8.2"]
+        );
 
         assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"list-2"])), bvecs![]);
         list_of(&mut db, "list-2", &["NOTADOUBLE"]);
-        assert_eq!(err_of(cmd(&mut db, &[b"SORT_RO", b"list-2"])), SORT_SCORE_ERR);
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"SORT_RO", b"list-2"])),
+            SORT_SCORE_ERR
+        );
         str_of(&mut db, "foo", "bar");
-        assert_eq!(err_of(cmd(&mut db, &[b"SORT_RO", b"foo"])), "WRONGTYPE Operation against a key holding the wrong kind of value");
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"SORT_RO", b"foo"])),
+            "WRONGTYPE Operation against a key holding the wrong kind of value"
+        );
 
-        list_of(&mut db, "list-3", &["", "2", "0", "", "-0.14", "0.12", "-0", "-123123", "7654"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"list-3"])), bvecs!["-123123", "-0.14", "", "", "-0", "0", "0.12", "2", "7654"]);
+        list_of(
+            &mut db,
+            "list-3",
+            &["", "2", "0", "", "-0.14", "0.12", "-0", "-123123", "7654"],
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT_RO", b"list-3"])),
+            bvecs!["-123123", "-0.14", "", "", "-0", "0", "0.12", "2", "7654"]
+        );
         list_of(&mut db, "NANvalue", &["nan"]);
-        assert_eq!(err_of(cmd(&mut db, &[b"SORT_RO", b"NANvalue"])), SORT_SCORE_ERR);
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"SORT_RO", b"NANvalue"])),
+            SORT_SCORE_ERR
+        );
 
         // STORE is rejected for SORT_RO.
-        assert_eq!(err_of(cmd(&mut db, &[b"SORT_RO", b"list-1", b"store", b"list-2"])), "ERR syntax error");
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"SORT_RO", b"list-1", b"store", b"list-2"])),
+            "ERR syntax error"
+        );
     }
 
     /// Port of `GenericFamilyTest.SortROBug3636`.
@@ -2976,13 +3532,29 @@ mod tests {
             &mut db,
             "foo",
             &[
-                "1.100000023841858", "1.100000023841858", "1.100000023841858", "-15710",
-                "1.100000023841858", "1.100000023841858", "1.100000023841858", "-15710", "-15710",
-                "1.100000023841858", "-15710", "-15710", "-15710", "-15710", "1.100000023841858",
-                "-15710", "-15710",
+                "1.100000023841858",
+                "1.100000023841858",
+                "1.100000023841858",
+                "-15710",
+                "1.100000023841858",
+                "1.100000023841858",
+                "1.100000023841858",
+                "-15710",
+                "-15710",
+                "1.100000023841858",
+                "-15710",
+                "-15710",
+                "-15710",
+                "-15710",
+                "1.100000023841858",
+                "-15710",
+                "-15710",
             ],
         );
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"foo", b"desc", b"alpha"])).len(), 17);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT_RO", b"foo", b"desc", b"alpha"])).len(),
+            17
+        );
     }
 
     /// Port of `GenericFamilyTest.SortNegativeLimit`.
@@ -2993,7 +3565,10 @@ mod tests {
         let cases: [[&[u8]; 2]; 3] = [[b"-1", b"2"], [b"0", b"-1"], [b"-1", b"-1"]];
         for limit in &cases {
             assert_eq!(
-                err_of(cmd(&mut db, &[b"SORT", b"list-neg", b"LIMIT", limit[0], limit[1]])),
+                err_of(cmd(
+                    &mut db,
+                    &[b"SORT", b"list-neg", b"LIMIT", limit[0], limit[1]]
+                )),
                 "ERR value is not an integer or out of range"
             );
         }
@@ -3007,21 +3582,45 @@ mod tests {
         str_of(&mut db, "w_1", "30");
         str_of(&mut db, "w_2", "20");
         str_of(&mut db, "w_3", "10");
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"w_*"])), bvecs!["3", "2", "1"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"w_*", b"DESC"])), bvecs!["1", "2", "3"]);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"w_*"])),
+            bvecs!["3", "2", "1"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"w_*", b"DESC"])),
+            bvecs!["1", "2", "3"]
+        );
 
         str_of(&mut db, "s_1", "c");
         str_of(&mut db, "s_2", "b");
         str_of(&mut db, "s_3", "a");
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"s_*", b"ALPHA"])), bvecs!["3", "2", "1"]);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"s_*", b"ALPHA"])),
+            bvecs!["3", "2", "1"]
+        );
         // nosort preserves insertion order.
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"nosort"])), bvecs!["1", "2", "3"]);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"nosort"])),
+            bvecs!["1", "2", "3"]
+        );
         // Missing weights read as 0.
         cmd(&mut db, &[b"DEL", b"w_1"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"w_*"])), bvecs!["1", "3", "2"]);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"w_*"])),
+            bvecs!["1", "3", "2"]
+        );
         str_of(&mut db, "w_1", "30");
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"w_*", b"LIMIT", b"1", b"2"])), bvecs!["2", "1"]);
-        assert_eq!(err_of(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"w_*_*"])), "ERR syntax error");
+        assert_eq!(
+            bulks(cmd(
+                &mut db,
+                &[b"SORT", b"list-1", b"BY", b"w_*", b"LIMIT", b"1", b"2"]
+            )),
+            bvecs!["2", "1"]
+        );
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"SORT", b"list-1", b"BY", b"w_*_*"])),
+            "ERR syntax error"
+        );
     }
 
     /// Port of `GenericFamilyTest.SortGet`.
@@ -3036,42 +3635,130 @@ mod tests {
         str_of(&mut db, "weight_2", "20");
         str_of(&mut db, "weight_3", "10");
 
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"obj_*"])), bvecs!["first", "second", "third"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"#"])), bvecs!["1", "2", "3"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"#", b"GET", b"obj_*"])), bvecs!["1", "first", "2", "second", "3", "third"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"BY", b"weight_*", b"GET", b"obj_*"])), bvecs!["third", "second", "first"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"BY", b"weight_*", b"GET", b"#", b"GET", b"obj_*"])), bvecs!["3", "third", "2", "second", "1", "first"]);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"obj_*"])),
+            bvecs!["first", "second", "third"]
+        );
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"#"])),
+            bvecs!["1", "2", "3"]
+        );
+        assert_eq!(
+            bulks(cmd(
+                &mut db,
+                &[b"SORT", b"mylist", b"GET", b"#", b"GET", b"obj_*"]
+            )),
+            bvecs!["1", "first", "2", "second", "3", "third"]
+        );
+        assert_eq!(
+            bulks(cmd(
+                &mut db,
+                &[b"SORT", b"mylist", b"BY", b"weight_*", b"GET", b"obj_*"]
+            )),
+            bvecs!["third", "second", "first"]
+        );
+        assert_eq!(
+            bulks(cmd(
+                &mut db,
+                &[
+                    b"SORT",
+                    b"mylist",
+                    b"BY",
+                    b"weight_*",
+                    b"GET",
+                    b"#",
+                    b"GET",
+                    b"obj_*"
+                ]
+            )),
+            bvecs!["3", "third", "2", "second", "1", "first"]
+        );
 
         // Missing GET key -> empty string.
         cmd(&mut db, &[b"DEL", b"obj_2"]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"obj_*"])), bvecs!["first", "", "third"]);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"obj_*"])),
+            bvecs!["first", "", "third"]
+        );
         str_of(&mut db, "obj_2", "second");
 
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"DESC", b"GET", b"obj_*"])), bvecs!["third", "second", "first"]);
+        assert_eq!(
+            bulks(cmd(
+                &mut db,
+                &[b"SORT", b"mylist", b"DESC", b"GET", b"obj_*"]
+            )),
+            bvecs!["third", "second", "first"]
+        );
 
         list_of(&mut db, "strlist", &["c", "b", "a"]);
         str_of(&mut db, "obj_a", "alpha");
         str_of(&mut db, "obj_b", "beta");
         str_of(&mut db, "obj_c", "gamma");
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"strlist", b"ALPHA", b"GET", b"obj_*"])), bvecs!["alpha", "beta", "gamma"]);
+        assert_eq!(
+            bulks(cmd(
+                &mut db,
+                &[b"SORT", b"strlist", b"ALPHA", b"GET", b"obj_*"]
+            )),
+            bvecs!["alpha", "beta", "gamma"]
+        );
 
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"#", b"GET", b"obj_*", b"LIMIT", b"1", b"2"])), bvecs!["2", "second", "3", "third"]);
+        assert_eq!(
+            bulks(cmd(
+                &mut db,
+                &[
+                    b"SORT", b"mylist", b"GET", b"#", b"GET", b"obj_*", b"LIMIT", b"1", b"2"
+                ]
+            )),
+            bvecs!["2", "second", "3", "third"]
+        );
 
-        assert_eq!(int_of(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"#", b"GET", b"obj_*", b"STORE", b"result"])), 6);
-        assert_eq!(lrange_of(&mut db, "result"), bvecs!["1", "first", "2", "second", "3", "third"]);
+        assert_eq!(
+            int_of(cmd(
+                &mut db,
+                &[
+                    b"SORT", b"mylist", b"GET", b"#", b"GET", b"obj_*", b"STORE", b"result"
+                ]
+            )),
+            6
+        );
+        assert_eq!(
+            lrange_of(&mut db, "result"),
+            bvecs!["1", "first", "2", "second", "3", "third"]
+        );
 
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"BY", b"nosort", b"GET", b"obj_*"])), bvecs!["first", "second", "third"]);
-        assert_eq!(err_of(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"obj_*_*"])), "ERR syntax error");
+        assert_eq!(
+            bulks(cmd(
+                &mut db,
+                &[b"SORT", b"mylist", b"BY", b"nosort", b"GET", b"obj_*"]
+            )),
+            bvecs!["first", "second", "third"]
+        );
+        assert_eq!(
+            err_of(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"obj_*_*"])),
+            "ERR syntax error"
+        );
 
         // Empty source list.
         list_of(&mut db, "emptylist", &[]);
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"emptylist", b"GET", b"obj_*"])), bvecs![]);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"emptylist", b"GET", b"obj_*"])),
+            bvecs![]
+        );
 
         // Literal pattern without '*'.
         str_of(&mut db, "fixed_key", "fixed_value");
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"fixed_key"])), bvecs!["fixed_value", "fixed_value", "fixed_value"]);
+        assert_eq!(
+            bulks(cmd(&mut db, &[b"SORT", b"mylist", b"GET", b"fixed_key"])),
+            bvecs!["fixed_value", "fixed_value", "fixed_value"]
+        );
 
-        assert_eq!(bulks(cmd(&mut db, &[b"SORT_RO", b"mylist", b"GET", b"#", b"GET", b"obj_*"])), bvecs!["1", "first", "2", "second", "3", "third"]);
+        assert_eq!(
+            bulks(cmd(
+                &mut db,
+                &[b"SORT_RO", b"mylist", b"GET", b"#", b"GET", b"obj_*"]
+            )),
+            bvecs!["1", "first", "2", "second", "3", "third"]
+        );
     }
 
     /// Port of `GenericFamilyTest.SortDeletesEmptySet`: iterating an
@@ -3083,7 +3770,7 @@ mod tests {
         for i in 0..20 {
             s.add_expirable(CompactString::from(format!("m{i}")), 1000, false);
         }
-        db.insert(CompactString::from("skey"), PrimeValue::Set(s));
+        db.insert(b"skey", PrimeValue::Set(s));
         let now = 2000;
         assert_eq!(int_of(cmd_at(&mut db, now, &[b"EXISTS", b"skey"])), 1);
         assert_eq!(bulks(cmd_at(&mut db, now, &[b"SORT", b"skey"])), bvecs![]);
@@ -3098,10 +3785,13 @@ mod tests {
         for i in 0..20 {
             s.add_expirable(CompactString::from(format!("m{i}")), 1000, false);
         }
-        db.insert(CompactString::from("skey"), PrimeValue::Set(s));
+        db.insert(b"skey", PrimeValue::Set(s));
         let now = 2000;
         assert_eq!(int_of(cmd_at(&mut db, now, &[b"EXISTS", b"skey"])), 1);
-        assert_eq!(bulks(cmd_at(&mut db, now, &[b"SORT", b"skey", b"BY", b"nosort"])), bvecs![]);
+        assert_eq!(
+            bulks(cmd_at(&mut db, now, &[b"SORT", b"skey", b"BY", b"nosort"])),
+            bvecs![]
+        );
         assert_eq!(int_of(cmd_at(&mut db, now, &[b"EXISTS", b"skey"])), 0);
     }
 
@@ -3112,10 +3802,10 @@ mod tests {
                 .into_iter()
                 .map(|x| match x {
                     RespValue::Integer(i) => i,
-                    o => panic!("expected integer element, got {:?}", o),
+                    o => panic!("expected integer element, got {o:?}"),
                 })
                 .collect(),
-            o => panic!("expected array, got {:?}", o),
+            o => panic!("expected array, got {o:?}"),
         }
     }
 
@@ -3134,13 +3824,25 @@ mod tests {
         assert_eq!(-1, int_of(cmd(&mut db, &[b"FIELDTTL", b"key", b"val3"])));
 
         // 1100ms later val1 (ttl 1s) is expired, val2 has 1s left.
-        assert_eq!(-3, int_of(cmd_at(&mut db, 1100, &[b"FIELDTTL", b"key", b"val1"])));
-        assert_eq!(1, int_of(cmd_at(&mut db, 1100, &[b"FIELDTTL", b"key", b"val2"])));
+        assert_eq!(
+            -3,
+            int_of(cmd_at(&mut db, 1100, &[b"FIELDTTL", b"key", b"val1"]))
+        );
+        assert_eq!(
+            1,
+            int_of(cmd_at(&mut db, 1100, &[b"FIELDTTL", b"key", b"val2"]))
+        );
 
         str_of(&mut db, "str", "val");
         assert!(err_of(cmd(&mut db, &[b"FIELDTTL", b"str", b"bar"])).starts_with("WRONGTYPE"));
 
-        assert_eq!(2, int_of(cmd(&mut db, &[b"HSETEX", b"k2", b"1", b"f1", b"v1", b"f2", b"v2"])));
+        assert_eq!(
+            2,
+            int_of(cmd(
+                &mut db,
+                &[b"HSETEX", b"k2", b"1", b"f1", b"v1", b"f2", b"v2"]
+            ))
+        );
         assert_eq!(1, int_of(cmd(&mut db, &[b"HSET", b"k2", b"f3", b"v3"])));
         assert_eq!(1, int_of(cmd(&mut db, &[b"FIELDTTL", b"k2", b"f1"])));
         assert_eq!(-1, int_of(cmd(&mut db, &[b"FIELDTTL", b"k2", b"f3"])));
@@ -3151,31 +3853,60 @@ mod tests {
     #[test]
     fn fieldexpire_set() {
         let mut db = DbSlice::new(0);
-        assert_eq!(3, int_of(cmd(&mut db, &[b"SADD", b"key", b"a", b"b", b"c"])));
+        assert_eq!(
+            3,
+            int_of(cmd(&mut db, &[b"SADD", b"key", b"a", b"b", b"c"]))
+        );
         let now = 2_000u64;
         assert_eq!(
-            ints(cmd_at(&mut db, now, &[b"FIELDEXPIRE", b"key", b"10", b"a", b"b", b"c"])),
+            ints(cmd_at(
+                &mut db,
+                now,
+                &[b"FIELDEXPIRE", b"key", b"10", b"a", b"b", b"c"]
+            )),
             [1, 1, 1]
         );
-        assert_eq!(10, int_of(cmd_at(&mut db, now, &[b"FIELDTTL", b"key", b"a"])));
+        assert_eq!(
+            10,
+            int_of(cmd_at(&mut db, now, &[b"FIELDTTL", b"key", b"a"]))
+        );
         // 10s later all members expired; reading the set removes the key.
         let later = now + 10_000;
-        assert_eq!(bulks(cmd_at(&mut db, later, &[b"SMEMBERS", b"key"])), bvecs![]);
+        assert_eq!(
+            bulks(cmd_at(&mut db, later, &[b"SMEMBERS", b"key"])),
+            bvecs![]
+        );
     }
 
     /// Port of `GenericFamilyTest.FieldExpireHset`.
     #[test]
     fn fieldexpire_hset() {
         let mut db = DbSlice::new(0);
-        assert_eq!(3, int_of(cmd(&mut db, &[b"HSET", b"key", b"k0", b"v", b"k1", b"v", b"k2", b"v"])));
+        assert_eq!(
+            3,
+            int_of(cmd(
+                &mut db,
+                &[b"HSET", b"key", b"k0", b"v", b"k1", b"v", b"k2", b"v"]
+            ))
+        );
         let now = 2_000u64;
         assert_eq!(
-            ints(cmd_at(&mut db, now, &[b"FIELDEXPIRE", b"key", b"10", b"k0", b"k1", b"k2"])),
+            ints(cmd_at(
+                &mut db,
+                now,
+                &[b"FIELDEXPIRE", b"key", b"10", b"k0", b"k1", b"k2"]
+            )),
             [1, 1, 1]
         );
-        assert_eq!(10, int_of(cmd_at(&mut db, now, &[b"FIELDTTL", b"key", b"k0"])));
+        assert_eq!(
+            10,
+            int_of(cmd_at(&mut db, now, &[b"FIELDTTL", b"key", b"k0"]))
+        );
         let later = now + 10_000;
-        assert_eq!(bulks(cmd_at(&mut db, later, &[b"HGETALL", b"key"])), bvecs![]);
+        assert_eq!(
+            bulks(cmd_at(&mut db, later, &[b"HGETALL", b"key"])),
+            bvecs![]
+        );
     }
 
     /// Port of `GenericFamilyTest.FieldExpireNoSuchField`.
@@ -3184,15 +3915,24 @@ mod tests {
         let mut db = DbSlice::new(0);
         assert_eq!(1, int_of(cmd(&mut db, &[b"SADD", b"key", b"a"])));
         assert_eq!(1, int_of(cmd(&mut db, &[b"HSET", b"key2", b"k0", b"v0"])));
-        assert_eq!(ints(cmd(&mut db, &[b"FIELDEXPIRE", b"key", b"10", b"a", b"b"])), [1, -2]);
-        assert_eq!(ints(cmd(&mut db, &[b"FIELDEXPIRE", b"key2", b"10", b"k0", b"b"])), [1, -2]);
+        assert_eq!(
+            ints(cmd(&mut db, &[b"FIELDEXPIRE", b"key", b"10", b"a", b"b"])),
+            [1, -2]
+        );
+        assert_eq!(
+            ints(cmd(&mut db, &[b"FIELDEXPIRE", b"key2", b"10", b"k0", b"b"])),
+            [1, -2]
+        );
     }
 
     /// Port of `GenericFamilyTest.FieldExpireNoSuchKey`.
     #[test]
     fn fieldexpire_no_such_key() {
         let mut db = DbSlice::new(0);
-        assert_eq!(ints(cmd(&mut db, &[b"FIELDEXPIRE", b"key", b"10", b"a", b"b"])), [-2, -2]);
+        assert_eq!(
+            ints(cmd(&mut db, &[b"FIELDEXPIRE", b"key", b"10", b"a", b"b"])),
+            [-2, -2]
+        );
     }
 
     #[test]
@@ -3213,9 +3953,11 @@ mod tests {
         );
         // A wrong-type key is reported per field as -2, not as an error.
         str_of(&mut db, "str", "val");
-        assert_eq!(ints(cmd(&mut db, &[b"FIELDEXPIRE", b"str", b"10", b"a", b"b"])), [-2, -2]);
+        assert_eq!(
+            ints(cmd(&mut db, &[b"FIELDEXPIRE", b"str", b"10", b"a", b"b"])),
+            [-2, -2]
+        );
         // FIELDTTL on the same key errors.
         assert!(err_of(cmd(&mut db, &[b"FIELDTTL", b"str", b"a"])).starts_with("WRONGTYPE"));
     }
 }
-

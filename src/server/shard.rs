@@ -3,13 +3,13 @@ use std::sync::mpsc;
 
 use crate::commands::exec::server::now_ms;
 use crate::commands::{OpContext, ShardPart};
-use crate::core::compact::CompactString;
 use crate::core::DbSlice;
+use crate::core::compact::CompactString;
 use crate::error::CmdResult;
-use crate::server::{command_for, encode_result, Reply, ShardMsg, SingleOp, WatchState, MAX_DB};
+use crate::server::{MAX_DB, Reply, ShardMsg, SingleOp, WatchState, command_for, encode_result};
 
-/// Context for an active transaction on this shard, stored between TxLock and
-/// TxExec.
+/// Context for an active transaction on this shard, stored between `TxLock` and
+/// `TxExec`.
 struct TxCtx {
     args: Vec<Vec<u8>>,
     owned_key_idxs: Vec<usize>,
@@ -19,10 +19,14 @@ struct TxCtx {
 
 /// A watch snapshot query queued while a transaction holds the shard:
 /// (keys, db index, reply channel).
-type PendingWatch = (Vec<Vec<u8>>, usize, mpsc::Sender<Vec<(Vec<u8>, WatchState)>>);
+type PendingWatch = (
+    Vec<Vec<u8>>,
+    usize,
+    mpsc::Sender<Vec<(Vec<u8>, WatchState)>>,
+);
 
 struct Shard {
-    shard_id: usize,
+    id: usize,
     /// Logical databases, index 0..N, grown lazily on demand.
     dbs: Vec<DbSlice>,
     /// The tx currently holding this shard, if any. While set, single ops are
@@ -34,25 +38,26 @@ struct Shard {
     pending_watches: VecDeque<PendingWatch>,
 }
 
+#[must_use]
 pub fn spawn(shard_id: usize, rx: mpsc::Receiver<ShardMsg>) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
-        .name(format!("shard-{}", shard_id))
+        .name(format!("shard-{shard_id}"))
         .spawn(move || {
             let mut shard = Shard {
-                shard_id,
+                id: shard_id,
                 dbs: vec![DbSlice::new(shard_id)],
                 active_tx: None,
                 tx_ctx: HashMap::new(),
                 pending_singles: VecDeque::new(),
                 pending_watches: VecDeque::new(),
             };
-            shard.run(rx);
+            shard.run(&rx);
         })
         .expect("failed to spawn shard thread")
 }
 
 impl Shard {
-    fn run(&mut self, rx: mpsc::Receiver<ShardMsg>) {
+    fn run(&mut self, rx: &mpsc::Receiver<ShardMsg>) {
         while let Ok(msg) = rx.recv() {
             self.handle(msg);
         }
@@ -64,14 +69,27 @@ impl Shard {
                 if self.active_tx.is_some() {
                     self.pending_singles.push_back(op);
                 } else {
-                    self.execute_single(op);
+                    self.execute_single(&op);
                 }
             }
-            ShardMsg::TxLock { tx_id, args, owned_key_idxs, first_key_idx, db_idx, ack, .. } => {
+            ShardMsg::TxLock {
+                tx_id,
+                args,
+                owned_key_idxs,
+                first_key_idx,
+                db_idx,
+                ack,
+                ..
+            } => {
                 self.active_tx = Some(tx_id);
                 self.tx_ctx.insert(
                     tx_id,
-                    TxCtx { args, owned_key_idxs, first_key_idx, db_idx },
+                    TxCtx {
+                        args,
+                        owned_key_idxs,
+                        first_key_idx,
+                        db_idx,
+                    },
                 );
                 let _ = ack.send(());
             }
@@ -85,13 +103,13 @@ impl Shard {
                             ctx.db_idx,
                         );
                         ShardPart {
-                            shard: self.shard_id,
+                            shard: self.id,
                             owned_key_idxs: ctx.owned_key_idxs,
                             result,
                         }
                     }
                     None => ShardPart {
-                        shard: self.shard_id,
+                        shard: self.id,
                         owned_key_idxs: vec![],
                         result: CmdResult::err("ERR internal: transaction not locked"),
                     },
@@ -103,28 +121,40 @@ impl Shard {
                     self.active_tx = None;
                     while self.active_tx.is_none() {
                         match self.pending_singles.pop_front() {
-                            Some(op) => self.execute_single(op),
+                            Some(op) => self.execute_single(&op),
                             None => break,
                         }
                     }
                     while let Some((keys, db_idx, tx)) = self.pending_watches.pop_front() {
-                        self.run_watch_query(&keys, db_idx, tx);
+                        self.run_watch_query(&keys, db_idx, &tx);
                     }
                 }
             }
-            ShardMsg::WatchQuery { keys, db_idx, result_tx } => {
+            ShardMsg::WatchQuery {
+                keys,
+                db_idx,
+                result_tx,
+            } => {
                 if self.active_tx.is_some() {
                     self.pending_watches.push_back((keys, db_idx, result_tx));
                 } else {
-                    self.run_watch_query(&keys, db_idx, result_tx);
+                    self.run_watch_query(&keys, db_idx, &result_tx);
                 }
             }
-            ShardMsg::StoreValue { tx_id, key, value, expire_at, sticky, db_idx, ack } => {
+            ShardMsg::StoreValue {
+                tx_id,
+                key,
+                value,
+                expire_at,
+                sticky,
+                db_idx,
+                ack,
+            } => {
                 self.active_tx = Some(tx_id);
                 match value {
                     Some(v) => {
                         let db = self.ensure_db(db_idx);
-                        db.insert(CompactString::from_bytes(&key), v);
+                        db.insert(&key, v);
                         match expire_at {
                             Some(at) => db.set_expiry(&key, at, now_ms()),
                             None => db.clear_expiry(&key),
@@ -137,16 +167,21 @@ impl Shard {
                 }
                 let _ = ack.send(());
             }
-            ShardMsg::ScriptOp { args, owned_key_idxs, first_key_idx, db_idx, result_tx } => {
+            ShardMsg::ScriptOp {
+                args,
+                owned_key_idxs,
+                first_key_idx,
+                db_idx,
+                result_tx,
+            } => {
                 let result = self.run_exec(&args, &owned_key_idxs, first_key_idx, db_idx);
                 let _ = result_tx.send(result);
             }
         }
     }
 
-    fn execute_single(&mut self, op: SingleOp) {
-        let first_key_idx =
-            command_for(&op.args).map(|c| c.key_range.first).unwrap_or(0);
+    fn execute_single(&mut self, op: &SingleOp) {
+        let first_key_idx = command_for(&op.args).map_or(0, |c| c.key_range.first);
         let result = self.run_exec(&op.args, &op.owned_key_idxs, first_key_idx, op.db_idx);
         let reply = Reply {
             conn_id: op.conn_id,
@@ -161,7 +196,7 @@ impl Shard {
         &mut self,
         keys: &[Vec<u8>],
         db_idx: usize,
-        result_tx: mpsc::Sender<Vec<(Vec<u8>, WatchState)>>,
+        result_tx: &mpsc::Sender<Vec<(Vec<u8>, WatchState)>>,
     ) {
         let now = now_ms();
         let out = {
@@ -181,7 +216,13 @@ impl Shard {
         let _ = result_tx.send(out);
     }
 
-    fn run_exec(&mut self, args: &[Vec<u8>], owned: &[usize], first_key_idx: usize, db_idx: usize) -> CmdResult {
+    fn run_exec(
+        &mut self,
+        args: &[Vec<u8>],
+        owned: &[usize],
+        first_key_idx: usize,
+        db_idx: usize,
+    ) -> CmdResult {
         let Some(cmd) = command_for(args) else {
             return CmdResult::err("ERR unknown command");
         };
@@ -209,7 +250,7 @@ impl Shard {
     /// Ensure db `db_idx` exists (created lazily, like `ActivateDb`).
     fn ensure_db(&mut self, db_idx: usize) -> &mut DbSlice {
         if self.dbs.len() <= db_idx {
-            self.dbs.resize_with(db_idx + 1, || DbSlice::new(self.shard_id));
+            self.dbs.resize_with(db_idx + 1, || DbSlice::new(self.id));
         }
         &mut self.dbs[db_idx]
     }
@@ -231,7 +272,7 @@ impl Shard {
     /// `FLUSHALL`: drain every DB on this shard and bump each DB epoch so that
     /// every WATCH (in any DB) becomes dirty at the next EXEC.
     fn run_flushall(&mut self) -> CmdResult {
-        for db in self.dbs.iter_mut() {
+        for db in &mut self.dbs {
             let keys: Vec<CompactString> = db.iter().map(|(k, _)| k.clone()).collect();
             for k in keys {
                 db.remove(k.as_bytes());

@@ -17,8 +17,12 @@ impl Default for RespParser {
 }
 
 impl RespParser {
+    #[must_use]
     pub fn new() -> Self {
-        RespParser { buf: Vec::with_capacity(1024), protocol_error: false }
+        RespParser {
+            buf: Vec::with_capacity(1024),
+            protocol_error: false,
+        }
     }
 
     pub fn feed(&mut self, data: &[u8]) {
@@ -28,6 +32,7 @@ impl RespParser {
         self.buf.extend_from_slice(data);
     }
 
+    #[must_use]
     pub fn has_protocol_error(&self) -> bool {
         self.protocol_error
     }
@@ -71,7 +76,8 @@ impl RespParser {
             None => return Ok(None),
         };
         let line = &self.buf[1..line_len];
-        let count: i64 = parse_decimal(line).ok_or_else(|| "Protocol error: invalid multibulk length".to_string())?;
+        let count: i64 = parse_decimal(line)
+            .ok_or_else(|| "Protocol error: invalid multibulk length".to_string())?;
         if count < 0 || count as usize > MAX_MULTIBULK {
             return Err("Protocol error: invalid multibulk length".to_string());
         }
@@ -92,8 +98,8 @@ impl RespParser {
                 Some(p) => (p, pos + 1),
                 None => return Ok(None),
             };
-            let len: i64 =
-                parse_decimal(&self.buf[bp..bp + blen]).ok_or_else(|| "Protocol error: invalid bulk length".to_string())?;
+            let len: i64 = parse_decimal(&self.buf[bp..bp + blen])
+                .ok_or_else(|| "Protocol error: invalid bulk length".to_string())?;
             if len < 0 || len as usize > MAX_BULK {
                 return Err("Protocol error: invalid bulk length".to_string());
             }
@@ -238,7 +244,7 @@ pub fn encode_reply(value: &RespValue, out: &mut Vec<u8>) {
             encode_reply(&RespValue::Bulk(s.into_bytes()), out);
         }
         RespValue::Bool(b) => {
-            encode_reply(&RespValue::Integer(*b as i64), out);
+            encode_reply(&RespValue::Integer(i64::from(*b)), out);
         }
         RespValue::Map(pairs) => {
             // RESP2: emit a flat array [k1,v1,k2,v2,...]
@@ -264,27 +270,44 @@ mod tests {
     #[test]
     fn parse_basic_request() {
         let mut p = RespParser::new();
-        assert_eq!(feed_req(&mut p, "*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n").unwrap(),
-                   Some(vec![b"ECHO".to_vec(), b"hello".to_vec()]));
+        assert_eq!(
+            feed_req(&mut p, "*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n").unwrap(),
+            Some(vec![b"ECHO".to_vec(), b"hello".to_vec()])
+        );
         assert!(p.buf.is_empty());
     }
 
     #[test]
     fn partial_request_waits() {
         let mut p = RespParser::new();
-        assert!(feed_req(&mut p, "*2\r\n$4\r\nECHO\r\n$5\r\nhe").unwrap().is_none());
+        assert!(
+            feed_req(&mut p, "*2\r\n$4\r\nECHO\r\n$5\r\nhe")
+                .unwrap()
+                .is_none()
+        );
         p.feed(b"llo\r\n");
-        assert_eq!(p.next_request().unwrap(),
-                   Some(vec![b"ECHO".to_vec(), b"hello".to_vec()]));
+        assert_eq!(
+            p.next_request().unwrap(),
+            Some(vec![b"ECHO".to_vec(), b"hello".to_vec()])
+        );
     }
 
     #[test]
     fn inline_command() {
         let mut p = RespParser::new();
-        assert_eq!(feed_req(&mut p, "PING\r\n").unwrap(), Some(vec![b"PING".to_vec()]));
+        assert_eq!(
+            feed_req(&mut p, "PING\r\n").unwrap(),
+            Some(vec![b"PING".to_vec()])
+        );
         let mut p = RespParser::new();
-        assert_eq!(feed_req(&mut p, "SET \"my key\" \"my value\"\r\n").unwrap(),
-                   Some(vec![b"SET".to_vec(), b"my key".to_vec(), b"my value".to_vec()]));
+        assert_eq!(
+            feed_req(&mut p, "SET \"my key\" \"my value\"\r\n").unwrap(),
+            Some(vec![
+                b"SET".to_vec(),
+                b"my key".to_vec(),
+                b"my value".to_vec()
+            ])
+        );
     }
 
     #[test]

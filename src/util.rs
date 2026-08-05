@@ -2,17 +2,20 @@ use xxhash_rust::xxh3::xxh3_64;
 
 /// Hash used for shard routing. Dragonfly routes a key to a shard by hashing
 /// the key and reducing modulo the number of shards.
+#[must_use]
 pub fn shard_hash(key: &[u8]) -> u64 {
     xxh3_64(key)
 }
 
 /// Compute the shard id for a key.
+#[must_use]
 pub fn shard_for_key(key: &[u8], num_shards: usize) -> usize {
     debug_assert!(num_shards > 0);
     (shard_hash(key) as usize) % num_shards
 }
 
 /// Fast 64-bit integer to decimal bytes (used for integer list items / replies).
+#[must_use]
 pub fn itoa(v: i64) -> Vec<u8> {
     let mut buf = [0u8; 20];
     if v == 0 {
@@ -33,6 +36,7 @@ pub fn itoa(v: i64) -> Vec<u8> {
     buf[pos..].to_vec()
 }
 
+#[must_use]
 pub fn parse_i64(s: &[u8]) -> Option<i64> {
     if s.is_empty() {
         return None;
@@ -52,7 +56,7 @@ pub fn parse_i64(s: &[u8]) -> Option<i64> {
         if !b.is_ascii_digit() {
             return None;
         }
-        v = v.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+        v = v.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
     }
     if neg {
         if v == (i64::MAX as u64) + 1 {
@@ -67,6 +71,7 @@ pub fn parse_i64(s: &[u8]) -> Option<i64> {
 
 /// Parse an unsigned decimal from bytes. Rejects empty strings, signs and
 /// non-digit characters (Redis integer parsing never accepts "+5" or "-3").
+#[must_use]
 pub fn parse_u64(s: &[u8]) -> Option<u64> {
     if s.is_empty() {
         return None;
@@ -76,13 +81,14 @@ pub fn parse_u64(s: &[u8]) -> Option<u64> {
         if !b.is_ascii_digit() {
             return None;
         }
-        v = v.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+        v = v.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
     }
     Some(v)
 }
 
 /// Redis-style range normalization. Redis uses negative indices from the end.
 /// `len` is the length of the sequence. Returns (start, count) or None if empty.
+#[must_use]
 pub fn redis_range(start: i64, stop: i64, len: i64) -> Option<(i64, i64)> {
     if len <= 0 {
         return None;
@@ -105,6 +111,7 @@ pub fn redis_range(start: i64, stop: i64, len: i64) -> Option<(i64, i64)> {
 }
 
 /// Redis-compatible float parsing. Handles "inf", "-inf", "+inf", "nan" and floats.
+#[must_use]
 pub fn parse_double(s: &[u8]) -> Option<f64> {
     let t = std::str::from_utf8(s).ok()?.trim().to_ascii_lowercase();
     match t.as_str() {
@@ -137,13 +144,14 @@ pub fn parse_list_timeout(arg: &[u8]) -> Result<f64, String> {
     if v < 0.0 {
         return Err("ERR timeout is negative".into());
     }
-    if v > 4294967.296 {
+    if v > 4_294_967.296 {
         return Err("ERR timeout is out of range".into());
     }
     Ok(v)
 }
 
 /// Format a double the way Redis does (shortest repr, "inf" for infinite).
+#[must_use]
 pub fn format_double(f: f64) -> String {
     if f.is_nan() {
         return "nan".to_string();
@@ -156,7 +164,7 @@ pub fn format_double(f: f64) -> String {
     }
     // Reference reply_builder.cc FormatDouble: DoubleToStringConverter(UNIQUE_ZERO|EMIT_POSITIVE_EXPONENT_SIGN, ...).ToShortest().
     // Rust's shortest round-trip repr matches for the ranges that matter; no forced ".0" suffix.
-    format!("{}", f)
+    format!("{f}")
 }
 
 #[cfg(test)]
@@ -197,7 +205,7 @@ mod tests {
     fn format_double_works() {
         assert_eq!(format_double(5.0), "5");
         assert_eq!(format_double(1.5), "1.5");
-        assert_eq!(format_double(3673983950397063.0), "3673983950397063");
+        assert_eq!(format_double(3_673_983_950_397_063.0), "3673983950397063");
         assert_eq!(format_double(0.0), "0");
         assert_eq!(format_double(-0.0), "0");
         assert_eq!(format_double(-3.25), "-3.25");

@@ -17,7 +17,7 @@
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 /// The seed used by `CuckooFilter::Hash` (`XXH3_64bits_withSeed`).
-const K_CUCKOO_SEED: u64 = 0xc6a4a7935bd1e995;
+const K_CUCKOO_SEED: u64 = 0xc6a4_a793_5bd1_e995;
 
 /// Options for constructing a filter (`CuckooFilterOptions`).
 #[derive(Debug, Clone, Copy)]
@@ -49,16 +49,16 @@ fn fingerprint(hash: u64) -> u8 {
     (hash % 255 + 1) as u8
 }
 
-/// 0x5bd1e995 is the MurmurHash2 mixing constant (Austin Appleby), chosen for
+/// 0x5bd1e995 is the `MurmurHash2` mixing constant (Austin Appleby), chosen for
 /// good bit-avalanche properties.
 ///
-/// AltIndex symmetry requires num_buckets to be a power of two. Power-of-2
+/// `AltIndex` symmetry requires `num_buckets` to be a power of two. Power-of-2
 /// modulo is a bitmask, and bitmasks commute with XOR:
 ///   (a XOR b) & mask == (a & mask) XOR (b & mask)
 /// so `alt_index(fp, i) % N == alt_index(fp, i % N) % N` holds, which is what
 /// lets KO-insert rollback and deletions find the same alternate bucket.
 fn alt_index(fp: u8, index: u64) -> u64 {
-    index ^ (fp as u64).wrapping_mul(0x5bd1e995)
+    index ^ u64::from(fp).wrapping_mul(0x5bd1_e995)
 }
 
 /// A cuckoo filter, mirroring `CuckooFilter`. Owns its sub-filters (the C++
@@ -87,14 +87,15 @@ struct LookupParams {
 }
 
 impl CuckooFilter {
+    #[must_use]
     pub fn new(options: &CuckooFilterOptions) -> Self {
         assert!(options.slots_per_bucket > 0);
         let expansion = if options.expansion != 0 {
-            next_power_of_two(options.expansion as u64) as u16
+            next_power_of_two(u64::from(options.expansion)) as u16
         } else {
             0
         };
-        let num_buckets = next_power_of_two(options.capacity / options.slots_per_bucket as u64);
+        let num_buckets = next_power_of_two(options.capacity / u64::from(options.slots_per_bucket));
         let num_buckets = if num_buckets == 0 { 1 } else { num_buckets };
         let mut cf = CuckooFilter {
             slots_per_bucket: options.slots_per_bucket,
@@ -114,12 +115,12 @@ impl CuckooFilter {
     /// and expansion is disabled (`expansion == 0`). Allows duplicate
     /// insertions — use `insert_unique` to prevent them.
     pub fn insert(&mut self, hash: u64) -> bool {
-        let p = self.lookup_params_from_hash(hash);
+        let p = Self::lookup_params_from_hash(hash);
         loop {
             for i in (0..self.filters.len()).rev() {
                 let (i1, i2) = self.bucket_indices(&self.filters[i], &p);
                 for idx in [i1, i2] {
-                    let base = (idx * self.slots_per_bucket as u64) as usize;
+                    let base = (idx * u64::from(self.slots_per_bucket)) as usize;
                     for s in 0..self.slots_per_bucket as usize {
                         if self.filters[i][base + s] == 0 {
                             self.filters[i][base + s] = p.fp;
@@ -154,12 +155,13 @@ impl CuckooFilter {
 
     /// Returns true if the hash is present in the filter. May return false
     /// positives but never false negatives.
+    #[must_use]
     pub fn exists(&self, hash: u64) -> bool {
-        let p = self.lookup_params_from_hash(hash);
+        let p = Self::lookup_params_from_hash(hash);
         for sf in &self.filters {
             let (i1, i2) = self.bucket_indices(sf, &p);
             for idx in [i1, i2] {
-                let base = (idx * self.slots_per_bucket as u64) as usize;
+                let base = (idx * u64::from(self.slots_per_bucket)) as usize;
                 for s in 0..self.slots_per_bucket as usize {
                     if sf[base + s] == p.fp {
                         return true;
@@ -174,13 +176,14 @@ impl CuckooFilter {
     /// and all sub-filters. Each successful `insert` of the same item occupies
     /// its own slot (insert never deduplicates), so this reflects how many
     /// times the item was added minus how many times it was deleted.
+    #[must_use]
     pub fn count(&self, hash: u64) -> usize {
-        let p = self.lookup_params_from_hash(hash);
+        let p = Self::lookup_params_from_hash(hash);
         let mut count = 0usize;
         for sf in &self.filters {
             let (i1, i2) = self.bucket_indices(sf, &p);
             for idx in [i1, i2] {
-                let base = (idx * self.slots_per_bucket as u64) as usize;
+                let base = (idx * u64::from(self.slots_per_bucket)) as usize;
                 for s in 0..self.slots_per_bucket as usize {
                     if sf[base + s] == p.fp {
                         count += 1;
@@ -195,11 +198,11 @@ impl CuckooFilter {
     /// found and removed. This is the key advantage over Bloom filters, which
     /// do not support deletion.
     pub fn delete(&mut self, hash: u64) -> bool {
-        let p = self.lookup_params_from_hash(hash);
+        let p = Self::lookup_params_from_hash(hash);
         for i in (0..self.filters.len()).rev() {
             let (i1, i2) = self.bucket_indices(&self.filters[i], &p);
             for idx in [i1, i2] {
-                let base = (idx * self.slots_per_bucket as u64) as usize;
+                let base = (idx * u64::from(self.slots_per_bucket)) as usize;
                 for s in 0..self.slots_per_bucket as usize {
                     if self.filters[i][base + s] == p.fp {
                         self.filters[i][base + s] = 0;
@@ -214,10 +217,12 @@ impl CuckooFilter {
     }
 
     /// `XXH3_64bits_withSeed(item, 0xc6a4a7935bd1e995ULL)`.
+    #[must_use]
     pub fn hash(item: &[u8]) -> u64 {
         xxh3_64_with_seed(item, K_CUCKOO_SEED)
     }
 
+    #[must_use]
     pub fn num_items(&self) -> u64 {
         self.num_items
     }
@@ -225,39 +230,47 @@ impl CuckooFilter {
     /// Number of times an insertion found both candidate buckets full and had
     /// to evict an existing fingerprint to its alternate bucket before the new
     /// fingerprint could be placed (mirrors `NumKOInserts`, used by tests).
+    #[must_use]
     pub fn num_ko_inserts(&self) -> u64 {
         self.num_ko_inserts
     }
 
+    #[must_use]
     pub fn num_buckets(&self) -> u64 {
         self.num_buckets
     }
 
+    #[must_use]
     pub fn num_filters(&self) -> usize {
         self.filters.len()
     }
 
+    #[must_use]
     pub fn num_deletes(&self) -> u64 {
         self.num_deletes
     }
 
+    #[must_use]
     pub fn slots_per_bucket(&self) -> u8 {
         self.slots_per_bucket
     }
 
+    #[must_use]
     pub fn max_iterations(&self) -> u16 {
         self.max_iterations
     }
 
+    #[must_use]
     pub fn expansion(&self) -> u16 {
         self.expansion
     }
 
     /// Approximate heap bytes used by this filter's sub-filter data.
+    #[must_use]
     pub fn malloc_used(&self) -> usize {
         std::mem::size_of::<CuckooFilter>()
             + self.filters.capacity() * std::mem::size_of::<Vec<u8>>()
-            + self.filters.iter().map(|f| f.len()).sum::<usize>()
+            + self.filters.iter().map(std::vec::Vec::len).sum::<usize>()
     }
 
     /// Reclaims space by moving items from newer sub-filters back into older
@@ -275,11 +288,12 @@ impl CuckooFilter {
         self.num_deletes = 0;
     }
 
-    /// Serialize the filter as a single blob: slots_per_bucket(1) +
-    /// max_iterations(2 LE) + expansion(2 LE) + num_buckets(8) + num_items(8) +
-    /// num_deletes(8) + per sub-filter length-prefixed raw bytes. Port-local
+    /// Serialize the filter as a single blob: `slots_per_bucket(1)` +
+    /// `max_iterations(2` LE) + expansion(2 LE) + `num_buckets(8)` + `num_items(8)` +
+    /// `num_deletes(8)` + per sub-filter length-prefixed raw bytes. Port-local
     /// wire format for the RDB save/load paths (the reference serializes
     /// sub-filters individually for a module RDB).
+    #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.push(self.slots_per_bucket);
@@ -297,6 +311,7 @@ impl CuckooFilter {
 
     /// Deserialize a blob written by `serialize`. Returns `None` on a
     /// malformed or truncated payload.
+    #[must_use]
     pub fn deserialize(bytes: &[u8]) -> Option<CuckooFilter> {
         if bytes.len() < 29 {
             return None;
@@ -344,9 +359,13 @@ impl CuckooFilter {
         })
     }
 
-    fn lookup_params_from_hash(&self, hash: u64) -> LookupParams {
+    fn lookup_params_from_hash(hash: u64) -> LookupParams {
         let fp = fingerprint(hash);
-        LookupParams { fp, h1: hash, h2: alt_index(fp, hash) }
+        LookupParams {
+            fp,
+            h1: hash,
+            h2: alt_index(fp, hash),
+        }
     }
 
     /// `{h1 % n, h2 % n}` for the given sub-filter.
@@ -365,19 +384,22 @@ impl CuckooFilter {
     fn add_new_sub_filter(&mut self) -> bool {
         const K_MAX_BUCKETS: u64 = (1 << 56) - 1; // preserve SubFilter numBuckets semantics
 
-        let growth = (self.expansion as f64).powi(self.filters.len() as i32) as u64;
+        let growth = f64::from(self.expansion).powi(self.filters.len() as i32) as u64;
 
         if growth > K_MAX_BUCKETS / self.num_buckets {
             return false;
         }
 
         let bucket_count = self.num_buckets * growth;
-        if bucket_count > u64::MAX / self.slots_per_bucket as u64 {
+        if bucket_count > u64::MAX / u64::from(self.slots_per_bucket) {
             return false;
         }
 
-        self.filters
-            .push(vec![0u8; (bucket_count * self.slots_per_bucket as u64) as usize]);
+        self.filters.push(vec![
+            0u8;
+            (bucket_count * u64::from(self.slots_per_bucket))
+                as usize
+        ]);
         true
     }
 
@@ -396,12 +418,12 @@ impl CuckooFilter {
             // Evict the fingerprint at victim_slot in bucket idx and take its
             // place. Then jump to the evicted fingerprint's alternate bucket.
             // victim_slot cycles across slots to avoid displacement cycles.
-            let pos = (idx * self.slots_per_bucket as u64) as usize + victim_slot as usize;
+            let pos = (idx * u64::from(self.slots_per_bucket)) as usize + victim_slot as usize;
             std::mem::swap(&mut self.filters[sf_idx][pos], &mut fp);
             idx = alt_index(fp, idx) % n;
 
             for s in 0..self.slots_per_bucket as usize {
-                let pos = (idx * self.slots_per_bucket as u64) as usize + s;
+                let pos = (idx * u64::from(self.slots_per_bucket)) as usize + s;
                 if self.filters[sf_idx][pos] == 0 {
                     self.filters[sf_idx][pos] = fp;
                     return true;
@@ -414,7 +436,7 @@ impl CuckooFilter {
         for _ in 0..self.max_iterations {
             victim_slot = (victim_slot + self.slots_per_bucket - 1) % self.slots_per_bucket;
             idx = alt_index(fp, idx) % n;
-            let pos = (idx * self.slots_per_bucket as u64) as usize + victim_slot as usize;
+            let pos = (idx * u64::from(self.slots_per_bucket)) as usize + victim_slot as usize;
             std::mem::swap(&mut self.filters[sf_idx][pos], &mut fp);
         }
 
@@ -449,7 +471,7 @@ impl CuckooFilter {
     /// if the slot was already empty or the fingerprint was relocated; false
     /// if no earlier sub-filter had room.
     fn relocate_slot(&mut self, filter_idx: usize, bucket_idx: u64, slot_idx: u8) -> bool {
-        let slot_pos = (bucket_idx * self.slots_per_bucket as u64) as usize + slot_idx as usize;
+        let slot_pos = (bucket_idx * u64::from(self.slots_per_bucket)) as usize + slot_idx as usize;
         let fp = self.filters[filter_idx][slot_pos];
         if fp == 0 {
             return true;
@@ -464,7 +486,7 @@ impl CuckooFilter {
         for prior in 0..filter_idx {
             let n = self.num_buckets_of(&self.filters[prior]);
             for idx in [bucket_idx % n, alt_bucket_idx % n] {
-                let base = (idx * self.slots_per_bucket as u64) as usize;
+                let base = (idx * u64::from(self.slots_per_bucket)) as usize;
                 for s in 0..self.slots_per_bucket as usize {
                     if self.filters[prior][base + s] == 0 {
                         self.filters[prior][base + s] = fp;
@@ -483,7 +505,11 @@ mod tests {
     use super::*;
 
     fn opts(capacity: u64, expansion: u16) -> CuckooFilterOptions {
-        CuckooFilterOptions { capacity, expansion, ..Default::default() }
+        CuckooFilterOptions {
+            capacity,
+            expansion,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -565,7 +591,10 @@ mod tests {
         assert!(cf.num_filters() <= filters_before);
         for i in 90..100 {
             let item = format!("item{i}");
-            assert!(cf.exists(CuckooFilter::hash(item.as_bytes())), "survivor {i}");
+            assert!(
+                cf.exists(CuckooFilter::hash(item.as_bytes())),
+                "survivor {i}"
+            );
         }
     }
 

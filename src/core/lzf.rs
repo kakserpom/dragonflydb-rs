@@ -20,12 +20,12 @@ const MAX_REF: usize = (1 << 8) + (1 << 3);
 
 #[inline]
 fn frst(p: &[u8]) -> u32 {
-    ((p[0] as u32) << 8) | p[1] as u32
+    (u32::from(p[0]) << 8) | u32::from(p[1])
 }
 
 #[inline]
 fn next(hval: u32, p: &[u8]) -> u32 {
-    (hval << 8) | p[2] as u32
+    (hval << 8) | u32::from(p[2])
 }
 
 #[inline]
@@ -36,6 +36,7 @@ fn idx(h: u32) -> usize {
 /// Compress `data`, mirroring `lzf_compress`. Returns `None` when the output
 /// would overflow the reference's `in_len + 1` buffer (caller falls back to
 /// storing the data verbatim).
+#[must_use]
 pub fn compress(data: &[u8]) -> Option<Vec<u8>> {
     let in_len = data.len();
     if in_len == 0 {
@@ -73,7 +74,7 @@ pub fn compress(data: &[u8]) -> Option<Vec<u8>> {
             };
 
             // Conservative, then exact, output bound checks.
-            if op + 4 >= out_end && op - (if lit == 0 { 1 } else { 0 }) + 4 >= out_end {
+            if op + 4 >= out_end && op - usize::from(lit == 0) + 4 >= out_end {
                 return None;
             }
 
@@ -178,6 +179,7 @@ pub fn compress(data: &[u8]) -> Option<Vec<u8>> {
 /// Returns `None` on any overflow (input or output); the output buffer is
 /// always exactly `expected` bytes (the reference tolerates a stream that
 /// produces fewer bytes).
+#[must_use]
 pub fn decompress(data: &[u8], expected: usize) -> Option<Vec<u8>> {
     let mut out = vec![0u8; expected];
     let in_end = data.len();
@@ -299,9 +301,9 @@ mod tests {
     fn roundtrip_random() {
         // Deterministic pseudo-random data, mixed with runs of repeats.
         let mut data = Vec::new();
-        let mut state = 0x12345678u32;
+        let mut state = 0x1234_5678_u32;
         for i in 0..8192 {
-            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
             let b = if i % 17 == 0 {
                 0x41
             } else {
@@ -314,9 +316,9 @@ mod tests {
         }
         // A genuinely repetitive payload must compress.
         let mut data = Vec::new();
-        let mut state = 0x12345678u32;
+        let mut state = 0x1234_5678_u32;
         for _ in 0..4096 {
-            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
             let word = (state & 0xffff) as u8;
             data.extend_from_slice(&[word, word, word, word, word]);
         }
@@ -336,7 +338,7 @@ mod tests {
         for len in 0..64usize {
             let data: Vec<u8> = (0..len).map(|i| ((i * 7) & 0xff) as u8).collect();
             if let Some(c) = compress(&data) {
-                assert_eq!(decompress(&c, len).unwrap(), data, "len={}", len);
+                assert_eq!(decompress(&c, len).unwrap(), data, "len={len}");
             }
         }
     }

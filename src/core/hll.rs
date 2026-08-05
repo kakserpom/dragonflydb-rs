@@ -1,4 +1,4 @@
-//! HyperLogLog probabilistic cardinality estimation.
+//! `HyperLogLog` probabilistic cardinality estimation.
 //!
 //! Port of `dragonfly/src/redis/hyperloglog.c` (itself a fork of Valkey's
 //! `src/hyperloglog.c`). Dragonfly only stores the dense encoding; sparse
@@ -24,7 +24,7 @@ pub const HLL_P_MASK: u64 = (HLL_REGISTERS - 1) as u64;
 pub const HLL_BITS: u32 = 6;
 pub const HLL_REGISTER_MAX: u8 = (1 << HLL_BITS) - 1;
 pub const HLL_HDR_SIZE: usize = 16;
-pub const HLL_DENSE_SIZE: usize = HLL_HDR_SIZE + ((HLL_REGISTERS * HLL_BITS as usize + 7) / 8);
+pub const HLL_DENSE_SIZE: usize = HLL_HDR_SIZE + (HLL_REGISTERS * HLL_BITS as usize).div_ceil(8);
 pub const HLL_DENSE: u8 = 0;
 pub const HLL_SPARSE: u8 = 1;
 pub const HLL_MAX_ENCODING: u8 = 1;
@@ -35,7 +35,7 @@ pub const HLL_SPARSE_VAL_MAX_LEN: usize = 4;
 pub const HLL_SPARSE_ZERO_MAX_LEN: usize = 64;
 pub const HLL_SPARSE_XZERO_MAX_LEN: usize = 16384;
 
-const HLL_ALPHA_INF: f64 = 0.721347520444481703680;
+const HLL_ALPHA_INF: f64 = 0.721_347_520_444_481_7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HllValidness {
@@ -44,12 +44,14 @@ pub enum HllValidness {
     ValidDense,
 }
 
+#[must_use]
 pub fn get_dense_hll_size() -> usize {
     HLL_DENSE_SIZE
 }
 
+#[must_use]
 pub fn get_sparse_hll_init_size() -> usize {
-    HLL_HDR_SIZE + ((HLL_REGISTERS + HLL_SPARSE_XZERO_MAX_LEN - 1) / HLL_SPARSE_XZERO_MAX_LEN) * 2
+    HLL_HDR_SIZE + HLL_REGISTERS.div_ceil(HLL_SPARSE_XZERO_MAX_LEN) * 2
 }
 
 // ---------------------------------------------------------------------------
@@ -67,7 +69,7 @@ fn hll_card_valid(buf: &[u8]) -> bool {
 fn hll_read_cached_card(buf: &[u8]) -> u64 {
     let mut card = 0u64;
     for i in 0..8 {
-        card |= (buf[8 + i] as u64) << (8 * i);
+        card |= u64::from(buf[8 + i]) << (8 * i);
     }
     card
 }
@@ -97,6 +99,7 @@ fn hll_cached_card(buf: &[u8]) -> Option<u64> {
 // Validity
 // ---------------------------------------------------------------------------
 
+#[must_use]
 pub fn is_valid_hll(buf: &[u8]) -> HllValidness {
     if buf.len() < HLL_HDR_SIZE {
         return HllValidness::Invalid;
@@ -134,8 +137,8 @@ fn dense_get_register(registers: &[u8], regnum: usize) -> u8 {
     let byte = regnum * HLL_BITS as usize / 8;
     let fb = (regnum * HLL_BITS as usize) & 7;
     let fb8 = 8 - fb;
-    let b0 = registers[byte] as u64;
-    let b1 = registers.get(byte + 1).copied().unwrap_or(0) as u64;
+    let b0 = u64::from(registers[byte]);
+    let b1 = u64::from(registers.get(byte + 1).copied().unwrap_or(0));
     ((b0 >> fb) | (b1 << fb8)) as u8 & HLL_REGISTER_MAX
 }
 
@@ -147,11 +150,11 @@ fn dense_set_register(registers: &mut [u8], regnum: usize, val: u8) {
     let byte = regnum * HLL_BITS as usize / 8;
     let fb = (regnum * HLL_BITS as usize) & 7;
     let fb8 = 8 - fb;
-    let v = val as u64;
-    registers[byte] = (registers[byte] & !((HLL_REGISTER_MAX as u64) << fb) as u8)
-        | ((v << fb) as u8);
-    registers[byte + 1] = (registers[byte + 1] & !((HLL_REGISTER_MAX as u64) >> fb8) as u8)
-        | ((v >> fb8) as u8);
+    let v = u64::from(val);
+    registers[byte] =
+        (registers[byte] & !(u64::from(HLL_REGISTER_MAX) << fb) as u8) | ((v << fb) as u8);
+    registers[byte + 1] =
+        (registers[byte + 1] & !(u64::from(HLL_REGISTER_MAX) >> fb8) as u8) | ((v >> fb8) as u8);
 }
 
 /// Set the register at `index` to `count` if `count` is larger.
@@ -181,18 +184,18 @@ fn hll_raw_reg_histo(registers: &[u8], reghisto: &mut [u32; 64]) {
 
 /// Merge dense-encoded registers into a raw (max) register array.
 fn hll_merge_dense(reg_raw: &mut [u8], reg_dense: &[u8]) {
-    for i in 0..HLL_REGISTERS {
+    for (i, reg) in reg_raw.iter_mut().enumerate() {
         let val = dense_get_register(reg_dense, i);
-        if val > reg_raw[i] {
-            reg_raw[i] = val;
+        if val > *reg {
+            *reg = val;
         }
     }
 }
 
 /// Compress a raw (max) register array into dense-encoded registers.
 fn hll_dense_compress(reg_dense: &mut [u8], reg_raw: &[u8]) {
-    for i in 0..HLL_REGISTERS {
-        dense_set_register(reg_dense, i, reg_raw[i]);
+    for (i, &val) in reg_raw.iter().enumerate() {
+        dense_set_register(reg_dense, i, val);
     }
 }
 
@@ -200,9 +203,10 @@ fn hll_dense_compress(reg_dense: &mut [u8], reg_raw: &[u8]) {
 // Hashing
 // ---------------------------------------------------------------------------
 
-/// Endian-neutral MurmurHash64A, matching `MurmurHash64A` in hyperloglog.c.
+/// Endian-neutral `MurmurHash64A`, matching `MurmurHash64A` in hyperloglog.c.
+#[must_use]
 pub fn murmur_hash64_a(key: &[u8], seed: u64) -> u64 {
-    const M: u64 = 0xc6a4a7935bd1e995;
+    const M: u64 = 0xc6a4_a793_5bd1_e995;
     const R: u32 = 47;
     let len = key.len();
     let mut h = seed ^ ((len as u64).wrapping_mul(M));
@@ -221,7 +225,7 @@ pub fn murmur_hash64_a(key: &[u8], seed: u64) -> u64 {
     // n appends bytes 0..n as a little-endian value and then multiplies.
     if len & 7 != 0 {
         for (i, &b) in key[end..].iter().enumerate() {
-            h ^= (b as u64) << (8 * i);
+            h ^= u64::from(b) << (8 * i);
         }
         h = h.wrapping_mul(M);
     }
@@ -233,7 +237,7 @@ pub fn murmur_hash64_a(key: &[u8], seed: u64) -> u64 {
 
 /// Pattern length (run of zeros + 1) and register index for an element.
 fn hll_pat_len(ele: &[u8], regp: &mut usize) -> u8 {
-    let mut hash = murmur_hash64_a(ele, 0xadc83b19);
+    let mut hash = murmur_hash64_a(ele, 0xadc8_3b19);
     let index = (hash & HLL_P_MASK) as usize;
     hash >>= HLL_P;
     hash |= 1u64 << HLL_Q; // ensure count <= Q+1, so ctz is defined
@@ -344,6 +348,7 @@ fn sparse_to_dense_registers(in_hll: &[u8], registers: &mut [u8]) -> bool {
 
 /// Convert a sparse HLL to a dense HLL buffer (with slack). Returns `None`
 /// when the input is not a valid sparse HLL.
+#[must_use]
 pub fn sparse_to_dense(in_hll: &[u8]) -> Option<Vec<u8>> {
     if in_hll.len() < HLL_HDR_SIZE || in_hll[4] != HLL_SPARSE {
         return None;
@@ -396,6 +401,7 @@ pub fn init_sparse_hll(buf: &mut [u8]) -> bool {
 }
 
 /// Create a dense HLL buffer (with slack) with all registers zero.
+#[must_use]
 pub fn create_dense_hll() -> Vec<u8> {
     let mut buf = vec![0u8; HLL_DENSE_SIZE + 1];
     buf[0..4].copy_from_slice(HLL_MAGIC);
@@ -404,6 +410,7 @@ pub fn create_dense_hll() -> Vec<u8> {
 }
 
 /// Copy a stored dense HLL into the slack form used for mutation.
+#[must_use]
 pub fn dense_with_slack(stored: &[u8]) -> Option<Vec<u8>> {
     if stored.len() != HLL_DENSE_SIZE {
         return None;
@@ -414,6 +421,7 @@ pub fn dense_with_slack(stored: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Strip the slack byte from a dense HLL buffer for storage.
+#[must_use]
 pub fn strip_dense_slack(mut v: Vec<u8>) -> Vec<u8> {
     v.truncate(HLL_DENSE_SIZE);
     v
@@ -459,7 +467,7 @@ fn hll_sparse_set(hll: &mut Vec<u8>, index: usize, count: u8, promoted: &mut boo
             span = sparse_xzero_len(b, b1);
             oplen = 2;
         }
-        if index <= first + span - 1 {
+        if index < first + span {
             break;
         }
         prev = Some(p);
@@ -571,9 +579,7 @@ fn hll_sparse_set(hll: &mut Vec<u8>, index: usize, count: u8, promoted: &mut boo
             }
             hll.resize(hll.len() + deltalen as usize, 0);
         }
-    } else if deltalen > 0 {
-        hll.resize(hll.len() + deltalen as usize, 0);
-    } else if deltalen < 0 {
+    } else if deltalen != 0 {
         hll.resize(hll.len() + deltalen as usize, 0);
     }
     hll[p..p + seqlen].copy_from_slice(&seq[..seqlen]);
@@ -622,9 +628,8 @@ fn hll_sparse_merge_adjacent(hll: &mut Vec<u8>, prev: Option<usize>) -> i32 {
 /// hllSparseSet's promote path: convert to dense, apply the register update,
 /// and report the promotion.
 fn hll_sparse_promote(hll: &mut Vec<u8>, index: usize, count: u8, promoted: &mut bool) -> i32 {
-    let dense = match sparse_to_dense(hll) {
-        Some(d) => d,
-        None => return -1, // corrupted HLL
+    let Some(dense) = sparse_to_dense(hll) else {
+        return -1;
     };
     *hll = dense;
     let dense_retval = hll_dense_set(&mut hll[16..], index, count);
@@ -651,7 +656,7 @@ pub fn pfadd_sparse(hll: &mut Vec<u8>, value: &[u8], promoted: &mut bool) -> i32
 
 /// Add `value` to a dense HLL (buffer with slack). Returns 1 if the register
 /// was updated, 0 otherwise, -1 if the buffer is not a valid dense HLL.
-pub fn pfadd_dense(hll: &mut Vec<u8>, value: &[u8]) -> i32 {
+pub fn pfadd_dense(hll: &mut [u8], value: &[u8]) -> i32 {
     if is_valid_hll(&hll[..HLL_DENSE_SIZE]) != HllValidness::ValidDense {
         return -1;
     }
@@ -661,11 +666,7 @@ pub fn pfadd_dense(hll: &mut Vec<u8>, value: &[u8]) -> i32 {
     if retval {
         hll_invalidate_cache(hll);
     }
-    if retval {
-        1
-    } else {
-        0
-    }
+    i32::from(retval)
 }
 
 // ---------------------------------------------------------------------------
@@ -713,12 +714,12 @@ fn hll_tau(x: f64) -> f64 {
 /// Estimate the cardinality from a register histogram (Ertl, arXiv:1702.01284).
 fn estimate_from_histo(reghisto: &[u32; 64]) -> u64 {
     let m = HLL_REGISTERS as f64;
-    let mut z = m * hll_tau((m - reghisto[HLL_Q as usize + 1] as f64) / m);
+    let mut z = m * hll_tau((m - f64::from(reghisto[HLL_Q as usize + 1])) / m);
     for j in (1..=HLL_Q as usize).rev() {
-        z += reghisto[j] as f64;
+        z += f64::from(reghisto[j]);
         z *= 0.5;
     }
-    z += m * hll_sigma(reghisto[0] as f64 / m);
+    z += m * hll_sigma(f64::from(reghisto[0]) / m);
     (HLL_ALPHA_INF * m * m / z).round() as u64
 }
 
@@ -747,6 +748,7 @@ pub fn pfcount_single(hll: &mut [u8]) -> i64 {
 
 /// Estimated count of the union of dense HLLs. Each element must be exactly
 /// `HLL_DENSE_SIZE` bytes (stored form). Returns -1 if any is invalid.
+#[must_use]
 pub fn pfcount_multi(hlls: &[&[u8]]) -> i64 {
     let mut max = [0u8; HLL_REGISTERS];
     for hll in hlls {
@@ -792,10 +794,10 @@ mod tests {
     fn murmur_hash_matches_reference() {
         // Reference values produced by hyperloglog.c's MurmurHash64A with
         // seed 0xadc83b19.
-        assert_eq!(murmur_hash64_a(b"", 0xadc83b19), 0xd8dfea6585bc9732);
-        assert_eq!(murmur_hash64_a(b"foo", 0xadc83b19), 0xe64609b8b0141cb4);
-        assert_eq!(murmur_hash64_a(b"1", 0xadc83b19), 0xd68cfa33ac865d67);
-        assert_eq!(murmur_hash64_a(b"2", 0xadc83b19), 0x2f1aa165b7523c0b);
+        assert_eq!(murmur_hash64_a(b"", 0xadc8_3b19), 0xd8df_ea65_85bc_9732);
+        assert_eq!(murmur_hash64_a(b"foo", 0xadc8_3b19), 0xe646_09b8_b014_1cb4);
+        assert_eq!(murmur_hash64_a(b"1", 0xadc8_3b19), 0xd68c_fa33_ac86_5d67);
+        assert_eq!(murmur_hash64_a(b"2", 0xadc8_3b19), 0x2f1a_a165_b752_3c0b);
     }
 
     #[test]
@@ -805,7 +807,10 @@ mod tests {
         assert_eq!(is_valid_hll(&sparse), HllValidness::ValidSparse);
 
         let mut dense = sparse_to_dense(&sparse).expect("empty sparse converts");
-        assert_eq!(is_valid_hll(&dense[..HLL_DENSE_SIZE]), HllValidness::ValidDense);
+        assert_eq!(
+            is_valid_hll(&dense[..HLL_DENSE_SIZE]),
+            HllValidness::ValidDense
+        );
         assert_eq!(pfcount_single(&mut dense[..]), 0);
     }
 
@@ -830,7 +835,10 @@ mod tests {
         assert_eq!(merged, 3);
 
         let mut out = create_dense_hll();
-        assert_eq!(pfmerge(&[&dense_stored(&a), &dense_stored(&b)], &mut out), 0);
+        assert_eq!(
+            pfmerge(&[&dense_stored(&a), &dense_stored(&b)], &mut out),
+            0
+        );
         assert_eq!(pfcount_single(&mut out[..]), 3);
     }
 
@@ -841,7 +849,7 @@ mod tests {
         hll.extend_from_slice(b"HYLL");
         hll.push(1); // sparse
         hll.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        for _ in 0..155486 {
+        for _ in 0..155_486 {
             hll.push(0x7f);
             hll.push(0xff);
         }

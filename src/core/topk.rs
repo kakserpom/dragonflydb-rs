@@ -7,7 +7,7 @@
 //! counter is instead decremented (mutually exclusive with the increment).
 //! The estimated frequency of an item is the minimum counter across all rows,
 //! and the heap keeps only the `k` items with the highest estimates. This is
-//! not a strict HeavyKeeper (no per-item fingerprint), so counts may overestimate
+//! not a strict `HeavyKeeper` (no per-item fingerprint), so counts may overestimate
 //! — which is acceptable for Top-K bounds.
 
 use std::cell::Cell;
@@ -44,7 +44,7 @@ fn default_decay_table() -> &'static [f64; DECAY_LOOKUP_SIZE] {
 // uses a thread-local Xoroshiro128p; the exact stream is irrelevant because
 // every TOPK test asserts on bounds, not on specific decay outcomes.
 thread_local! {
-    static BITGEN: Cell<u64> = const { Cell::new(0x9E3779B97F4A7C15) };
+    static BITGEN: Cell<u64> = const { Cell::new(0x9E37_79B9_7F4A_7C15) };
 }
 
 fn uniform() -> f64 {
@@ -90,6 +90,7 @@ pub struct Topk {
 impl Topk {
     /// Initialize a sketch (`TOPK(mr, k, width, depth, decay)`). The caller
     /// validates `k`, `width`, `depth` and `decay` bounds.
+    #[must_use]
     pub fn new(k: u32, width: u32, depth: u32, decay: f64) -> Self {
         debug_assert!(k > 0 && width > 0 && depth > 0 && (0.0..=1.0).contains(&decay));
         let counters = vec![0u32; (width as usize) * (depth as usize)];
@@ -121,28 +122,34 @@ impl Topk {
     }
 
     /// The maximum number of items maintained in the min-heap.
+    #[must_use]
     pub fn k(&self) -> u32 {
         self.k
     }
 
     /// The number of items currently tracked in the heap.
+    #[must_use]
     pub fn size(&self) -> usize {
         self.heap.len()
     }
 
+    #[must_use]
     pub fn width(&self) -> u32 {
         self.width
     }
 
+    #[must_use]
     pub fn depth(&self) -> u32 {
         self.depth
     }
 
+    #[must_use]
     pub fn decay(&self) -> f64 {
         self.decay
     }
 
     /// Estimate the frequency of an item: the minimum counter across all rows.
+    #[must_use]
     pub fn count(&self, item: &[u8]) -> u32 {
         let mut min_count = u32::MAX;
         for row in 0..self.depth {
@@ -153,6 +160,7 @@ impl Topk {
     }
 
     /// Whether the item currently resides in the Top-K heap.
+    #[must_use]
     pub fn query(&self, item: &[u8]) -> bool {
         self.heap.iter().any(|h| h.key.as_bytes() == item)
     }
@@ -174,17 +182,21 @@ impl Topk {
 
     /// The complete list of current Top-K items, sorted descending by count
     /// with lexicographic tie-break (deterministic, Redis-compatible).
+    #[must_use]
     pub fn list(&self) -> Vec<TopkItem> {
         let mut result: Vec<TopkItem> = self
             .heap
             .iter()
-            .map(|h| TopkItem { item: h.key.clone(), count: h.count })
+            .map(|h| TopkItem {
+                item: h.key.clone(),
+                count: h.count,
+            })
             .collect();
         result.sort_by(|a, b| {
-            if a.count != b.count {
-                b.count.cmp(&a.count)
-            } else {
+            if a.count == b.count {
                 a.item.as_bytes().cmp(b.item.as_bytes())
+            } else {
+                b.count.cmp(&a.count)
             }
         });
         result
@@ -192,6 +204,7 @@ impl Topk {
 
     /// Total heap memory dynamically allocated by this instance, including
     /// the custom decay table, counter grid and heap allocations.
+    #[must_use]
     pub fn malloc_used(&self) -> usize {
         let mut size = 0;
         if self.decay_table.is_some() {
@@ -214,9 +227,9 @@ impl Topk {
     /// `row * width + bucket`.
     fn counter_index(&self, item: &[u8], row: u32) -> usize {
         debug_assert!(row < self.depth);
-        let full_hash = xxh3_64_with_seed(item, row as u64);
-        let bucket = ((full_hash as u32) as u64 * self.width as u64) >> 32;
-        debug_assert!(bucket < self.width as u64);
+        let full_hash = xxh3_64_with_seed(item, u64::from(row));
+        let bucket = (u64::from(full_hash as u32) * u64::from(self.width)) >> 32;
+        debug_assert!(bucket < u64::from(self.width));
         (row as usize) * (self.width as usize) + bucket as usize
     }
 
@@ -237,7 +250,7 @@ impl Topk {
         }
         let m = (DECAY_LOOKUP_SIZE - 1) as u32;
         let base = table[DECAY_LOOKUP_SIZE - 1];
-        base.powf((count / m) as f64) * table[(count % m) as usize]
+        base.powf(f64::from(count / m)) * table[(count % m) as usize]
     }
 
     fn should_decay(&self, count: u32) -> bool {
@@ -290,7 +303,10 @@ impl Topk {
         if self.heap.len() < self.k as usize {
             // Heap not full: add the item, no eviction.
             let new_idx = self.heap.len();
-            self.heap.push(HeapItem { key: CompactString::from_bytes(item), count: new_count });
+            self.heap.push(HeapItem {
+                key: CompactString::from_bytes(item),
+                count: new_count,
+            });
             self.heapify_up(new_idx);
             return None;
         }
@@ -298,7 +314,10 @@ impl Topk {
         // Heap is full: evict the minimum and add the new item.
         debug_assert_eq!(self.heap.len(), self.k as usize);
         let old_key = self.heap[0].key.clone();
-        self.heap[0] = HeapItem { key: CompactString::from_bytes(item), count: new_count };
+        self.heap[0] = HeapItem {
+            key: CompactString::from_bytes(item),
+            count: new_count,
+        };
         self.heapify_down(0);
         Some(old_key)
     }
@@ -352,6 +371,7 @@ impl Topk {
     /// Serialize the sketch as a single blob: k(4) + width(4) + depth(4) +
     /// decay(8) + heap (count(4), then count(4) + item len(4) + item bytes per
     /// entry) + counter count(4) + counter values (4 LE each).
+    #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.k.to_le_bytes());
@@ -373,6 +393,7 @@ impl Topk {
 
     /// Deserialize a blob written by `serialize`. Returns `None` on a
     /// malformed or truncated payload.
+    #[must_use]
     pub fn deserialize(bytes: &[u8]) -> Option<Topk> {
         fn u32_at(b: &[u8], off: &mut usize) -> Option<u32> {
             let end = off.checked_add(4)?;
@@ -486,7 +507,7 @@ mod tests {
         assert!(topk.query(b"heavy2"));
         assert!(!topk.query(b"weak"));
         // A strong item evicts the weakest.
-        let evicted = topk.incr_by(b"newcomer", 100000).expect("eviction");
+        let evicted = topk.incr_by(b"newcomer", 100_000).expect("eviction");
         assert_eq!(evicted.as_bytes(), b"heavy2");
     }
 

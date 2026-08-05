@@ -12,6 +12,7 @@ pub enum ListItem {
 }
 
 impl ListItem {
+    #[must_use]
     pub fn as_bytes(&self) -> Vec<u8> {
         match self {
             ListItem::Int(i) => itoa(*i),
@@ -19,6 +20,7 @@ impl ListItem {
         }
     }
 
+    #[must_use]
     pub fn from_bytes(b: &[u8]) -> Self {
         // Redis encodes integers when possible; we try to detect them too.
         if let Some(i) = parse_i64(b) {
@@ -28,6 +30,7 @@ impl ListItem {
         }
     }
 
+    #[must_use]
     pub fn byte_len(&self) -> usize {
         match self {
             ListItem::Int(_) => 8,
@@ -106,6 +109,7 @@ impl Default for QuickList {
 }
 
 impl QuickList {
+    #[must_use]
     pub fn new() -> Self {
         QuickList {
             chunks: VecDeque::new(),
@@ -113,10 +117,12 @@ impl QuickList {
         }
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.count
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
@@ -173,15 +179,18 @@ impl QuickList {
         Some(item)
     }
 
+    #[must_use]
     pub fn front(&self) -> Option<&ListItem> {
         self.chunks.front()?.items.front()
     }
 
+    #[must_use]
     pub fn back(&self) -> Option<&ListItem> {
         self.chunks.back()?.items.back()
     }
 
     /// Get an item at a logical index (negative indices wrap from the end).
+    #[must_use]
     pub fn get(&self, index: i64) -> Option<&ListItem> {
         let len = self.count as i64;
         let idx = if index < 0 { len + index } else { index };
@@ -224,6 +233,7 @@ impl QuickList {
     }
 
     /// Number of chunks (listpack nodes).
+    #[must_use]
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
     }
@@ -235,6 +245,7 @@ impl QuickList {
 
     /// Return an iterator over elements [start, stop] inclusive using Redis index
     /// semantics; start/stop may be negative. Returns None if range is empty.
+    #[must_use]
     pub fn range(&self, start: i64, stop: i64) -> Option<impl Iterator<Item = &ListItem>> {
         let len = self.count as i64;
         let (s, count) = crate::util::redis_range(start, stop, len)?;
@@ -269,7 +280,8 @@ impl QuickList {
         removed
     }
 
-    /// Rebuild a QuickList from a plain vec of items.
+    /// Rebuild a `QuickList` from a plain vec of items.
+    #[must_use]
     pub fn from_items(items: Vec<ListItem>) -> Self {
         let mut ql = QuickList::new();
         for it in items {
@@ -295,16 +307,14 @@ impl QuickList {
         let mut removed = 0usize;
         let keep: Vec<ListItem> = self
             .iter()
-            .cloned()
-            .filter(|it| {
-                if it.as_bytes() == value {
-                    if removed < count.unsigned_abs() as usize {
-                        removed += 1;
-                        return false;
-                    }
+            .filter(|&it| {
+                if it.as_bytes() == value && removed < count.unsigned_abs() as usize {
+                    removed += 1;
+                    return false;
                 }
                 true
             })
+            .cloned()
             .collect();
         *self = Self::from_items(keep);
         removed
@@ -334,8 +344,8 @@ impl QuickList {
         } else {
             // find the chunk containing position idx and insert into its middle
             let mut rem = idx;
-            let mut it = self.chunks.iter_mut().enumerate();
-            while let Some((ci, c)) = it.next() {
+            let it = self.chunks.iter_mut().enumerate();
+            for (ci, c) in it {
                 let n = c.len() as i64;
                 if rem < n {
                     c.items.insert(rem as usize, item);
@@ -344,7 +354,7 @@ impl QuickList {
                         // split the chunk to respect the size invariant
                         let half = c.len() / 2;
                         let right: VecDeque<ListItem> = c.items.split_off(half);
-                        let right_bytes = right.iter().map(|i| i.byte_len()).sum();
+                        let right_bytes = right.iter().map(ListItem::byte_len).sum();
                         self.chunks.insert(
                             ci + 1,
                             Chunk {

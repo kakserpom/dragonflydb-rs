@@ -16,7 +16,6 @@ use crate::commands::{
     integer, ok,
 };
 use crate::core::PrimeValue;
-use crate::core::compact::CompactString;
 use crate::core::json::Json;
 use crate::core::jsonpath::{self, Segment};
 use crate::error::{CmdResult, RespError, RespValue};
@@ -85,7 +84,7 @@ fn parse_json_path(raw: &str) -> Option<WrappedJsonPath> {
             } else {
                 "."
             };
-            format!("${}{}", sep, raw)
+            format!("${sep}{raw}")
         };
         let path = jsonpath::parse_path(&v2).ok()?;
         Some(WrappedJsonPath {
@@ -176,7 +175,7 @@ impl<T> JsonCallbackResult<T> {
 /// `RespValue`.
 fn send_legacy_v2<T>(
     c: &JsonCallbackResult<T>,
-    mut elem: impl FnMut(&Option<T>) -> RespValue,
+    mut elem: impl FnMut(Option<&T>) -> RespValue,
 ) -> CmdResult {
     if c.should_send_nil() {
         return CmdResult::Ok(RespValue::Nil);
@@ -185,27 +184,29 @@ fn send_legacy_v2<T>(
         return CmdResult::Err(e(ERR_WRONG_JSON_TYPE));
     }
     if c.legacy {
-        CmdResult::Ok(elem(&c.result[0]))
+        CmdResult::Ok(elem(c.result[0].as_ref()))
     } else {
-        CmdResult::Ok(RespValue::Array(c.result.iter().map(elem).collect()))
+        CmdResult::Ok(RespValue::Array(
+            c.result.iter().map(Option::as_ref).map(elem).collect(),
+        ))
     }
 }
 
-fn elem_size(v: &Option<usize>) -> RespValue {
+fn elem_size(v: Option<&usize>) -> RespValue {
     match v {
         Some(n) => RespValue::Integer(*n as i64),
         None => RespValue::Nil,
     }
 }
 
-fn elem_i64(v: &Option<i64>) -> RespValue {
+fn elem_i64(v: Option<&i64>) -> RespValue {
     match v {
         Some(i) => RespValue::Integer(*i),
         None => RespValue::Nil,
     }
 }
 
-fn elem_str(v: &Option<String>) -> RespValue {
+fn elem_str(v: Option<&String>) -> RespValue {
     match v {
         Some(s) => RespValue::Bulk(s.as_bytes().to_vec()),
         None => RespValue::Nil,
@@ -425,12 +426,11 @@ fn op_set_root(
         }
         _ => {}
     }
-    let parsed = match Json::parse(value) {
-        Ok(j) => j,
-        Err(_) => return CmdResult::Err(e(ERR_INVALID_JSON)),
+    let Ok(parsed) = Json::parse(value) else {
+        return CmdResult::Err(e(ERR_INVALID_JSON));
     };
     db.clear_expiry(key);
-    db.insert(CompactString::from_bytes(key), PrimeValue::Json(parsed));
+    db.insert(key, PrimeValue::Json(parsed));
     CmdResult::Ok(ok())
 }
 
@@ -444,9 +444,8 @@ fn op_set_partial(
     xx: bool,
     now: u64,
 ) -> CmdResult {
-    let parsed = match Json::parse(value) {
-        Ok(j) => j,
-        Err(_) => return CmdResult::Err(e(ERR_INVALID_JSON)),
+    let Ok(parsed) = Json::parse(value) else {
+        return CmdResult::Err(e(ERR_INVALID_JSON));
     };
     let json = match json_mut(db, key, now) {
         Ok(j) => j,
@@ -500,9 +499,8 @@ fn exec_set(ctx: &mut OpContext) -> CmdResult {
         return CmdResult::Err(e(ERR_SYNTAX));
     }
 
-    let w = match parse_json_path(path) {
-        Some(w) => w,
-        None => return CmdResult::Err(e(ERR_SYNTAX)),
+    let Some(w) = parse_json_path(path) else {
+        return CmdResult::Err(e(ERR_SYNTAX));
     };
 
     if w.refers_to_root() {
@@ -522,9 +520,8 @@ fn exec_mset(ctx: &mut OpContext) -> CmdResult {
         let key = &data[i];
         let path = std::str::from_utf8(&data[i + 1]).unwrap_or("");
         let value = &data[i + 2];
-        let w = match parse_json_path(path) {
-            Some(w) => w,
-            None => return CmdResult::Err(e(ERR_SYNTAX)),
+        let Some(w) = parse_json_path(path) else {
+            return CmdResult::Err(e(ERR_SYNTAX));
         };
         let r = if w.refers_to_root() {
             op_set_root(ctx.db, key, value, false, false, ctx.now_ms)
@@ -676,19 +673,15 @@ fn exec_get(ctx: &mut OpContext) -> CmdResult {
 
 fn exec_mget(ctx: &mut OpContext) -> CmdResult {
     let path_str = std::str::from_utf8(ctx.args.last().unwrap()).unwrap_or("");
-    let w = match parse_json_path(path_str) {
-        Some(w) => w,
-        None => return CmdResult::Err(e(ERR_SYNTAX)),
+    let Some(w) = parse_json_path(path_str) else {
+        return CmdResult::Err(e(ERR_SYNTAX));
     };
 
     let mut out = Vec::new();
     for key in &ctx.args[ctx.first_key_idx..ctx.args.len() - 1] {
-        let json = match get_str_for_key(ctx.db, key, ctx.now_ms) {
-            Ok(j) => j,
-            Err(_) => {
-                out.push(RespValue::Nil);
-                continue;
-            }
+        let Ok(json) = get_str_for_key(ctx.db, key, ctx.now_ms) else {
+            out.push(RespValue::Nil);
+            continue;
         };
         match eval_wrapped(&w, &json) {
             Some(v) => out.push(RespValue::Bulk(v.dump().into_bytes())),
@@ -730,11 +723,9 @@ fn exec_del(ctx: &mut OpContext) -> CmdResult {
     let path = ctx
         .args
         .get(ctx.first_key_idx + 1)
-        .map(|p| std::str::from_utf8(p).unwrap_or(""))
-        .unwrap_or("");
-    let w = match parse_json_path(path) {
-        Some(w) => w,
-        None => return CmdResult::Err(e(ERR_SYNTAX)),
+        .map_or("", |p| std::str::from_utf8(p).unwrap_or(""));
+    let Some(w) = parse_json_path(path) else {
+        return CmdResult::Err(e(ERR_SYNTAX));
     };
 
     if w.refers_to_root() {
@@ -769,8 +760,7 @@ fn exec_strlen(ctx: &mut OpContext) -> CmdResult {
     let path = ctx
         .args
         .get(ctx.first_key_idx + 1)
-        .map(|p| std::str::from_utf8(p).unwrap_or(""))
-        .unwrap_or("");
+        .map_or("", |p| std::str::from_utf8(p).unwrap_or(""));
     let w = parse_json_path(path).unwrap();
     let Some(pv) = ctx.db.find(key, ctx.now_ms) else {
         return if w.is_legacy() {
@@ -784,7 +774,7 @@ fn exec_strlen(ctx: &mut OpContext) -> CmdResult {
     };
     let mut c = JsonCallbackResult::new(w.legacy, OnEmpty::SendNil, SavingOrder::SaveFirst, true);
     jsonpath::eval_path(&w.path, json, |_, v| {
-        c.add_opt(v.as_str().map(|s| s.len()));
+        c.add_opt(v.as_str().map(str::len));
     });
     send_legacy_v2(&c, elem_size)
 }
@@ -794,8 +784,7 @@ fn exec_objlen(ctx: &mut OpContext) -> CmdResult {
     let path = ctx
         .args
         .get(ctx.first_key_idx + 1)
-        .map(|p| std::str::from_utf8(p).unwrap_or(""))
-        .unwrap_or("");
+        .map_or("", |p| std::str::from_utf8(p).unwrap_or(""));
     let w = parse_json_path(path).unwrap();
     let Some(pv) = ctx.db.find(key, ctx.now_ms) else {
         return if w.is_legacy() {
@@ -819,8 +808,7 @@ fn exec_arrlen(ctx: &mut OpContext) -> CmdResult {
     let path = ctx
         .args
         .get(ctx.first_key_idx + 1)
-        .map(|p| std::str::from_utf8(p).unwrap_or(""))
-        .unwrap_or("");
+        .map_or("", |p| std::str::from_utf8(p).unwrap_or(""));
     let w = parse_json_path(path).unwrap();
     let Some(pv) = ctx.db.find(key, ctx.now_ms) else {
         return CmdResult::Ok(RespValue::Nil);
@@ -840,8 +828,7 @@ fn exec_objkeys(ctx: &mut OpContext) -> CmdResult {
     let path = ctx
         .args
         .get(ctx.first_key_idx + 1)
-        .map(|p| std::str::from_utf8(p).unwrap_or(""))
-        .unwrap_or("");
+        .map_or("", |p| std::str::from_utf8(p).unwrap_or(""));
     let w = parse_json_path(path).unwrap();
     let Some(pv) = ctx.db.find(key, ctx.now_ms) else {
         return if w.is_legacy() {
@@ -889,10 +876,8 @@ fn exec_strappend(ctx: &mut OpContext) -> CmdResult {
     if ctx.args.len() > ctx.first_key_idx + 1 + rest.len() {
         return CmdResult::Err(e(ERR_SYNTAX));
     }
-    let parsed = match Json::parse(&value_bytes) {
-        Ok(Json::String(s)) => s,
-        Ok(_) => return CmdResult::Err(e("expected string value")),
-        Err(_) => return CmdResult::Err(e("expected string value")),
+    let Ok(Json::String(parsed)) = Json::parse(&value_bytes) else {
+        return CmdResult::Err(e("expected string value"));
     };
 
     let w = parse_json_path(path_str).unwrap();
@@ -908,7 +893,7 @@ fn exec_strappend(ctx: &mut OpContext) -> CmdResult {
     );
     jsonpath::mutate_path(&w.path, json, |_, val| {
         if let Some(s) = val.as_str() {
-            let newv = format!("{}{}", s, parsed);
+            let newv = format!("{s}{parsed}");
             *val = Json::String(newv.clone());
             c.add_defined(newv.len());
         } else if !w.legacy {
@@ -922,9 +907,8 @@ fn exec_strappend(ctx: &mut OpContext) -> CmdResult {
 fn exec_toggle(ctx: &mut OpContext) -> CmdResult {
     let key = &ctx.args[ctx.first_key_idx];
     let path = std::str::from_utf8(&ctx.args[ctx.first_key_idx + 1]).unwrap_or("");
-    let w = match parse_json_path(path) {
-        Some(w) => w,
-        None => return CmdResult::Err(e(ERR_SYNTAX)),
+    let Some(w) = parse_json_path(path) else {
+        return CmdResult::Err(e(ERR_SYNTAX));
     };
     let json = match json_mut(ctx.db, key, ctx.now_ms) {
         Ok(j) => j,
@@ -960,7 +944,7 @@ fn exec_toggle(ctx: &mut OpContext) -> CmdResult {
             if let Some(b) = val.as_bool() {
                 let nv = !b;
                 *val = Json::Bool(nv);
-                c.add_defined(if nv { 1 } else { 0 });
+                c.add_defined(i64::from(nv));
             } else if !legacy {
                 c.add_empty();
             }
@@ -978,8 +962,7 @@ fn exec_clear(ctx: &mut OpContext) -> CmdResult {
     let path = ctx
         .args
         .get(ctx.first_key_idx + 1)
-        .map(|p| std::str::from_utf8(p).unwrap_or(""))
-        .unwrap_or("");
+        .map_or("", |p| std::str::from_utf8(p).unwrap_or(""));
     let w = parse_json_path(path).unwrap();
     let json = match json_mut(ctx.db, key, ctx.now_ms) {
         Ok(j) => j,
@@ -1012,20 +995,16 @@ fn exec_arrpop(ctx: &mut OpContext) -> CmdResult {
     let path = ctx
         .args
         .get(ctx.first_key_idx + 1)
-        .map(|p| std::str::from_utf8(p).unwrap_or(""))
-        .unwrap_or("");
+        .map_or("", |p| std::str::from_utf8(p).unwrap_or(""));
     let index_str = ctx
         .args
         .get(ctx.first_key_idx + 2)
-        .map(|s| std::str::from_utf8(s).unwrap_or(""))
-        .unwrap_or("-1");
-    let index = match parse_i64(index_str.as_bytes()) {
-        Some(i) => i,
-        None => return CmdResult::Err(e("ERR value is not an integer or out of range")),
+        .map_or("-1", |s| std::str::from_utf8(s).unwrap_or(""));
+    let Some(index) = parse_i64(index_str.as_bytes()) else {
+        return CmdResult::Err(e("ERR value is not an integer or out of range"));
     };
-    let w = match parse_json_path(path) {
-        Some(w) => w,
-        None => return CmdResult::Err(e(ERR_SYNTAX)),
+    let Some(w) = parse_json_path(path) else {
+        return CmdResult::Err(e(ERR_SYNTAX));
     };
     let json = match json_mut(ctx.db, key, ctx.now_ms) {
         Ok(j) => j,
@@ -1054,16 +1033,14 @@ fn exec_arrpop(ctx: &mut OpContext) -> CmdResult {
 fn exec_arrtrim(ctx: &mut OpContext) -> CmdResult {
     let key = &ctx.args[ctx.first_key_idx];
     let path = std::str::from_utf8(&ctx.args[ctx.first_key_idx + 1]).unwrap_or("");
-    let (start, stop) = match (
+    let (Some(start), Some(stop)) = (
         parse_i64(&ctx.args[ctx.first_key_idx + 2]),
         parse_i64(&ctx.args[ctx.first_key_idx + 3]),
-    ) {
-        (Some(s), Some(t)) => (s, t),
-        _ => return CmdResult::Err(RespError::integer()),
+    ) else {
+        return CmdResult::Err(RespError::integer());
     };
-    let w = match parse_json_path(path) {
-        Some(w) => w,
-        None => return CmdResult::Err(e(ERR_SYNTAX)),
+    let Some(w) = parse_json_path(path) else {
+        return CmdResult::Err(e(ERR_SYNTAX));
     };
     let json = match json_mut(ctx.db, key, ctx.now_ms) {
         Ok(j) => j,
@@ -1106,13 +1083,11 @@ fn exec_arrtrim(ctx: &mut OpContext) -> CmdResult {
 fn exec_arrinsert(ctx: &mut OpContext) -> CmdResult {
     let key = &ctx.args[ctx.first_key_idx];
     let path = std::str::from_utf8(&ctx.args[ctx.first_key_idx + 1]).unwrap_or("");
-    let index = match parse_i64(&ctx.args[ctx.first_key_idx + 2]) {
-        Some(i) => i,
-        None => return CmdResult::Err(RespError::integer()),
+    let Some(index) = parse_i64(&ctx.args[ctx.first_key_idx + 2]) else {
+        return CmdResult::Err(RespError::integer());
     };
-    let w = match parse_json_path(path) {
-        Some(w) => w,
-        None => return CmdResult::Err(e(ERR_SYNTAX)),
+    let Some(w) = parse_json_path(path) else {
+        return CmdResult::Err(e(ERR_SYNTAX));
     };
     let mut parsed_values = Vec::new();
     for v in &ctx.args[ctx.first_key_idx + 3..] {
@@ -1169,9 +1144,8 @@ fn exec_arrinsert(ctx: &mut OpContext) -> CmdResult {
 fn exec_arrappend(ctx: &mut OpContext) -> CmdResult {
     let key = &ctx.args[ctx.first_key_idx];
     let path = std::str::from_utf8(&ctx.args[ctx.first_key_idx + 1]).unwrap_or("");
-    let w = match parse_json_path(path) {
-        Some(w) => w,
-        None => return CmdResult::Err(e(ERR_SYNTAX)),
+    let Some(w) = parse_json_path(path) else {
+        return CmdResult::Err(e(ERR_SYNTAX));
     };
     let mut parsed_values = Vec::new();
     for v in &ctx.args[ctx.first_key_idx + 2..] {
@@ -1222,13 +1196,11 @@ fn exec_arrindex(ctx: &mut OpContext) -> CmdResult {
         },
         None => 0,
     };
-    let w = match parse_json_path(path) {
-        Some(w) => w,
-        None => return CmdResult::Err(e(ERR_SYNTAX)),
+    let Some(w) = parse_json_path(path) else {
+        return CmdResult::Err(e(ERR_SYNTAX));
     };
-    let search_json = match Json::parse(search) {
-        Ok(j) => j,
-        Err(_) => return CmdResult::Err(e(ERR_SYNTAX)),
+    let Ok(search_json) = Json::parse(search) else {
+        return CmdResult::Err(e(ERR_SYNTAX));
     };
     let Some(pv) = ctx.db.find(key, ctx.now_ms) else {
         return CmdResult::Err(e(ERR_NO_SUCH_KEY));
@@ -1273,8 +1245,7 @@ fn exec_arrindex(ctx: &mut OpContext) -> CmdResult {
                             .skip(pos_start)
                             .take(pos_end + 1 - pos_start)
                             .find(|(_, it)| json_are_equals(&search_json, it))
-                            .map(|(i, _)| i as i64)
-                            .unwrap_or(-1);
+                            .map_or(-1, |(i, _)| i as i64);
                         Some(found)
                     }
                 }
@@ -1320,15 +1291,13 @@ fn op_arith(ctx: &mut OpContext, op: Arith) -> CmdResult {
     let key = &ctx.args[ctx.first_key_idx];
     let path = std::str::from_utf8(&ctx.args[ctx.first_key_idx + 1]).unwrap_or("");
     let num = &ctx.args[ctx.first_key_idx + 2];
-    let w = match parse_json_path(path) {
-        Some(w) => w,
-        None => return CmdResult::Err(e(ERR_SYNTAX)),
+    let Some(w) = parse_json_path(path) else {
+        return CmdResult::Err(e(ERR_SYNTAX));
     };
     let num_str = std::str::from_utf8(num).unwrap_or("");
     let has_fractional_part = num_str.contains('.');
-    let double_value = match parse_double(num) {
-        Some(d) => d,
-        None => return CmdResult::Err(e(ERR_WRONG_TYPE)),
+    let Some(double_value) = parse_double(num) else {
+        return CmdResult::Err(e(ERR_WRONG_TYPE));
     };
     let json = match json_mut(ctx.db, key, ctx.now_ms) {
         Ok(j) => j,
@@ -1384,11 +1353,9 @@ fn exec_resp(ctx: &mut OpContext) -> CmdResult {
     let path = ctx
         .args
         .get(ctx.first_key_idx + 1)
-        .map(|p| std::str::from_utf8(p).unwrap_or(""))
-        .unwrap_or("");
-    let w = match parse_json_path(path) {
-        Some(w) => w,
-        None => return CmdResult::Err(e(ERR_SYNTAX)),
+        .map_or("", |p| std::str::from_utf8(p).unwrap_or(""));
+    let Some(w) = parse_json_path(path) else {
+        return CmdResult::Err(e(ERR_SYNTAX));
     };
     let Some(pv) = ctx.db.find(key, ctx.now_ms) else {
         return CmdResult::Err(e(ERR_NO_SUCH_KEY));
@@ -1426,11 +1393,9 @@ fn exec_debug(ctx: &mut OpContext) -> CmdResult {
         let path = ctx
             .args
             .get(ctx.first_key_idx + 2)
-            .map(|p| std::str::from_utf8(p).unwrap_or(""))
-            .unwrap_or("");
-        let w = match parse_json_path(path) {
-            Some(w) => w,
-            None => return CmdResult::Err(e(ERR_SYNTAX)),
+            .map_or("", |p| std::str::from_utf8(p).unwrap_or(""));
+        let Some(w) = parse_json_path(path) else {
+            return CmdResult::Err(e(ERR_SYNTAX));
         };
         let Some(pv) = ctx.db.find(key_bytes, ctx.now_ms) else {
             return CmdResult::Err(e(ERR_NO_SUCH_KEY));
@@ -1458,13 +1423,11 @@ fn exec_merge(ctx: &mut OpContext) -> CmdResult {
     let key = &ctx.args[ctx.first_key_idx];
     let path = std::str::from_utf8(&ctx.args[ctx.first_key_idx + 1]).unwrap_or("");
     let patch_str = &ctx.args[ctx.first_key_idx + 2];
-    let w = match parse_json_path(path) {
-        Some(w) => w,
-        None => return CmdResult::Err(e(ERR_SYNTAX)),
+    let Some(w) = parse_json_path(path) else {
+        return CmdResult::Err(e(ERR_SYNTAX));
     };
-    let patch = match Json::parse(patch_str) {
-        Ok(p) => p,
-        Err(_) => return CmdResult::Err(e(ERR_INVALID_JSON)),
+    let Ok(patch) = Json::parse(patch_str) else {
+        return CmdResult::Err(e(ERR_INVALID_JSON));
     };
 
     match ctx.db.find_mut(key, ctx.now_ms) {
@@ -1479,10 +1442,7 @@ fn exec_merge(ctx: &mut OpContext) -> CmdResult {
         None => {
             if w.refers_to_root() {
                 ctx.db.clear_expiry(key);
-                ctx.db.insert(
-                    CompactString::from_bytes(key),
-                    PrimeValue::Json(patch.clone()),
-                );
+                ctx.db.insert(key, PrimeValue::Json(patch.clone()));
                 CmdResult::Ok(ok())
             } else {
                 CmdResult::Err(e(ERR_SYNTAX))
@@ -2220,14 +2180,14 @@ mod tests {
     #[test]
     fn arrpop_works() {
         let mut d = db();
-        db_set(&mut d, "json", r#"[[6,1,6],[7,2,7],[8,3,8]]"#);
+        db_set(&mut d, "json", r"[[6,1,6],[7,2,7],[8,3,8]]");
         assert_eq!(
             s(&mut d, &["JSON.ARRPOP", "json", "$[*]", "-2"]),
             "[1, 2, 3]"
         );
         assert_eq!(
             s(&mut d, &["JSON.GET", "json", "."]),
-            r#"[[6,6],[7,7],[8,8]]"#
+            r"[[6,6],[7,7],[8,8]]"
         );
         db_set(&mut d, "json", r#"[[],["a"],["a","b"]]"#);
         assert_eq!(
@@ -2292,7 +2252,7 @@ mod tests {
             r#"[["b","a"],["a","b","a"],["a","a","b","b"]]"#
         );
         // out of range
-        db_set(&mut d, "arr", r#"[0,1,2,3,4,5]"#);
+        db_set(&mut d, "arr", r"[0,1,2,3,4,5]");
         assert_eq!(
             s(&mut d, &["JSON.ARRINSERT", "arr", "$", "-55", "6"]),
             "ERR index out of range"
@@ -2378,10 +2338,10 @@ mod tests {
     #[test]
     fn arrindex_numeric_types() {
         let mut d = db();
-        db_set(&mut d, "json", r#"[2, 3.0, 3]"#);
+        db_set(&mut d, "json", r"[2, 3.0, 3]");
         assert_eq!(s(&mut d, &["JSON.ARRINDEX", "json", "$", "3"]), "[2]");
         assert_eq!(s(&mut d, &["JSON.ARRINDEX", "json", "$", "3.0"]), "[1]");
-        db_set(&mut d, "json", r#"[[1,2,3],[1.0,2.0,3.0],2.0,[1,2,3]]"#);
+        db_set(&mut d, "json", r"[[1,2,3],[1.0,2.0,3.0],2.0,[1,2,3]]");
         assert_eq!(s(&mut d, &["JSON.ARRINDEX", "json", "$", "[1,2,3]"]), "[0]");
         db_set(&mut d, "json", r#"[{"a":2},{"a":2.0},2.0]"#);
         assert_eq!(

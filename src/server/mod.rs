@@ -68,13 +68,7 @@ pub fn local_script(mgr: &mut ScriptMgr, args: &[Vec<u8>]) -> RespValue {
         b"EXISTS" if args.len() >= 3 => RespValue::Array(
             args[2..]
                 .iter()
-                .map(|sha| {
-                    RespValue::Integer(if mgr.exists(&String::from_utf8_lossy(sha)) {
-                        1
-                    } else {
-                        0
-                    })
-                })
+                .map(|sha| RespValue::Integer(i64::from(mgr.exists(&String::from_utf8_lossy(sha)))))
                 .collect(),
         ),
         b"FLUSH" => {
@@ -162,6 +156,7 @@ pub struct ReplyBus {
 }
 
 impl ReplyBus {
+    #[must_use]
     pub fn new(tx: mpsc::Sender<Reply>, wake_w: RawFd) -> Self {
         ReplyBus {
             tx: Arc::new(tx),
@@ -175,7 +170,7 @@ impl ReplyBus {
         }
         let one = [1u8];
         unsafe {
-            libc::write(self.wake_w, one.as_ptr() as *const libc::c_void, 1);
+            libc::write(self.wake_w, one.as_ptr().cast::<libc::c_void>(), 1);
         }
     }
 }
@@ -183,6 +178,7 @@ impl ReplyBus {
 impl std::fmt::Debug for ReplyBus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReplyBus")
+            .field("tx", &self.tx)
             .field("wake_w", &self.wake_w)
             .finish()
     }
@@ -237,7 +233,7 @@ pub enum ShardMsg {
         db_idx: usize,
         ack: mpsc::Sender<()>,
     },
-    /// Snapshot the (version, existed, db_epoch) of each key, in order. Queued
+    /// Snapshot the (version, existed, `db_epoch`) of each key, in order. Queued
     /// behind an active transaction like a single op. Backs WATCH.
     WatchQuery {
         keys: Vec<Vec<u8>>,
@@ -288,6 +284,7 @@ pub struct ServerEnv {
 }
 
 impl ServerEnv {
+    #[must_use]
     pub fn shard_for_key(&self, key: &[u8]) -> usize {
         shard_for_key(key, self.num_shards)
     }
@@ -296,6 +293,7 @@ impl ServerEnv {
 /// Key indices for a command. Handles movable keys (XREAD/XREADGROUP,
 /// SORT's runtime STORE destination) and numkeys-prefixed keys (LMPOP)
 /// by scanning the argument list.
+#[must_use]
 pub fn extract_keys(cmd: &'static Command, args: &[Vec<u8>]) -> Vec<usize> {
     if cmd.name == "CMS.MERGE" {
         // `CMS.MERGE <dest> <numkeys> <key>... [WEIGHTS w...]`: the
@@ -346,9 +344,10 @@ pub fn extract_keys(cmd: &'static Command, args: &[Vec<u8>]) -> Vec<usize> {
     }
 }
 
-/// Key indices for SORT/SORT_RO: the source key plus the STORE destination
+/// Key indices for `SORT/SORT_RO`: the source key plus the STORE destination
 /// when present (mirrors `CO::STORE_LAST_KEY`). Options are skipped so a GET
 /// pattern argument is never mistaken for a STORE key.
+#[must_use]
 pub fn extract_sort_keys(args: &[Vec<u8>]) -> Vec<usize> {
     let mut keys = vec![1];
     let mut i = 2;
@@ -371,6 +370,7 @@ pub fn extract_sort_keys(args: &[Vec<u8>]) -> Vec<usize> {
 /// Key indices for GEORADIUS / GEORADIUSBYMEMBER: the source key plus the
 /// STORE/STOREDIST destination as the last argument (mirrors `STORE_LAST_KEY`
 /// in `transaction.cc`: the penultimate arg must be STORE/STOREDIST).
+#[must_use]
 pub fn extract_geo_radius_keys(args: &[Vec<u8>]) -> Vec<usize> {
     let mut keys = vec![1];
     if args.len() >= 3 {
@@ -382,6 +382,7 @@ pub fn extract_geo_radius_keys(args: &[Vec<u8>]) -> Vec<usize> {
     keys
 }
 
+#[must_use]
 pub fn extract_movable_keys(args: &[Vec<u8>]) -> Vec<usize> {
     for i in 1..args.len() {
         if args[i].eq_ignore_ascii_case(b"STREAMS") {
@@ -399,6 +400,7 @@ pub fn extract_movable_keys(args: &[Vec<u8>]) -> Vec<usize> {
 /// Key indices for numkeys-prefixed commands (LMPOP/BLMPOP): the `numkeys`
 /// argument at `numkeys_idx` names how many of the following args are keys.
 /// Malformed counts yield an empty range so the executor reports the error.
+#[must_use]
 pub fn extract_numkeys_keys(args: &[Vec<u8>], numkeys_idx: usize) -> Vec<usize> {
     let Some(n) = args
         .get(numkeys_idx)
@@ -451,10 +453,11 @@ pub fn blocking_timeout_ms(cmd: &Command, args: &[Vec<u8>]) -> Option<u64> {
 }
 
 fn secs_to_ms(secs: f64) -> u64 {
-    ((secs * 1000.0) as u64).min(u32::MAX as u64)
+    ((secs * 1000.0) as u64).min(u64::from(u32::MAX))
 }
 
 /// Group key indices by shard.
+#[must_use]
 pub fn keys_per_shard(
     args: &[Vec<u8>],
     keys: &[usize],
@@ -469,17 +472,20 @@ pub fn keys_per_shard(
 }
 
 /// The command for a request.
+#[must_use]
 pub fn command_for(args: &[Vec<u8>]) -> Option<&'static Command> {
     lookup(args.first()?)
 }
 
 /// True for the EVAL family. These run on the coordinator (they own the Lua
 /// interpreter), so they never touch a shard's `run_exec`.
+#[must_use]
 pub fn is_eval_cmd(name: &str) -> bool {
     matches!(name, "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO")
 }
 
 /// Parse the BLOCK timeout in ms from XREAD/XREADGROUP args.
+#[must_use]
 pub fn parse_block_ms(args: &[Vec<u8>]) -> Option<u64> {
     for i in 1..args.len() {
         if args[i].eq_ignore_ascii_case(b"BLOCK") {
@@ -493,6 +499,7 @@ pub fn parse_block_ms(args: &[Vec<u8>]) -> Option<u64> {
 }
 
 /// Encode a `RespValue` to RESP wire bytes.
+#[must_use]
 pub fn encode_value(v: &RespValue) -> Vec<u8> {
     let mut out = Vec::new();
     encode_reply(v, &mut out);
@@ -500,6 +507,7 @@ pub fn encode_value(v: &RespValue) -> Vec<u8> {
 }
 
 /// Encode a command result to RESP wire bytes.
+#[must_use]
 pub fn encode_result(r: CmdResult) -> Vec<u8> {
     encode_value(&r.into_resp_value())
 }

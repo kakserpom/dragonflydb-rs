@@ -20,12 +20,14 @@ pub struct SubscribeInfo {
 }
 
 impl SubscribeInfo {
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.channels.is_empty() && self.patterns.is_empty() && self.sharded.is_empty()
     }
 
     /// Total subscription count reported in subscribe/unsubscribe replies
     /// (`SubscribeInfo::SubscriptionCount`).
+    #[must_use]
     pub fn count(&self) -> usize {
         self.channels.len() + self.patterns.len() + self.sharded.len()
     }
@@ -41,12 +43,16 @@ pub struct ChannelStore {
 }
 
 impl ChannelStore {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn subscribe(&mut self, channel: &[u8], conn: u64) {
-        self.channels.entry(channel.to_vec()).or_default().insert(conn);
+        self.channels
+            .entry(channel.to_vec())
+            .or_default()
+            .insert(conn);
     }
 
     pub fn unsubscribe(&mut self, channel: &[u8], conn: u64) {
@@ -59,7 +65,10 @@ impl ChannelStore {
     }
 
     pub fn psubscribe(&mut self, pattern: &[u8], conn: u64) {
-        self.patterns.entry(pattern.to_vec()).or_default().insert(conn);
+        self.patterns
+            .entry(pattern.to_vec())
+            .or_default()
+            .insert(conn);
     }
 
     pub fn punsubscribe(&mut self, pattern: &[u8], conn: u64) {
@@ -72,7 +81,10 @@ impl ChannelStore {
     }
 
     pub fn ssubscribe(&mut self, channel: &[u8], conn: u64) {
-        self.sharded.entry(channel.to_vec()).or_default().insert(conn);
+        self.sharded
+            .entry(channel.to_vec())
+            .or_default()
+            .insert(conn);
     }
 
     pub fn sunsubscribe(&mut self, channel: &[u8], conn: u64) {
@@ -104,6 +116,7 @@ impl ChannelStore {
     /// first, then pattern subscribers whose pattern matches. A connection
     /// subscribed to both a matching pattern and the channel receives both
     /// pushes (one "message", one "pmessage"), like upstream.
+    #[must_use]
     pub fn subscribers(&self, channel: &[u8]) -> Vec<(u64, Option<Vec<u8>>)> {
         let mut out = Vec::new();
         if let Some(subs) = self.channels.get(channel) {
@@ -121,6 +134,7 @@ impl ChannelStore {
         out
     }
 
+    #[must_use]
     pub fn sharded_subscribers(&self, channel: &[u8]) -> Vec<u64> {
         self.sharded
             .get(channel)
@@ -130,6 +144,7 @@ impl ChannelStore {
 
     /// Active channel names sorted, optionally filtered by `pattern` (empty
     /// means all) — `ChannelStore::ListChannels`.
+    #[must_use]
     pub fn list_channels(&self, pattern: &[u8]) -> Vec<Vec<u8>> {
         let mut v: Vec<Vec<u8>> = self
             .channels
@@ -141,6 +156,7 @@ impl ChannelStore {
         v
     }
 
+    #[must_use]
     pub fn list_sharded_channels(&self, pattern: &[u8]) -> Vec<Vec<u8>> {
         let mut v: Vec<Vec<u8>> = self
             .sharded
@@ -153,6 +169,7 @@ impl ChannelStore {
     }
 
     /// Number of unique active patterns (`ChannelStore::PatternCount`).
+    #[must_use]
     pub fn pattern_count(&self) -> usize {
         self.patterns.len()
     }
@@ -168,6 +185,7 @@ impl ChannelStore {
 
 /// `[action, channel | nil, count]` — one top-level reply per channel of
 /// SUBSCRIBE/UNSUBSCRIBE/PSUBSCRIBE/PUNSUBSCRIBE (`SendSubscriptionChangedResponse`).
+#[must_use]
 pub fn sub_change(action: &str, channel: Option<&[u8]>, count: usize) -> RespValue {
     RespValue::Array(vec![
         RespValue::bulk(action),
@@ -182,7 +200,13 @@ pub fn sub_change(action: &str, channel: Option<&[u8]>, count: usize) -> RespVal
 /// A pushed message. Exact subscribers get `["message", channel, msg]`; pattern
 /// subscribers `["pmessage", pattern, channel, msg]`; shard subscribers
 /// `["smessage", channel, msg]` (`Connection::SendPubMessageAsync`).
-pub fn push_message(pattern: Option<&[u8]>, channel: &[u8], msg: &[u8], sharded: bool) -> RespValue {
+#[must_use]
+pub fn push_message(
+    pattern: Option<&[u8]>,
+    channel: &[u8],
+    msg: &[u8],
+    sharded: bool,
+) -> RespValue {
     let mut v = Vec::with_capacity(4);
     if sharded {
         v.push(RespValue::bulk("smessage"));
@@ -199,6 +223,7 @@ pub fn push_message(pattern: Option<&[u8]>, channel: &[u8], msg: &[u8], sharded:
 
 /// PING while subscribed in RESP2 replies with `["pong", msg]`
 /// (`GenericFamily::Ping`).
+#[must_use]
 pub fn ping_pubsub(msg: &[u8]) -> RespValue {
     RespValue::Array(vec![RespValue::bulk("pong"), RespValue::bulk(msg)])
 }
@@ -415,8 +440,10 @@ mod tests {
         );
         assert_eq!(
             pubsub_command(&b(&["PUBSUB", "BOGUS"]), &store),
-            Err("ERR Unknown subcommand or wrong number of arguments for 'BOGUS'. Try PUBSUB HELP."
-                .to_string())
+            Err(
+                "ERR Unknown subcommand or wrong number of arguments for 'BOGUS'. Try PUBSUB HELP."
+                    .to_string()
+            )
         );
     }
 }

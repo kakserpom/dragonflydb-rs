@@ -1,9 +1,12 @@
 use std::ops::Bound;
 
-use crate::commands::{bulk, integer, Command, OpContext, ShardPart, KeyRange, FLAG_BLOCKING, FLAG_DENYOOM, FLAG_FAST, FLAG_MOVABLEKEYS, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE};
+use crate::commands::{
+    Command, FLAG_BLOCKING, FLAG_DENYOOM, FLAG_FAST, FLAG_MOVABLEKEYS, FLAG_MULTI_KEY,
+    FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext, ShardPart, bulk, integer,
+};
+use crate::core::PrimeValue;
 use crate::core::compact::CompactString;
 use crate::core::stream::{PendingEntry, Stream, StreamId};
-use crate::core::PrimeValue;
 use crate::error::{CmdResult, RespError, RespValue};
 use crate::util::parse_i64;
 use crate::util::parse_u64;
@@ -18,23 +21,34 @@ fn stream_mut<'a>(ctx: &'a mut OpContext, key: &[u8]) -> Result<&'a mut Stream, 
 
 fn ensure_stream<'a>(ctx: &'a mut OpContext, key: &[u8]) -> Result<&'a mut Stream, RespError> {
     if ctx.db.find(key, ctx.now_ms).is_none() {
-        ctx.db.insert(CompactString::from_bytes(key), PrimeValue::Stream(Stream::new()));
+        ctx.db.insert(key, PrimeValue::Stream(Stream::new()));
     }
     stream_mut(ctx, key)
 }
 
 fn parse_stream_id_literal(s: &[u8], missing_seq: u64) -> Result<StreamId, RespError> {
     if s == b"*" {
-        return Err(RespError::new("ERR Invalid stream ID specified as stream command argument"));
+        return Err(RespError::new(
+            "ERR Invalid stream ID specified as stream command argument",
+        ));
     }
     if let Some(idx) = s.iter().position(|&b| b == b'-') {
-        let ms = parse_u64(&s[..idx]).ok_or_else(|| RespError::new("ERR Invalid stream ID specified as stream command argument"))?;
-        let seq = parse_u64(&s[idx + 1..]).ok_or_else(|| RespError::new("ERR Invalid stream ID specified as stream command argument"))?;
+        let ms = parse_u64(&s[..idx]).ok_or_else(|| {
+            RespError::new("ERR Invalid stream ID specified as stream command argument")
+        })?;
+        let seq = parse_u64(&s[idx + 1..]).ok_or_else(|| {
+            RespError::new("ERR Invalid stream ID specified as stream command argument")
+        })?;
         Ok(StreamId { ms, seq })
     } else {
         // Bare "<ms>" is shorthand for "<ms>-<missing_seq>".
-        let ms = parse_u64(s).ok_or_else(|| RespError::new("ERR Invalid stream ID specified as stream command argument"))?;
-        Ok(StreamId { ms, seq: missing_seq })
+        let ms = parse_u64(s).ok_or_else(|| {
+            RespError::new("ERR Invalid stream ID specified as stream command argument")
+        })?;
+        Ok(StreamId {
+            ms,
+            seq: missing_seq,
+        })
     }
 }
 
@@ -42,7 +56,10 @@ fn next_star_id(last: StreamId, now_ms: u64) -> StreamId {
     if now_ms > last.ms {
         StreamId { ms: now_ms, seq: 0 }
     } else {
-        StreamId { ms: last.ms, seq: last.seq + 1 }
+        StreamId {
+            ms: last.ms,
+            seq: last.seq + 1,
+        }
     }
 }
 
@@ -50,28 +67,35 @@ fn parse_xadd_id(s: &[u8], last: StreamId, now_ms: u64) -> Result<StreamId, Resp
     if s == b"*" {
         return Ok(next_star_id(last, now_ms));
     }
-    let idx = s
-        .iter()
-        .position(|&b| b == b'-')
-        .ok_or_else(|| RespError::new("ERR Invalid stream ID specified as stream command argument"))?;
+    let idx = s.iter().position(|&b| b == b'-').ok_or_else(|| {
+        RespError::new("ERR Invalid stream ID specified as stream command argument")
+    })?;
     let ms_str = &s[..idx];
     let seq_str = &s[idx + 1..];
     let ms = if ms_str == b"*" {
         last.ms
     } else {
-        parse_u64(ms_str).ok_or_else(|| RespError::new("ERR Invalid stream ID specified as stream command argument"))?
+        parse_u64(ms_str).ok_or_else(|| {
+            RespError::new("ERR Invalid stream ID specified as stream command argument")
+        })?
     };
     let seq = if seq_str == b"*" {
         if ms < last.ms {
-            return Err(RespError::new("ERR The ID specified in XADD is equal or smaller than the target stream top item"));
+            return Err(RespError::new(
+                "ERR The ID specified in XADD is equal or smaller than the target stream top item",
+            ));
         }
         if ms == last.ms { last.seq + 1 } else { 0 }
     } else {
-        parse_u64(seq_str).ok_or_else(|| RespError::new("ERR Invalid stream ID specified as stream command argument"))?
+        parse_u64(seq_str).ok_or_else(|| {
+            RespError::new("ERR Invalid stream ID specified as stream command argument")
+        })?
     };
     let id = StreamId { ms, seq };
     if id <= last {
-        return Err(RespError::new("ERR The ID specified in XADD is equal or smaller than the target stream top item"));
+        return Err(RespError::new(
+            "ERR The ID specified in XADD is equal or smaller than the target stream top item",
+        ));
     }
     Ok(id)
 }
@@ -96,10 +120,15 @@ fn exec_xadd(ctx: &mut OpContext) -> CmdResult {
             return CmdResult::Err(RespError::syntax());
         }
         match ctx.args[i].to_ascii_uppercase().as_slice() {
-            b"NOMKSTREAM" => { nomkstream = true; i += 1; }
+            b"NOMKSTREAM" => {
+                nomkstream = true;
+                i += 1;
+            }
             b"MAXLEN" => {
                 i += 1;
-                if i < ctx.args.len() && (ctx.args[i] == b"~".to_vec() || ctx.args[i] == b"=".to_vec()) {
+                if i < ctx.args.len()
+                    && (ctx.args[i] == b"~".to_vec() || ctx.args[i] == b"=".to_vec())
+                {
                     i += 1;
                 }
                 if i >= ctx.args.len() {
@@ -113,7 +142,9 @@ fn exec_xadd(ctx: &mut OpContext) -> CmdResult {
             }
             b"MINID" => {
                 i += 1;
-                if i < ctx.args.len() && (ctx.args[i] == b"~".to_vec() || ctx.args[i] == b"=".to_vec()) {
+                if i < ctx.args.len()
+                    && (ctx.args[i] == b"~".to_vec() || ctx.args[i] == b"=".to_vec())
+                {
                     i += 1;
                 }
                 if i >= ctx.args.len() {
@@ -129,8 +160,10 @@ fn exec_xadd(ctx: &mut OpContext) -> CmdResult {
         }
     }
     let fvs = &ctx.args[i..];
-    if fvs.len() < 2 || (fvs.len() - 1) % 2 != 0 {
-        return CmdResult::Err(RespError::new("ERR wrong number of arguments for 'xadd' command"));
+    if fvs.len() < 2 || !(fvs.len() - 1).is_multiple_of(2) {
+        return CmdResult::Err(RespError::new(
+            "ERR wrong number of arguments for 'xadd' command",
+        ));
     }
     let id_arg = fvs[0].as_slice();
 
@@ -149,7 +182,10 @@ fn exec_xadd(ctx: &mut OpContext) -> CmdResult {
     };
     let mut fields = Vec::with_capacity(fvs.len() - 1);
     for pair in fvs[1..].chunks(2) {
-        fields.push((CompactString::from_bytes(&pair[0]), CompactString::from_bytes(&pair[1])));
+        fields.push((
+            CompactString::from_bytes(&pair[0]),
+            CompactString::from_bytes(&pair[1]),
+        ));
     }
     s.append(id, fields);
     if maxlen.is_some() || minid.is_some() {
@@ -230,17 +266,18 @@ fn exec_xrange_common(ctx: &mut OpContext, rev: bool) -> CmdResult {
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::Stream(s)) => {
             let mut out = Vec::new();
-            let it: Box<dyn Iterator<Item = (&StreamId, &crate::core::stream::StreamEntry)>> = if rev {
-                Box::new(s.entries.iter().rev())
-            } else {
-                Box::new(s.entries.iter())
-            };
+            let it: Box<dyn Iterator<Item = (&StreamId, &crate::core::stream::StreamEntry)>> =
+                if rev {
+                    Box::new(s.entries.iter().rev())
+                } else {
+                    Box::new(s.entries.iter())
+                };
             for (eid, e) in it {
                 if *eid < start || *eid > end || e.deleted {
                     continue;
                 }
                 out.push(entry_to_resp(*eid, &e.fields));
-                if count.map(|c| out.len() >= c).unwrap_or(false) {
+                if count.is_some_and(|c| out.len() >= c) {
                     break;
                 }
             }
@@ -297,7 +334,8 @@ fn exec_xtrim(ctx: &mut OpContext) -> CmdResult {
     let (mut maxlen, mut minid) = (None, None);
     match kind.as_slice() {
         b"MAXLEN" => {
-            if i < ctx.args.len() && (ctx.args[i] == b"~".to_vec() || ctx.args[i] == b"=".to_vec()) {
+            if i < ctx.args.len() && (ctx.args[i] == b"~".to_vec() || ctx.args[i] == b"=".to_vec())
+            {
                 i += 1;
             }
             maxlen = Some(match parse_u64(&ctx.args[i]) {
@@ -306,7 +344,8 @@ fn exec_xtrim(ctx: &mut OpContext) -> CmdResult {
             });
         }
         b"MINID" => {
-            if i < ctx.args.len() && (ctx.args[i] == b"~".to_vec() || ctx.args[i] == b"=".to_vec()) {
+            if i < ctx.args.len() && (ctx.args[i] == b"~".to_vec() || ctx.args[i] == b"=".to_vec())
+            {
                 i += 1;
             }
             minid = Some(match parse_stream_id_literal(&ctx.args[i], 0) {
@@ -335,7 +374,7 @@ struct XReadArgs {
     block_ms: Option<u64>,
     /// indices of keys in args
     key_idxs: Vec<usize>,
-    /// id args, parallel to key_idxs
+    /// id args, parallel to `key_idxs`
     id_args: Vec<Vec<u8>>,
 }
 
@@ -352,7 +391,11 @@ fn parse_xread_args(ctx: &OpContext) -> Result<XReadArgs, RespError> {
                 if i + 1 >= args.len() {
                     return Err(RespError::syntax());
                 }
-                count = Some(parse_i64(&args[i + 1]).ok_or_else(RespError::integer)?.max(0) as usize);
+                count = Some(
+                    parse_i64(&args[i + 1])
+                        .ok_or_else(RespError::integer)?
+                        .max(0) as usize,
+                );
                 i += 2;
             }
             b"BLOCK" => {
@@ -377,8 +420,10 @@ fn parse_xread_args(ctx: &OpContext) -> Result<XReadArgs, RespError> {
         return Err(RespError::new("ERR syntax error"));
     };
     let remaining = args.len() - si - 1;
-    if remaining == 0 || remaining % 2 != 0 {
-        return Err(RespError::new("ERR Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified."));
+    if remaining == 0 || !remaining.is_multiple_of(2) {
+        return Err(RespError::new(
+            "ERR Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified.",
+        ));
     }
     let n = remaining / 2;
     let mut key_idxs = Vec::with_capacity(n);
@@ -387,11 +432,21 @@ fn parse_xread_args(ctx: &OpContext) -> Result<XReadArgs, RespError> {
         key_idxs.push(si + 1 + j);
         id_args.push(args[si + 1 + n + j].clone());
     }
-    Ok(XReadArgs { count, block_ms, key_idxs, id_args })
+    Ok(XReadArgs {
+        count,
+        block_ms,
+        key_idxs,
+        id_args,
+    })
 }
 
 /// Read entries after `id` for a single stream key.
-fn read_after(ctx: &mut OpContext, key: &[u8], id: StreamId, count: Option<usize>) -> Result<Vec<(StreamId, Vec<(CompactString, CompactString)>)>, RespError> {
+fn read_after(
+    ctx: &mut OpContext,
+    key: &[u8],
+    id: StreamId,
+    count: Option<usize>,
+) -> Result<Vec<(StreamId, Vec<(CompactString, CompactString)>)>, RespError> {
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::Stream(s)) => {
             let mut out = Vec::new();
@@ -400,7 +455,7 @@ fn read_after(ctx: &mut OpContext, key: &[u8], id: StreamId, count: Option<usize
                     continue;
                 }
                 out.push((*eid, e.fields.clone()));
-                if count.map(|c| out.len() >= c).unwrap_or(false) {
+                if count.is_some_and(|c| out.len() >= c) {
                     break;
                 }
             }
@@ -448,8 +503,10 @@ fn exec_xread(ctx: &mut OpContext) -> CmdResult {
                 if !entries.is_empty() {
                     any = true;
                 }
-                let arr: Vec<RespValue> =
-                    entries.into_iter().map(|(eid, f)| entry_to_resp(eid, &f)).collect();
+                let arr: Vec<RespValue> = entries
+                    .into_iter()
+                    .map(|(eid, f)| entry_to_resp(eid, &f))
+                    .collect();
                 out.push(RespValue::Bulk(key.clone()));
                 out.push(RespValue::Array(arr));
             }
@@ -463,10 +520,9 @@ fn exec_xread(ctx: &mut OpContext) -> CmdResult {
             if parsed.id_args[pos] == b"$" {
                 let last = match ctx.db.find(key, ctx.now_ms) {
                     Some(PrimeValue::Stream(s)) => s.last_entry().copied().unwrap_or(StreamId::MIN),
-                    Some(_) => StreamId::MIN,
-                    None => StreamId::MIN,
+                    _ => StreamId::MIN,
                 };
-                ctx.db.set_stream_watermark(key.to_vec(), last);
+                ctx.db.set_stream_watermark(key.clone(), last);
             }
         }
         return CmdResult::Blocked;
@@ -494,7 +550,9 @@ fn merge_xread(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u64)
                     CmdResult::Ok(RespValue::Array(sub)) => {
                         let pos = p.owned_key_idxs.iter().position(|&k| k == ki).unwrap();
                         if sub.len() < (pos + 1) * 2 {
-                            return CmdResult::Err(RespError::new("ERR internal: bad XREAD shard result"));
+                            return CmdResult::Err(RespError::new(
+                                "ERR internal: bad XREAD shard result",
+                            ));
                         }
                         result.push(sub[pos * 2].clone());
                         result.push(sub[pos * 2 + 1].clone());
@@ -505,7 +563,11 @@ fn merge_xread(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u64)
                         result.push(RespValue::Array(vec![]));
                     }
                     CmdResult::Err(e) => return CmdResult::Err(e.clone()),
-                    _ => return CmdResult::Err(RespError::new("ERR internal: bad XREAD shard result")),
+                    _ => {
+                        return CmdResult::Err(RespError::new(
+                            "ERR internal: bad XREAD shard result",
+                        ));
+                    }
                 }
             }
         }
@@ -543,19 +605,21 @@ fn exec_xreadgroup(ctx: &mut OpContext) -> CmdResult {
                 if i + 1 >= args.len() {
                     return CmdResult::Err(RespError::syntax());
                 }
-                count = Some(match parse_i64(&args[i + 1]) {
-                    Some(v) => v,
-                    None => return CmdResult::Err(RespError::integer()),
-                }.max(0) as usize);
+                count = Some(
+                    match parse_i64(&args[i + 1]) {
+                        Some(v) => v,
+                        None => return CmdResult::Err(RespError::integer()),
+                    }
+                    .max(0) as usize,
+                );
                 i += 2;
             }
             b"BLOCK" => {
                 if i + 1 >= args.len() {
                     return CmdResult::Err(RespError::syntax());
                 }
-                let ms = match parse_i64(&args[i + 1]) {
-                    Some(v) => v,
-                    None => return CmdResult::Err(RespError::integer()),
+                let Some(ms) = parse_i64(&args[i + 1]) else {
+                    return CmdResult::Err(RespError::integer());
                 };
                 if ms < 0 {
                     return CmdResult::Err(RespError::new("ERR timeout is negative"));
@@ -563,7 +627,10 @@ fn exec_xreadgroup(ctx: &mut OpContext) -> CmdResult {
                 block_ms = Some(ms as u64);
                 i += 2;
             }
-            b"NOACK" => { noack = true; i += 1; }
+            b"NOACK" => {
+                noack = true;
+                i += 1;
+            }
             b"STREAMS" => break,
             _ => return CmdResult::Err(RespError::syntax()),
         }
@@ -578,8 +645,10 @@ fn exec_xreadgroup(ctx: &mut OpContext) -> CmdResult {
     }
     let si = i;
     let remaining = args.len() - si - 1;
-    if remaining == 0 || remaining % 2 != 0 {
-        return CmdResult::Err(RespError::new("ERR Unbalanced XREADGROUP list of streams: for each stream key an ID or '$' must be specified."));
+    if remaining == 0 || !remaining.is_multiple_of(2) {
+        return CmdResult::Err(RespError::new(
+            "ERR Unbalanced XREADGROUP list of streams: for each stream key an ID or '$' must be specified.",
+        ));
     }
     let n = remaining / 2;
     let mut key_idxs = Vec::with_capacity(n);
@@ -614,8 +683,10 @@ fn exec_xreadgroup(ctx: &mut OpContext) -> CmdResult {
                         if !entries.is_empty() {
                             any = true;
                         }
-                        let arr: Vec<RespValue> =
-                            entries.into_iter().map(|(eid, f)| entry_to_resp(eid, &f)).collect();
+                        let arr: Vec<RespValue> = entries
+                            .into_iter()
+                            .map(|(eid, f)| entry_to_resp(eid, &f))
+                            .collect();
                         out.push(RespValue::Bulk(key.clone()));
                         out.push(RespValue::Array(arr));
                     }
@@ -687,10 +758,13 @@ fn exec_xpending(ctx: &mut OpContext) -> CmdResult {
         if i + 1 >= ctx.args.len() {
             return CmdResult::Err(RespError::syntax());
         }
-        idle_ms = Some(match parse_i64(&ctx.args[i + 1]) {
-            Some(v) => v,
-            None => return CmdResult::Err(RespError::integer()),
-        }.max(0) as u64);
+        idle_ms = Some(
+            match parse_i64(&ctx.args[i + 1]) {
+                Some(v) => v,
+                None => return CmdResult::Err(RespError::integer()),
+            }
+            .max(0) as u64,
+        );
         i += 2;
     }
     if i < ctx.args.len() {
@@ -706,7 +780,8 @@ fn exec_xpending(ctx: &mut OpContext) -> CmdResult {
         let count = match parse_i64(&ctx.args[i + 2]) {
             Some(v) => v,
             None => return CmdResult::Err(RespError::integer()),
-        }.max(0) as usize;
+        }
+        .max(0) as usize;
         let consumer_filter = if ctx.args.len() > i + 3 {
             Some(CompactString::from_bytes(&ctx.args[i + 3]))
         } else {
@@ -715,19 +790,19 @@ fn exec_xpending(ctx: &mut OpContext) -> CmdResult {
         let now = ctx.now_ms;
         let mut out = Vec::new();
         for (eid, pe) in grp.pel.range(start..=end) {
-            if let Some(cf) = &consumer_filter {
-                if &pe.consumer != cf {
-                    continue;
-                }
+            if let Some(cf) = &consumer_filter
+                && &pe.consumer != cf
+            {
+                continue;
             }
-            if let Some(idle) = idle_ms {
-                if now.saturating_sub(pe.delivery_time) < idle {
-                    continue;
-                }
+            if let Some(idle) = idle_ms
+                && now.saturating_sub(pe.delivery_time) < idle
+            {
+                continue;
             }
             out.push(RespValue::Array(vec![
                 bulk(render_id(eid)),
-                bulk(pe.consumer.as_bytes().to_vec()),
+                bulk(pe.consumer.as_bytes()),
                 integer(now.saturating_sub(pe.delivery_time) as i64),
                 integer(pe.delivery_count as i64),
             ]));
@@ -757,7 +832,7 @@ fn exec_xpending(ctx: &mut OpContext) -> CmdResult {
             .map(|(eid, pe)| {
                 RespValue::Array(vec![
                     bulk(render_id(eid)),
-                    bulk(pe.consumer.as_bytes().to_vec()),
+                    bulk(pe.consumer.as_bytes()),
                     integer(now.saturating_sub(pe.delivery_time) as i64),
                     integer(pe.delivery_count as i64),
                 ])
@@ -766,15 +841,26 @@ fn exec_xpending(ctx: &mut OpContext) -> CmdResult {
     };
     CmdResult::Ok(RespValue::Array(vec![
         integer(grp.pel.len() as i64),
-        if grp.pel.is_empty() { RespValue::Nil } else { bulk(render_id(&min_id)) },
-        if grp.pel.is_empty() { RespValue::Nil } else { bulk(render_id(&max_id)) },
+        if grp.pel.is_empty() {
+            RespValue::Nil
+        } else {
+            bulk(render_id(&min_id))
+        },
+        if grp.pel.is_empty() {
+            RespValue::Nil
+        } else {
+            bulk(render_id(&max_id))
+        },
         RespValue::Array(details),
     ]))
 }
 
 fn parse_group_id_arg(arg: &[u8], stream: &Stream) -> Result<StreamId, RespError> {
     if arg == b"$" {
-        Ok(stream.last_entry().copied().unwrap_or(StreamId { ms: 0, seq: 0 }))
+        Ok(stream
+            .last_entry()
+            .copied()
+            .unwrap_or(StreamId { ms: 0, seq: 0 }))
     } else {
         parse_stream_id_literal(arg, 0)
     }
@@ -803,7 +889,7 @@ fn exec_xgroup(ctx: &mut OpContext) -> CmdResult {
                 ));
             }
             if !key_exists {
-                ctx.db.insert(CompactString::from_bytes(key), PrimeValue::Stream(Stream::new()));
+                ctx.db.insert(key, PrimeValue::Stream(Stream::new()));
             }
             let s = match stream_mut(ctx, key) {
                 Ok(s) => s,
@@ -816,9 +902,9 @@ fn exec_xgroup(ctx: &mut OpContext) -> CmdResult {
             };
             match s.create_group(group, id, mkstream, id_is_dollar) {
                 Ok(()) => CmdResult::Ok(crate::commands::ok()),
-                Err(crate::core::stream::GroupCreateErr::Exists) => {
-                    CmdResult::Err(RespError::new("BUSYGROUP Consumer Group name already exists"))
-                }
+                Err(crate::core::stream::GroupCreateErr::Exists) => CmdResult::Err(RespError::new(
+                    "BUSYGROUP Consumer Group name already exists",
+                )),
                 Err(crate::core::stream::GroupCreateErr::Empty) => CmdResult::Err(RespError::new(
                     "ERR The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use the MKSTREAM option to create an empty stream automatically.",
                 )),
@@ -860,7 +946,7 @@ fn exec_xgroup(ctx: &mut OpContext) -> CmdResult {
                     return CmdResult::Ok(integer(0));
                 }
             };
-            CmdResult::Ok(integer(s.destroy_group(&group) as i64))
+            CmdResult::Ok(integer(i64::from(s.destroy_group(&group))))
         }
         b"DELCONSUMER" => {
             if ctx.args.len() < key_idx + 3 {
@@ -907,7 +993,14 @@ fn exec_xgroup(ctx: &mut OpContext) -> CmdResult {
             if grp.consumers.contains_key(&consumer) {
                 CmdResult::Ok(integer(0))
             } else {
-                grp.consumers.insert(consumer, crate::core::stream::Consumer { seen_time: now, active_time: now, pending: 0 });
+                grp.consumers.insert(
+                    consumer,
+                    crate::core::stream::Consumer {
+                        seen_time: now,
+                        active_time: now,
+                        pending: 0,
+                    },
+                );
                 CmdResult::Ok(integer(1))
             }
         }
@@ -937,8 +1030,8 @@ fn exec_xinfo(ctx: &mut OpContext) -> CmdResult {
                 let fields = &s.entries[id].fields;
                 let mut arr = Vec::with_capacity(fields.len() * 2);
                 for (f, v) in fields {
-                    arr.push(bulk(f.as_bytes().to_vec()));
-                    arr.push(bulk(v.as_bytes().to_vec()));
+                    arr.push(bulk(f.as_bytes()));
+                    arr.push(bulk(v.as_bytes()));
                 }
                 RespValue::Array(vec![bulk(render_id(id)), RespValue::Array(arr)])
             });
@@ -946,23 +1039,33 @@ fn exec_xinfo(ctx: &mut OpContext) -> CmdResult {
                 let fields = &s.entries[id].fields;
                 let mut arr = Vec::with_capacity(fields.len() * 2);
                 for (f, v) in fields {
-                    arr.push(bulk(f.as_bytes().to_vec()));
-                    arr.push(bulk(v.as_bytes().to_vec()));
+                    arr.push(bulk(f.as_bytes()));
+                    arr.push(bulk(v.as_bytes()));
                 }
                 RespValue::Array(vec![bulk(render_id(id)), RespValue::Array(arr)])
             });
             let s = &*s;
             CmdResult::Ok(RespValue::Array(vec![
-                bulk(b"length"), integer(s.length as i64),
-                bulk(b"radix-tree-keys"), integer(0),
-                bulk(b"radix-tree-nodes"), integer(0),
-                bulk(b"last-generated-id"), bulk(render_id(&s.last_id)),
-                bulk(b"max-deleted-entry-id"), bulk(render_id(&s.max_deleted_id)),
-                bulk(b"entries-added"), integer(s.length as i64),
-                bulk(b"recorded-first-entry-id"), bulk(render_id(&StreamId::MIN)),
-                bulk(b"groups"), integer(s.groups.len() as i64),
-                bulk(b"first-entry"), first.unwrap_or(RespValue::Nil),
-                bulk(b"last-entry"), last.unwrap_or(RespValue::Nil),
+                bulk(b"length"),
+                integer(s.length as i64),
+                bulk(b"radix-tree-keys"),
+                integer(0),
+                bulk(b"radix-tree-nodes"),
+                integer(0),
+                bulk(b"last-generated-id"),
+                bulk(render_id(&s.last_id)),
+                bulk(b"max-deleted-entry-id"),
+                bulk(render_id(&s.max_deleted_id)),
+                bulk(b"entries-added"),
+                integer(s.length as i64),
+                bulk(b"recorded-first-entry-id"),
+                bulk(render_id(&StreamId::MIN)),
+                bulk(b"groups"),
+                integer(s.groups.len() as i64),
+                bulk(b"first-entry"),
+                first.unwrap_or(RespValue::Nil),
+                bulk(b"last-entry"),
+                last.unwrap_or(RespValue::Nil),
             ]))
         }
         b"GROUPS" => {
@@ -977,15 +1080,21 @@ fn exec_xinfo(ctx: &mut OpContext) -> CmdResult {
             };
             let mut out = Vec::new();
             let length = s.length;
-            for (name, g) in s.groups.iter() {
+            for (name, g) in &s.groups {
                 let lag = length as i64 - g.entries_read as i64;
                 out.push(RespValue::Array(vec![
-                    bulk(b"name"), bulk(name.as_bytes().to_vec()),
-                    bulk(b"consumers"), integer(g.consumers.len() as i64),
-                    bulk(b"pending"), integer(g.pel.len() as i64),
-                    bulk(b"last-delivered-id"), bulk(render_id(&g.last_delivered)),
-                    bulk(b"entries-read"), integer(g.entries_read as i64),
-                    bulk(b"lag"), integer(lag.max(0)),
+                    bulk(b"name"),
+                    bulk(name.as_bytes()),
+                    bulk(b"consumers"),
+                    integer(g.consumers.len() as i64),
+                    bulk(b"pending"),
+                    integer(g.pel.len() as i64),
+                    bulk(b"last-delivered-id"),
+                    bulk(render_id(&g.last_delivered)),
+                    bulk(b"entries-read"),
+                    integer(g.entries_read as i64),
+                    bulk(b"lag"),
+                    integer(lag.max(0)),
                 ]));
             }
             CmdResult::Ok(RespValue::Array(out))
@@ -1017,7 +1126,12 @@ fn exec_xsetid(ctx: &mut OpContext) -> CmdResult {
             "stream_smaller_deleted The ID specified in XSETID is smaller than current max_deleted_entry_id",
         ));
     }
-    if let Some(top) = s.entries.iter().rev().find(|(_, e)| !e.deleted).map(|(id, _)| *id)
+    if let Some(top) = s
+        .entries
+        .iter()
+        .rev()
+        .find(|(_, e)| !e.deleted)
+        .map(|(id, _)| *id)
         && id < top
     {
         return CmdResult::Err(RespError::new(
@@ -1118,7 +1232,7 @@ fn exec_xclaim(ctx: &mut OpContext) -> CmdResult {
             _ => {
                 return CmdResult::Err(RespError::new(
                     "ERR Unknown argument given for XCLAIM command",
-                ))
+                ));
             }
         }
     }
@@ -1136,7 +1250,7 @@ fn exec_xclaim(ctx: &mut OpContext) -> CmdResult {
     };
     let exists: Vec<bool> = ids
         .iter()
-        .map(|id| s.entries.get(id).map(|e| !e.deleted).unwrap_or(false))
+        .map(|id| s.entries.get(id).is_some_and(|e| !e.deleted))
         .collect();
     let Some(grp) = s.group_mut(&group) else {
         // Missing group: XCLAIM returns an empty array (OpStatus::SKIPPED).
@@ -1164,10 +1278,16 @@ fn exec_xclaim(ctx: &mut OpContext) -> CmdResult {
         if !nack_present && force {
             grp.pel.insert(
                 id,
-                PendingEntry { consumer: CompactString::new(), delivery_time: now, delivery_count: 0 },
+                PendingEntry {
+                    consumer: CompactString::new(),
+                    delivery_time: now,
+                    delivery_count: 0,
+                },
             );
         }
-        let Some(pe) = grp.pel.get_mut(&id) else { continue };
+        let Some(pe) = grp.pel.get_mut(&id) else {
+            continue;
+        };
         if !pe.consumer.is_empty()
             && min_idle_time > 0
             && now.saturating_sub(pe.delivery_time) < min_idle_time
@@ -1214,7 +1334,11 @@ fn exec_xclaim(ctx: &mut OpContext) -> CmdResult {
 // ---------------------------------------------------------------------------
 
 fn parse_autoclaim_start(s: &[u8]) -> Result<StreamId, RespError> {
-    let (exclude, rest) = if s.first() == Some(&b'(') { (true, &s[1..]) } else { (false, s) };
+    let (exclude, rest) = if s.first() == Some(&b'(') {
+        (true, &s[1..])
+    } else {
+        (false, s)
+    };
     let id = if rest == b"-" {
         StreamId::MIN
     } else if rest == b"+" {
@@ -1227,9 +1351,15 @@ fn parse_autoclaim_start(s: &[u8]) -> Result<StreamId, RespError> {
             return Err(RespError::new("invalid start ID for the interval"));
         }
         Ok(if id.seq > 0 {
-            StreamId { ms: id.ms, seq: id.seq - 1 }
+            StreamId {
+                ms: id.ms,
+                seq: id.seq - 1,
+            }
         } else {
-            StreamId { ms: id.ms - 1, seq: u64::MAX }
+            StreamId {
+                ms: id.ms - 1,
+                seq: u64::MAX,
+            }
         })
     } else {
         Ok(id)
@@ -1263,14 +1393,11 @@ fn exec_xautoclaim(ctx: &mut OpContext) -> CmdResult {
         let t = ctx.args[i].to_ascii_uppercase();
         let has_next = i + 1 < ctx.args.len();
         if has_next && t == b"COUNT" {
-            let v = match parse_i64(&ctx.args[i + 1]) {
-                Some(v) => v,
-                None => return CmdResult::Err(RespError::integer()),
+            let Some(v) = parse_i64(&ctx.args[i + 1]) else {
+                return CmdResult::Err(RespError::integer());
             };
             if v <= 0 || v >= CLAIM_COUNT_LIMIT {
-                return CmdResult::Err(RespError::new(
-                    "ERR COUNT must be > 0 and less than 2^18",
-                ));
+                return CmdResult::Err(RespError::new("ERR COUNT must be > 0 and less than 2^18"));
             }
             count = v;
             i += 2;
@@ -1302,7 +1429,7 @@ fn exec_xautoclaim(ctx: &mut OpContext) -> CmdResult {
     let pel_ids: Vec<StreamId> = grp.pel.range(start_id..).map(|(id, _)| *id).collect();
     let exists: Vec<bool> = pel_ids
         .iter()
-        .map(|id| s.entries.get(id).map(|e| !e.deleted).unwrap_or(false))
+        .map(|id| s.entries.get(id).is_some_and(|e| !e.deleted))
         .collect();
     let grp = s.group_mut(&group).unwrap();
     grp.consumer_mut(&consumer, now);
@@ -1317,7 +1444,11 @@ fn exec_xautoclaim(ctx: &mut OpContext) -> CmdResult {
         let id = pel_ids[idx];
         idx += 1;
         let entry_exists = exists[idx - 1];
-        if let Some(pe) = if entry_exists { None } else { grp.pel.remove(&id) } {
+        if let Some(pe) = if entry_exists {
+            None
+        } else {
+            grp.pel.remove(&id)
+        } {
             if let Some(c) = grp.consumers.get_mut(&pe.consumer) {
                 c.pending = c.pending.saturating_sub(1);
             }
@@ -1325,7 +1456,9 @@ fn exec_xautoclaim(ctx: &mut OpContext) -> CmdResult {
             remaining -= 1;
             continue;
         }
-        let Some(pe) = grp.pel.get_mut(&id) else { continue };
+        let Some(pe) = grp.pel.get_mut(&id) else {
+            continue;
+        };
         if min_idle_time > 0 && now.saturating_sub(pe.delivery_time) < min_idle_time {
             continue;
         }
@@ -1351,7 +1484,11 @@ fn exec_xautoclaim(ctx: &mut OpContext) -> CmdResult {
         claimed.push(id);
         remaining -= 1;
     }
-    let end_id = if idx >= pel_ids.len() { StreamId::MIN } else { pel_ids[idx] };
+    let end_id = if idx >= pel_ids.len() {
+        StreamId::MIN
+    } else {
+        pel_ids[idx]
+    };
 
     let claimed_arr = if justid {
         claimed.iter().map(|id| bulk(render_id(id))).collect()
@@ -1361,8 +1498,7 @@ fn exec_xautoclaim(ctx: &mut OpContext) -> CmdResult {
             .map(|id| entry_to_resp(*id, &s.entries[id].fields))
             .collect()
     };
-    let deleted_arr: Vec<RespValue> =
-        deleted.iter().map(|id| bulk(render_id(id))).collect();
+    let deleted_arr: Vec<RespValue> = deleted.iter().map(|id| bulk(render_id(id))).collect();
     CmdResult::Ok(RespValue::Array(vec![
         bulk(render_id(&end_id)),
         RespValue::Array(claimed_arr),
@@ -1435,7 +1571,11 @@ pub static CMD_XGROUP: Command = Command {
     arity: -2,
     flags: FLAG_WRITE | FLAG_DENYOOM,
     // Syntax is XGROUP <subcommand> key [...], so the key is the 3rd argument.
-    key_range: KeyRange { first: 2, last: 2, step: 1 },
+    key_range: KeyRange {
+        first: 2,
+        last: 2,
+        step: 1,
+    },
     exec: exec_xgroup,
     merge: None,
 };
@@ -1468,7 +1608,11 @@ pub static CMD_XINFO: Command = Command {
     arity: -2,
     flags: FLAG_READONLY,
     // Syntax is XINFO <subcommand> key [...], so the key is the 3rd argument.
-    key_range: KeyRange { first: 2, last: 2, step: 1 },
+    key_range: KeyRange {
+        first: 2,
+        last: 2,
+        step: 1,
+    },
     exec: exec_xinfo,
     merge: None,
 };
@@ -1539,24 +1683,30 @@ mod tests {
         let cmd = argv[0].to_ascii_uppercase();
         let (exec, first_key_idx, owned): (crate::commands::ExecFn, usize, Vec<usize>) =
             match cmd.as_slice() {
-            b"XADD" => (exec_xadd, 1, vec![1]),
-            b"XDEL" => (exec_xdel, 1, vec![1]),
-            b"XSETID" => (exec_xsetid, 1, vec![1]),
-            b"XCLAIM" => (exec_xclaim, 1, vec![1]),
-            b"XAUTOCLAIM" => (exec_xautoclaim, 1, vec![1]),
-            b"XPENDING" => (exec_xpending, 1, vec![1]),
-            b"XGROUP" => (exec_xgroup, 2, vec![2]),
-            b"XINFO" => (exec_xinfo, 2, vec![2]),
-            b"XREADGROUP" => {
-                let si = argv
-                    .iter()
-                    .position(|a| a.eq_ignore_ascii_case(b"STREAMS"))
-                    .expect("XREADGROUP without STREAMS");
-                (exec_xreadgroup, 0, vec![si + 1])
-            }
-            _ => panic!("unhandled command {:?}", argv[0]),
+                b"XADD" => (exec_xadd, 1, vec![1]),
+                b"XDEL" => (exec_xdel, 1, vec![1]),
+                b"XSETID" => (exec_xsetid, 1, vec![1]),
+                b"XCLAIM" => (exec_xclaim, 1, vec![1]),
+                b"XAUTOCLAIM" => (exec_xautoclaim, 1, vec![1]),
+                b"XPENDING" => (exec_xpending, 1, vec![1]),
+                b"XGROUP" => (exec_xgroup, 2, vec![2]),
+                b"XINFO" => (exec_xinfo, 2, vec![2]),
+                b"XREADGROUP" => {
+                    let si = argv
+                        .iter()
+                        .position(|a| a.eq_ignore_ascii_case(b"STREAMS"))
+                        .expect("XREADGROUP without STREAMS");
+                    (exec_xreadgroup, 0, vec![si + 1])
+                }
+                _ => panic!("unhandled command {:?}", argv[0]),
+            };
+        let mut ctx = OpContext {
+            db,
+            args: argv,
+            owned_keys: &owned,
+            first_key_idx,
+            now_ms,
         };
-        let mut ctx = OpContext { db, args: argv, owned_keys: &owned, first_key_idx, now_ms };
         exec(&mut ctx)
     }
 
@@ -1565,7 +1715,11 @@ mod tests {
     }
 
     fn cmd_at(db: &mut DbSlice, now_ms: u64, args: &[&[u8]]) -> CmdResult {
-        dispatch_at(db, now_ms, &args.iter().map(|a| a.to_vec()).collect::<Vec<_>>())
+        dispatch_at(
+            db,
+            now_ms,
+            &args.iter().map(|a| a.to_vec()).collect::<Vec<_>>(),
+        )
     }
 
     /// Port of `StreamFamilyTest.Xclaim`.
@@ -1577,52 +1731,130 @@ mod tests {
         cmd(&mut db, &[b"XADD", b"foo", b"1-2", b"k3", b"v3"]);
         cmd(&mut db, &[b"XADD", b"foo", b"1-3", b"k4", b"v4"]);
         cmd(&mut db, &[b"XGROUP", b"CREATE", b"foo", b"group", b"0"]);
-        cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"group", b"alice", b"STREAMS", b"foo", b">"]);
+        cmd(
+            &mut db,
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"group",
+                b"alice",
+                b"STREAMS",
+                b"foo",
+                b">",
+            ],
+        );
 
         // bob claims alice's two pending stream entries.
-        let resp = cmd(&mut db, &[b"XCLAIM", b"foo", b"group", b"bob", b"0", b"1-2", b"1-3"]);
-        assert_eq!(val(resp), arr(vec![
+        let resp = cmd(
+            &mut db,
+            &[b"XCLAIM", b"foo", b"group", b"bob", b"0", b"1-2", b"1-3"],
+        );
+        assert_eq!(
+            val(resp),
+            arr(vec![
                 arr(vec![blk(b"1-2"), arr(vec![blk(b"k3"), blk(b"v3")])]),
                 arr(vec![blk(b"1-3"), arr(vec![blk(b"k4"), blk(b"v4")])]),
             ])
         );
 
         // bob really has these claimed entries.
-        let resp =
-            cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"group", b"bob", b"STREAMS", b"foo", b"0"]);
-        assert_eq!(val(resp), arr(vec![blk(b"foo"), arr(vec![
-                arr(vec![blk(b"1-2"), arr(vec![blk(b"k3"), blk(b"v3")])]),
-                arr(vec![blk(b"1-3"), arr(vec![blk(b"k4"), blk(b"v4")])]),
-            ])])
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"group",
+                b"bob",
+                b"STREAMS",
+                b"foo",
+                b"0",
+            ],
+        );
+        assert_eq!(
+            val(resp),
+            arr(vec![
+                blk(b"foo"),
+                arr(vec![
+                    arr(vec![blk(b"1-2"), arr(vec![blk(b"k3"), blk(b"v3")])]),
+                    arr(vec![blk(b"1-3"), arr(vec![blk(b"k4"), blk(b"v4")])]),
+                ])
+            ])
         );
 
         // alice no longer has those entries.
-        let resp =
-            cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"group", b"alice", b"STREAMS", b"foo", b"0"]);
-        assert_eq!(val(resp), arr(vec![blk(b"foo"), arr(vec![
-                arr(vec![blk(b"1-0"), arr(vec![blk(b"k1"), blk(b"v1")])]),
-                arr(vec![blk(b"1-1"), arr(vec![blk(b"k2"), blk(b"v2")])]),
-            ])])
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"group",
+                b"alice",
+                b"STREAMS",
+                b"foo",
+                b"0",
+            ],
+        );
+        assert_eq!(
+            val(resp),
+            arr(vec![
+                blk(b"foo"),
+                arr(vec![
+                    arr(vec![blk(b"1-0"), arr(vec![blk(b"k1"), blk(b"v1")])]),
+                    arr(vec![blk(b"1-1"), arr(vec![blk(b"k2"), blk(b"v2")])]),
+                ])
+            ])
         );
 
         // xclaim ensures that entries before the min-idle-time are not claimed by bob.
-        let resp = cmd(&mut db, &[b"XCLAIM", b"foo", b"group", b"bob", b"3600000", b"1-0"]);
+        let resp = cmd(
+            &mut db,
+            &[b"XCLAIM", b"foo", b"group", b"bob", b"3600000", b"1-0"],
+        );
         assert_eq!(val(resp), arr(vec![]));
 
         cmd(&mut db, &[b"XADD", b"foo", b"1-4", b"k5", b"v5"]);
-        cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"group", b"alice", b"STREAMS", b"foo", b">"]);
+        cmd(
+            &mut db,
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"group",
+                b"alice",
+                b"STREAMS",
+                b"foo",
+                b">",
+            ],
+        );
         // xclaim returns only claimed ids when justid is set.
-        let resp =
-            cmd(&mut db, &[b"XCLAIM", b"foo", b"group", b"bob", b"0", b"1-0", b"1-4", b"JUSTID"]);
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XCLAIM", b"foo", b"group", b"bob", b"0", b"1-0", b"1-4", b"JUSTID",
+            ],
+        );
         assert_eq!(val(resp), arr(vec![blk(b"1-0"), blk(b"1-4")]));
 
         cmd(&mut db, &[b"XADD", b"foo", b"1-5", b"k6", b"v6"]);
         // bob should claim the id forcefully even if it is not yet present in group pel.
-        let resp =
-            cmd(&mut db, &[b"XCLAIM", b"foo", b"group", b"bob", b"0", b"1-5", b"FORCE", b"JUSTID"]);
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XCLAIM", b"foo", b"group", b"bob", b"0", b"1-5", b"FORCE", b"JUSTID",
+            ],
+        );
         assert_eq!(val(resp), arr(vec![blk(b"1-5")]));
-        let resp =
-            cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"group", b"bob", b"STREAMS", b"foo", b"0"]);
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"group",
+                b"bob",
+                b"STREAMS",
+                b"foo",
+                b"0",
+            ],
+        );
         let bob_pel = match resp {
             CmdResult::Ok(RespValue::Array(v)) => match &v[1] {
                 RespValue::Array(entries) => entries.clone(),
@@ -1630,7 +1862,10 @@ mod tests {
             },
             o => panic!("expected array, got {:?}", o.into_resp_value()),
         };
-        assert_eq!(bob_pel[4], arr(vec![blk(b"1-5"), arr(vec![blk(b"k6"), blk(b"v6")])]));
+        assert_eq!(
+            bob_pel[4],
+            arr(vec![blk(b"1-5"), arr(vec![blk(b"k6"), blk(b"v6")])])
+        );
 
         let now = 2000;
         let time = now - 500;
@@ -1645,58 +1880,102 @@ mod tests {
                 b"0",
                 b"1-4",
                 b"TIME",
-                format!("{}", time).as_bytes(),
+                format!("{time}").as_bytes(),
                 b"JUSTID",
             ],
         );
         assert_eq!(val(resp), arr(vec![blk(b"1-4")]));
 
         // min idle time is exceeded for this entry (idle == 500 < 600).
-        let resp = cmd_at(&mut db, now, &[b"XCLAIM", b"foo", b"group", b"bob", b"600", b"1-4"]);
+        let resp = cmd_at(
+            &mut db,
+            now,
+            &[b"XCLAIM", b"foo", b"group", b"bob", b"600", b"1-4"],
+        );
         assert_eq!(val(resp), arr(vec![]));
 
-        let resp = cmd_at(&mut db, now, &[b"XCLAIM", b"foo", b"group", b"bob", b"400", b"1-4", b"JUSTID"]);
+        let resp = cmd_at(
+            &mut db,
+            now,
+            &[
+                b"XCLAIM", b"foo", b"group", b"bob", b"400", b"1-4", b"JUSTID",
+            ],
+        );
         assert_eq!(val(resp), arr(vec![blk(b"1-4")]));
 
         // test RETRYCOUNT.
         cmd(&mut db, &[b"XADD", b"foo", b"1-6", b"k7", b"v7"]);
-        let resp = cmd(&mut db, &[
-            b"XCLAIM",
-            b"foo",
-            b"group",
-            b"bob",
-            b"0",
-            b"1-6",
-            b"FORCE",
-            b"JUSTID",
-            b"RETRYCOUNT",
-            b"5",
-        ]);
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XCLAIM",
+                b"foo",
+                b"group",
+                b"bob",
+                b"0",
+                b"1-6",
+                b"FORCE",
+                b"JUSTID",
+                b"RETRYCOUNT",
+                b"5",
+            ],
+        );
         assert_eq!(val(resp), arr(vec![blk(b"1-6")]));
-        let resp = cmd(&mut db, &[b"XPENDING", b"foo", b"group", b"1-6", b"1-6", b"1"]);
+        let resp = cmd(
+            &mut db,
+            &[b"XPENDING", b"foo", b"group", b"1-6", b"1-6", b"1"],
+        );
         let pending = arr_of(resp);
         assert_eq!(
             pending[0],
-            arr(vec![blk(b"1-6"), blk(b"bob"), RespValue::Integer(0), RespValue::Integer(5)])
+            arr(vec![
+                blk(b"1-6"),
+                blk(b"bob"),
+                RespValue::Integer(0),
+                RespValue::Integer(5)
+            ])
         );
 
         // test LASTID.
-        cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"group", b"bob", b"COUNT", b"2", b"STREAMS", b"foo", b">"]);
-        cmd(&mut db, &[b"XCLAIM", b"foo", b"group", b"alice", b"0", b"1-6", b"LASTID", b"1-4"]);
+        cmd(
+            &mut db,
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"group",
+                b"bob",
+                b"COUNT",
+                b"2",
+                b"STREAMS",
+                b"foo",
+                b">",
+            ],
+        );
+        cmd(
+            &mut db,
+            &[
+                b"XCLAIM", b"foo", b"group", b"alice", b"0", b"1-6", b"LASTID", b"1-4",
+            ],
+        );
         let resp = cmd(&mut db, &[b"XINFO", b"GROUPS", b"foo"]);
         let groups = arr_of(resp);
         let g = match &groups[0] {
             RespValue::Array(v) => v.clone(),
-            o => panic!("expected array, got {:?}", o),
+            o => panic!("expected array, got {o:?}"),
         };
         assert_eq!(g[7], blk(b"1-6"));
 
-        cmd(&mut db, &[b"XCLAIM", b"foo", b"group", b"bob", b"0", b"1-6", b"LASTID", b"1-9"]);
+        cmd(
+            &mut db,
+            &[
+                b"XCLAIM", b"foo", b"group", b"bob", b"0", b"1-6", b"LASTID", b"1-9",
+            ],
+        );
         let resp = cmd(&mut db, &[b"XINFO", b"GROUPS", b"foo"]);
         let groups = arr_of(resp);
         let g = match &groups[0] {
             RespValue::Array(v) => v.clone(),
-            o => panic!("expected array, got {:?}", o),
+            o => panic!("expected array, got {o:?}"),
         };
         assert_eq!(g[7], blk(b"1-9"));
     }
@@ -1710,11 +1989,27 @@ mod tests {
         cmd(&mut db, &[b"XADD", b"foo", b"1-2", b"k3", b"v3"]);
         cmd(&mut db, &[b"XADD", b"foo", b"1-3", b"k4", b"v4"]);
         cmd(&mut db, &[b"XGROUP", b"CREATE", b"foo", b"group", b"0"]);
-        cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"group", b"alice", b"STREAMS", b"foo", b">"]);
+        cmd(
+            &mut db,
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"group",
+                b"alice",
+                b"STREAMS",
+                b"foo",
+                b">",
+            ],
+        );
 
         // bob claims alice's two pending stream entries.
-        let resp = cmd(&mut db, &[b"XAUTOCLAIM", b"foo", b"group", b"bob", b"0", b"1-2"]);
-        assert_eq!(val(resp), arr(vec![
+        let resp = cmd(
+            &mut db,
+            &[b"XAUTOCLAIM", b"foo", b"group", b"bob", b"0", b"1-2"],
+        );
+        assert_eq!(
+            val(resp),
+            arr(vec![
                 blk(b"0-0"),
                 arr(vec![
                     arr(vec![blk(b"1-2"), arr(vec![blk(b"k3"), blk(b"v3")])]),
@@ -1725,63 +2020,195 @@ mod tests {
         );
 
         // bob really has these claimed entries.
-        let resp =
-            cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"group", b"bob", b"STREAMS", b"foo", b"0"]);
-        assert_eq!(val(resp), arr(vec![blk(b"foo"), arr(vec![
-                arr(vec![blk(b"1-2"), arr(vec![blk(b"k3"), blk(b"v3")])]),
-                arr(vec![blk(b"1-3"), arr(vec![blk(b"k4"), blk(b"v4")])]),
-            ])])
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"group",
+                b"bob",
+                b"STREAMS",
+                b"foo",
+                b"0",
+            ],
+        );
+        assert_eq!(
+            val(resp),
+            arr(vec![
+                blk(b"foo"),
+                arr(vec![
+                    arr(vec![blk(b"1-2"), arr(vec![blk(b"k3"), blk(b"v3")])]),
+                    arr(vec![blk(b"1-3"), arr(vec![blk(b"k4"), blk(b"v4")])]),
+                ])
+            ])
         );
 
         // alice no longer has those entries.
-        let resp =
-            cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"group", b"alice", b"STREAMS", b"foo", b"0"]);
-        assert_eq!(val(resp), arr(vec![blk(b"foo"), arr(vec![
-                arr(vec![blk(b"1-0"), arr(vec![blk(b"k1"), blk(b"v1")])]),
-                arr(vec![blk(b"1-1"), arr(vec![blk(b"k2"), blk(b"v2")])]),
-            ])])
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"group",
+                b"alice",
+                b"STREAMS",
+                b"foo",
+                b"0",
+            ],
+        );
+        assert_eq!(
+            val(resp),
+            arr(vec![
+                blk(b"foo"),
+                arr(vec![
+                    arr(vec![blk(b"1-0"), arr(vec![blk(b"k1"), blk(b"v1")])]),
+                    arr(vec![blk(b"1-1"), arr(vec![blk(b"k2"), blk(b"v2")])]),
+                ])
+            ])
         );
 
         // xautoclaim ensures that entries before the min-idle-time are not claimed by bob.
-        let resp = cmd(&mut db, &[b"XAUTOCLAIM", b"foo", b"group", b"bob", b"3600000", b"0-0"]);
-        assert_eq!(val(resp), arr(vec![blk(b"0-0"), arr(vec![]), arr(vec![])])
+        let resp = cmd(
+            &mut db,
+            &[b"XAUTOCLAIM", b"foo", b"group", b"bob", b"3600000", b"0-0"],
         );
+        assert_eq!(val(resp), arr(vec![blk(b"0-0"), arr(vec![]), arr(vec![])]));
 
         cmd(&mut db, &[b"XADD", b"foo", b"1-4", b"k5", b"v5"]);
-        cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"group", b"alice", b"STREAMS", b"foo", b">"]);
+        cmd(
+            &mut db,
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"group",
+                b"alice",
+                b"STREAMS",
+                b"foo",
+                b">",
+            ],
+        );
         // xautoclaim returns only claimed ids when justid is set.
-        let resp = cmd(&mut db, &[b"XAUTOCLAIM", b"foo", b"group", b"bob", b"0", b"0-0", b"JUSTID"]);
-        assert_eq!(val(resp), arr(vec![
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XAUTOCLAIM",
+                b"foo",
+                b"group",
+                b"bob",
+                b"0",
+                b"0-0",
+                b"JUSTID",
+            ],
+        );
+        assert_eq!(
+            val(resp),
+            arr(vec![
                 blk(b"0-0"),
-                arr(vec![blk(b"1-0"), blk(b"1-1"), blk(b"1-2"), blk(b"1-3"), blk(b"1-4")]),
+                arr(vec![
+                    blk(b"1-0"),
+                    blk(b"1-1"),
+                    blk(b"1-2"),
+                    blk(b"1-3"),
+                    blk(b"1-4")
+                ]),
                 arr(vec![]),
             ])
         );
 
         cmd(&mut db, &[b"XADD", b"foo", b"1-5", b"k6", b"v6"]);
         cmd(&mut db, &[b"XADD", b"foo", b"1-6", b"k7", b"v7"]);
-        cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"group", b"alice", b"STREAMS", b"foo", b">"]);
+        cmd(
+            &mut db,
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"group",
+                b"alice",
+                b"STREAMS",
+                b"foo",
+                b">",
+            ],
+        );
         // test count and end_id.
-        let resp =
-            cmd(&mut db, &[b"XAUTOCLAIM", b"foo", b"group", b"bob", b"0", b"1-5", b"COUNT", b"1", b"JUSTID"]);
-        assert_eq!(val(resp), arr(vec![blk(b"1-6"), arr(vec![blk(b"1-5")]), arr(vec![])])
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XAUTOCLAIM",
+                b"foo",
+                b"group",
+                b"bob",
+                b"0",
+                b"1-5",
+                b"COUNT",
+                b"1",
+                b"JUSTID",
+            ],
+        );
+        assert_eq!(
+            val(resp),
+            arr(vec![blk(b"1-6"), arr(vec![blk(b"1-5")]), arr(vec![])])
         );
 
-        let resp =
-            cmd(&mut db, &[b"XAUTOCLAIM", b"foo", b"group", b"bob", b"0", b"1-6", b"COUNT", b"1", b"JUSTID"]);
-        assert_eq!(val(resp), arr(vec![blk(b"0-0"), arr(vec![blk(b"1-6")]), arr(vec![])])
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XAUTOCLAIM",
+                b"foo",
+                b"group",
+                b"bob",
+                b"0",
+                b"1-6",
+                b"COUNT",
+                b"1",
+                b"JUSTID",
+            ],
+        );
+        assert_eq!(
+            val(resp),
+            arr(vec![blk(b"0-0"), arr(vec![blk(b"1-6")]), arr(vec![])])
         );
 
-        let resp =
-            cmd(&mut db, &[b"XAUTOCLAIM", b"foo", b"group", b"bob", b"0", b"1-10", b"COUNT", b"1", b"JUSTID"]);
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XAUTOCLAIM",
+                b"foo",
+                b"group",
+                b"bob",
+                b"0",
+                b"1-10",
+                b"COUNT",
+                b"1",
+                b"JUSTID",
+            ],
+        );
         assert_eq!(val(resp), arr(vec![blk(b"0-0"), arr(vec![]), arr(vec![])]));
 
         // if a message being claimed is deleted, it should be listed separately.
         cmd(&mut db, &[b"XDEL", b"foo", b"1-2", b"1-4"]);
-        let resp = cmd(&mut db, &[b"XAUTOCLAIM", b"foo", b"group", b"alice", b"0", b"0-0", b"JUSTID"]);
-        assert_eq!(val(resp), arr(vec![
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XAUTOCLAIM",
+                b"foo",
+                b"group",
+                b"alice",
+                b"0",
+                b"0-0",
+                b"JUSTID",
+            ],
+        );
+        assert_eq!(
+            val(resp),
+            arr(vec![
                 blk(b"0-0"),
-                arr(vec![blk(b"1-0"), blk(b"1-1"), blk(b"1-3"), blk(b"1-5"), blk(b"1-6")]),
+                arr(vec![
+                    blk(b"1-0"),
+                    blk(b"1-1"),
+                    blk(b"1-3"),
+                    blk(b"1-5"),
+                    blk(b"1-6")
+                ]),
                 arr(vec![blk(b"1-2"), blk(b"1-4")]),
             ])
         );
@@ -1792,38 +2219,91 @@ mod tests {
     fn autoclaim_pel_items_from_another_consumer() {
         let mut db = DbSlice::new(0);
         let mut now = 0u64;
-        let id1 = bulk_of(cmd_at(&mut db, now, &[b"XADD", b"mystream", b"*", b"a", b"1"]));
-        let id2 = bulk_of(cmd_at(&mut db, now, &[b"XADD", b"mystream", b"*", b"b", b"2"]));
-        let id3 = bulk_of(cmd_at(&mut db, now, &[b"XADD", b"mystream", b"*", b"c", b"3"]));
-        let id4 = bulk_of(cmd_at(&mut db, now, &[b"XADD", b"mystream", b"*", b"d", b"4"]));
-        cmd(&mut db, &[b"XGROUP", b"CREATE", b"mystream", b"mygroup", b"0"]);
+        let id1 = bulk_of(cmd_at(
+            &mut db,
+            now,
+            &[b"XADD", b"mystream", b"*", b"a", b"1"],
+        ));
+        let id2 = bulk_of(cmd_at(
+            &mut db,
+            now,
+            &[b"XADD", b"mystream", b"*", b"b", b"2"],
+        ));
+        let id3 = bulk_of(cmd_at(
+            &mut db,
+            now,
+            &[b"XADD", b"mystream", b"*", b"c", b"3"],
+        ));
+        let id4 = bulk_of(cmd_at(
+            &mut db,
+            now,
+            &[b"XADD", b"mystream", b"*", b"d", b"4"],
+        ));
+        cmd(
+            &mut db,
+            &[b"XGROUP", b"CREATE", b"mystream", b"mygroup", b"0"],
+        );
 
         let resp = cmd_at(
             &mut db,
             now,
-            &[b"XREADGROUP", b"GROUP", b"mygroup", b"consumer1", b"COUNT", b"1", b"STREAMS", b"mystream", b">"],
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"mygroup",
+                b"consumer1",
+                b"COUNT",
+                b"1",
+                b"STREAMS",
+                b"mystream",
+                b">",
+            ],
         );
-        assert_eq!(val(resp), arr(vec![blk(b"mystream"), arr(vec![arr(vec![
-                blk(&id1),
-                arr(vec![blk(b"a"), blk(b"1")]),
-            ])])])
+        assert_eq!(
+            val(resp),
+            arr(vec![
+                blk(b"mystream"),
+                arr(vec![arr(vec![blk(&id1), arr(vec![blk(b"a"), blk(b"1")]),])])
+            ])
         );
 
         now += 200;
         let resp = cmd_at(
             &mut db,
             now,
-            &[b"XAUTOCLAIM", b"mystream", b"mygroup", b"consumer2", b"10", b"-", b"COUNT", b"1"],
+            &[
+                b"XAUTOCLAIM",
+                b"mystream",
+                b"mygroup",
+                b"consumer2",
+                b"10",
+                b"-",
+                b"COUNT",
+                b"1",
+            ],
         );
         let v = arr_of(resp);
         assert_eq!(v[0], blk(b"0-0"));
-        assert_eq!(v[1], arr(vec![arr(vec![blk(&id1), arr(vec![blk(b"a"), blk(b"1")])])]));
+        assert_eq!(
+            v[1],
+            arr(vec![arr(vec![blk(&id1), arr(vec![blk(b"a"), blk(b"1")])])])
+        );
         assert_eq!(v[2], arr(vec![]));
 
         cmd_at(
             &mut db,
             now,
-            &[b"XREADGROUP", b"GROUP", b"mygroup", b"consumer1", b"COUNT", b"3", b"STREAMS", b"mystream", b">"],
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"mygroup",
+                b"consumer1",
+                b"COUNT",
+                b"3",
+                b"STREAMS",
+                b"mystream",
+                b">",
+            ],
         );
         now += 200;
 
@@ -1832,7 +2312,16 @@ mod tests {
         let resp = cmd_at(
             &mut db,
             now,
-            &[b"XAUTOCLAIM", b"mystream", b"mygroup", b"consumer2", b"10", b"-", b"COUNT", b"3"],
+            &[
+                b"XAUTOCLAIM",
+                b"mystream",
+                b"mygroup",
+                b"consumer2",
+                b"10",
+                b"-",
+                b"COUNT",
+                b"3",
+            ],
         );
         let v = arr_of(resp);
         assert_eq!(v[0], blk(&id4));
@@ -1851,9 +2340,19 @@ mod tests {
         let resp = cmd_at(
             &mut db,
             now,
-            &[b"XAUTOCLAIM", b"mystream", b"mygroup", b"consumer2", b"10", b"-", b"JUSTID"],
+            &[
+                b"XAUTOCLAIM",
+                b"mystream",
+                b"mygroup",
+                b"consumer2",
+                b"10",
+                b"-",
+                b"JUSTID",
+            ],
         );
-        assert_eq!(val(resp), arr(vec![
+        assert_eq!(
+            val(resp),
+            arr(vec![
                 blk(b"0-0"),
                 arr(vec![blk(&id1), blk(&id3)]),
                 arr(vec![blk(&id4)]),
@@ -1869,30 +2368,102 @@ mod tests {
         cmd(&mut db, &[b"XADD", b"x", b"2-0", b"f", b"v"]);
         cmd(&mut db, &[b"XADD", b"x", b"3-0", b"f", b"v"]);
         cmd(&mut db, &[b"XGROUP", b"CREATE", b"x", b"grp", b"0"]);
-        cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"grp", b"Alice", b"STREAMS", b"x", b">"]);
+        cmd(
+            &mut db,
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"grp",
+                b"Alice",
+                b"STREAMS",
+                b"x",
+                b">",
+            ],
+        );
 
         cmd(&mut db, &[b"XDEL", b"x", b"1-0"]);
         cmd(&mut db, &[b"XDEL", b"x", b"2-0"]);
 
-        let resp = cmd(&mut db, &[b"XAUTOCLAIM", b"x", b"grp", b"Bob", b"0", b"0-0", b"COUNT", b"1"]);
-        assert_eq!(val(resp), arr(vec![blk(b"2-0"), arr(vec![]), arr(vec![blk(b"1-0")])]));
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XAUTOCLAIM",
+                b"x",
+                b"grp",
+                b"Bob",
+                b"0",
+                b"0-0",
+                b"COUNT",
+                b"1",
+            ],
+        );
+        assert_eq!(
+            val(resp),
+            arr(vec![blk(b"2-0"), arr(vec![]), arr(vec![blk(b"1-0")])])
+        );
 
-        let resp = cmd(&mut db, &[b"XAUTOCLAIM", b"x", b"grp", b"Bob", b"0", b"2-0", b"COUNT", b"1"]);
-        assert_eq!(val(resp), arr(vec![blk(b"3-0"), arr(vec![]), arr(vec![blk(b"2-0")])]));
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XAUTOCLAIM",
+                b"x",
+                b"grp",
+                b"Bob",
+                b"0",
+                b"2-0",
+                b"COUNT",
+                b"1",
+            ],
+        );
+        assert_eq!(
+            val(resp),
+            arr(vec![blk(b"3-0"), arr(vec![]), arr(vec![blk(b"2-0")])])
+        );
 
-        let resp = cmd(&mut db, &[b"XAUTOCLAIM", b"x", b"grp", b"Bob", b"0", b"3-0", b"COUNT", b"1"]);
-        assert_eq!(val(resp), arr(vec![
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XAUTOCLAIM",
+                b"x",
+                b"grp",
+                b"Bob",
+                b"0",
+                b"3-0",
+                b"COUNT",
+                b"1",
+            ],
+        );
+        assert_eq!(
+            val(resp),
+            arr(vec![
                 blk(b"0-0"),
-                arr(vec![arr(vec![blk(b"3-0"), arr(vec![blk(b"f"), blk(b"v")])])]),
+                arr(vec![arr(vec![
+                    blk(b"3-0"),
+                    arr(vec![blk(b"f"), blk(b"v")])
+                ])]),
                 arr(vec![]),
             ])
         );
 
-        let resp = cmd(&mut db, &[b"XPENDING", b"x", b"grp", b"-", b"+", b"10", b"Alice"]);
+        let resp = cmd(
+            &mut db,
+            &[b"XPENDING", b"x", b"grp", b"-", b"+", b"10", b"Alice"],
+        );
         assert_eq!(val(resp), arr(vec![]));
 
-        let resp =
-            cmd(&mut db, &[b"XAUTOCLAIM", b"x", b"grp", b"Bob", b"0", b"3-0", b"COUNT", b"704505322"]);
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XAUTOCLAIM",
+                b"x",
+                b"grp",
+                b"Bob",
+                b"0",
+                b"3-0",
+                b"COUNT",
+                b"704505322",
+            ],
+        );
         assert!(err_of(resp).contains("COUNT"));
     }
 
@@ -1900,39 +2471,54 @@ mod tests {
     #[test]
     fn xclaim_with_nonexistent_group() {
         let mut db = DbSlice::new(0);
-        cmd(&mut db, &[b"XADD", b"mystream", b"1-0", b"field1", b"value1"]);
-        cmd(&mut db, &[b"XADD", b"mystream", b"1-1", b"field2", b"value2"]);
+        cmd(
+            &mut db,
+            &[b"XADD", b"mystream", b"1-0", b"field1", b"value1"],
+        );
+        cmd(
+            &mut db,
+            &[b"XADD", b"mystream", b"1-1", b"field2", b"value2"],
+        );
 
-        let resp = cmd(&mut db, &[
-            b"XCLAIM",
-            b"mystream",
-            b"nonexistent-group",
-            b"consumer1",
-            b"0",
-            b"1-0",
-        ]);
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XCLAIM",
+                b"mystream",
+                b"nonexistent-group",
+                b"consumer1",
+                b"0",
+                b"1-0",
+            ],
+        );
         assert_eq!(val(resp), arr(vec![]));
 
-        let resp = cmd(&mut db, &[
-            b"XCLAIM",
-            b"mystream",
-            b"nonexistent-group",
-            b"consumer1",
-            b"0",
-            b"1-0",
-            b"1-1",
-        ]);
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XCLAIM",
+                b"mystream",
+                b"nonexistent-group",
+                b"consumer1",
+                b"0",
+                b"1-0",
+                b"1-1",
+            ],
+        );
         assert_eq!(val(resp), arr(vec![]));
 
-        let resp = cmd(&mut db, &[
-            b"XCLAIM",
-            b"mystream",
-            b"nonexistent-group",
-            b"consumer1",
-            b"0",
-            b"1-0",
-            b"JUSTID",
-        ]);
+        let resp = cmd(
+            &mut db,
+            &[
+                b"XCLAIM",
+                b"mystream",
+                b"nonexistent-group",
+                b"consumer1",
+                b"0",
+                b"1-0",
+                b"JUSTID",
+            ],
+        );
         assert_eq!(val(resp), arr(vec![]));
     }
 
@@ -1966,8 +2552,14 @@ mod tests {
     fn xautoclaim_empty_consumer() {
         let mut db = DbSlice::new(0);
         cmd(&mut db, &[b"XADD", b"stream4", b"*", b"field", b"val1"]);
-        cmd(&mut db, &[b"XGROUP", b"CREATE", b"stream4", b"group2", b"0"]);
-        let resp = cmd(&mut db, &[b"XAUTOCLAIM", b"stream4", b"group2", b"", b"0", b"0-0"]);
+        cmd(
+            &mut db,
+            &[b"XGROUP", b"CREATE", b"stream4", b"group2", b"0"],
+        );
+        let resp = cmd(
+            &mut db,
+            &[b"XAUTOCLAIM", b"stream4", b"group2", b"", b"0", b"0-0"],
+        );
         assert!(matches!(resp, CmdResult::Err(_)));
     }
 }

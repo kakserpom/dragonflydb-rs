@@ -18,10 +18,11 @@ const INTSET_ENC_INT64: usize = 8;
 const HEADER: usize = 8;
 
 /// The encoding width (2/4/8) required to represent `v`.
+#[must_use]
 pub fn value_encoding(v: i64) -> usize {
-    if v < i32::MIN as i64 || v > i32::MAX as i64 {
+    if v < i64::from(i32::MIN) || v > i64::from(i32::MAX) {
         INTSET_ENC_INT64
-    } else if v < i16::MIN as i64 || v > i16::MAX as i64 {
+    } else if v < i64::from(i16::MIN) || v > i64::from(i16::MAX) {
         INTSET_ENC_INT32
     } else {
         INTSET_ENC_INT16
@@ -32,6 +33,7 @@ pub fn value_encoding(v: i64) -> usize {
 ///
 /// Accepts `"0"`, optional leading `-`, digits with no leading zeros and no
 /// trailing garbage, within `[i64::MIN, i64::MAX]`.
+#[must_use]
 pub fn string2ll(s: &[u8]) -> Option<i64> {
     if s.is_empty() {
         return None;
@@ -50,13 +52,13 @@ pub fn string2ll(s: &[u8]) -> Option<i64> {
     if !s[i].is_ascii_digit() || s[i] == b'0' {
         return None;
     }
-    let mut v: u64 = (s[i] - b'0') as u64;
+    let mut v: u64 = u64::from(s[i] - b'0');
     i += 1;
     while i < s.len() {
         if !s[i].is_ascii_digit() {
             return None;
         }
-        let d = (s[i] - b'0') as u64;
+        let d = u64::from(s[i] - b'0');
         v = v.checked_mul(10).and_then(|x| x.checked_add(d))?;
         i += 1;
     }
@@ -85,8 +87,8 @@ fn read_value(buf: &[u8], enc: usize, i: usize) -> i64 {
     let mut b = [0u8; 8];
     b[..enc].copy_from_slice(slice);
     match enc {
-        INTSET_ENC_INT16 => i16::from_le_bytes([b[0], b[1]]) as i64,
-        INTSET_ENC_INT32 => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64,
+        INTSET_ENC_INT16 => i64::from(i16::from_le_bytes([b[0], b[1]])),
+        INTSET_ENC_INT32 => i64::from(i32::from_le_bytes([b[0], b[1], b[2], b[3]])),
         _ => i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
     }
 }
@@ -96,6 +98,7 @@ fn read_value(buf: &[u8], enc: usize, i: usize) -> i64 {
 /// `deep` additionally checks strictly-ascending records (no duplicates, no
 /// out-of-order). An empty intset is rejected (the reference considers
 /// `count == 0` invalid).
+#[must_use]
 pub fn validate_integrity(buf: &[u8], deep: bool) -> bool {
     if buf.len() < HEADER {
         return false;
@@ -127,6 +130,7 @@ pub fn validate_integrity(buf: &[u8], deep: bool) -> bool {
 
 /// Decode all records of a validated intset blob. Returns `None` on any
 /// integrity violation.
+#[must_use]
 pub fn values(buf: &[u8]) -> Option<Vec<i64>> {
     if !validate_integrity(buf, true) {
         return None;
@@ -161,6 +165,7 @@ pub fn build<I: IntoIterator<Item = i64>>(values: I) -> Vec<u8> {
 }
 
 /// Number of records in a (validated) intset blob.
+#[must_use]
 pub fn len(buf: &[u8]) -> Option<usize> {
     if buf.len() < HEADER {
         return None;
@@ -198,11 +203,11 @@ mod tests {
         assert!(validate_integrity(&blob, true));
         assert_eq!(values(&blob), Some(vec![1, 2, 3]));
 
-        let blob = build([-5i64, 200000, -200000, 1000]);
+        let blob = build([-5i64, 200_000, -200_000, 1000]);
         // 200000 does not fit i16, so encoding must be INT32.
         assert_eq!(u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]), 4);
         assert!(validate_integrity(&blob, true));
-        assert_eq!(values(&blob), Some(vec![-200000, -5, 1000, 200000]));
+        assert_eq!(values(&blob), Some(vec![-200_000, -5, 1000, 200_000]));
 
         let blob = build([i64::MAX, i64::MIN]);
         assert_eq!(u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]), 8);
