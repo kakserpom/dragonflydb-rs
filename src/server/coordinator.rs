@@ -66,8 +66,9 @@ struct Coordinator {
     /// script runs (the dispatch context borrows the whole `Coordinator`).
     sandbox: Option<SandboxedInterpreter>,
     /// Libraries already loaded into `sandbox`, keyed by library name with the
-    /// loaded sha (so FUNCTION LOAD REPLACE invalidates the cached callbacks).
-    loaded_libs: HashMap<String, String>,
+    /// loaded sha and its function names (so `FUNCTION LOAD REPLACE` invalidates
+    /// the cached callbacks and purges names the new version dropped).
+    loaded_libs: HashMap<String, (String, Vec<String>)>,
     tx_counter: u64,
     pending: VecDeque<PendingTx>,
 }
@@ -397,7 +398,7 @@ impl Coordinator {
         let keys: Vec<Vec<u8>> = key_idxs.iter().map(|&i| args[i].clone()).collect();
         let argv: Vec<Vec<u8>> = args[3 + numkeys..].to_vec();
 
-        let (lib, func) = {
+        let (lib, func, to_purge) = {
             let mgr = self.script_mgr.lock().unwrap();
             let Some(lib) = mgr.function_lib(&name) else {
                 return CmdResult::err("ERR Function not found");
@@ -405,7 +406,21 @@ impl Coordinator {
             let Some(func) = lib.functions.iter().find(|f| f.name == name) else {
                 return CmdResult::err("ERR Function not found");
             };
-            (lib.clone(), func.clone())
+            // Callbacks of the previously loaded version that are no longer
+            // registered anywhere (a REPLACE dropping them). Names still owned
+            // by this or another library are left alone.
+            let to_purge: Vec<String> = self
+                .loaded_libs
+                .get(&lib.name)
+                .map(|(_, old_names)| {
+                    old_names
+                        .iter()
+                        .filter(|n| mgr.function_lib(n).is_none())
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            (lib.clone(), func.clone(), to_purge)
         };
         // `no-writes` (header or per-function) forces the read-only path.
         let read_only =
@@ -422,12 +437,18 @@ impl Coordinator {
         let Some(sandbox) = self.sandbox.take() else {
             return CmdResult::err("ERR internal: no script interpreter");
         };
-        if self.loaded_libs.get(&lib.name) != Some(&lib.sha) {
-            if let Err(e) = sandbox.load_function_lib(&lib.code) {
-                self.sandbox = Some(sandbox);
-                return CmdResult::err(format!("ERR {e}"));
-            }
-            self.loaded_libs.insert(lib.name.clone(), lib.sha.clone());
+        if self.loaded_libs.get(&lib.name).map(|(sha, _)| sha) != Some(&lib.sha) {
+            sandbox.purge_functions(&to_purge);
+            let functions = match sandbox.load_function_lib(&lib.code) {
+                Ok(f) => f,
+                Err(e) => {
+                    self.sandbox = Some(sandbox);
+                    return CmdResult::err(format!("ERR {e}"));
+                }
+            };
+            let names: Vec<String> = functions.into_iter().map(|f| f.name).collect();
+            self.loaded_libs
+                .insert(lib.name.clone(), (lib.sha.clone(), names));
         }
 
         // Lock the shards of the declared keys (like `execute_script`).

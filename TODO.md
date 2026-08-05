@@ -94,9 +94,14 @@ Legend:
   IO thread (`compile_check`); the actual sandbox bootstrap applies at EVAL.
 - No `redis.acall`/`redis.apcall` (no async path); `SCRIPT LATENCY` returns an
   empty array.
-- Function library callbacks live in `__dfly_functions__` in the coordinator's
-  interpreter and are recreated on first FCALL (or when a library's sha
-  changes); `FUNCTION DUMP`/`RESTORE` use an opaque local binary format.
+- Function library callbacks live in a `__dfly_functions__` table in the Lua
+  registry (hidden from scripts, which would otherwise bypass FCALL's locking
+  and flag enforcement) and are recreated on first FCALL or when a library's
+  sha changes, purging names the replacement dropped;
+  `FUNCTION DUMP`/`RESTORE` use an opaque local binary format.
+- `redis.register_function` outside a `FUNCTION LOAD` body errors with
+  `Function registration is not allowed during execution`; library and
+  function names are validated (`[A-Za-z0-9_.-]`, like `functionVerifyName`).
 - `FUNCTION KILL` always reports idle (functions run synchronously on the
   coordinator and cannot be interrupted from the IO thread).
 

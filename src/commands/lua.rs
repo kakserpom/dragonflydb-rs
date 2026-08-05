@@ -506,6 +506,14 @@ fn trim_ascii_start(mut b: &[u8]) -> &[u8] {
 // Function library loading
 // ---------------------------------------------------------------------------
 
+/// The registry key holding the `__dfly_functions__` callback table (hidden
+/// from scripts: `LUA_REGISTRYINDEX`, not `_G`).
+const DFLY_FUNCTIONS: &str = "__dfly_functions__";
+
+/// `redis.register_function` error outside a `FUNCTION LOAD` body
+/// (`luaRegisterFunction` when `!lue->loading`).
+const REGISTER_FUNCTION_ERR: &str = "Function registration is not allowed during execution";
+
 /// Metadata parsed from a library's `#!lua name=<name> [flags=...]` header.
 #[derive(Debug)]
 pub struct FunctionHeader {
@@ -547,6 +555,9 @@ pub fn parse_function_header(code: &[u8]) -> Result<FunctionHeader, String> {
     let Some(name) = name else {
         return Err("Missing library name".into());
     };
+    if !is_valid_function_name(&name) {
+        return Err("Library names can only contain letters, numbers, '_', '-' and '.'".into());
+    }
     // Validate the header flags like SCRIPT FLAGS does.
     let mut params = ScriptParams::default();
     for f in &header_flags {
@@ -563,6 +574,16 @@ pub fn function_body(code: &[u8]) -> &[u8] {
         Some(pos) => &code[pos + 1..],
         None => &[],
     }
+}
+
+/// Redis' `functionVerifyName`: letters, numbers, `_`, `-` and `.`, matching
+/// `LIBRARY_NAMES`/`FUNCTION_NAMES` in functions.c. Used for both library and
+/// function names (the two callers emit their own error text).
+fn is_valid_function_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
 /// Extract `(name, callback, flags)` from a `redis.register_function` call:
@@ -615,6 +636,11 @@ fn register_function_args(args: &MultiValue) -> mlua::Result<(String, Value, Vec
         }
         (name, callback, flags)
     };
+    if !is_valid_function_name(&name) {
+        return Err(mlua::Error::runtime(
+            "Function names can only contain letters, numbers, '_', '-' and '.'",
+        ));
+    }
     Ok((name, callback, flags))
 }
 
@@ -775,13 +801,15 @@ impl SandboxedInterpreter {
         Ok(())
     }
 
-    /// The `__dfly_functions__` global: every registered function callback,
-    /// keyed by function name, created when a library is (re)loaded.
+    /// The `__dfly_functions__` table: every registered function callback, keyed
+    /// by function name, created when a library is (re)loaded. It lives in the
+    /// Lua registry rather than `_G` so scripts cannot reach it (Redis never
+    /// exposes functions to scripts; direct access would bypass FCALL's locking,
+    /// `no-writes` and undeclared-keys enforcement).
     fn setup_function_table(&self) -> Result<(), String> {
         let t = self.lua.create_table().map_err(|e| e.to_string())?;
         self.lua
-            .globals()
-            .set("__dfly_functions__", t)
+            .set_named_registry_value(DFLY_FUNCTIONS, t)
             .map_err(|e| e.to_string())
     }
 
@@ -907,6 +935,14 @@ impl SandboxedInterpreter {
             .map_err(|e| e.to_string())?;
         t.raw_set("log", log).map_err(|e| e.to_string())?;
 
+        // `register_function` is only legal inside a `FUNCTION LOAD` body;
+        // anything else gets a clear error (see `load_function_lib`).
+        t.raw_set(
+            "register_function",
+            register_function_blocker(&self.lua).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+
         t.raw_set("LOG_DEBUG", 0).map_err(|e| e.to_string())?;
         t.raw_set("LOG_VERBOSE", 1).map_err(|e| e.to_string())?;
         t.raw_set("LOG_NOTICE", 2).map_err(|e| e.to_string())?;
@@ -993,8 +1029,8 @@ impl SandboxedInterpreter {
 
     /// Execute a FUNCTION library payload's body, collecting every
     /// `redis.register_function` call and storing the callbacks in the
-    /// `__dfly_functions__` table (keyed by function name). `redis.call` and
-    /// `redis.pcall` are unavailable during a load, mirroring Redis.
+    /// `__dfly_functions__` registry table (keyed by function name). `redis.call`
+    /// and `redis.pcall` are unavailable during a load, mirroring Redis.
     pub fn load_function_lib(&self, code: &[u8]) -> Result<Vec<FunctionInfo>, String> {
         let body = function_body(code);
         let lua = &self.lua;
@@ -1008,7 +1044,7 @@ impl SandboxedInterpreter {
                         name: name.clone(),
                         flags,
                     });
-                    let funcs: Table = lua.globals().get("__dfly_functions__")?;
+                    let funcs: Table = lua.named_registry_value(DFLY_FUNCTIONS)?;
                     funcs.raw_set(name, callback)?;
                     Ok(Value::Nil)
                 })?;
@@ -1026,12 +1062,25 @@ impl SandboxedInterpreter {
                 .set_name("@user_function")
                 .set_mode(ChunkMode::Text)
                 .exec();
-            // Leave the load-only API absent for later runs.
-            redis.set("register_function", Value::Nil)?;
+            // Restore the idle `register_function` (an execution-time error)
+            // before the load-only collector goes out of scope.
+            redis.set("register_function", register_function_blocker(lua)?)?;
             res?;
             Ok(collected.borrow().clone())
         });
         result.map_err(|e| clean_script_error(&e.to_string()))
+    }
+
+    /// Drop the callbacks for `names` from `__dfly_functions__`, purging stale
+    /// entries when a library is redefined (`FUNCTION LOAD REPLACE`) or removed.
+    /// The caller must only pass names no longer registered to any library.
+    pub fn purge_functions(&self, names: &[String]) {
+        let Ok(funcs) = self.lua.named_registry_value::<Table>(DFLY_FUNCTIONS) else {
+            return;
+        };
+        for name in names {
+            let _ = funcs.raw_remove(name.clone());
+        }
     }
 
     /// Run a registered function with `keys`/`argv` as its two arguments and
@@ -1076,7 +1125,7 @@ impl SandboxedInterpreter {
             let redis: Table = lua.globals().get("redis")?;
             redis.set("call", call)?;
             redis.set("pcall", pcall)?;
-            let funcs: Table = lua.globals().get("__dfly_functions__")?;
+            let funcs: Table = lua.named_registry_value(DFLY_FUNCTIONS)?;
             let f: Function = funcs.get(name)?;
             let keys_t = lua.create_table()?;
             for (i, k) in keys.iter().enumerate() {
@@ -1105,6 +1154,15 @@ fn raise_string_error(lua: &Lua, msg: String) -> ! {
         ffi::lua_pushlstring(raw.state(), msg.as_ptr().cast::<c_char>(), len);
         std::mem::drop(msg);
         ffi::lua_error(raw.state())
+    })
+}
+
+/// The idle `redis.register_function`: an owned closure (not scoped) that always
+/// errors, installed at bootstrap and restored after every library load so
+/// scripts/functions get a clear message instead of a nil-call.
+fn register_function_blocker(lua: &Lua) -> mlua::Result<Function> {
+    lua.create_function(|lua, _: MultiValue| -> mlua::Result<Value> {
+        raise_string_error(lua, REGISTER_FUNCTION_ERR.into())
     })
 }
 
@@ -1451,6 +1509,10 @@ mod tests {
             parse_function_header(b"#!lua name=x flags=bogus").unwrap_err(),
             "Invalid flag: bogus"
         );
+        assert_eq!(
+            parse_function_header(b"#!lua name=my-lib!").unwrap_err(),
+            "Library names can only contain letters, numbers, '_', '-' and '.'"
+        );
         assert_eq!(function_body(b"#!lua name=x\nreturn 1"), b"return 1");
         assert_eq!(function_body(b"#!lua name=x"), b"");
     }
@@ -1520,12 +1582,88 @@ mod tests {
             .load_function_lib(b"#!lua name=l\nredis.register_function()")
             .unwrap_err();
         assert!(err.contains("wrong number or type of arguments"), "{err}");
+        let err = interp
+            .load_function_lib(
+                b"#!lua name=l\nredis.register_function('bad name!', function() end)",
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("Function names can only contain letters, numbers, '_', '-' and '.'"),
+            "{err}"
+        );
         // redis.call at library top level is rejected.
         let err = interp
             .load_function_lib(b"#!lua name=l\nredis.call('get', 'k')")
             .unwrap_err();
         assert!(
             err.contains("redis.call is not allowed during function library load"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn function_table_is_hidden_and_purged() {
+        struct Get;
+        impl ScriptDispatch for Get {
+            fn dispatch(&mut self, args: Vec<Vec<u8>>) -> Result<RespValue, String> {
+                assert_eq!(args[0], b"get");
+                Ok(RespValue::Bulk(b"v".to_vec()))
+            }
+        }
+
+        let interp = SandboxedInterpreter::new().unwrap();
+        // The callback table lives in the Lua registry, not `_G`, so scripts
+        // cannot read it (direct access would bypass FCALL's checks).
+        interp.define("aaaa", b"return __dfly_functions__").unwrap();
+        let err = interp.run("aaaa", &mut Noop, false).unwrap_err();
+        assert!(
+            err.contains("nonexistent global variable '__dfly_functions__'"),
+            "{err}"
+        );
+
+        interp
+            .load_function_lib(
+                b"#!lua name=l\nredis.register_function('f', function() return 1 end)",
+            )
+            .unwrap();
+        assert_eq!(
+            interp.run_function("f", &[], &[], &mut Get, false).unwrap(),
+            RespValue::Integer(1)
+        );
+
+        // purge_functions drops the callback (used when a REPLACE drops a name).
+        interp.purge_functions(&["f".to_string()]);
+        assert!(interp.run_function("f", &[], &[], &mut Get, false).is_err());
+    }
+
+    #[test]
+    fn register_function_errors_outside_load() {
+        let interp = SandboxedInterpreter::new().unwrap();
+        // The bootstrap blocker covers the pre-load state.
+        interp
+            .define(
+                "aaaa",
+                b"return redis.register_function('x', function() end)",
+            )
+            .unwrap();
+        let err = interp.run("aaaa", &mut Noop, false).unwrap_err();
+        assert!(
+            err.contains("Function registration is not allowed during execution"),
+            "{err}"
+        );
+        // After a load the blocker is restored, not the load-only collector.
+        interp
+            .load_function_lib(b"#!lua name=l\nredis.register_function('f', function() end)")
+            .unwrap();
+        interp
+            .define(
+                "bbbb",
+                b"return redis.register_function('y', function() end)",
+            )
+            .unwrap();
+        let err = interp.run("bbbb", &mut Noop, false).unwrap_err();
+        assert!(
+            err.contains("Function registration is not allowed during execution"),
             "{err}"
         );
     }
