@@ -64,16 +64,30 @@ Legend:
 
 ## Server / admin (`server_family.cc` + `main_service.cc`)
 - [x] ADDREPLICAOF, AUTH, BGSAVE, CLIENT, COMMAND, CONFIG, DBSIZE, DEBUG,
-  DISCARD, EXEC, FLUSHALL, FLUSHDB, FUNCTION, HELLO, INFO, LASTSAVE, LATENCY,
+  DISCARD, EXEC, FLUSHALL, FLUSHDB, HELLO, INFO, LASTSAVE, LATENCY,
   MEMORY, MODULE, MONITOR, MULTI, PING, PSUBSCRIBE, PUBLISH, PUBSUB,
   PUNSUBSCRIBE, QUIT, REPLCONF, REPLICAOF, REPLTAKEOVER, RESET, ROLE, SAVE,
   SHRINK, SHUTDOWN, SLAVEOF, SLOWLOG, SPUBLISH, SSUBSCRIBE, SUBSCRIBE,
   SUNSUBSCRIBE, UNSUBSCRIBE, UNWATCH, WAIT, WATCH
-- [~] SCRIPT (EXISTS/LIST/FLUSH/LATENCY/GC/FLAGS/HELP ported; LOAD blocked by
-  the missing Lua engine)
-- [~] EVAL, EVALSHA, EVAL_RO, EVALSHA_RO, DFLY (registered, reject with an
-  explicit "not supported" error: no Lua engine or replication stack in
-  `Cargo.toml`)
+- [~] FUNCTION (FLUSH ported; LOAD/other subcommands reject: no library engine)
+- [x] SCRIPT (EXISTS, LIST, FLUSH, LATENCY, GC, FLAGS, LOAD, HELP backed by a
+  shared `ScriptMgr` cache of compiled scripts; `SCRIPT FLAGS` and `--!df`
+  comment flags set per-script params)
+- [x] EVAL, EVALSHA, EVAL_RO, EVALSHA_RO (sandboxed Lua interpreter on the
+  coordinator thread: compile-before-cache, `KEYS`/`ARGV` globals, per-key
+  transaction locking, cross-shard `redis.call`/`redis.pcall` dispatch, script
+  error wrapping `ERR Error running script (call to <sha>): ...`, NOSCRIPT and
+  read-only write rejection)
+- [~] DFLY (registered, rejects: no replication stack in `Cargo.toml`)
+
+### Scripting deviations
+- Scripts run on a single coordinator-side interpreter (taken from the sandbox
+  pool), not one per shard; EVAL is serialized by the coordinator and holds
+  the script's locks for its whole body (no `lua_auto_async` squash).
+- `SCRIPT LOAD` compiles with a throwaway unsandboxed `Lua` instance on the
+  IO thread (`compile_check`); the actual sandbox bootstrap applies at EVAL.
+- No `redis.acall`/`redis.apcall` (no async path); `SCRIPT LATENCY` returns an
+  empty array.
 
 ## Module / probabilistic (`bloom_family.cc`, `cms_family.cc`, `cuckoo_filter_family.cc`, `topk_family.cc`)
 - [x] BF.ADD, BF.EXISTS, BF.INFO, BF.LOADCHUNK, BF.MADD, BF.MEXISTS, BF.RESERVE,
@@ -106,6 +120,8 @@ function + thin exec wrapper).
    (biggest day-to-day surface, fits existing architecture).
 2. GEO (self-contained, well-specified).
 3. Scripting (EVAL/FUNCTION/MULTI) + pub/sub (need connection/runtime hooks).
+   - Done: EVAL family + SCRIPT + pub/sub are ported; FUNCTION and the
+     replication-related DFLY remain.
 4. Server/admin + SORT.
 5. Probabilistic structures (BF/CF/CMS/TOPK) and JSON (large; need new value
    types in `src/core/value.rs`).

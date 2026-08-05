@@ -1,4 +1,5 @@
 pub mod exec;
+pub mod lua;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -16,6 +17,7 @@ pub const FLAG_LOCAL: u32 = 1 << 6;
 pub const FLAG_GLOBAL: u32 = 1 << 7;
 pub const FLAG_ADMIN: u32 = 1 << 8;
 pub const FLAG_MOVABLEKEYS: u32 = 1 << 9;
+pub const FLAG_NOSCRIPT: u32 = 1 << 10;
 
 /// Sentinel for `KeyRange::last`: keys run through the second-to-last argument
 /// (used by BLPOP/BRPOP whose trailing argument is the float timeout).

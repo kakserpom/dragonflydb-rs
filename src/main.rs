@@ -1,7 +1,9 @@
 use std::net::TcpListener;
 use std::os::fd::RawFd;
 use std::sync::mpsc;
+use std::sync::Arc;
 
+use dragonflydb::commands::lua::ScriptMgr;
 use dragonflydb::server::event_loop::IoLoop;
 use dragonflydb::server::{coordinator, shard};
 use dragonflydb::server::{Reply, ReplyBus, ServerEnv};
@@ -74,7 +76,8 @@ fn main() {
 
     // Transaction coordinator thread.
     let (coord_tx, coord_rx) = mpsc::channel();
-    coordinator::spawn(num_shards, coord_rx, shard_txs.clone(), reply_bus.clone());
+    let script_mgr = Arc::new(std::sync::Mutex::new(ScriptMgr::new()));
+    coordinator::spawn(num_shards, coord_rx, shard_txs.clone(), reply_bus.clone(), script_mgr.clone());
 
     let listener = match TcpListener::bind(("0.0.0.0", port)) {
         Ok(l) => l,
@@ -89,6 +92,7 @@ fn main() {
         shard_txs,
         coord_tx,
         reply_bus_tx: reply_bus,
+        script_mgr,
     };
 
     println!("dragonflydb-rs listening on 0.0.0.0:{} with {} shards", port, num_shards);

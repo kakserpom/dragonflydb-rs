@@ -7,13 +7,132 @@ pub mod shard;
 pub const MAX_DB: usize = 16;
 
 use std::os::fd::RawFd;
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 
-use crate::commands::{lookup, Command};
+use crate::commands::lua::{ScriptMgr, compile_check, sha1_hex};
+use crate::commands::{Command, lookup};
 use crate::error::{CmdResult, ReplyBytes, RespValue};
 use crate::protocol::resp::encode_reply;
 use crate::util::shard_for_key;
+
+/// SCRIPT subcommands against a shared script cache (`ScriptMgr::Run`). LOAD
+/// compiles the body in a throwaway Lua state so a compile error never enters
+/// the cache; the coordinator owns the long-lived interpreter used by EVAL.
+pub fn local_script(mgr: &mut ScriptMgr, args: &[Vec<u8>]) -> RespValue {
+    let sub = args
+        .get(1)
+        .map(|a| a.to_ascii_uppercase())
+        .unwrap_or_default();
+    match sub.as_slice() {
+        b"HELP" => RespValue::Array(vec![
+            RespValue::Simple("SCRIPT <subcommand> [<arg> [value] [opt] ...]".into()),
+            RespValue::Simple("Subcommands are:".into()),
+            RespValue::Simple("EXISTS <sha1> [<sha1> ...]".into()),
+            RespValue::Simple(
+                "   Return information about the existence of the scripts in the script cache."
+                    .into(),
+            ),
+            RespValue::Simple("FLUSH".into()),
+            RespValue::Simple("   Flush the Lua scripts cache. Very dangerous on replicas.".into()),
+            RespValue::Simple("LOAD <script>".into()),
+            RespValue::Simple(
+                "   Load a script into the scripts cache without executing it.".into(),
+            ),
+            RespValue::Simple("FLAGS <sha> [flags ...]".into()),
+            RespValue::Simple(
+                "   Set specific flags for script. Can be called before the sript is loaded."
+                    .into(),
+            ),
+            RespValue::Simple("   The following flags are possible: ".into()),
+            RespValue::Simple(
+                "      - Use 'allow-undeclared-keys' to allow accessing undeclared keys".into(),
+            ),
+            RespValue::Simple(
+                "      - Use 'disable-atomicity' to allow running scripts non-atomically".into(),
+            ),
+            RespValue::Simple("      - Use 'legacy-float' to return floats as integers".into()),
+            RespValue::Simple("LIST".into()),
+            RespValue::Simple("   Lists loaded scripts.".into()),
+            RespValue::Simple("LATENCY".into()),
+            RespValue::Simple(
+                "   Prints latency histograms in usec for every called function.".into(),
+            ),
+            RespValue::Simple("GC".into()),
+            RespValue::Simple(
+                "   Invokes garbage collection on all unused interpreter instances.".into(),
+            ),
+            RespValue::Simple("HELP".into()),
+            RespValue::Simple("   Prints this help.".into()),
+        ]),
+        b"EXISTS" if args.len() >= 3 => RespValue::Array(
+            args[2..]
+                .iter()
+                .map(|sha| {
+                    RespValue::Integer(if mgr.exists(&String::from_utf8_lossy(sha)) {
+                        1
+                    } else {
+                        0
+                    })
+                })
+                .collect(),
+        ),
+        b"FLUSH" => {
+            mgr.flush();
+            RespValue::Simple("OK".into())
+        }
+        b"LIST" => RespValue::Array(
+            mgr.get_all()
+                .into_iter()
+                .map(|(sha, body)| {
+                    RespValue::Array(vec![
+                        RespValue::Bulk(sha.into_bytes()),
+                        RespValue::Bulk(body),
+                    ])
+                })
+                .collect(),
+        ),
+        b"LATENCY" => RespValue::Array(vec![]),
+        b"LOAD" if args.len() == 3 => {
+            let body = &args[2];
+            if body.is_empty() {
+                // `LoadCmd` returns the empty-body SHA without caching it.
+                return RespValue::Bulk(sha1_hex(b"").into_bytes());
+            }
+            if let Err(e) = compile_check(body) {
+                return RespValue::Error(format!("ERR {e}"));
+            }
+            let sha = sha1_hex(body);
+            let params = match ScriptMgr::deduce_and_override(body) {
+                Ok(p) => p,
+                Err(e) => return RespValue::Error(format!("ERR {e}")),
+            };
+            if !mgr.exists(&sha) {
+                mgr.store(sha.clone(), body.clone(), params);
+            }
+            RespValue::Bulk(sha.into_bytes())
+        }
+        b"FLAGS" if args.len() >= 3 => {
+            let sha = &args[2];
+            if sha.len() != 40 {
+                return RespValue::Error("ERR syntax error".into());
+            }
+            let flags: Vec<String> = args[3..]
+                .iter()
+                .map(|f| String::from_utf8_lossy(f).into_owned())
+                .collect();
+            match mgr.apply_flags(&String::from_utf8_lossy(sha), &flags) {
+                Ok(()) => RespValue::Simple("OK".into()),
+                Err(e) => RespValue::Error(format!("ERR {e}")),
+            }
+        }
+        b"GC" => RespValue::Simple("OK".into()),
+        other => RespValue::Error(format!(
+            "ERR Unknown subcommand or wrong number of arguments for '{}'. Try SCRIPT HELP.",
+            String::from_utf8_lossy(other)
+        )),
+    }
+}
 
 /// A reply routed back to a specific connection. `seq` preserves request order.
 #[derive(Debug)]
@@ -44,7 +163,10 @@ pub struct ReplyBus {
 
 impl ReplyBus {
     pub fn new(tx: mpsc::Sender<Reply>, wake_w: RawFd) -> Self {
-        ReplyBus { tx: Arc::new(tx), wake_w }
+        ReplyBus {
+            tx: Arc::new(tx),
+            wake_w,
+        }
     }
 
     pub fn send(&self, reply: Reply) {
@@ -60,7 +182,9 @@ impl ReplyBus {
 
 impl std::fmt::Debug for ReplyBus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ReplyBus").field("wake_w", &self.wake_w).finish()
+        f.debug_struct("ReplyBus")
+            .field("wake_w", &self.wake_w)
+            .finish()
     }
 }
 
@@ -120,6 +244,18 @@ pub enum ShardMsg {
         db_idx: usize,
         result_tx: mpsc::Sender<Vec<(Vec<u8>, WatchState)>>,
     },
+    /// A single `redis.call(...)` dispatched from a script running on the
+    /// coordinator. The target shard is already locked by the script's
+    /// transaction, so the subcommand executes immediately and its result is
+    /// sent back on `result_tx`.
+    ScriptOp {
+        args: Vec<Vec<u8>>,
+        owned_key_idxs: Vec<usize>,
+        /// The subcommand's `KeyRange::first` for the `OpContext`.
+        first_key_idx: usize,
+        db_idx: usize,
+        result_tx: mpsc::Sender<crate::error::CmdResult>,
+    },
 }
 
 /// Messages to the transaction coordinator.
@@ -146,57 +282,67 @@ pub struct ServerEnv {
     pub shard_txs: Vec<mpsc::Sender<ShardMsg>>,
     pub coord_tx: mpsc::Sender<CoordMsg>,
     pub reply_bus_tx: ReplyBus,
+    /// Shared script cache: SCRIPT subcommands (IO thread) and EVAL
+    /// (coordinator) both read/write it.
+    pub script_mgr: std::sync::Arc<std::sync::Mutex<crate::commands::lua::ScriptMgr>>,
 }
 
 impl ServerEnv {
     pub fn shard_for_key(&self, key: &[u8]) -> usize {
         shard_for_key(key, self.num_shards)
     }
+}
 
-    /// Key indices for a command. Handles movable keys (XREAD/XREADGROUP,
-    /// SORT's runtime STORE destination) and numkeys-prefixed keys (LMPOP)
-    /// by scanning the argument list.
-    pub fn extract_keys(&self, cmd: &'static Command, args: &[Vec<u8>]) -> Vec<usize> {
-        if cmd.name == "CMS.MERGE" {
-            // `CMS.MERGE <dest> <numkeys> <key>... [WEIGHTS w...]`: the
-            // destination (args[1]) plus the numkeys-prefixed sources.
-            let mut keys = extract_numkeys_keys(args, 2);
-            keys.insert(0, 1);
-            keys
-        } else if cmd.name == "LMPOP" || cmd.name == "BLMPOP" {
-            // `LMPOP <numkeys> <key>...` / `BLMPOP <timeout> <numkeys> <key>...`
-            let numkeys_idx = if cmd.name == "LMPOP" { 1 } else { 2 };
-            extract_numkeys_keys(args, numkeys_idx)
-        } else if matches!(
-            cmd.name,
-            "ZUNION" | "ZINTER" | "ZDIFF" | "ZINTERCARD" | "ZMPOP" | "BZMPOP" | "ZUNIONSTORE"
-                | "ZINTERSTORE" | "ZDIFFSTORE"
-        ) {
-            // `ZUNION <numkeys> <key>...` / `ZUNIONSTORE <dest> <numkeys> <key>...` /
-            // `BZMPOP <timeout> <numkeys> <key>...`. The store variants add the
-            // destination key as a leading bonus key (mirrors the `STORE` bonus in
-            // `transaction.cc DetermineKeys`).
-            let numkeys_idx = if cmd.name.ends_with("STORE") || cmd.name == "BZMPOP" {
-                2
-            } else {
-                1
-            };
-            let mut keys = extract_numkeys_keys(args, numkeys_idx);
-            if cmd.name.ends_with("STORE") && !keys.is_empty() {
-                keys.insert(0, 1);
-            }
-            keys
-        } else if cmd.flags & crate::commands::FLAG_MOVABLEKEYS != 0 {
-            if cmd.name == "SORT" || cmd.name == "SORT_RO" {
-                extract_sort_keys(args)
-            } else if cmd.name == "GEORADIUS" || cmd.name == "GEORADIUSBYMEMBER" {
-                extract_geo_radius_keys(args)
-            } else {
-                extract_movable_keys(args)
-            }
+/// Key indices for a command. Handles movable keys (XREAD/XREADGROUP,
+/// SORT's runtime STORE destination) and numkeys-prefixed keys (LMPOP)
+/// by scanning the argument list.
+pub fn extract_keys(cmd: &'static Command, args: &[Vec<u8>]) -> Vec<usize> {
+    if cmd.name == "CMS.MERGE" {
+        // `CMS.MERGE <dest> <numkeys> <key>... [WEIGHTS w...]`: the
+        // destination (args[1]) plus the numkeys-prefixed sources.
+        let mut keys = extract_numkeys_keys(args, 2);
+        keys.insert(0, 1);
+        keys
+    } else if cmd.name == "LMPOP" || cmd.name == "BLMPOP" {
+        // `LMPOP <numkeys> <key>...` / `BLMPOP <timeout> <numkeys> <key>...`
+        let numkeys_idx = if cmd.name == "LMPOP" { 1 } else { 2 };
+        extract_numkeys_keys(args, numkeys_idx)
+    } else if matches!(
+        cmd.name,
+        "ZUNION"
+            | "ZINTER"
+            | "ZDIFF"
+            | "ZINTERCARD"
+            | "ZMPOP"
+            | "BZMPOP"
+            | "ZUNIONSTORE"
+            | "ZINTERSTORE"
+            | "ZDIFFSTORE"
+    ) {
+        // `ZUNION <numkeys> <key>...` / `ZUNIONSTORE <dest> <numkeys> <key>...` /
+        // `BZMPOP <timeout> <numkeys> <key>...`. The store variants add the
+        // destination key as a leading bonus key (mirrors the `STORE` bonus in
+        // `transaction.cc DetermineKeys`).
+        let numkeys_idx = if cmd.name.ends_with("STORE") || cmd.name == "BZMPOP" {
+            2
         } else {
-            cmd.key_range.keys(args.len())
+            1
+        };
+        let mut keys = extract_numkeys_keys(args, numkeys_idx);
+        if cmd.name.ends_with("STORE") && !keys.is_empty() {
+            keys.insert(0, 1);
         }
+        keys
+    } else if cmd.flags & crate::commands::FLAG_MOVABLEKEYS != 0 {
+        if cmd.name == "SORT" || cmd.name == "SORT_RO" {
+            extract_sort_keys(args)
+        } else if cmd.name == "GEORADIUS" || cmd.name == "GEORADIUSBYMEMBER" {
+            extract_geo_radius_keys(args)
+        } else {
+            extract_movable_keys(args)
+        }
+    } else {
+        cmd.key_range.keys(args.len())
     }
 }
 
@@ -254,7 +400,10 @@ pub fn extract_movable_keys(args: &[Vec<u8>]) -> Vec<usize> {
 /// argument at `numkeys_idx` names how many of the following args are keys.
 /// Malformed counts yield an empty range so the executor reports the error.
 pub fn extract_numkeys_keys(args: &[Vec<u8>], numkeys_idx: usize) -> Vec<usize> {
-    let Some(n) = args.get(numkeys_idx).and_then(|a| crate::util::parse_i64(a)) else {
+    let Some(n) = args
+        .get(numkeys_idx)
+        .and_then(|a| crate::util::parse_i64(a))
+    else {
         return vec![];
     };
     if n < 1 {
@@ -306,7 +455,11 @@ fn secs_to_ms(secs: f64) -> u64 {
 }
 
 /// Group key indices by shard.
-pub fn keys_per_shard(args: &[Vec<u8>], keys: &[usize], num_shards: usize) -> Vec<(usize, Vec<usize>)> {
+pub fn keys_per_shard(
+    args: &[Vec<u8>],
+    keys: &[usize],
+    num_shards: usize,
+) -> Vec<(usize, Vec<usize>)> {
     let mut map: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
     for &ki in keys {
         let s = shard_for_key(&args[ki], num_shards);
@@ -320,11 +473,20 @@ pub fn command_for(args: &[Vec<u8>]) -> Option<&'static Command> {
     lookup(args.first()?)
 }
 
+/// True for the EVAL family. These run on the coordinator (they own the Lua
+/// interpreter), so they never touch a shard's `run_exec`.
+pub fn is_eval_cmd(name: &str) -> bool {
+    matches!(name, "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO")
+}
+
 /// Parse the BLOCK timeout in ms from XREAD/XREADGROUP args.
 pub fn parse_block_ms(args: &[Vec<u8>]) -> Option<u64> {
     for i in 1..args.len() {
         if args[i].eq_ignore_ascii_case(b"BLOCK") {
-            return args.get(i + 1).and_then(|a| crate::util::parse_i64(a)).map(|v| v.max(0) as u64);
+            return args
+                .get(i + 1)
+                .and_then(|a| crate::util::parse_i64(a))
+                .map(|v| v.max(0) as u64);
         }
     }
     None

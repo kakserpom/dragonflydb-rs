@@ -1,7 +1,7 @@
 use hashbrown::{HashMap, HashSet};
 
 use crate::commands::exec::keys::glob_match;
-use crate::commands::{bulk, integer, Command, OpContext, ShardPart, KeyRange, FLAG_BLOCKING, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE};
+use crate::commands::{bulk, integer, Command, OpContext, ShardPart, KeyRange, FLAG_BLOCKING, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_NOSCRIPT, FLAG_READONLY, FLAG_WRITE};
 use crate::core::compact::CompactString;
 use crate::core::zset::ZSet;
 use crate::core::PrimeValue;
@@ -2264,7 +2264,7 @@ pub static CMD_BZMPOP: Command = Command {
 pub static CMD_BZPOPMIN: Command = Command {
     name: "BZPOPMIN",
     arity: -3,
-    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY,
+    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_NOSCRIPT,
     key_range: KeyRange::ALL_BUT_LAST,
     exec: exec_bzpopmin,
     merge: Some(merge_bzpop),
@@ -2272,7 +2272,7 @@ pub static CMD_BZPOPMIN: Command = Command {
 pub static CMD_BZPOPMAX: Command = Command {
     name: "BZPOPMAX",
     arity: -3,
-    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY,
+    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_NOSCRIPT,
     key_range: KeyRange::ALL_BUT_LAST,
     exec: exec_bzpopmax,
     merge: Some(merge_bzpop),

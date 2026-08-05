@@ -137,6 +137,10 @@ impl Shard {
                 }
                 let _ = ack.send(());
             }
+            ShardMsg::ScriptOp { args, owned_key_idxs, first_key_idx, db_idx, result_tx } => {
+                let result = self.run_exec(&args, &owned_key_idxs, first_key_idx, db_idx);
+                let _ = result_tx.send(result);
+            }
         }
     }
 

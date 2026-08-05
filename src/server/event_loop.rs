@@ -10,8 +10,8 @@ use crate::error::RespValue;
 use crate::protocol::resp::RespParser;
 use crate::server::pubsub::{self, ChannelStore, SubscribeInfo};
 use crate::server::{
-    command_for, encode_value, keys_per_shard, CoordMsg, Reply, ServerEnv, ShardMsg, SingleOp,
-    WatchState,
+    CoordMsg, Reply, ServerEnv, ShardMsg, SingleOp, WatchState, command_for, encode_value,
+    extract_keys, is_eval_cmd, keys_per_shard, local_script,
 };
 
 const EV_READ: i16 = libc::EVFILT_READ;
@@ -276,7 +276,9 @@ impl IoLoop {
     }
 
     fn handle_read(&mut self, fd: RawFd) {
-        let Some(&conn_id) = self.fd_to_id.get(&fd) else { return };
+        let Some(&conn_id) = self.fd_to_id.get(&fd) else {
+            return;
+        };
         let mut buf = [0u8; 16384];
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n <= 0 {
@@ -320,7 +322,10 @@ impl IoLoop {
         let seq = self.next_seq(conn_id);
 
         let Some(cmd) = command_for(&args) else {
-            let msg = format!("ERR unknown command '{}'", String::from_utf8_lossy(&args[0]));
+            let msg = format!(
+                "ERR unknown command '{}'",
+                String::from_utf8_lossy(&args[0])
+            );
             self.deliver(conn_id, seq, encode_value(&RespValue::Error(msg)));
             return;
         };
@@ -338,11 +343,7 @@ impl IoLoop {
 
         // A MONITOR connection may only run RESET or QUIT
         // (`main_service.cc:1413-1414`).
-        if self
-            .conns
-            .get(&conn_id)
-            .map(|c| c.monitor)
-            .unwrap_or(false)
+        if self.conns.get(&conn_id).map(|c| c.monitor).unwrap_or(false)
             && !matches!(cmd.name, "RESET" | "QUIT")
         {
             self.deliver(
@@ -404,13 +405,26 @@ impl IoLoop {
 
     /// Split a command by its keys and send it to a shard or the coordinator.
     fn dispatch_keyed(&self, conn_id: u64, seq: u64, cmd: &'static Command, args: &[Vec<u8>]) {
+        // The EVAL family runs entirely on the coordinator (it owns the Lua
+        // interpreter); the coordinator derives the declared keys itself.
+        if is_eval_cmd(cmd.name) {
+            self.send_coord(conn_id, seq, args.to_vec(), vec![], vec![], 0);
+            return;
+        }
         if cmd.has_flag(FLAG_GLOBAL) {
             let shards: Vec<usize> = (0..self.env.num_shards).collect();
-            self.send_coord(conn_id, seq, args.to_vec(), vec![], shards, cmd.key_range.first);
+            self.send_coord(
+                conn_id,
+                seq,
+                args.to_vec(),
+                vec![],
+                shards,
+                cmd.key_range.first,
+            );
             return;
         }
 
-        let keys = self.env.extract_keys(cmd, args);
+        let keys = extract_keys(cmd, args);
         if keys.is_empty() {
             // Malformed/movable-key command without keys: let the executor
             // validate and reply with an error from shard 0.
@@ -422,7 +436,14 @@ impl IoLoop {
             self.send_single(conn_id, seq, per[0].0, args.to_vec(), per[0].1.clone());
         } else {
             let shards: Vec<usize> = per.iter().map(|(s, _)| *s).collect();
-            self.send_coord(conn_id, seq, args.to_vec(), keys, shards, cmd.key_range.first);
+            self.send_coord(
+                conn_id,
+                seq,
+                args.to_vec(),
+                keys,
+                shards,
+                cmd.key_range.first,
+            );
         }
     }
 
@@ -544,7 +565,9 @@ impl IoLoop {
             self.deliver(
                 conn_id,
                 seq,
-                encode_value(&RespValue::Error("ERR MULTI calls can not be nested".into())),
+                encode_value(&RespValue::Error(
+                    "ERR MULTI calls can not be nested".into(),
+                )),
             );
             return;
         }
@@ -628,7 +651,11 @@ impl IoLoop {
             conn.watched_dirty |= dirty;
             if !dirty {
                 for (key, state) in states {
-                    conn.watched.push(WatchedKey { db: db_idx, key, state });
+                    conn.watched.push(WatchedKey {
+                        db: db_idx,
+                        key,
+                        state,
+                    });
                 }
             }
         }
@@ -738,7 +765,11 @@ impl IoLoop {
         }
         self.pubsub.remove_conn(conn_id);
         self.monitors.retain(|&c| c != conn_id);
-        self.deliver(conn_id, seq, encode_value(&RespValue::Simple("RESET".into())));
+        self.deliver(
+            conn_id,
+            seq,
+            encode_value(&RespValue::Simple("RESET".into())),
+        );
     }
 
     /// QUIT: reply `+OK`, then close once the reply is flushed (upstream
@@ -763,11 +794,7 @@ impl IoLoop {
             if let Some(conn) = self.conns.get_mut(&conn_id) {
                 conn.sub.channels.insert(ch.to_vec());
             }
-            let count = self
-                .conns
-                .get(&conn_id)
-                .map(|c| c.sub.count())
-                .unwrap_or(0);
+            let count = self.conns.get(&conn_id).map(|c| c.sub.count()).unwrap_or(0);
             let reply = encode_value(&pubsub::sub_change("subscribe", Some(ch), count));
             self.deliver(conn_id, seq, reply);
         }
@@ -795,11 +822,7 @@ impl IoLoop {
             if let Some(conn) = self.conns.get_mut(&conn_id) {
                 conn.sub.channels.remove(&ch);
             }
-            let count = self
-                .conns
-                .get(&conn_id)
-                .map(|c| c.sub.count())
-                .unwrap_or(0);
+            let count = self.conns.get(&conn_id).map(|c| c.sub.count()).unwrap_or(0);
             let reply = encode_value(&pubsub::sub_change("unsubscribe", Some(&ch), count));
             self.deliver(conn_id, seq, reply);
         }
@@ -811,11 +834,7 @@ impl IoLoop {
             if let Some(conn) = self.conns.get_mut(&conn_id) {
                 conn.sub.patterns.insert(pat.to_vec());
             }
-            let count = self
-                .conns
-                .get(&conn_id)
-                .map(|c| c.sub.count())
-                .unwrap_or(0);
+            let count = self.conns.get(&conn_id).map(|c| c.sub.count()).unwrap_or(0);
             let reply = encode_value(&pubsub::sub_change("psubscribe", Some(pat), count));
             self.deliver(conn_id, seq, reply);
         }
@@ -840,11 +859,7 @@ impl IoLoop {
             if let Some(conn) = self.conns.get_mut(&conn_id) {
                 conn.sub.patterns.remove(&pat);
             }
-            let count = self
-                .conns
-                .get(&conn_id)
-                .map(|c| c.sub.count())
-                .unwrap_or(0);
+            let count = self.conns.get(&conn_id).map(|c| c.sub.count()).unwrap_or(0);
             let reply = encode_value(&pubsub::sub_change("punsubscribe", Some(&pat), count));
             self.deliver(conn_id, seq, reply);
         }
@@ -860,11 +875,7 @@ impl IoLoop {
             if let Some(conn) = self.conns.get_mut(&conn_id) {
                 conn.sub.sharded.insert(ch.to_vec());
             }
-            let count = self
-                .conns
-                .get(&conn_id)
-                .map(|c| c.sub.count())
-                .unwrap_or(0);
+            let count = self.conns.get(&conn_id).map(|c| c.sub.count()).unwrap_or(0);
             let reply = encode_value(&pubsub::sub_change("ssubscribe", Some(ch), count));
             self.deliver(conn_id, seq, reply);
         }
@@ -889,11 +900,7 @@ impl IoLoop {
             if let Some(conn) = self.conns.get_mut(&conn_id) {
                 conn.sub.sharded.remove(&ch);
             }
-            let count = self
-                .conns
-                .get(&conn_id)
-                .map(|c| c.sub.count())
-                .unwrap_or(0);
+            let count = self.conns.get(&conn_id).map(|c| c.sub.count()).unwrap_or(0);
             let reply = encode_value(&pubsub::sub_change("sunsubscribe", Some(&ch), count));
             self.deliver(conn_id, seq, reply);
         }
@@ -907,8 +914,12 @@ impl IoLoop {
         let message = args[2].clone();
         let targets = self.pubsub.subscribers(&channel);
         for (target, pattern) in &targets {
-            let frame =
-                encode_value(&pubsub::push_message(pattern.as_deref(), &channel, &message, false));
+            let frame = encode_value(&pubsub::push_message(
+                pattern.as_deref(),
+                &channel,
+                &message,
+                false,
+            ));
             if let Some(conn) = self.conns.get_mut(target) {
                 conn.out.extend_from_slice(&frame);
             }
@@ -956,7 +967,11 @@ impl IoLoop {
             .map(|k| {
                 (
                     k.clone(),
-                    WatchState { version: 0, existed: false, db_epoch: 0 },
+                    WatchState {
+                        version: 0,
+                        existed: false,
+                        db_epoch: 0,
+                    },
                 )
             })
             .collect();
@@ -964,7 +979,11 @@ impl IoLoop {
             let ks: Vec<Vec<u8>> = idxs.iter().map(|&i| keys[i].clone()).collect();
             let (tx, rx) = mpsc::channel();
             if self.env.shard_txs[shard]
-                .send(ShardMsg::WatchQuery { keys: ks, db_idx, result_tx: tx })
+                .send(ShardMsg::WatchQuery {
+                    keys: ks,
+                    db_idx,
+                    result_tx: tx,
+                })
                 .is_ok()
                 && let Ok(states) = rx.recv()
             {
@@ -1002,7 +1021,17 @@ impl IoLoop {
         if let Some(conn) = self.conns.get_mut(&conn_id) {
             conn.multi.queue.push(args);
         }
-        self.deliver(conn_id, seq, encode_value(&RespValue::Simple("QUEUED".into())));
+        self.deliver(
+            conn_id,
+            seq,
+            encode_value(&RespValue::Simple("QUEUED".into())),
+        );
+    }
+
+    /// SCRIPT subcommands against the shared script cache (see
+    /// `server::local_script`).
+    fn local_script(&self, args: &[Vec<u8>]) -> RespValue {
+        local_script(&mut self.env.script_mgr.lock().unwrap(), args)
     }
 
     fn run_local(&self, cmd: &Command, args: &[Vec<u8>]) -> RespValue {
@@ -1026,8 +1055,7 @@ impl IoLoop {
             "REPLTAKEOVER" => server::local_repltakeover(args),
             "MODULE" => server::local_module(args),
             "FUNCTION" => server::local_function(args),
-            "SCRIPT" => server::local_script(args),
-            "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" => server::local_lua(args),
+            "SCRIPT" => self.local_script(args),
             "DFLY" => server::local_dfly(args),
             _ => RespValue::Error("ERR internal: unhandled local command".into()),
         }
@@ -1060,7 +1088,12 @@ impl IoLoop {
             line.push('"');
         }
         let frame = encode_value(&RespValue::Bulk(line.into_bytes()));
-        let targets: Vec<u64> = self.monitors.iter().copied().filter(|&m| m != conn_id).collect();
+        let targets: Vec<u64> = self
+            .monitors
+            .iter()
+            .copied()
+            .filter(|&m| m != conn_id)
+            .collect();
         for mon in targets {
             if let Some(c) = self.conns.get_mut(&mon) {
                 c.out.extend_from_slice(&frame);
@@ -1068,7 +1101,14 @@ impl IoLoop {
         }
     }
 
-    fn send_single(&self, conn_id: u64, seq: u64, shard: usize, args: Vec<Vec<u8>>, owned: Vec<usize>) {
+    fn send_single(
+        &self,
+        conn_id: u64,
+        seq: u64,
+        shard: usize,
+        args: Vec<Vec<u8>>,
+        owned: Vec<usize>,
+    ) {
         let db_idx = self.conns.get(&conn_id).map(|c| c.db_idx).unwrap_or(0);
         let op = SingleOp {
             conn_id,
@@ -1109,7 +1149,9 @@ impl IoLoop {
     // ------------------------------------------------------------------
 
     fn deliver(&mut self, conn_id: u64, seq: u64, bytes: Vec<u8>) {
-        let Some(conn) = self.conns.get_mut(&conn_id) else { return };
+        let Some(conn) = self.conns.get_mut(&conn_id) else {
+            return;
+        };
         if seq == conn.deliver_seq {
             conn.out.extend_from_slice(&bytes);
             conn.deliver_seq += 1;
@@ -1131,7 +1173,13 @@ impl IoLoop {
     fn drain_wake(&mut self) {
         let mut buf = [0u8; 4096];
         loop {
-            let n = unsafe { libc::read(self.wake_r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            let n = unsafe {
+                libc::read(
+                    self.wake_r,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
             if n <= 0 || (n as usize) < buf.len() {
                 break;
             }
@@ -1152,7 +1200,12 @@ impl IoLoop {
         for id in ids {
             self.flush_conn(id);
             // QUIT closes the socket right after its +OK has been written.
-            if self.conns.get(&id).map(|c| c.closing && c.out.is_empty()).unwrap_or(false) {
+            if self
+                .conns
+                .get(&id)
+                .map(|c| c.closing && c.out.is_empty())
+                .unwrap_or(false)
+            {
                 self.close_conn(id);
             }
         }
@@ -1190,7 +1243,10 @@ impl IoLoop {
         }
 
         let (needs_del, needs_add) = match self.conns.get(&conn_id) {
-            Some(c) => (c.out.is_empty() && c.write_registered, !c.out.is_empty() && !c.write_registered),
+            Some(c) => (
+                c.out.is_empty() && c.write_registered,
+                !c.out.is_empty() && !c.write_registered,
+            ),
             None => return,
         };
         if needs_del {
@@ -1228,7 +1284,14 @@ impl IoLoop {
 }
 
 fn kev(ident: usize, filter: i16, flags: u16) -> libc::kevent {
-    libc::kevent { ident, filter, flags, fflags: 0, data: 0, udata: std::ptr::null_mut() }
+    libc::kevent {
+        ident,
+        filter,
+        flags,
+        fflags: 0,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    }
 }
 
 fn zero_kev() -> libc::kevent {

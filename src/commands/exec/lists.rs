@@ -1,6 +1,6 @@
 use crate::commands::{
     integer, ok, Command, OpContext, ShardPart, KeyRange, FLAG_BLOCKING, FLAG_DENYOOM, FLAG_FAST,
-    FLAG_MOVABLEKEYS, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE,
+    FLAG_MOVABLEKEYS, FLAG_MULTI_KEY, FLAG_NOSCRIPT, FLAG_READONLY, FLAG_WRITE,
 };
 use crate::core::compact::CompactString;
 use crate::core::quicklist::{ListItem, QuickList};
@@ -1198,7 +1198,7 @@ pub static CMD_LMPOP: Command = Command {
 pub static CMD_BLPOP: Command = Command {
     name: "BLPOP",
     arity: -3,
-    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY,
+    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_NOSCRIPT,
     key_range: KeyRange::ALL_BUT_LAST,
     exec: exec_blpop,
     merge: Some(merge_bpop),
@@ -1206,7 +1206,7 @@ pub static CMD_BLPOP: Command = Command {
 pub static CMD_BRPOP: Command = Command {
     name: "BRPOP",
     arity: -3,
-    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY,
+    flags: FLAG_WRITE | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_NOSCRIPT,
     key_range: KeyRange::ALL_BUT_LAST,
     exec: exec_brpop,
     merge: Some(merge_bpop),
@@ -1222,7 +1222,7 @@ pub static CMD_BLMOVE: Command = Command {
 pub static CMD_BRPOPLPUSH: Command = Command {
     name: "BRPOPLPUSH",
     arity: 4,
-    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_BLOCKING | FLAG_MULTI_KEY,
+    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_NOSCRIPT,
     key_range: KeyRange::TWO,
     exec: exec_blmove,
     merge: Some(merge_move_blocking),

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::commands::{ok, Command, OpContext, ShardPart, KeyRange, FLAG_ADMIN, FLAG_FAST, FLAG_GLOBAL, FLAG_LOCAL, FLAG_READONLY, FLAG_WRITE};
+use crate::commands::{ok, Command, OpContext, ShardPart, KeyRange, FLAG_ADMIN, FLAG_FAST, FLAG_GLOBAL, FLAG_LOCAL, FLAG_NOSCRIPT, FLAG_READONLY, FLAG_WRITE};
 use crate::core::value::ObjType;
 use crate::error::{CmdResult, RespError, RespValue};
 
@@ -655,73 +655,6 @@ pub fn local_function(args: &[Vec<u8>]) -> RespValue {
     RespValue::Error(unknown_subcmd(&sub, "FUNCTION"))
 }
 
-/// SCRIPT introspection without a Lua interpreter. EXISTS always reports 0,
-/// LIST/LATENCY are empty, FLUSH/GC reply OK, and LOAD errors because there is
-/// no script engine to compile against (a documented deviation).
-pub fn local_script(args: &[Vec<u8>]) -> RespValue {
-    let sub = args.get(1).map(|a| a.to_ascii_uppercase()).unwrap_or_default();
-    match sub.as_slice() {
-        b"HELP" => RespValue::Array(vec![
-            RespValue::Simple("SCRIPT <subcommand> [<arg> [value] [opt] ...]".into()),
-            RespValue::Simple("Subcommands are:".into()),
-            RespValue::Simple("EXISTS <sha1> [<sha1> ...]".into()),
-            RespValue::Simple(
-                "   Return information about the existence of the scripts in the script cache.".into(),
-            ),
-            RespValue::Simple("FLUSH".into()),
-            RespValue::Simple("   Flush the Lua scripts cache. Very dangerous on replicas.".into()),
-            RespValue::Simple("LOAD <script>".into()),
-            RespValue::Simple("   Load a script into the scripts cache without executing it.".into()),
-            RespValue::Simple("FLAGS <sha> [flags ...]".into()),
-            RespValue::Simple(
-                "   Set specific flags for script. Can be called before the sript is loaded.".into(),
-            ),
-            RespValue::Simple("   The following flags are possible: ".into()),
-            RespValue::Simple(
-                "      - Use 'allow-undeclared-keys' to allow accessing undeclared keys".into(),
-            ),
-            RespValue::Simple(
-                "      - Use 'disable-atomicity' to allow running scripts non-atomically".into(),
-            ),
-            RespValue::Simple("      - Use 'legacy-float' to return floats as integers".into()),
-            RespValue::Simple("LIST".into()),
-            RespValue::Simple("   Lists loaded scripts.".into()),
-            RespValue::Simple("LATENCY".into()),
-            RespValue::Simple(
-                "   Prints latency histograms in usec for every called function.".into(),
-            ),
-            RespValue::Simple("GC".into()),
-            RespValue::Simple(
-                "   Invokes garbage collection on all unused interpreter instances.".into(),
-            ),
-            RespValue::Simple("HELP".into()),
-            RespValue::Simple("   Prints this help.".into()),
-        ]),
-        b"EXISTS" if args.len() >= 3 => {
-            RespValue::Array(vec![RespValue::Integer(0); args.len() - 2])
-        }
-        b"FLUSH" | b"GC" => RespValue::Simple("OK".into()),
-        b"LIST" | b"LATENCY" => RespValue::Array(vec![]),
-        b"LOAD" => RespValue::Error("ERR Lua scripting is not supported".into()),
-        b"FLAGS" if args.len() >= 3 => {
-            // Reference requires a 40-char SHA; without a script cache there is
-            // nothing else to record.
-            if args[2].len() != 40 {
-                return RespValue::Error("ERR syntax error".into());
-            }
-            RespValue::Simple("OK".into())
-        }
-        other => RespValue::Error(unknown_subcmd(other, "SCRIPT")),
-    }
-}
-
-/// EVAL/EVALSHA require a Lua interpreter, which this port does not embed
-/// (only hashbrown/libc/mimalloc/simd-json/xxhash dependencies). Registration
-/// keeps the command name known; execution is rejected explicitly.
-pub fn local_lua(_args: &[Vec<u8>]) -> RespValue {
-    RespValue::Error("ERR Lua scripting is not supported".into())
-}
-
 /// DFLY is the replication control protocol (`dflycmd.cc`); the port has no
 /// replication stack, so it is rejected explicitly.
 pub fn local_dfly(_args: &[Vec<u8>]) -> RespValue {
@@ -1159,7 +1092,7 @@ pub static CMD_SHRINK: Command = Command {
 pub static CMD_EVAL: Command = Command {
     name: "EVAL",
     arity: -3,
-    flags: FLAG_LOCAL,
+    flags: FLAG_NOSCRIPT,
     key_range: KeyRange::NONE,
     exec: local_stub,
     merge: None,
@@ -1167,7 +1100,7 @@ pub static CMD_EVAL: Command = Command {
 pub static CMD_EVALSHA: Command = Command {
     name: "EVALSHA",
     arity: -3,
-    flags: FLAG_LOCAL,
+    flags: FLAG_NOSCRIPT,
     key_range: KeyRange::NONE,
     exec: local_stub,
     merge: None,
@@ -1175,7 +1108,7 @@ pub static CMD_EVALSHA: Command = Command {
 pub static CMD_EVAL_RO: Command = Command {
     name: "EVAL_RO",
     arity: -3,
-    flags: FLAG_LOCAL,
+    flags: FLAG_READONLY | FLAG_NOSCRIPT,
     key_range: KeyRange::NONE,
     exec: local_stub,
     merge: None,
@@ -1183,7 +1116,7 @@ pub static CMD_EVAL_RO: Command = Command {
 pub static CMD_EVALSHA_RO: Command = Command {
     name: "EVALSHA_RO",
     arity: -3,
-    flags: FLAG_LOCAL,
+    flags: FLAG_READONLY | FLAG_NOSCRIPT,
     key_range: KeyRange::NONE,
     exec: local_stub,
     merge: None,
@@ -1589,20 +1522,27 @@ mod tests {
 
     #[test]
     fn script_reply() {
-        let r = |a: &[&str]| render(&local_script(&b_args(a)));
-        assert_eq!(r(&["SCRIPT", "FLUSH"]), "OK");
-        assert_eq!(r(&["SCRIPT", "GC"]), "OK");
-        assert_eq!(r(&["SCRIPT", "EXISTS", "a", "b"]), "[0, 0]");
-        assert_eq!(r(&["SCRIPT", "LIST"]), "[]");
-        assert_eq!(r(&["SCRIPT", "FLAGS", "0123456789012345678901234567890123456789"]), "OK");
-        assert_eq!(r(&["SCRIPT", "FLAGS", "short"]), "ERR syntax error");
-        assert_eq!(
-            r(&["SCRIPT", "LOAD", "return 1"]),
-            "ERR Lua scripting is not supported"
-        );
-        assert!(
-            r(&["SCRIPT", "HELP"]).contains("SCRIPT <subcommand>")
-        );
+        use crate::commands::lua::ScriptMgr;
+        use crate::server::local_script;
+        let mut mgr = ScriptMgr::new();
+        let r = |m: &mut ScriptMgr, a: &[&str]| render(&local_script(m, &b_args(a)));
+        assert_eq!(r(&mut mgr, &["SCRIPT", "FLUSH"]), "OK");
+        assert_eq!(r(&mut mgr, &["SCRIPT", "GC"]), "OK");
+        assert_eq!(r(&mut mgr, &["SCRIPT", "EXISTS", "a", "b"]), "[0, 0]");
+        assert_eq!(r(&mut mgr, &["SCRIPT", "LIST"]), "[]");
+        let sha = "e0e1f9fabfc9d4800c877a703b823ac0578ff8db";
+        assert_eq!(r(&mut mgr, &["SCRIPT", "FLAGS", sha, "allow-undeclared-keys"]), "OK");
+        // A sha with no flags applies nothing and replies OK (reference ConfigCmd).
+        assert_eq!(r(&mut mgr, &["SCRIPT", "FLAGS", sha]), "OK");
+        assert_eq!(r(&mut mgr, &["SCRIPT", "FLAGS"]), "ERR Unknown subcommand or wrong number of arguments for 'FLAGS'. Try SCRIPT HELP.");
+        let sha40 = "0123456789012345678901234567890123456789";
+        assert_eq!(r(&mut mgr, &["SCRIPT", "FLAGS", sha40]), "OK");
+        assert_eq!(r(&mut mgr, &["SCRIPT", "FLAGS", "short", "x"]), "ERR syntax error");
+        assert_eq!(r(&mut mgr, &["SCRIPT", "LOAD", "return 1"]), sha);
+        assert_eq!(r(&mut mgr, &["SCRIPT", "EXISTS", sha]), "[1]");
+        assert_eq!(r(&mut mgr, &["SCRIPT", "FLAGS", sha, "bogus"]), "ERR Invalid config format: Invalid flag: bogus");
+        assert!(r(&mut mgr, &["SCRIPT", "LOAD", "return {"]).starts_with("ERR syntax error"));
+        assert!(r(&mut mgr, &["SCRIPT", "HELP"]).contains("SCRIPT <subcommand>"));
     }
 
     #[test]
