@@ -94,6 +94,12 @@ Legend:
   for atomic scripts, applied at SCRIPT LOAD and first EVAL while keeping the
   SHA over the original body)
 - [~] DFLY (registered, rejects: no replication stack in `Cargo.toml`)
+- [x] Lua extension libraries loaded at interpreter bootstrap (`LoadLibrary`
+  order): `cjson` (2.1devel), `struct` (v1.7), `cmsgpack`, `bit` (BitOp
+  1.0.3) — pure-Rust ports in `src/commands/lua_libs.rs` mirroring Dragonfly's
+  vendored C sources, including the Dragonfly deltas (always-global `cjson`,
+  integer-returning `decode`, `int64_t` msgpack sizes) and the C error strings
+  (raised as plain Lua strings so `__redis__err__handler` can format them)
 
 ### Scripting deviations
 - Scripts run on a single coordinator-side interpreter (taken from the sandbox

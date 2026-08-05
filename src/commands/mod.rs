@@ -1,5 +1,6 @@
 pub mod exec;
 pub mod lua;
+pub mod lua_libs;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;

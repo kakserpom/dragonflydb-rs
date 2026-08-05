@@ -196,7 +196,7 @@ pub fn format_lua_float(f: f64) -> String {
 /// `[-4, sig)`, otherwise scientific with a signed, zero-padded exponent.
 /// The caller must pass a finite, non-zero value.
 #[must_use]
-fn format_g(f: f64, sig: i32) -> String {
+pub(crate) fn format_g(f: f64, sig: i32) -> String {
     // `{:.{prec}e}` with `prec = sig - 1` is correctly rounded to `sig`
     // significant digits, the same value `%.<sig>g` starts from.
     let sci = format!("{f:.prec$e}", prec = (sig - 1) as usize);

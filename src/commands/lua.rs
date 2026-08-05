@@ -15,6 +15,7 @@ use mlua::chunk::ChunkMode;
 use mlua::ffi;
 use mlua::{Function, HookTriggers, Lua, MultiValue, StdLib, Table, Value, VmState};
 
+use crate::commands::lua_libs;
 use crate::core::histogram::Histogram;
 use crate::error::RespValue;
 use crate::util::{format_lua_float, itoa, lua_tolstring};
@@ -1116,6 +1117,7 @@ impl SandboxedInterpreter {
             .set("dofile", Value::Nil)
             .map_err(|e| e.to_string())?;
         self.exec(POLYFILLS, "@dfly_polyfills")?;
+        lua_libs::install_all(&self.lua).map_err(|e| e.to_string())?;
         self.exec(RUNNER, "@dfly_runner")?;
         self.setup_redis_table(enable_redis_log)?;
         self.setup_function_table()?;
@@ -1577,7 +1579,7 @@ impl SandboxedInterpreter {
 /// `xpcall`, which the handler cannot concatenate. `CallFromScript` pushes the
 /// reply error string and calls `lua_error`, so this mirrors the reference.
 /// `lua_pushlstring` copies the bytes into Lua memory before `msg` is freed.
-fn raise_string_error(lua: &Lua, msg: String) -> ! {
+pub(crate) fn raise_string_error(lua: &Lua, msg: String) -> ! {
     lua.exec_raw_lua(|raw| unsafe {
         let len = msg.len();
         ffi::lua_pushlstring(raw.state(), msg.as_ptr().cast::<c_char>(), len);
