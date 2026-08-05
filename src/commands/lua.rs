@@ -154,13 +154,74 @@ pub struct Script {
     pub params: ScriptParams,
 }
 
-/// SHA-1 keyed script cache (`ScriptMgr`). Shared behind a `Mutex` between the
-/// IO thread (SCRIPT subcommands) and the coordinator thread (EVAL).
+// ---------------------------------------------------------------------------
+// Function library registry (FUNCTION / FCALL)
+// ---------------------------------------------------------------------------
+
+/// One function registered by a library's `redis.register_function(...)` call.
+#[derive(Debug, Clone)]
+pub struct FunctionInfo {
+    pub name: String,
+    /// Per-function flags from the table form (`no-writes`,
+    /// `allow-undeclared-keys`).
+    pub flags: Vec<String>,
+}
+
+/// A loaded function library: the metadata `FUNCTION LOAD` parsed out of the
+/// `#!lua name=...` header plus the registered function list. The callbacks
+/// themselves live in the coordinator's Lua state (recreated lazily on first
+/// FCALL), keyed by the library `sha`.
+#[derive(Debug, Clone)]
+pub struct FunctionLib {
+    pub name: String,
+    pub engine: String,
+    pub code: Vec<u8>,
+    pub sha: String,
+    /// Flags from the `#!lua ... flags=` header line.
+    pub header_flags: Vec<String>,
+    pub functions: Vec<FunctionInfo>,
+}
+
+/// A function currently executing on the coordinator (`FUNCTION STATS`).
+#[derive(Debug, Clone)]
+pub struct RunningFunction {
+    pub name: String,
+    /// The original FCALL/FCALL_RO command as text.
+    pub command: String,
+    pub started_ms: u64,
+}
+
+impl FunctionLib {
+    /// Execution flags derived from the `#!lua flags=` header.
+    pub fn params(&self) -> Result<ScriptParams, String> {
+        let mut params = ScriptParams::default();
+        for f in &self.header_flags {
+            params.apply_flags(f)?;
+        }
+        Ok(params)
+    }
+
+    #[must_use]
+    pub fn is_no_writes(&self) -> bool {
+        self.header_flags.iter().any(|f| f == "no-writes")
+    }
+}
+
+/// SHA-1 keyed script cache plus the FUNCTION library registry (`ScriptMgr`).
+/// Shared behind a `Mutex` between the IO thread (SCRIPT/FUNCTION subcommands)
+/// and the coordinator thread (EVAL/FCALL).
 #[derive(Debug, Default)]
 pub struct ScriptMgr {
     scripts: HashMap<String, Script>,
     /// Flag-only entries created by SCRIPT FLAGS before the script is loaded.
     params: HashMap<String, ScriptParams>,
+    /// Function libraries by library name (FUNCTION registry).
+    libraries: HashMap<String, FunctionLib>,
+    /// Function name -> library name index (function names are unique across
+    /// libraries, like Redis).
+    functions: HashMap<String, String>,
+    /// The function running on the coordinator, if any.
+    running: Option<RunningFunction>,
 }
 
 /// Script SHAs upstream force-flags (buggy clients, see `script_mgr.cc:284`).
@@ -280,6 +341,155 @@ impl ScriptMgr {
         }
         Ok(params)
     }
+
+    /// Insert a library into the FUNCTION registry, replacing any existing one
+    /// (used by both `FUNCTION LOAD REPLACE` and `FUNCTION RESTORE REPLACE`).
+    pub fn store_library(&mut self, lib: FunctionLib) {
+        self.remove_library_index(&lib.name);
+        for f in &lib.functions {
+            self.functions.insert(f.name.clone(), lib.name.clone());
+        }
+        self.libraries.insert(lib.name.clone(), lib);
+    }
+
+    /// Drop a library and its functions from the registry. Returns false when
+    /// no library by that name existed (`FUNCTION DELETE`).
+    pub fn delete_library(&mut self, name: &str) -> bool {
+        let Some(lib) = self.libraries.remove(name) else {
+            return false;
+        };
+        self.remove_library_index(&lib.name);
+        true
+    }
+
+    fn remove_library_index(&mut self, name: &str) {
+        if let Some(lib) = self.libraries.get(name) {
+            for f in &lib.functions {
+                self.functions.remove(&f.name);
+            }
+        }
+    }
+
+    /// `FUNCTION FLUSH`: drop every library.
+    pub fn flush_libraries(&mut self) {
+        self.libraries.clear();
+        self.functions.clear();
+    }
+
+    #[must_use]
+    pub fn library(&self, name: &str) -> Option<&FunctionLib> {
+        self.libraries.get(name)
+    }
+
+    /// Unordered `(name, library)` pairs (`FUNCTION LIST`).
+    #[must_use]
+    pub fn libraries(&self) -> Vec<(&String, &FunctionLib)> {
+        self.libraries.iter().collect()
+    }
+
+    /// The library owning `function`, if registered (`FCALL` lookup).
+    #[must_use]
+    pub fn function_lib(&self, name: &str) -> Option<&FunctionLib> {
+        let lib = self.functions.get(name)?;
+        self.libraries.get(lib)
+    }
+
+    /// Record the function the coordinator is about to run (`FUNCTION STATS`).
+    pub fn set_running(&mut self, name: &str, command: String, started_ms: u64) {
+        self.running = Some(RunningFunction {
+            name: name.to_string(),
+            command,
+            started_ms,
+        });
+    }
+
+    pub fn clear_running(&mut self) {
+        self.running = None;
+    }
+
+    #[must_use]
+    pub fn running(&self) -> Option<&RunningFunction> {
+        self.running.as_ref()
+    }
+
+    /// FUNCTION DUMP: an opaque binary snapshot of every loaded library. The
+    /// restored payload is re-validated by `FUNCTION RESTORE`, so a valid dump
+    /// is interchangeable with `FUNCTION LOAD` of its `library_code` values.
+    #[must_use]
+    pub fn dump_libraries(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"DFYFLIB1");
+        out.extend_from_slice(&(self.libraries.len() as u32).to_be_bytes());
+        for lib in self.libraries.values() {
+            out.extend_from_slice(&(lib.name.len() as u16).to_be_bytes());
+            out.extend_from_slice(lib.name.as_bytes());
+            let flags = lib.header_flags.join(",");
+            out.extend_from_slice(&(flags.len() as u16).to_be_bytes());
+            out.extend_from_slice(flags.as_bytes());
+            out.extend_from_slice(&(lib.code.len() as u32).to_be_bytes());
+            out.extend_from_slice(&lib.code);
+        }
+        out
+    }
+
+    /// FUNCTION RESTORE: decode a [`dump_libraries`] payload. The returned
+    /// libraries have an empty `functions` list; the caller re-runs each
+    /// `code` through an interpreter (validating the payload like `LOAD`).
+    pub fn restore_libraries(data: &[u8]) -> Result<Vec<FunctionLib>, String> {
+        const BAD: &str = "Invalid function dump payload";
+        fn take<'a>(data: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
+            if data.len() < n {
+                return Err(BAD.into());
+            }
+            let (head, rest) = data.split_at(n);
+            *data = rest;
+            Ok(head)
+        }
+        let mut data = data;
+        let magic = take(&mut data, 8).map_err(|_| BAD.to_string())?;
+        if magic != b"DFYFLIB1" {
+            return Err(BAD.into());
+        }
+        let n = take(&mut data, 4).map_err(|_| BAD.to_string())?;
+        let count = u32::from_be_bytes(n.try_into().map_err(|_| BAD.to_string())?) as usize;
+        let mut libs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name_len = take(&mut data, 2).map_err(|_| BAD.to_string())?;
+            let name_len =
+                u16::from_be_bytes(name_len.try_into().map_err(|_| BAD.to_string())?) as usize;
+            let name =
+                String::from_utf8_lossy(take(&mut data, name_len).map_err(|_| BAD.to_string())?)
+                    .into_owned();
+            let flags_len = take(&mut data, 2).map_err(|_| BAD.to_string())?;
+            let flags_len =
+                u16::from_be_bytes(flags_len.try_into().map_err(|_| BAD.to_string())?) as usize;
+            let flags =
+                String::from_utf8_lossy(take(&mut data, flags_len).map_err(|_| BAD.to_string())?)
+                    .into_owned();
+            let code_len = take(&mut data, 4).map_err(|_| BAD.to_string())?;
+            let code_len =
+                u32::from_be_bytes(code_len.try_into().map_err(|_| BAD.to_string())?) as usize;
+            let code = take(&mut data, code_len)
+                .map_err(|_| BAD.to_string())?
+                .to_vec();
+            libs.push(FunctionLib {
+                name,
+                engine: "LUA".into(),
+                sha: sha1_hex(&code),
+                code,
+                header_flags: flags
+                    .split(',')
+                    .filter(|f| !f.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                functions: Vec::new(),
+            });
+        }
+        if !data.is_empty() {
+            return Err(BAD.into());
+        }
+        Ok(libs)
+    }
 }
 
 fn trim_ascii_start(mut b: &[u8]) -> &[u8] {
@@ -290,6 +500,122 @@ fn trim_ascii_start(mut b: &[u8]) -> &[u8] {
         b = rest;
     }
     b
+}
+
+// ---------------------------------------------------------------------------
+// Function library loading
+// ---------------------------------------------------------------------------
+
+/// Metadata parsed from a library's `#!lua name=<name> [flags=...]` header.
+#[derive(Debug)]
+pub struct FunctionHeader {
+    pub name: String,
+    pub header_flags: Vec<String>,
+}
+
+/// Parse the `#!lua ...` first line of a FUNCTION LOAD payload. Mirrors
+/// `functionLibParseMetaData` (functions.c): the code must start with `#!`,
+/// the engine must be `lua`, and `name=` is required.
+pub fn parse_function_header(code: &[u8]) -> Result<FunctionHeader, String> {
+    let first_line = code.split(|&b| b == b'\n').next().unwrap_or(code);
+    let Some(rest) = first_line.strip_prefix(b"#!") else {
+        return Err("Missing library metadata".into());
+    };
+    let mut tokens = rest.split(|&b| b.is_ascii_whitespace());
+    let engine = tokens.next().unwrap_or(&[]);
+    if engine != b"lua" {
+        return Err("Invalid engine type".into());
+    }
+    let mut name: Option<String> = None;
+    let mut header_flags: Vec<String> = Vec::new();
+    for tok in tokens {
+        if let Some(v) = tok.strip_prefix(b"name=") {
+            if v.is_empty() {
+                return Err("Missing library name".into());
+            }
+            name = Some(String::from_utf8_lossy(v).into_owned());
+        } else if let Some(v) = tok.strip_prefix(b"flags=") {
+            for f in v.split(|&b| b == b',') {
+                if !f.is_empty() {
+                    header_flags.push(String::from_utf8_lossy(f).into_owned());
+                }
+            }
+        } else if !tok.is_empty() {
+            return Err("Invalid metadata".into());
+        }
+    }
+    let Some(name) = name else {
+        return Err("Missing library name".into());
+    };
+    // Validate the header flags like SCRIPT FLAGS does.
+    let mut params = ScriptParams::default();
+    for f in &header_flags {
+        params.apply_flags(f)?;
+    }
+    Ok(FunctionHeader { name, header_flags })
+}
+
+/// The bytes of a library payload after its `#!` metadata line (the chunk
+/// `FUNCTION LOAD` executes).
+#[must_use]
+pub fn function_body(code: &[u8]) -> &[u8] {
+    match code.iter().position(|&b| b == b'\n') {
+        Some(pos) => &code[pos + 1..],
+        None => &[],
+    }
+}
+
+/// Extract `(name, callback, flags)` from a `redis.register_function` call:
+/// either `(name, callback)` or the `{function_name=..., callback=...,
+/// flags={...}}` table form. Mirrors `luaRegisterFunction` (function_lua.c).
+fn register_function_args(args: &MultiValue) -> mlua::Result<(String, Value, Vec<String>)> {
+    let two = args.len() == 2 && matches!(&args[0], Value::String(_));
+    let one = args.len() == 1 && matches!(&args[0], Value::Table(_));
+    if !two && !one {
+        return Err(mlua::Error::runtime("wrong number or type of arguments"));
+    }
+    let (name, callback, flags) = if two {
+        let Value::String(name) = &args[0] else {
+            unreachable!()
+        };
+        if !matches!(&args[1], Value::Function(_)) {
+            return Err(mlua::Error::runtime("Function callback must be a function"));
+        }
+        (
+            String::from_utf8_lossy(&name.as_bytes()).into_owned(),
+            args[1].clone(),
+            Vec::new(),
+        )
+    } else {
+        let Value::Table(t) = &args[0] else {
+            unreachable!()
+        };
+        let name = match t.raw_get::<Value>("function_name")? {
+            Value::String(name) => String::from_utf8_lossy(&name.as_bytes()).into_owned(),
+            _ => return Err(mlua::Error::runtime("Function name must be a string")),
+        };
+        let callback = match t.raw_get::<Value>("callback")? {
+            Value::Function(f) => Value::Function(f),
+            _ => return Err(mlua::Error::runtime("Function callback must be a function")),
+        };
+        let mut flags = Vec::new();
+        match t.raw_get::<Value>("flags")? {
+            Value::Nil => {}
+            Value::Table(ft) => {
+                for v in ft.sequence_values::<Value>() {
+                    let Value::String(s) = v? else {
+                        return Err(mlua::Error::runtime(
+                            "Function flags must be a table of strings",
+                        ));
+                    };
+                    flags.push(String::from_utf8_lossy(&s.as_bytes()).into_owned());
+                }
+            }
+            _ => return Err(mlua::Error::runtime("Function flags must be a table")),
+        }
+        (name, callback, flags)
+    };
+    Ok((name, callback, flags))
 }
 
 // ---------------------------------------------------------------------------
@@ -445,7 +771,18 @@ impl SandboxedInterpreter {
         self.exec(POLYFILLS, "@dfly_polyfills")?;
         self.exec(RUNNER, "@dfly_runner")?;
         self.setup_redis_table()?;
+        self.setup_function_table()?;
         Ok(())
+    }
+
+    /// The `__dfly_functions__` global: every registered function callback,
+    /// keyed by function name, created when a library is (re)loaded.
+    fn setup_function_table(&self) -> Result<(), String> {
+        let t = self.lua.create_table().map_err(|e| e.to_string())?;
+        self.lua
+            .globals()
+            .set("__dfly_functions__", t)
+            .map_err(|e| e.to_string())
     }
 
     fn exec(&self, code: &str, name: &str) -> Result<(), String> {
@@ -649,6 +986,107 @@ impl SandboxedInterpreter {
             redis.set("pcall", pcall)?;
             let runner: Function = lua.globals().get("__dfly__run")?;
             let v: Value = runner.call(sha)?;
+            serialize_value(v, float_as_int, 0)
+        });
+        result.map_err(|e| clean_script_error(&e.to_string()))
+    }
+
+    /// Execute a FUNCTION library payload's body, collecting every
+    /// `redis.register_function` call and storing the callbacks in the
+    /// `__dfly_functions__` table (keyed by function name). `redis.call` and
+    /// `redis.pcall` are unavailable during a load, mirroring Redis.
+    pub fn load_function_lib(&self, code: &[u8]) -> Result<Vec<FunctionInfo>, String> {
+        let body = function_body(code);
+        let lua = &self.lua;
+        let collected = RefCell::new(Vec::new());
+        let result = lua.scope(|scope| {
+            let collected = &collected;
+            let register =
+                scope.create_function_mut(move |lua, args: MultiValue| -> mlua::Result<Value> {
+                    let (name, callback, flags) = register_function_args(&args)?;
+                    collected.borrow_mut().push(FunctionInfo {
+                        name: name.clone(),
+                        flags,
+                    });
+                    let funcs: Table = lua.globals().get("__dfly_functions__")?;
+                    funcs.raw_set(name, callback)?;
+                    Ok(Value::Nil)
+                })?;
+            let no_call = scope.create_function(|_, _: MultiValue| -> mlua::Result<Value> {
+                Err(mlua::Error::runtime(
+                    "redis.call is not allowed during function library load",
+                ))
+            })?;
+            let redis: Table = lua.globals().get("redis")?;
+            redis.set("register_function", register)?;
+            redis.set("call", no_call.clone())?;
+            redis.set("pcall", no_call)?;
+            let res = lua
+                .load(body)
+                .set_name("@user_function")
+                .set_mode(ChunkMode::Text)
+                .exec();
+            // Leave the load-only API absent for later runs.
+            redis.set("register_function", Value::Nil)?;
+            res?;
+            Ok(collected.borrow().clone())
+        });
+        result.map_err(|e| clean_script_error(&e.to_string()))
+    }
+
+    /// Run a registered function with `keys`/`argv` as its two arguments and
+    /// `redis.call`/`redis.pcall` dispatching through `dispatch`, mirroring
+    /// `FunctionRunner`/`FunctionLibInvoke` plus the EVAL path above.
+    pub fn run_function<D: ScriptDispatch>(
+        &self,
+        name: &str,
+        keys: &[Vec<u8>],
+        argv: &[Vec<u8>],
+        dispatch: &mut D,
+        float_as_int: bool,
+    ) -> Result<RespValue, String> {
+        let lua = &self.lua;
+        let cell = RefCell::new(&mut *dispatch);
+        let dispatch = &cell;
+        let result = lua.scope(|scope| {
+            let call = scope.create_function_mut(move |lua, args: MultiValue| {
+                let Ok(cmd_args) = prepare_args(&args) else {
+                    raise_string_error(lua, ARG_TYPE_ERR.into())
+                };
+                let dispatched = {
+                    let mut d = dispatch.borrow_mut();
+                    d.dispatch(cmd_args)
+                };
+                match dispatched {
+                    Ok(v) => resp_to_lua(lua, v),
+                    Err(msg) => raise_string_error(lua, msg),
+                }
+            })?;
+            let pcall = scope.create_function_mut(move |lua, args: MultiValue| {
+                let cmd_args = prepare_args(&args)?;
+                match dispatch.borrow_mut().dispatch(cmd_args) {
+                    Ok(v) => resp_to_lua(lua, v),
+                    Err(msg) => {
+                        let t = lua.create_table()?;
+                        t.raw_set("err", lua.create_string(msg.as_bytes())?)?;
+                        Ok(Value::Table(t))
+                    }
+                }
+            })?;
+            let redis: Table = lua.globals().get("redis")?;
+            redis.set("call", call)?;
+            redis.set("pcall", pcall)?;
+            let funcs: Table = lua.globals().get("__dfly_functions__")?;
+            let f: Function = funcs.get(name)?;
+            let keys_t = lua.create_table()?;
+            for (i, k) in keys.iter().enumerate() {
+                keys_t.raw_set(i + 1, lua.create_string(k)?)?;
+            }
+            let args_t = lua.create_table()?;
+            for (i, a) in argv.iter().enumerate() {
+                args_t.raw_set(i + 1, lua.create_string(a)?)?;
+            }
+            let v: Value = f.call((keys_t, args_t))?;
             serialize_value(v, float_as_int, 0)
         });
         result.map_err(|e| clean_script_error(&e.to_string()))
@@ -982,5 +1420,142 @@ mod tests {
             interp.run("bbbb", &mut Noop, false).unwrap(),
             RespValue::Integer(42)
         );
+    }
+
+    #[test]
+    fn function_header_parsing() {
+        assert_eq!(
+            parse_function_header(b"#!lua name=lib1").unwrap().name,
+            "lib1"
+        );
+        let h = parse_function_header(b"#!lua name=lib1 flags=no-writes,allow-undeclared-keys")
+            .unwrap();
+        assert_eq!(h.header_flags, vec!["no-writes", "allow-undeclared-keys"]);
+        assert_eq!(
+            parse_function_header(b"return 1").unwrap_err(),
+            "Missing library metadata"
+        );
+        assert_eq!(
+            parse_function_header(b"#!js name=x").unwrap_err(),
+            "Invalid engine type"
+        );
+        assert_eq!(
+            parse_function_header(b"#!lua").unwrap_err(),
+            "Missing library name"
+        );
+        assert_eq!(
+            parse_function_header(b"#!lua name=").unwrap_err(),
+            "Missing library name"
+        );
+        assert_eq!(
+            parse_function_header(b"#!lua name=x flags=bogus").unwrap_err(),
+            "Invalid flag: bogus"
+        );
+        assert_eq!(function_body(b"#!lua name=x\nreturn 1"), b"return 1");
+        assert_eq!(function_body(b"#!lua name=x"), b"");
+    }
+
+    #[test]
+    fn function_lib_load_and_run() {
+        struct Get;
+        impl ScriptDispatch for Get {
+            fn dispatch(&mut self, args: Vec<Vec<u8>>) -> Result<RespValue, String> {
+                assert_eq!(args[0], b"get");
+                Ok(RespValue::Bulk(b"v".to_vec()))
+            }
+        }
+
+        let interp = SandboxedInterpreter::new().unwrap();
+        let code = b"#!lua name=lib1\n\
+            redis.register_function('add', function(keys, args)\n\
+              return redis.call('get', keys[1]) .. ':' .. args[1]\n\
+            end)\n\
+            redis.register_function{function_name='one', callback=function() return 1 end, flags={'no-writes'}}\n\
+            return 0";
+        let fns = interp.load_function_lib(code).unwrap();
+        assert_eq!(fns.len(), 2);
+        assert_eq!(fns[0].name, "add");
+        assert!(fns[0].flags.is_empty());
+        assert_eq!(fns[1].name, "one");
+        assert_eq!(fns[1].flags, vec!["no-writes"]);
+
+        // The callback receives the (keys, args) tables and redis.call works.
+        assert_eq!(
+            interp
+                .run_function("add", &[b"k".to_vec()], &[b"a".to_vec()], &mut Get, false)
+                .unwrap(),
+            RespValue::Bulk(b"v:a".to_vec())
+        );
+        assert_eq!(
+            interp
+                .run_function("one", &[], &[], &mut Get, false)
+                .unwrap(),
+            RespValue::Integer(1)
+        );
+        // Unknown function name.
+        assert!(
+            interp
+                .run_function("nope", &[], &[], &mut Get, false)
+                .is_err()
+        );
+        // Reloading a library replaces the callback in place.
+        let code2 = b"#!lua name=lib1\nredis.register_function('one', function() return 2 end)";
+        interp.load_function_lib(code2).unwrap();
+        assert_eq!(
+            interp
+                .run_function("one", &[], &[], &mut Get, false)
+                .unwrap(),
+            RespValue::Integer(2)
+        );
+
+        // Bad register_function calls fail the whole load.
+        let err = interp
+            .load_function_lib(b"#!lua name=l\nredis.register_function('x', 5)")
+            .unwrap_err();
+        assert!(
+            err.contains("Function callback must be a function"),
+            "{err}"
+        );
+        let err = interp
+            .load_function_lib(b"#!lua name=l\nredis.register_function()")
+            .unwrap_err();
+        assert!(err.contains("wrong number or type of arguments"), "{err}");
+        // redis.call at library top level is rejected.
+        let err = interp
+            .load_function_lib(b"#!lua name=l\nredis.call('get', 'k')")
+            .unwrap_err();
+        assert!(
+            err.contains("redis.call is not allowed during function library load"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn library_dump_restore() {
+        let mut mgr = ScriptMgr::new();
+        let lib = FunctionLib {
+            name: "lib1".into(),
+            engine: "LUA".into(),
+            code: b"#!lua name=lib1\nredis.register_function('f', function() end)".to_vec(),
+            sha: "abc".into(),
+            header_flags: vec!["no-writes".into()],
+            functions: vec![FunctionInfo {
+                name: "f".into(),
+                flags: vec![],
+            }],
+        };
+        mgr.store_library(lib);
+        let dump = mgr.dump_libraries();
+        let mut restored = ScriptMgr::restore_libraries(&dump).unwrap();
+        assert_eq!(restored.len(), 1);
+        let r = restored.remove(0);
+        assert_eq!(r.name, "lib1");
+        assert_eq!(r.header_flags, vec!["no-writes"]);
+        assert_eq!(
+            r.code,
+            b"#!lua name=lib1\nredis.register_function('f', function() end)"
+        );
+        assert!(ScriptMgr::restore_libraries(b"junk").is_err());
+        assert!(ScriptMgr::restore_libraries(b"").is_err());
     }
 }

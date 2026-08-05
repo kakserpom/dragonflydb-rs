@@ -700,20 +700,6 @@ pub fn local_module(args: &[Vec<u8>]) -> RespValue {
     ])
 }
 
-/// FUNCTION: only `FLUSH` is implemented in the reference (a decorator for
-/// tests); anything else is an unknown-subcommand error.
-#[must_use]
-pub fn local_function(args: &[Vec<u8>]) -> RespValue {
-    let sub = args
-        .get(1)
-        .map(|a| a.to_ascii_uppercase())
-        .unwrap_or_default();
-    if sub.as_slice() == b"FLUSH" {
-        return RespValue::Simple("OK".into());
-    }
-    RespValue::Error(unknown_subcmd(&sub, "FUNCTION"))
-}
-
 /// DFLY is the replication control protocol (`dflycmd.cc`); the port has no
 /// replication stack, so it is rejected explicitly.
 #[must_use]
@@ -1137,7 +1123,7 @@ pub static CMD_MODULE: Command = Command {
 };
 pub static CMD_FUNCTION: Command = Command {
     name: "FUNCTION",
-    arity: 2,
+    arity: -2,
     flags: FLAG_LOCAL,
     key_range: KeyRange::NONE,
     exec: local_stub,
@@ -1185,6 +1171,22 @@ pub static CMD_EVAL_RO: Command = Command {
 };
 pub static CMD_EVALSHA_RO: Command = Command {
     name: "EVALSHA_RO",
+    arity: -3,
+    flags: FLAG_READONLY | FLAG_NOSCRIPT,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_FCALL: Command = Command {
+    name: "FCALL",
+    arity: -3,
+    flags: FLAG_NOSCRIPT,
+    key_range: KeyRange::NONE,
+    exec: local_stub,
+    merge: None,
+};
+pub static CMD_FCALL_RO: Command = Command {
+    name: "FCALL_RO",
     arity: -3,
     flags: FLAG_READONLY | FLAG_NOSCRIPT,
     key_range: KeyRange::NONE,
@@ -1244,6 +1246,25 @@ mod tests {
             RespValue::Map(m) => format!("MAP{}", m.len()),
             RespValue::Bool(b) => b.to_string(),
             RespValue::Double(f) => crate::util::format_double(*f),
+        }
+    }
+
+    /// Like [`render`] but recurses into maps (FUNCTION LIST/STATS replies).
+    fn render_full(v: &RespValue) -> String {
+        match v {
+            RespValue::Map(pairs) => format!(
+                "{{{}}}",
+                pairs
+                    .iter()
+                    .map(|(k, val)| format!("{} => {}", render_full(k), render_full(val)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            RespValue::Array(items) => format!(
+                "[{}]",
+                items.iter().map(render_full).collect::<Vec<_>>().join(", ")
+            ),
+            other => render(other),
         }
     }
 
@@ -1599,14 +1620,115 @@ mod tests {
 
     #[test]
     fn function_reply() {
+        use crate::commands::lua::ScriptMgr;
+        use crate::server::local_function;
+        let mut mgr = ScriptMgr::new();
+        let r = |m: &mut ScriptMgr, a: &[&str]| render(&local_function(m, &b_args(a)));
+        let rf = |m: &mut ScriptMgr, a: &[&str]| render_full(&local_function(m, &b_args(a)));
+        assert_eq!(r(&mut mgr, &["FUNCTION", "FLUSH"]), "OK");
         assert_eq!(
-            render(&local_function(&b_args(&["FUNCTION", "FLUSH"]))),
-            "OK"
+            r(&mut mgr, &["FUNCTION", "KILL"]),
+            "ERR No scripts in execution right now."
+        );
+        assert!(r(&mut mgr, &["FUNCTION", "HELP"]).contains("FUNCTION <subcommand>"));
+        assert_eq!(r(&mut mgr, &["FUNCTION", "LIST"]), "[]");
+        assert_eq!(
+            r(&mut mgr, &["FUNCTION", "BOGUS"]),
+            "ERR Unknown subcommand or wrong number of arguments for 'BOGUS'. Try FUNCTION HELP."
+        );
+
+        let lib1 = "#!lua name=lib1\n\
+            redis.register_function('f1', function(keys, args) return 1 end)";
+        assert_eq!(r(&mut mgr, &["FUNCTION", "LOAD", lib1]), "lib1");
+        assert_eq!(
+            r(&mut mgr, &["FUNCTION", "LOAD", lib1]),
+            "ERR Library 'lib1' already exists"
+        );
+        // A duplicate function name in another library is rejected.
+        let lib2 = "#!lua name=lib2\n\
+            redis.register_function('f1', function(keys, args) return 2 end)";
+        assert_eq!(
+            r(&mut mgr, &["FUNCTION", "LOAD", lib2]),
+            "ERR Function 'f1' already exists"
+        );
+        // REPLACE redefines the same library without a duplicate-function error.
+        assert_eq!(r(&mut mgr, &["FUNCTION", "LOAD", "REPLACE", lib1]), "lib1");
+        // The name is only freed when its library is deleted.
+        assert_eq!(r(&mut mgr, &["FUNCTION", "DELETE", "lib1"]), "OK");
+        assert_eq!(r(&mut mgr, &["FUNCTION", "LOAD", lib2]), "lib2");
+        assert!(rf(&mut mgr, &["FUNCTION", "LIST"]).contains("lib2"));
+
+        // LIST filters by library name and carries flags + optional code.
+        let lib3 = "#!lua name=lib3 flags=no-writes\n\
+            redis.register_function{function_name='ro', callback=function() return 3 end}";
+        assert_eq!(r(&mut mgr, &["FUNCTION", "LOAD", lib3]), "lib3");
+        let list = rf(
+            &mut mgr,
+            &["FUNCTION", "LIST", "LIBRARYNAME", "lib3", "WITHCODE"],
+        );
+        assert!(
+            list.contains("library_name") && list.contains("lib3"),
+            "{list}"
+        );
+        assert!(list.contains("library_code"), "{list}");
+        assert!(list.contains("no-writes"), "{list}");
+        assert_eq!(
+            r(&mut mgr, &["FUNCTION", "LIST", "LIBRARYNAME", "nope"]),
+            "[]"
+        );
+
+        let stats = rf(&mut mgr, &["FUNCTION", "STATS"]);
+        assert!(
+            stats.contains("engines") && stats.contains("libraries_count"),
+            "{stats}"
+        );
+
+        // Bad payloads.
+        assert!(
+            r(&mut mgr, &["FUNCTION", "LOAD", "return 1"])
+                .starts_with("ERR Missing library metadata")
         );
         assert_eq!(
-            render(&local_function(&b_args(&["FUNCTION", "LOAD", "x"]))),
-            "ERR Unknown subcommand or wrong number of arguments for 'LOAD'. Try FUNCTION HELP."
+            r(&mut mgr, &["FUNCTION", "LOAD", "#!lua name=empty"]),
+            "ERR No functions registered"
         );
+        assert!(
+            r(&mut mgr, &["FUNCTION", "LOAD", "#!js name=x\n"])
+                .starts_with("ERR Invalid engine type")
+        );
+        assert!(
+            r(
+                &mut mgr,
+                &["FUNCTION", "LOAD", "#!lua\nredis.register_function('x', 1)"]
+            )
+            .starts_with("ERR Missing library name")
+        );
+
+        // DUMP/RESTORE round-trips the registry into a fresh manager.
+        let dump = match local_function(&mut mgr, &b_args(&["FUNCTION", "DUMP"])) {
+            RespValue::Bulk(b) => b,
+            other => panic!("unexpected DUMP reply: {other:?}"),
+        };
+        let mut mgr2 = ScriptMgr::new();
+        let restore_args = vec![b"FUNCTION".to_vec(), b"RESTORE".to_vec(), dump.clone()];
+        assert_eq!(render(&local_function(&mut mgr2, &restore_args)), "OK");
+        assert_eq!(
+            r(&mut mgr2, &["FUNCTION", "LIST"]),
+            r(&mut mgr, &["FUNCTION", "LIST"])
+        );
+        assert_eq!(
+            r(&mut mgr2, &["FUNCTION", "RESTORE", "bogus"]),
+            "ERR Invalid function dump payload"
+        );
+
+        // DELETE (lib1 was already deleted above to free the 'f1' name).
+        assert_eq!(r(&mut mgr, &["FUNCTION", "DELETE", "lib3"]), "OK");
+        assert_eq!(
+            r(&mut mgr, &["FUNCTION", "DELETE", "lib3"]),
+            "ERR Library not found"
+        );
+        assert_eq!(r(&mut mgr, &["FUNCTION", "FLUSH"]), "OK");
+        assert_eq!(r(&mut mgr, &["FUNCTION", "LIST"]), "[]");
     }
 
     #[test]

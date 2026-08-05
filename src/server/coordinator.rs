@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::mpsc::RecvTimeoutError;
@@ -10,7 +11,7 @@ use crate::commands::{FLAG_GLOBAL, FLAG_NOSCRIPT, FLAG_WRITE, ShardPart};
 use crate::error::{CmdResult, RespValue};
 use crate::server::{
     CoordMsg, Reply, ReplyBus, ShardMsg, blocking_timeout_ms, command_for, encode_result,
-    extract_keys, is_eval_cmd, keys_per_shard, shard_for_key,
+    extract_keys, is_eval_cmd, is_function_cmd, keys_per_shard, shard_for_key,
 };
 
 /// A blocking command (XREAD/XREADGROUP) waiting for data or a timeout. The
@@ -46,6 +47,7 @@ pub fn spawn(
                 reply_bus,
                 script_mgr,
                 sandbox,
+                loaded_libs: HashMap::new(),
                 tx_counter: 0,
                 pending: VecDeque::new(),
             }
@@ -63,6 +65,9 @@ struct Coordinator {
     /// The coordinator-owned Lua state. `Option` so it can be taken out while a
     /// script runs (the dispatch context borrows the whole `Coordinator`).
     sandbox: Option<SandboxedInterpreter>,
+    /// Libraries already loaded into `sandbox`, keyed by library name with the
+    /// loaded sha (so FUNCTION LOAD REPLACE invalidates the cached callbacks).
+    loaded_libs: HashMap<String, String>,
     tx_counter: u64,
     pending: VecDeque<PendingTx>,
 }
@@ -89,6 +94,15 @@ impl Coordinator {
             let is_evalsha = matches!(cmd.name, "EVALSHA" | "EVALSHA_RO");
             let read_only = cmd.name.ends_with("_RO");
             let result = self.execute_script(&msg, is_evalsha, read_only);
+            self.reply_result(msg.conn_id, msg.seq, result);
+            return;
+        }
+        // The FCALL family runs registered functions the same way.
+        if let Some(cmd) = command_for(&msg.args)
+            && is_function_cmd(cmd.name)
+        {
+            let read_only = cmd.name.ends_with("_RO");
+            let result = self.execute_function(&msg, read_only);
             self.reply_result(msg.conn_id, msg.seq, result);
             return;
         }
@@ -363,6 +377,122 @@ impl Coordinator {
             Ok(v) => CmdResult::Ok(v),
             Err(e) => CmdResult::err(format!("ERR Error running script (call to {sha}): {e}")),
         }
+    }
+
+    /// Run a registered function (`FCALL`/`FCALL_RO`): resolve the function
+    /// through the shared library registry, load its library into the
+    /// coordinator's interpreter if needed, lock the declared-key shards, and
+    /// invoke the callback with `(keys, args)` tables like the EVAL path.
+    fn execute_function(&mut self, msg: &CoordMsg, read_only: bool) -> CmdResult {
+        let args = &msg.args;
+        let name = String::from_utf8_lossy(&args[1]).into_owned();
+        let numkeys = match args.get(2).and_then(|a| crate::util::parse_i64(a)) {
+            Some(n) if n >= 0 => n as usize,
+            _ => return CmdResult::err("ERR value is not an integer or out of range"),
+        };
+        if args.len() < numkeys + 3 {
+            return CmdResult::err("ERR Number of keys can't be greater than number of args");
+        }
+        let key_idxs: Vec<usize> = (3..3 + numkeys).collect();
+        let keys: Vec<Vec<u8>> = key_idxs.iter().map(|&i| args[i].clone()).collect();
+        let argv: Vec<Vec<u8>> = args[3 + numkeys..].to_vec();
+
+        let (lib, func) = {
+            let mgr = self.script_mgr.lock().unwrap();
+            let Some(lib) = mgr.function_lib(&name) else {
+                return CmdResult::err("ERR Function not found");
+            };
+            let Some(func) = lib.functions.iter().find(|f| f.name == name) else {
+                return CmdResult::err("ERR Function not found");
+            };
+            (lib.clone(), func.clone())
+        };
+        // `no-writes` (header or per-function) forces the read-only path.
+        let read_only =
+            read_only || lib.is_no_writes() || func.flags.iter().any(|f| f == "no-writes");
+        let params = match lib.params() {
+            Ok(p) => p,
+            Err(e) => return CmdResult::err(format!("ERR {e}")),
+        };
+        let undeclared =
+            params.undeclared_keys || func.flags.iter().any(|f| f == "allow-undeclared-keys");
+
+        // (Re)create the library's callbacks in the coordinator's interpreter
+        // on first FCALL or after a REPLACE (sha change).
+        let Some(sandbox) = self.sandbox.take() else {
+            return CmdResult::err("ERR internal: no script interpreter");
+        };
+        if self.loaded_libs.get(&lib.name) != Some(&lib.sha) {
+            if let Err(e) = sandbox.load_function_lib(&lib.code) {
+                self.sandbox = Some(sandbox);
+                return CmdResult::err(format!("ERR {e}"));
+            }
+            self.loaded_libs.insert(lib.name.clone(), lib.sha.clone());
+        }
+
+        // Lock the shards of the declared keys (like `execute_script`).
+        let tx_id = self.next_tx_id();
+        let per = keys_per_shard(args, &key_idxs, self.num_shards);
+        let shards: Vec<usize> = per.iter().map(|(s, _)| *s).collect();
+        let mut ack_rxs = Vec::new();
+        for &s in &shards {
+            let (ack_tx, ack_rx) = mpsc::channel();
+            if self.shard_txs[s]
+                .send(ShardMsg::TxLock {
+                    tx_id,
+                    conn_id: msg.conn_id,
+                    seq: msg.seq,
+                    args: args.clone(),
+                    owned_key_idxs: owned_for(&per, s),
+                    first_key_idx: 0,
+                    db_idx: msg.db_idx,
+                    ack: ack_tx,
+                })
+                .is_ok()
+            {
+                ack_rxs.push(ack_rx);
+            }
+        }
+        for rx in &ack_rxs {
+            let _ = rx.recv();
+        }
+
+        // Record the running function so `FUNCTION STATS` (IO thread) can see it.
+        self.script_mgr.lock().unwrap().set_running(
+            &name,
+            Self::render_fcall_command(args),
+            now_ms(),
+        );
+
+        let ctx = ScriptCtx {
+            declared: keys.clone(),
+            undeclared_keys: undeclared,
+            read_only,
+            num_shards: self.num_shards,
+            db_idx: msg.db_idx,
+        };
+        let result = {
+            let mut dctx = ScriptDispatchCtx { coord: self, ctx };
+            sandbox.run_function(&name, &keys, &argv, &mut dctx, params.float_as_int)
+        };
+        self.script_mgr.lock().unwrap().clear_running();
+        self.sandbox = Some(sandbox);
+        self.unlock_script(tx_id, &shards);
+
+        match result {
+            Ok(v) => CmdResult::Ok(v),
+            Err(e) => CmdResult::err(format!("ERR Error running function (call to {name}): {e}")),
+        }
+    }
+
+    /// The original FCALL command text for `FUNCTION STATS` (`fcall <name> ...`).
+    fn render_fcall_command(args: &[Vec<u8>]) -> String {
+        let mut parts: Vec<String> = args
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        parts[0] = parts[0].to_ascii_lowercase();
+        parts.join(" ")
     }
 
     /// Release the shard locks held for a script run.

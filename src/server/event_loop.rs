@@ -13,7 +13,7 @@ use crate::protocol::resp::RespParser;
 use crate::server::pubsub::{self, ChannelStore, SubscribeInfo};
 use crate::server::{
     CoordMsg, Reply, ServerEnv, ShardMsg, SingleOp, WatchState, command_for, encode_value,
-    extract_keys, is_eval_cmd, keys_per_shard, local_script,
+    extract_keys, is_eval_cmd, is_function_cmd, keys_per_shard, local_function, local_script,
 };
 
 const EV_READ: i16 = libc::EVFILT_READ;
@@ -406,9 +406,9 @@ impl IoLoop {
 
     /// Split a command by its keys and send it to a shard or the coordinator.
     fn dispatch_keyed(&self, conn_id: u64, seq: u64, cmd: &'static Command, args: &[Vec<u8>]) {
-        // The EVAL family runs entirely on the coordinator (it owns the Lua
-        // interpreter); the coordinator derives the declared keys itself.
-        if is_eval_cmd(cmd.name) {
+        // The EVAL/FCALL families run entirely on the coordinator (it owns the
+        // Lua interpreter); the coordinator derives the declared keys itself.
+        if is_eval_cmd(cmd.name) || is_function_cmd(cmd.name) {
             self.send_coord(conn_id, seq, args.to_vec(), vec![], vec![], 0);
             return;
         }
@@ -1017,6 +1017,12 @@ impl IoLoop {
         local_script(&mut self.env.script_mgr.lock().unwrap(), args)
     }
 
+    /// FUNCTION subcommands against the shared library registry (see
+    /// `server::local_function`).
+    fn local_function(&self, args: &[Vec<u8>]) -> RespValue {
+        local_function(&mut self.env.script_mgr.lock().unwrap(), args)
+    }
+
     fn run_local(&self, cmd: &Command, args: &[Vec<u8>]) -> RespValue {
         match cmd.name {
             "PING" => server::local_ping(args),
@@ -1037,7 +1043,7 @@ impl IoLoop {
             "ADDREPLICAOF" => server::local_addreplicaof(args),
             "REPLTAKEOVER" => server::local_repltakeover(args),
             "MODULE" => server::local_module(args),
-            "FUNCTION" => server::local_function(args),
+            "FUNCTION" => self.local_function(args),
             "SCRIPT" => self.local_script(args),
             "DFLY" => server::local_dfly(args),
             _ => RespValue::Error("ERR internal: unhandled local command".into()),

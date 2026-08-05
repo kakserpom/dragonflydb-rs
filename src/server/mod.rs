@@ -10,7 +10,10 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::sync::mpsc;
 
-use crate::commands::lua::{ScriptMgr, compile_check, sha1_hex};
+use crate::commands::exec::server::now_ms;
+use crate::commands::lua::{
+    FunctionLib, SandboxedInterpreter, ScriptMgr, compile_check, parse_function_header, sha1_hex,
+};
 use crate::commands::{Command, lookup};
 use crate::error::{CmdResult, ReplyBytes, RespValue};
 use crate::protocol::resp::encode_reply;
@@ -126,6 +129,280 @@ pub fn local_script(mgr: &mut ScriptMgr, args: &[Vec<u8>]) -> RespValue {
             String::from_utf8_lossy(other)
         )),
     }
+}
+
+fn unknown_function_subcmd(sub: &[u8]) -> String {
+    format!(
+        "ERR Unknown subcommand or wrong number of arguments for '{}'. Try FUNCTION HELP.",
+        String::from_utf8_lossy(sub)
+    )
+}
+
+/// FUNCTION subcommands against the shared library registry. `LOAD` validates
+/// the payload in a throwaway Lua state (collecting the `redis.register_function`
+/// calls); the coordinator recreates the callbacks in its own interpreter the
+/// first time a library's function runs (`FCALL`).
+pub fn local_function(mgr: &mut ScriptMgr, args: &[Vec<u8>]) -> RespValue {
+    let sub = args
+        .get(1)
+        .map(|a| a.to_ascii_uppercase())
+        .unwrap_or_default();
+    match sub.as_slice() {
+        b"HELP" => RespValue::Array(vec![
+            RespValue::Simple("FUNCTION <subcommand> [<arg> [value] [opt] ...]".into()),
+            RespValue::Simple("Subcommands are:".into()),
+            RespValue::Simple("LOAD [REPLACE] <code>".into()),
+            RespValue::Simple("   Load a new library to the server.".into()),
+            RespValue::Simple("DELETE <library-name>".into()),
+            RespValue::Simple("   Delete the given library.".into()),
+            RespValue::Simple("FLUSH [ASYNC|SYNC]".into()),
+            RespValue::Simple("   Delete all the libraries.".into()),
+            RespValue::Simple("LIST [LIBRARYNAME <library-name>] [WITHCODE]".into()),
+            RespValue::Simple("   Return information about the functions.".into()),
+            RespValue::Simple("STATS".into()),
+            RespValue::Simple("   Return information about the current function execution.".into()),
+            RespValue::Simple("DUMP".into()),
+            RespValue::Simple("   Return the payload of all functions.".into()),
+            RespValue::Simple("RESTORE <payload> [FLUSH|APPEND|REPLACE]".into()),
+            RespValue::Simple("   Restore the functions from the payload.".into()),
+            RespValue::Simple("KILL".into()),
+            RespValue::Simple("   Kill the currently executing function.".into()),
+            RespValue::Simple("HELP".into()),
+            RespValue::Simple("   Prints this help.".into()),
+        ]),
+        b"LOAD" => {
+            let (replace, code_idx) = if args
+                .get(2)
+                .is_some_and(|a| a.eq_ignore_ascii_case(b"REPLACE"))
+            {
+                (true, 3)
+            } else {
+                (false, 2)
+            };
+            let Some(code) = args.get(code_idx) else {
+                return RespValue::Error(unknown_function_subcmd(&sub));
+            };
+            match load_library(mgr, code, replace) {
+                Ok(name) => RespValue::Bulk(name.into_bytes()),
+                Err(e) => RespValue::Error(format!("ERR {e}")),
+            }
+        }
+        b"DELETE" => {
+            let Some(name) = args.get(2).map(|a| String::from_utf8_lossy(a).into_owned()) else {
+                return RespValue::Error(unknown_function_subcmd(&sub));
+            };
+            if mgr.delete_library(&name) {
+                RespValue::Simple("OK".into())
+            } else {
+                RespValue::Error("ERR Library not found".into())
+            }
+        }
+        b"FLUSH" => {
+            if args.len() > 3 {
+                return RespValue::Error(unknown_function_subcmd(&sub));
+            }
+            mgr.flush_libraries();
+            RespValue::Simple("OK".into())
+        }
+        b"LIST" => function_list(mgr, args),
+        b"STATS" => function_stats(mgr),
+        b"DUMP" => RespValue::Bulk(mgr.dump_libraries()),
+        b"RESTORE" => function_restore(mgr, args),
+        b"KILL" => {
+            // Functions run synchronously on the coordinator and cannot be
+            // interrupted from the IO thread, so KILL always reports idle.
+            RespValue::Error("ERR No scripts in execution right now.".into())
+        }
+        other => RespValue::Error(unknown_function_subcmd(other)),
+    }
+}
+
+/// Validate `code` (header, compile and `redis.register_function` calls) and
+/// insert it into the registry, enforcing the Redis uniqueness rules: the
+/// library name and every function name must be free unless `replace` allows
+/// redefining the same library. Returns the library name on success.
+fn load_library(mgr: &mut ScriptMgr, code: &[u8], replace: bool) -> Result<String, String> {
+    let header = parse_function_header(code)?;
+    if !replace && mgr.library(&header.name).is_some() {
+        return Err(format!("Library '{}' already exists", header.name));
+    }
+    let interp = SandboxedInterpreter::new()?;
+    let functions = interp.load_function_lib(code)?;
+    if functions.is_empty() {
+        return Err("No functions registered".into());
+    }
+    let lib = FunctionLib {
+        name: header.name.clone(),
+        engine: "LUA".into(),
+        sha: sha1_hex(code),
+        code: code.to_vec(),
+        header_flags: header.header_flags,
+        functions,
+    };
+    for f in &lib.functions {
+        if let Some(other) = mgr.function_lib(&f.name)
+            && other.name != lib.name
+        {
+            return Err(format!("Function '{}' already exists", f.name));
+        }
+    }
+    let name = lib.name.clone();
+    mgr.store_library(lib);
+    Ok(name)
+}
+
+fn function_list(mgr: &ScriptMgr, args: &[Vec<u8>]) -> RespValue {
+    let mut filter: Option<String> = None;
+    let mut with_code = false;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].to_ascii_uppercase().as_slice() {
+            b"LIBRARYNAME" => {
+                let Some(name) = args.get(i + 1) else {
+                    return RespValue::Error(unknown_function_subcmd(b"LIST"));
+                };
+                filter = Some(String::from_utf8_lossy(name).into_owned());
+                i += 2;
+            }
+            b"WITHCODE" => {
+                with_code = true;
+                i += 1;
+            }
+            _ => return RespValue::Error(unknown_function_subcmd(b"LIST")),
+        }
+    }
+    let mut libs: Vec<&FunctionLib> = mgr.libraries().into_iter().map(|(_, l)| l).collect();
+    if let Some(f) = filter {
+        libs.retain(|l| l.name == f);
+    }
+    libs.sort_by(|a, b| a.name.cmp(&b.name));
+    RespValue::Array(
+        libs.into_iter()
+            .map(|lib| {
+                let mut pairs = vec![
+                    (
+                        RespValue::Bulk(b"library_name".to_vec()),
+                        RespValue::Bulk(lib.name.clone().into_bytes()),
+                    ),
+                    (
+                        RespValue::Bulk(b"engine".to_vec()),
+                        RespValue::Bulk(lib.engine.clone().into_bytes()),
+                    ),
+                    (
+                        RespValue::Bulk(b"functions".to_vec()),
+                        RespValue::Array(
+                            lib.functions
+                                .iter()
+                                .map(|f| {
+                                    RespValue::Map(vec![
+                                        (
+                                            RespValue::Bulk(b"name".to_vec()),
+                                            RespValue::Bulk(f.name.clone().into_bytes()),
+                                        ),
+                                        (
+                                            RespValue::Bulk(b"description".to_vec()),
+                                            RespValue::Bulk(Vec::new()),
+                                        ),
+                                        (
+                                            RespValue::Bulk(b"flags".to_vec()),
+                                            RespValue::Array(
+                                                f.flags
+                                                    .iter()
+                                                    .map(|s| {
+                                                        RespValue::Bulk(s.clone().into_bytes())
+                                                    })
+                                                    .collect(),
+                                            ),
+                                        ),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                ];
+                if with_code {
+                    pairs.push((
+                        RespValue::Bulk(b"library_code".to_vec()),
+                        RespValue::Bulk(lib.code.clone()),
+                    ));
+                }
+                RespValue::Map(pairs)
+            })
+            .collect(),
+    )
+}
+
+fn function_stats(mgr: &ScriptMgr) -> RespValue {
+    let running = match mgr.running() {
+        Some(r) => RespValue::Map(vec![
+            (
+                RespValue::Bulk(b"name".to_vec()),
+                RespValue::Bulk(r.name.clone().into_bytes()),
+            ),
+            (
+                RespValue::Bulk(b"command".to_vec()),
+                RespValue::Bulk(r.command.clone().into_bytes()),
+            ),
+            (
+                RespValue::Bulk(b"duration_ms".to_vec()),
+                RespValue::Integer(now_ms().saturating_sub(r.started_ms) as i64),
+            ),
+        ]),
+        None => RespValue::Nil,
+    };
+    let libs = mgr.libraries();
+    let functions_count: usize = libs.iter().map(|(_, l)| l.functions.len()).sum();
+    RespValue::Map(vec![
+        (RespValue::Bulk(b"running_script".to_vec()), running),
+        (
+            RespValue::Bulk(b"engines".to_vec()),
+            RespValue::Map(vec![(
+                RespValue::Bulk(b"LUA".to_vec()),
+                RespValue::Map(vec![
+                    (
+                        RespValue::Bulk(b"libraries_count".to_vec()),
+                        RespValue::Integer(libs.len() as i64),
+                    ),
+                    (
+                        RespValue::Bulk(b"functions_count".to_vec()),
+                        RespValue::Integer(functions_count as i64),
+                    ),
+                ]),
+            )]),
+        ),
+    ])
+}
+
+fn function_restore(mgr: &mut ScriptMgr, args: &[Vec<u8>]) -> RespValue {
+    let Some(payload) = args.get(2) else {
+        return RespValue::Error(unknown_function_subcmd(b"RESTORE"));
+    };
+    let mut flush = false;
+    let mut replace = false;
+    if let Some(p) = args.get(3) {
+        match p.to_ascii_uppercase().as_slice() {
+            b"FLUSH" => flush = true,
+            b"REPLACE" => replace = true,
+            b"APPEND" => {}
+            _ => return RespValue::Error(unknown_function_subcmd(b"RESTORE")),
+        }
+    }
+    let libs = match ScriptMgr::restore_libraries(payload) {
+        Ok(l) => l,
+        Err(e) => return RespValue::Error(format!("ERR {e}")),
+    };
+    if flush {
+        mgr.flush_libraries();
+    }
+    for lib in libs {
+        if !replace && mgr.library(&lib.name).is_some() {
+            return RespValue::Error(format!("ERR Library '{}' already exists", lib.name));
+        }
+        if let Err(e) = load_library(mgr, &lib.code, replace) {
+            return RespValue::Error(format!("ERR {e}"));
+        }
+    }
+    RespValue::Simple("OK".into())
 }
 
 /// A reply routed back to a specific connection. `seq` preserves request order.
@@ -482,6 +759,13 @@ pub fn command_for(args: &[Vec<u8>]) -> Option<&'static Command> {
 #[must_use]
 pub fn is_eval_cmd(name: &str) -> bool {
     matches!(name, "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO")
+}
+
+/// True for the FCALL family, which also runs on the coordinator (the function
+/// callbacks live in its Lua interpreter).
+#[must_use]
+pub fn is_function_cmd(name: &str) -> bool {
+    matches!(name, "FCALL" | "FCALL_RO")
 }
 
 /// Parse the BLOCK timeout in ms from XREAD/XREADGROUP args.

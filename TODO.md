@@ -69,7 +69,13 @@ Legend:
   PUNSUBSCRIBE, QUIT, REPLCONF, REPLICAOF, REPLTAKEOVER, RESET, ROLE, SAVE,
   SHRINK, SHUTDOWN, SLAVEOF, SLOWLOG, SPUBLISH, SSUBSCRIBE, SUBSCRIBE,
   SUNSUBSCRIBE, UNSUBSCRIBE, UNWATCH, WAIT, WATCH
-- [~] FUNCTION (FLUSH ported; LOAD/other subcommands reject: no library engine)
+- [x] FUNCTION (LOAD [REPLACE], DELETE, FLUSH, LIST [LIBRARYNAME] [WITHCODE],
+  STATS, DUMP, RESTORE [FLUSH|APPEND|REPLACE], KILL, HELP backed by a shared
+  library registry with per-library `#!lua name=...` headers, `redis.register_function`
+  collection, and duplicate library/function-name enforcement)
+- [x] FCALL, FCALL_RO (run registered functions on the coordinator: lazy library
+  load into its interpreter, `(keys, args)` tables, per-key transaction locking,
+  `no-writes`/`allow-undeclared-keys` flag enforcement)
 - [x] SCRIPT (EXISTS, LIST, FLUSH, LATENCY, GC, FLAGS, LOAD, HELP backed by a
   shared `ScriptMgr` cache of compiled scripts; `SCRIPT FLAGS` and `--!df`
   comment flags set per-script params)
@@ -88,6 +94,11 @@ Legend:
   IO thread (`compile_check`); the actual sandbox bootstrap applies at EVAL.
 - No `redis.acall`/`redis.apcall` (no async path); `SCRIPT LATENCY` returns an
   empty array.
+- Function library callbacks live in `__dfly_functions__` in the coordinator's
+  interpreter and are recreated on first FCALL (or when a library's sha
+  changes); `FUNCTION DUMP`/`RESTORE` use an opaque local binary format.
+- `FUNCTION KILL` always reports idle (functions run synchronously on the
+  coordinator and cannot be interrupted from the IO thread).
 
 ## Module / probabilistic (`bloom_family.cc`, `cms_family.cc`, `cuckoo_filter_family.cc`, `topk_family.cc`)
 - [x] BF.ADD, BF.EXISTS, BF.INFO, BF.LOADCHUNK, BF.MADD, BF.MEXISTS, BF.RESERVE,
