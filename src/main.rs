@@ -23,6 +23,7 @@ fn main() {
     let mut lua_float_as_int_shas = Vec::new();
     let mut lua_allow_undeclared_auto_correct = false;
     let mut lua_resp2_legacy_float = false;
+    let mut lua_enable_redis_log = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -69,6 +70,8 @@ fn main() {
             }
             "--lua_resp2_legacy_float" => lua_resp2_legacy_float = true,
             "--lua_resp2_legacy_float=false" => lua_resp2_legacy_float = false,
+            "--lua_enable_redis_log" => lua_enable_redis_log = true,
+            "--lua_enable_redis_log=false" => lua_enable_redis_log = false,
             "--help" | "-h" => {
                 usage();
                 return;
@@ -119,6 +122,7 @@ fn main() {
         lua_float_as_int_shas,
         lua_allow_undeclared_auto_correct,
         lua_resp2_legacy_float,
+        lua_enable_redis_log,
     ) {
         eprintln!("invalid --default_lua_flags: {e}");
         std::process::exit(1);
@@ -170,7 +174,7 @@ fn usage() {
         "usage: dragonflydb [--port PORT] [--num-shards N] [--lua_auto_async[=false]] \
          [--default_lua_flags FLAGS] [--lua_undeclared_keys_shas SHA,...] \
          [--lua_float_as_int_shas SHA,...] [--lua_allow_undeclared_auto_correct[=false]] \
-         [--lua_resp2_legacy_float[=false]] [--help]"
+         [--lua_resp2_legacy_float[=false]] [--lua_enable_redis_log[=false]] [--help]"
     );
 }
 

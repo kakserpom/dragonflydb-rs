@@ -17,7 +17,7 @@ use mlua::{Function, HookTriggers, Lua, MultiValue, StdLib, Table, Value, VmStat
 
 use crate::core::histogram::Histogram;
 use crate::error::RespValue;
-use crate::util::{format_lua_float, itoa};
+use crate::util::{format_lua_float, itoa, lua_tolstring};
 
 /// Error returned when a script/EVALSHA SHA is unknown.
 pub const NOSCRIPT_ERR: &str = "NOSCRIPT No matching script. Please use EVAL.";
@@ -259,6 +259,10 @@ pub struct ScriptMgr {
     /// `--lua_resp2_legacy_float`: treat every script float result as
     /// `legacy-float` regardless of the script's flags (`EvalSerializer::OnDouble`).
     pub lua_resp2_legacy_float: bool,
+    /// `--lua_enable_redis_log`: `redis.log` validates its level and actually
+    /// logs to stderr (`FLAGS_lua_enable_redis_log`); off, the call is a silent
+    /// no-op.
+    pub lua_enable_redis_log: bool,
 }
 
 /// Script SHAs upstream force-flags (buggy clients, see `script_mgr.cc:284`).
@@ -295,12 +299,14 @@ impl ScriptMgr {
         float_as_int_shas: Vec<String>,
         lua_allow_undeclared_auto_correct: bool,
         lua_resp2_legacy_float: bool,
+        lua_enable_redis_log: bool,
     ) -> Result<(), String> {
         self.default_params.apply_flags(default_lua_flags)?;
         self.undeclared_keys_shas = undeclared_keys_shas;
         self.float_as_int_shas = float_as_int_shas;
         self.lua_allow_undeclared_auto_correct = lua_allow_undeclared_auto_correct;
         self.lua_resp2_legacy_float = lua_resp2_legacy_float;
+        self.lua_enable_redis_log = lua_enable_redis_log;
         Ok(())
     }
 
@@ -1073,8 +1079,15 @@ pub struct SandboxedInterpreter {
 }
 
 impl SandboxedInterpreter {
-    /// Create a state and run the full bootstrap exactly once.
+    /// Create a state and run the full bootstrap exactly once, with
+    /// `--lua_enable_redis_log` off.
     pub fn new() -> Result<Self, String> {
+        Self::with_redis_log(false)
+    }
+
+    /// Create a state with the `--lua_enable_redis_log` flag applied to
+    /// `redis.log` (`FLAGS_lua_enable_redis_log`).
+    pub fn with_redis_log(enable_redis_log: bool) -> Result<Self, String> {
         // The reference loads the base/table/string/math/debug libraries only.
         // StdLib::DEBUG trips mlua's safety check, so this must go through the
         // unsafe constructor; the sandbox hides `debug` from scripts anyway.
@@ -1085,11 +1098,11 @@ impl SandboxedInterpreter {
             )
         };
         let interp = SandboxedInterpreter { lua };
-        interp.bootstrap()?;
+        interp.bootstrap(enable_redis_log)?;
         Ok(interp)
     }
 
-    fn bootstrap(&self) -> Result<(), String> {
+    fn bootstrap(&self, enable_redis_log: bool) -> Result<(), String> {
         self.exec(ERR_HANDLER, "@err_handler_def")?;
         self.exec(STRICT, "@enable_strictlua")?;
         self.install_protected_funcs()?;
@@ -1104,7 +1117,7 @@ impl SandboxedInterpreter {
             .map_err(|e| e.to_string())?;
         self.exec(POLYFILLS, "@dfly_polyfills")?;
         self.exec(RUNNER, "@dfly_runner")?;
-        self.setup_redis_table()?;
+        self.setup_redis_table(enable_redis_log)?;
         self.setup_function_table()?;
         Ok(())
     }
@@ -1200,19 +1213,25 @@ impl SandboxedInterpreter {
 
     /// The `redis.*` table with the always-static helpers. `call`/`pcall` are
     /// (re)installed per run with the dispatch context.
-    fn setup_redis_table(&self) -> Result<(), String> {
+    fn setup_redis_table(&self, enable_redis_log: bool) -> Result<(), String> {
         let t = self.lua.create_table().map_err(|e| e.to_string())?;
 
         let sha1hex = self
             .lua
             .create_function(|lua, args: MultiValue| -> mlua::Result<Value> {
                 if args.len() != 1 {
-                    return Err(mlua::Error::runtime("wrong number of arguments"));
+                    raise_string_error(lua, "wrong number of arguments".into())
                 }
-                let Value::String(s) = &args[0] else {
-                    return Err(mlua::Error::runtime("wrong number or type of arguments"));
+                // `lua_tolstring` coerces numbers to their string form
+                // (`RedisSha1Command`); other types are rejected (NULL in the
+                // reference, i.e. undefined).
+                let bytes = match &args[0] {
+                    Value::String(s) => s.as_bytes().to_vec(),
+                    Value::Integer(i) => itoa(*i),
+                    Value::Number(f) => lua_tolstring(*f).into_bytes(),
+                    _ => raise_string_error(lua, "wrong number or type of arguments".into()),
                 };
-                Ok(Value::String(lua.create_string(sha1_hex(&s.as_bytes()))?))
+                Ok(Value::String(lua.create_string(sha1_hex(&bytes))?))
             })
             .map_err(|e| e.to_string())?;
         t.raw_set("sha1hex", sha1hex).map_err(|e| e.to_string())?;
@@ -1239,16 +1258,40 @@ impl SandboxedInterpreter {
 
         let log = self
             .lua
-            .create_function(|_, args: MultiValue| -> mlua::Result<Value> {
+            .create_function(move |lua, args: MultiValue| -> mlua::Result<Value> {
                 if args.len() < 2 {
-                    return Err(mlua::Error::runtime(
-                        "redis.log() requires two arguments or more.",
-                    ));
+                    raise_string_error(lua, "redis.log() requires two arguments or more.".into())
                 }
-                if !matches!(args[0], Value::Integer(_) | Value::Number(_)) {
-                    return Err(mlua::Error::runtime(
-                        "First argument must be a number (log level).",
-                    ));
+                let level: f64 = match args[0] {
+                    Value::Integer(i) => i as f64,
+                    Value::Number(f) => f,
+                    _ => raise_string_error(
+                        lua,
+                        "First argument must be a number (log level).".into(),
+                    ),
+                };
+                // `RedisLogCommand`: with `--lua_enable_redis_log` off the call
+                // is a silent no-op; when on, the level must be a valid
+                // `LOG_DEBUG`..`LOG_WARNING` and the message is emitted.
+                if enable_redis_log {
+                    let level = level as i64;
+                    if !(0..=3).contains(&level) {
+                        raise_string_error(lua, "Invalid log level.".into())
+                    }
+                    let msg = args
+                        .iter()
+                        .skip(1)
+                        .filter_map(|a| match a {
+                            Value::String(s) => s.to_str().ok().as_deref().map(str::to_owned),
+                            Value::Integer(i) => {
+                                Some(String::from_utf8_lossy(&itoa(*i)).into_owned())
+                            }
+                            Value::Number(f) => Some(format_lua_float(*f)),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    eprintln!("lua[{level}] {msg}");
                 }
                 Ok(Value::Nil)
             })
@@ -1626,13 +1669,22 @@ fn is_global_table_or_metatable(lua: &Lua, v: &Value) -> mlua::Result<bool> {
 }
 
 /// `SingleFieldTable`: build `{field = <string>}`, erroring with a `{err=...}`
-/// table on bad arguments (the reference returns the table, not a raise).
+/// table on bad arguments (the reference returns the table, not a raise). The
+/// error carries the `source:line:` trace prefix of `PushError` (interpreter.cc).
 fn single_field_table(lua: &Lua, field: &str, args: &MultiValue) -> mlua::Result<Value> {
     if args.len() != 1 || !matches!(&args[0], Value::String(_)) {
+        let prefix = lua
+            .inspect_stack(1, |dbg| {
+                let src = dbg.source();
+                let source = src.source.as_deref().unwrap_or("");
+                let line = dbg.current_line().unwrap_or(0);
+                format!("{source}:{line}: ")
+            })
+            .unwrap_or_default();
         let t = lua.create_table()?;
         t.raw_set(
             "err",
-            lua.create_string("wrong number or type of arguments")?,
+            lua.create_string(format!("{prefix}wrong number or type of arguments"))?,
         )?;
         return Ok(Value::Table(t));
     }
@@ -1899,6 +1951,7 @@ mod tests {
             vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()],
             false,
             false,
+            false,
         )
         .unwrap();
 
@@ -1930,7 +1983,8 @@ mod tests {
     #[test]
     fn on_script_error_auto_corrects_undeclared_keys() {
         let mut mgr = ScriptMgr::new();
-        mgr.configure("", vec![], vec![], true, false).unwrap();
+        mgr.configure("", vec![], vec![], true, false, false)
+            .unwrap();
         let body = b"return KEYS[1]";
         let sha = sha1_hex(body);
         let params = ScriptParams::default();
@@ -2568,5 +2622,103 @@ mod tests {
         assert!(mgr.kill_requested());
         mgr.clear_kill();
         assert!(!mgr.kill_requested());
+    }
+
+    #[test]
+    fn sha1hex_coerces_numbers() {
+        let interp = SandboxedInterpreter::new().unwrap();
+        let run_body = |sha: &str, body: &str| -> RespValue {
+            interp.define(sha, body.as_bytes()).unwrap();
+            interp.run(sha, &mut Noop, false, &no_kill()).unwrap()
+        };
+        // `lua_tolstring` coerces strings, integers and floats (`RedisSha1Command`).
+        assert_eq!(
+            run_body("s1", "return redis.sha1hex('x')"),
+            RespValue::Bulk(sha1_hex(b"x").into_bytes())
+        );
+        assert_eq!(
+            run_body("s2", "return redis.sha1hex(123)"),
+            RespValue::Bulk(sha1_hex(b"123").into_bytes())
+        );
+        assert_eq!(
+            run_body("s3", "return redis.sha1hex(100)"),
+            RespValue::Bulk(sha1_hex(b"100").into_bytes())
+        );
+        assert_eq!(
+            run_body("s4", "return redis.sha1hex(3.7)"),
+            RespValue::Bulk(sha1_hex(b"3.7").into_bytes())
+        );
+        assert_eq!(
+            run_body("s5", "return redis.sha1hex(1e16)"),
+            RespValue::Bulk(sha1_hex(b"10000000000000000").into_bytes())
+        );
+        // Non-coercible types are rejected.
+        interp.define("s6", b"return redis.sha1hex(true)").unwrap();
+        let err = interp.run("s6", &mut Noop, false, &no_kill()).unwrap_err();
+        assert!(err.contains("wrong number or type of arguments"), "{err}");
+    }
+
+    #[test]
+    fn redis_log_level_validation() {
+        // Flag off (default): a silent no-op, even for out-of-range levels.
+        let interp = SandboxedInterpreter::new().unwrap();
+        interp
+            .define("aaaa", b"return redis.log(999, 'noop')")
+            .unwrap();
+        assert_eq!(
+            interp.run("aaaa", &mut Noop, false, &no_kill()).unwrap(),
+            RespValue::Nil
+        );
+        // Arity and level-type checks run regardless of the flag.
+        interp.define("bbbb", b"return redis.log('x')").unwrap();
+        let err = interp
+            .run("bbbb", &mut Noop, false, &no_kill())
+            .unwrap_err();
+        assert!(
+            err.contains("redis.log() requires two arguments or more."),
+            "{err}"
+        );
+        interp
+            .define("cccc", b"return redis.log('not-a-number', 'x')")
+            .unwrap();
+        let err = interp
+            .run("cccc", &mut Noop, false, &no_kill())
+            .unwrap_err();
+        assert!(
+            err.contains("First argument must be a number (log level)."),
+            "{err}"
+        );
+        // Flag on: the level must be a valid LOG_DEBUG..LOG_WARNING.
+        let interp = SandboxedInterpreter::with_redis_log(true).unwrap();
+        interp
+            .define("dddd", b"return redis.log(999, 'x')")
+            .unwrap();
+        let err = interp
+            .run("dddd", &mut Noop, false, &no_kill())
+            .unwrap_err();
+        assert!(err.contains("Invalid log level."), "{err}");
+        interp
+            .define("eeee", b"return redis.log(1, 'hi', 42)")
+            .unwrap();
+        assert_eq!(
+            interp.run("eeee", &mut Noop, false, &no_kill()).unwrap(),
+            RespValue::Nil
+        );
+    }
+
+    #[test]
+    fn error_reply_bad_args_carries_trace_prefix() {
+        let interp = SandboxedInterpreter::new().unwrap();
+        interp
+            .define("aaaa", b"return redis.error_reply(1, 2).err")
+            .unwrap();
+        let v = interp.run("aaaa", &mut Noop, false, &no_kill()).unwrap();
+        let RespValue::Bulk(b) = v else {
+            panic!("expected bulk, got {v:?}");
+        };
+        let s = String::from_utf8(b).unwrap();
+        // `PushError` prefixes `source:currentline` (interpreter.cc).
+        assert!(s.starts_with("@user_script:"), "{s}");
+        assert!(s.ends_with(": wrong number or type of arguments"), "{s}");
     }
 }

@@ -188,16 +188,25 @@ pub fn format_lua_float(f: f64) -> String {
             "0".into()
         };
     }
-    // `{:.16e}` is correctly rounded to 17 significant digits, the same value
-    // `%.17g` starts from.
-    let sci = format!("{f:.16e}");
+    format_g(f, 17)
+}
+
+/// `%.<sig>g` equivalent (C printf semantics): `sig` significant digits with
+/// trailing zeros stripped, fixed notation when the base-10 exponent is in
+/// `[-4, sig)`, otherwise scientific with a signed, zero-padded exponent.
+/// The caller must pass a finite, non-zero value.
+#[must_use]
+fn format_g(f: f64, sig: i32) -> String {
+    // `{:.{prec}e}` with `prec = sig - 1` is correctly rounded to `sig`
+    // significant digits, the same value `%.<sig>g` starts from.
+    let sci = format!("{f:.prec$e}", prec = (sig - 1) as usize);
     let (mant, exp) = sci.split_once('e').unwrap();
     let exp: i32 = exp.parse().unwrap();
     let mut digits: String = mant.chars().filter(|&c| c != '.').collect();
     while digits.len() > 1 && digits.ends_with('0') {
         digits.pop();
     }
-    if (-4..17).contains(&exp) {
+    if (-4..sig).contains(&exp) {
         let ip = exp as i64 + 1;
         if ip >= digits.len() as i64 {
             format!(
@@ -225,6 +234,39 @@ pub fn format_lua_float(f: f64) -> String {
             exp.abs()
         )
     }
+}
+
+/// Lua 5.4 `lua_tolstring` number formatting: integral values that fit in a
+/// `lua_Integer` (53-bit) use the precise decimal form, everything else is
+/// `%.14g` upgraded to `%.17g` when that avoids a decimal exponent or point
+/// (`lua_number2strbuff`). Used by `redis.sha1hex` on number arguments.
+#[must_use]
+pub fn lua_tolstring(f: f64) -> String {
+    const MAX_INT: f64 = 9_007_199_254_740_992.0; // 2^53, `MAX_FP` in lobject.h
+    if f.is_nan() {
+        return "nan".into();
+    }
+    if f.is_infinite() {
+        return if f < 0.0 { "-inf".into() } else { "inf".into() };
+    }
+    if f == 0.0 {
+        return "0".into();
+    }
+    if f.fract() == 0.0 && f.abs() <= MAX_INT {
+        return String::from_utf8(itoa(f as i64)).unwrap();
+    }
+    let short = format_g(f, 14);
+    // `strpbrk(buff, "E.")` in `lua_float2strbuff`: a plain integer needs no
+    // alternative; otherwise try `%.17g` and prefer it if it also has no
+    // exponent/point.
+    if !short.contains(['.', 'e', 'E']) {
+        return short;
+    }
+    let long = format_g(f, 17);
+    if !long.contains(['.', 'e', 'E']) {
+        return long;
+    }
+    short
 }
 
 #[cfg(test)]
@@ -302,6 +344,34 @@ mod tests {
             assert_eq!(format_lua_float(*v), *want, "%.17g mismatch for {v}");
         }
         assert_eq!(format_lua_float(f64::NAN), "nan");
+    }
+
+    #[test]
+    fn lua_tolstring_matches_lua54() {
+        // Values captured from Lua 5.4's `tostring()` (lua_number2strbuff).
+        let cases: &[(f64, &str)] = &[
+            (3.7, "3.7"),
+            (0.1, "0.1"),
+            (2.0, "2"),
+            (100.0, "100"),
+            (0.0, "0"),
+            (-0.0, "0"),
+            (1e16, "10000000000000000"),
+            (1e17, "1e+17"),
+            (3.0e6, "3000000"),
+            (1.0e9, "1000000000"),
+            (0.0001, "0.0001"),
+            (2.5e-5, "2.5e-05"),
+            (123.456, "123.456"),
+            (0.300_000_000_000_000_04, "0.3"),
+            (123_456_789_012_345_678.0, "1.2345678901235e+17"),
+            (f64::NAN, "nan"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+        ];
+        for (v, want) in cases {
+            assert_eq!(lua_tolstring(*v), *want, "lua_tolstring mismatch for {v}");
+        }
     }
 
     #[test]

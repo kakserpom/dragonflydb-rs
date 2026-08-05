@@ -38,7 +38,8 @@ pub fn spawn(
         .spawn(move || {
             // The Lua state is not `Send`, so it must be created here on the
             // coordinator thread (the only thread that ever runs scripts).
-            let sandbox = match SandboxedInterpreter::new() {
+            let enable_redis_log = script_mgr.lock().unwrap().lua_enable_redis_log;
+            let sandbox = match SandboxedInterpreter::with_redis_log(enable_redis_log) {
                 Ok(s) => Some(s),
                 Err(e) => {
                     eprintln!("coordinator: failed to init Lua interpreter: {e}");
