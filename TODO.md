@@ -102,10 +102,14 @@ Legend:
 - `SCRIPT LATENCY` aggregates per-SHA usec runs on the coordinator into a
   single summary per script (the reference merges per-shard
   `base::Histogram` dumps).
-- The async batch is squashed sequentially through the shards rather than
-  through a real `MultiCommandSquasher` single-hop; the byte budget uses an
-  approximate per-command heap cost (arg bytes + 64), so the mid-script flush
-  point may differ slightly from the reference.
+- The async batch is flushed as a `MultiCommandSquasher`-style squashed phase:
+  per-shard accumulation runs in a single parallel hop per shard
+  (`ShardMsg::ScriptBatch`) when a shard's batch reaches `max_squash_cmd_num`
+  (32) or at flush time; keyless and multi-shard commands flush the hop then
+  run standalone. An `acall` error aborts the remaining batch
+  (`error_abort`), `apcall` errors are suppressed. The byte budget uses the
+  reference's per-command heap formula (`BackedArguments` inline caps +
+  `sizeof(StoredCmd)`), so the mid-script flush point matches the reference.
 - Function library callbacks live in a `__dfly_functions__` table in the Lua
   registry (hidden from scripts, which would otherwise bypass FCALL's locking
   and flag enforcement) and are recreated on first FCALL or when a library's

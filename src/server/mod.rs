@@ -564,6 +564,25 @@ pub enum ShardMsg {
         db_idx: usize,
         result_tx: mpsc::Sender<crate::error::CmdResult>,
     },
+    /// A squashed batch of `redis.acall`/`redis.apcall` subcommands that all
+    /// target this shard, dispatched as one hop (`MultiCommandSquasher`). The
+    /// shard is already locked by the script's transaction, so every entry runs
+    /// inline in order and the results are sent back together.
+    ScriptBatch {
+        cmds: Vec<ScriptBatchEntry>,
+        result_tx: mpsc::Sender<Vec<crate::error::CmdResult>>,
+    },
+}
+
+/// One entry of a squashed script batch (a `MultiCommandSquasher` hop). Each
+/// entry is a subcommand that runs on the shard receiving the batch.
+#[derive(Debug, Clone)]
+pub struct ScriptBatchEntry {
+    pub args: Vec<Vec<u8>>,
+    pub owned_key_idxs: Vec<usize>,
+    /// The subcommand's `KeyRange::first` for the `OpContext`.
+    pub first_key_idx: usize,
+    pub db_idx: usize,
 }
 
 /// Messages to the transaction coordinator.

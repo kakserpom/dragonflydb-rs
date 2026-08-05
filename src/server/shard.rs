@@ -177,6 +177,16 @@ impl Shard {
                 let result = self.run_exec(&args, &owned_key_idxs, first_key_idx, db_idx);
                 let _ = result_tx.send(result);
             }
+            ShardMsg::ScriptBatch { cmds, result_tx } => {
+                // The shard is locked by the script's transaction, so every
+                // entry runs inline in order and the results go back as one
+                // reply (one squashed hop, like `MultiCommandSquasher`).
+                let results = cmds
+                    .iter()
+                    .map(|c| self.run_exec(&c.args, &c.owned_key_idxs, c.first_key_idx, c.db_idx))
+                    .collect();
+                let _ = result_tx.send(results);
+            }
         }
     }
 

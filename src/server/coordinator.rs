@@ -13,8 +13,8 @@ use crate::commands::lua::{
 use crate::commands::{Command, FLAG_GLOBAL, FLAG_NOSCRIPT, FLAG_WRITE, ShardPart};
 use crate::error::{CmdResult, RespValue};
 use crate::server::{
-    CoordMsg, Reply, ReplyBus, ShardMsg, blocking_timeout_ms, command_for, encode_result,
-    extract_keys, is_eval_cmd, is_function_cmd, keys_per_shard, shard_for_key,
+    CoordMsg, Reply, ReplyBus, ScriptBatchEntry, ShardMsg, blocking_timeout_ms, command_for,
+    encode_result, extract_keys, is_eval_cmd, is_function_cmd, keys_per_shard, shard_for_key,
 };
 
 /// A blocking command (XREAD/XREADGROUP) waiting for data or a timeout. The
@@ -655,10 +655,12 @@ struct ScriptCtx {
     num_shards: usize,
     /// The DB all subcommands run in (the connection's selected DB).
     db_idx: usize,
-    /// Pending `redis.acall`/`redis.apcall` commands batched for one flush
-    /// (`ConnectionState::ScriptInfo::async_cmds`).
+    /// Pending `redis.acall`/`redis.apcall` commands batched for one squashed
+    /// flush (`ConnectionState::ScriptInfo::async_cmds`).
     async_cmds: Vec<AsyncCmd>,
-    /// Heap bytes held by `async_cmds`, the `--multi_eval_squash_buffer` budget.
+    /// The batch's `used_mem` (`FlushEvalAsyncCmds`): every command's
+    /// `BackedArguments` heap + struct size plus a `StoredCmd` per slot, the
+    /// `--multi_eval_squash_buffer` budget.
     async_bytes: usize,
 }
 
@@ -671,8 +673,46 @@ struct AsyncCmd {
 }
 
 /// `--multi_eval_squash_buffer`: max bytes of queued async commands before the
-/// batch is flushed mid-script.
+/// batch is flushed mid-script (`FLAGS_multi_eval_squash_buffer`, default 8096).
 const ASYNC_FLUSH_LIMIT: usize = 8096;
+
+/// Commands executed per squashed hop (`max_squash_cmd_num`, default 32): when
+/// a shard's accumulated batch reaches this many commands the accumulated hop
+/// runs (`SquashResult::SQUASHED_FULL`).
+const MAX_SQUASH_SIZE: usize = 32;
+
+/// `sizeof(cmn::BackedArguments)` in the reference: two `absl::InlinedVector`s
+/// (a `uint32_t` offsets array with inline capacity 5 and a `char` storage
+/// array with inline capacity 128) plus their heap pointers/sizes. Included in
+/// `StoredCmd::UsedMemory`.
+const BACKED_ARGS_STRUCT_SIZE: usize = 200;
+
+/// `sizeof(StoredCmd)` in the reference: command id pointer + `ParsedArgs`
+/// variant + `BackedArguments` unique_ptr + reply mode.
+const STORED_CMD_SIZE: usize = 48;
+
+/// `cmn::BackedArguments::kLenCap`: arguments stored inline before any heap
+/// allocation.
+const BACKED_ARGS_INLINE_ARGS: usize = 5;
+
+/// `cmn::BackedArguments::kStorageCap`: total argument bytes stored inline
+/// before any heap allocation.
+const BACKED_ARGS_INLINE_BYTES: usize = 128;
+
+/// Heap bytes `cmn::BackedArguments::HeapMemory` attributes to a command's
+/// tail arguments (excluding the command name, which `FindExtended` strips).
+/// Arguments that fit the inline buffer cost nothing; otherwise the cost is the
+/// offset array's `capacity * sizeof(uint32_t)` plus the storage capacity.
+fn backed_args_heap_cost(tail_args: &[Vec<u8>]) -> usize {
+    let bytes: usize = tail_args.iter().map(Vec::len).sum();
+    if tail_args.len() <= BACKED_ARGS_INLINE_ARGS && bytes <= BACKED_ARGS_INLINE_BYTES {
+        0
+    } else {
+        // `capacity` is approximated by the current size, as the reference
+        // charges the actual (possibly larger) capacity.
+        tail_args.len() * 4 + bytes
+    }
+}
 
 /// Routes a script subcommand to the shards owning its keys while the script's
 /// tx holds the declared-key locks.
@@ -713,12 +753,15 @@ impl ScriptDispatch for ScriptDispatchCtx<'_> {
         // deferred to the flush, mirroring `VerifyCommandState` in
         // `FlushEvalAsyncCmds` — so `pcall(redis.acall, ...)` cannot catch an
         // error that only surfaces at the flush boundary.
-        let bytes: usize = args.iter().map(Vec::len).sum::<usize>() + 64;
+        // The byte cost mirrors the reference's `used_mem`: each command's
+        // `BackedArguments` heap + struct size, plus a `StoredCmd` per slot.
+        let tail: Vec<Vec<u8>> = args[1..].to_vec();
+        self.ctx.async_bytes +=
+            backed_args_heap_cost(&tail) + BACKED_ARGS_STRUCT_SIZE + STORED_CMD_SIZE;
         self.ctx.async_cmds.push(AsyncCmd {
             args,
             abort_on_error,
         });
-        self.ctx.async_bytes += bytes;
         self.flush_pending(false)
     }
 
@@ -728,10 +771,18 @@ impl ScriptDispatch for ScriptDispatchCtx<'_> {
 }
 
 impl ScriptDispatchCtx<'_> {
-    /// Execute the pending async batch as one phase (`FlushEvalAsyncCmds`).
+    /// Execute the pending async batch as a squashed phase (`FlushEvalAsyncCmds`
+    /// + `MultiCommandSquasher::Execute` with `error_abort=true`).
+    ///
     /// `force=false` only flushes when the byte budget is exhausted. Every
-    /// command is verified before any runs; a failing `acall` command aborts
-    /// the remaining batch (`error_abort`) and surfaces its error.
+    /// command is verified before any runs. Commands accumulate per shard and
+    /// run in one hop per shard (`ShardMsg::ScriptBatch`, dispatched in
+    /// parallel); when a shard's batch reaches `max_squash_size` the
+    /// accumulated hop runs; keyless and multi-shard commands run standalone
+    /// (flushing the accumulated hop first). An `acall` error in a hop aborts
+    /// the remaining batch (`error_abort`); standalone errors surface at the
+    /// end of the flush. `apcall` errors are suppressed (`ReplyMode::NONE`) and
+    /// the batch continues.
     fn flush_pending(&mut self, force: bool) -> Result<(), String> {
         if self.ctx.async_cmds.is_empty() {
             return Ok(());
@@ -750,20 +801,89 @@ impl ScriptDispatchCtx<'_> {
                 return Err(e);
             }
         }
+        let cmds = std::mem::take(&mut self.ctx.async_cmds);
+        self.ctx.async_bytes = 0;
+
+        let mut batches: Vec<Vec<BatchEntry>> =
+            (0..self.ctx.num_shards).map(|_| Vec::new()).collect();
+        // Call positions accumulated in the current hop (for the in-order error
+        // scan), and the abort flag of every command by call position.
+        let mut hop_positions: Vec<usize> = Vec::new();
+        let mut abort_flags: Vec<bool> = Vec::with_capacity(cmds.len());
+        let mut results: Vec<Option<CmdResult>> = vec![None; cmds.len()];
         let mut fatal: Option<String> = None;
-        for cmd in std::mem::take(&mut self.ctx.async_cmds) {
-            let exec = command_for(&cmd.args).expect("verified command");
-            let result = self.execute_script_cmd(exec, &cmd.args);
-            if result.is_err() {
-                if cmd.abort_on_error
-                    && let CmdResult::Err(e) = result
-                {
-                    fatal = Some(e.message);
+
+        for (pos, cmd) in cmds.into_iter().enumerate() {
+            abort_flags.push(cmd.abort_on_error);
+            let exec = command_for(&cmd.args).expect("verified async command");
+            let keys = extract_keys(exec, &cmd.args);
+            let per = keys_per_shard(&cmd.args, &keys, self.ctx.num_shards);
+            if per.len() == 1 {
+                let shard = per[0].0;
+                batches[shard].push(BatchEntry {
+                    pos,
+                    args: cmd.args,
+                    owned: per[0].1.clone(),
+                    first_key_idx: exec.key_range.first,
+                });
+                hop_positions.push(pos);
+                if batches[shard].len() >= MAX_SQUASH_SIZE {
+                    fatal = run_squash_hop(
+                        self.coord,
+                        self.ctx.db_idx,
+                        &mut batches,
+                        &mut results,
+                        &abort_flags,
+                        &mut hop_positions,
+                    );
+                    if fatal.is_some() {
+                        break;
+                    }
                 }
-                break;
+            } else {
+                // A keyless or multi-shard command cannot be squashed
+                // (`keys->NumArgs() == 0` or keys on ≥2 shards in `TrySquash`):
+                // flush the accumulated hop first, then run it standalone
+                // (`ExecuteStandalone`). Standalone runtime errors do not abort
+                // the remaining batch; they surface at the end.
+                fatal = run_squash_hop(
+                    self.coord,
+                    self.ctx.db_idx,
+                    &mut batches,
+                    &mut results,
+                    &abort_flags,
+                    &mut hop_positions,
+                );
+                if fatal.is_some() {
+                    break;
+                }
+                let result = self.execute_script_cmd(exec, &cmd.args);
+                results[pos] = Some(result);
             }
         }
-        self.ctx.async_bytes = 0;
+        if fatal.is_none() {
+            fatal = run_squash_hop(
+                self.coord,
+                self.ctx.db_idx,
+                &mut batches,
+                &mut results,
+                &abort_flags,
+                &mut hop_positions,
+            );
+        }
+
+        // The first `acall` error in call order surfaces as the flush error;
+        // `apcall` errors are invisible (`ReplyMode::NONE`).
+        if fatal.is_none() {
+            for (pos, slot) in results.iter().enumerate() {
+                if abort_flags[pos]
+                    && let Some(CmdResult::Err(e)) = slot
+                {
+                    fatal = Some(e.message.clone());
+                    break;
+                }
+            }
+        }
         match fatal {
             Some(msg) => Err(msg),
             None => Ok(()),
@@ -860,4 +980,78 @@ impl ScriptDispatchCtx<'_> {
             other => other,
         }
     }
+}
+
+/// Run one squashed hop: every shard with queued entries executes them in a
+/// single message (`ShardMsg::ScriptBatch`, dispatched in parallel). Results
+/// are reassembled by call position; the first `acall` error in call order is
+/// returned (`error_abort` in `ExecuteSquashed`). The whole hop runs even when
+/// it contains an error, mirroring the reference's shard-side execution.
+/// Clears the batches and the hop position list.
+fn run_squash_hop(
+    coord: &mut Coordinator,
+    db_idx: usize,
+    batches: &mut [Vec<BatchEntry>],
+    results: &mut [Option<CmdResult>],
+    abort_flags: &[bool],
+    hop_positions: &mut Vec<usize>,
+) -> Option<String> {
+    let mut hops: Vec<(usize, mpsc::Receiver<Vec<CmdResult>>)> = Vec::new();
+    for (shard, entries) in batches.iter().enumerate() {
+        if entries.is_empty() {
+            continue;
+        }
+        let (result_tx, result_rx) = mpsc::channel();
+        if coord.shard_txs[shard]
+            .send(ShardMsg::ScriptBatch {
+                cmds: entries
+                    .iter()
+                    .map(|e| ScriptBatchEntry {
+                        args: e.args.clone(),
+                        owned_key_idxs: e.owned.clone(),
+                        first_key_idx: e.first_key_idx,
+                        db_idx,
+                    })
+                    .collect(),
+                result_tx,
+            })
+            .is_err()
+        {
+            return Some("ERR internal: shard thread exited".into());
+        }
+        hops.push((shard, result_rx));
+    }
+    for (shard, rx) in hops {
+        match rx.recv() {
+            Ok(per_shard) => {
+                for (entry, result) in batches[shard].iter().zip(per_shard) {
+                    results[entry.pos] = Some(result);
+                }
+            }
+            Err(_) => {
+                for entry in &batches[shard] {
+                    results[entry.pos] = Some(CmdResult::err("ERR internal: shard thread exited"));
+                }
+            }
+        }
+    }
+    batches.iter_mut().for_each(Vec::clear);
+    let positions = std::mem::take(hop_positions);
+    for pos in positions {
+        if abort_flags[pos]
+            && let Some(CmdResult::Err(e)) = &results[pos]
+        {
+            return Some(e.message.clone());
+        }
+    }
+    None
+}
+
+/// One squashed-batch entry destined for a specific shard, keeping its call
+/// position so results reassemble in script order.
+struct BatchEntry {
+    pos: usize,
+    args: Vec<Vec<u8>>,
+    owned: Vec<usize>,
+    first_key_idx: usize,
 }
