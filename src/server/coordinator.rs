@@ -316,13 +316,19 @@ impl Coordinator {
 
         // Reuse a flag-only or loaded entry's params (`GetScriptParams`);
         // otherwise deduce them, letting a bad `--!df flags=` line abort the
-        // EVAL exactly like `ScriptMgr::Insert`.
-        let params = match self.script_mgr.lock().unwrap().params(&sha) {
-            Some(p) => p,
-            None => match ScriptMgr::deduce_and_override(&body) {
-                Ok(p) => p,
-                Err(e) => return CmdResult::err(format!("ERR {e}")),
-            },
+        // EVAL exactly like `ScriptMgr::Insert`. The guard is taken once: a
+        // `MutexGuard` temporary in a `match` scrutinee lives through the whole
+        // match, so a second `lock()` in the `None` arm would self-deadlock.
+        let params = {
+            let mgr = self.script_mgr.lock().unwrap();
+            match mgr.params(&sha) {
+                Some(p) => Ok(p),
+                None => mgr.deduce_and_override(&body),
+            }
+        };
+        let params = match params {
+            Ok(p) => p,
+            Err(e) => return CmdResult::err(format!("ERR {e}")),
         };
         // `lua_auto_async`: rewrite statement-context `redis.call`/`redis.pcall`
         // into `acall`/`apcall` for atomic bodies before the first compile
@@ -416,9 +422,11 @@ impl Coordinator {
         // `CallSHA` records the script's run duration in usec for SCRIPT LATENCY.
         let started = Instant::now();
         let kill = Arc::clone(&self.kill);
+        let float_as_int =
+            params.float_as_int || self.script_mgr.lock().unwrap().lua_resp2_legacy_float;
         let result = {
             let mut dctx = ScriptDispatchCtx { coord: self, ctx };
-            let run = sandbox.run(&sha, &mut dctx, params.float_as_int, &kill);
+            let run = sandbox.run(&sha, &mut dctx, float_as_int, &kill);
             // Force-flush pending `redis.acall` commands; a flush error
             // overrides the script's own result (`FlushEvalAsyncCmds(true)`).
             match dctx.flush() {
@@ -436,12 +444,18 @@ impl Coordinator {
 
         match result {
             Ok(v) => CmdResult::Ok(v),
-            // `IsResultSafe` failing sends the message bare, without the
-            // `Error running script (call to ...)` wrapper.
-            Err(e) if e == "reached lua stack limit" => {
-                CmdResult::err("ERR reached lua stack limit")
+            // `ScriptMgr::OnScriptError` runs for every `RUN_ERR`; only the
+            // undeclared-key message triggers the auto-correct flag flip.
+            Err(e) => {
+                self.script_mgr.lock().unwrap().on_script_error(&sha, &e);
+                // `IsResultSafe` failing sends the message bare, without the
+                // `Error running script (call to ...)` wrapper.
+                if e == "reached lua stack limit" {
+                    CmdResult::err("ERR reached lua stack limit")
+                } else {
+                    CmdResult::err(format!("ERR Error running script (call to {sha}): {e}"))
+                }
             }
-            Err(e) => CmdResult::err(format!("ERR Error running script (call to {sha}): {e}")),
         }
     }
 
@@ -563,9 +577,10 @@ impl Coordinator {
         };
         let result = {
             let kill = Arc::clone(&self.kill);
+            let float_as_int =
+                params.float_as_int || self.script_mgr.lock().unwrap().lua_resp2_legacy_float;
             let mut dctx = ScriptDispatchCtx { coord: self, ctx };
-            let run =
-                sandbox.run_function(&name, &keys, &argv, &mut dctx, params.float_as_int, &kill);
+            let run = sandbox.run_function(&name, &keys, &argv, &mut dctx, float_as_int, &kill);
             // Force-flush pending `redis.acall` commands; a flush error
             // overrides the function's own result (`FlushEvalAsyncCmds(true)`).
             match dctx.flush() {

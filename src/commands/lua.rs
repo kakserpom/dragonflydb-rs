@@ -17,7 +17,7 @@ use mlua::{Function, HookTriggers, Lua, MultiValue, StdLib, Table, Value, VmStat
 
 use crate::core::histogram::Histogram;
 use crate::error::RespValue;
-use crate::util::{format_double, itoa};
+use crate::util::{format_lua_float, itoa};
 
 /// Error returned when a script/EVALSHA SHA is unknown.
 pub const NOSCRIPT_ERR: &str = "NOSCRIPT No matching script. Please use EVAL.";
@@ -244,6 +244,21 @@ pub struct ScriptMgr {
     /// into `redis.acall`/`redis.apcall` at load time (`FLAGS_lua_auto_async`).
     /// Defaults off; applies only to atomic scripts.
     pub lua_auto_async: bool,
+    /// `--default_lua_flags`: flags applied to scripts that carry no own
+    /// `--!df flags=` line (`default_params_` in `ScriptMgr`'s constructor).
+    pub default_params: ScriptParams,
+    /// `--lua_undeclared_keys_shas`: SHAs force-flagged `undeclared_keys` at
+    /// load time (`FLAGS_lua_undeclared_keys_shas`, only read at insert).
+    pub undeclared_keys_shas: Vec<String>,
+    /// `--lua_float_as_int_shas`: SHAs force-flagged `float_as_int` at load
+    /// time (`FLAGS_lua_float_as_int_shas`).
+    pub float_as_int_shas: Vec<String>,
+    /// `--lua_allow_undeclared_auto_correct`: on an undeclared-key error, flip
+    /// the cached script's flag so the next run is global (`ScriptMgr::OnScriptError`).
+    pub lua_allow_undeclared_auto_correct: bool,
+    /// `--lua_resp2_legacy_float`: treat every script float result as
+    /// `legacy-float` regardless of the script's flags (`EvalSerializer::OnDouble`).
+    pub lua_resp2_legacy_float: bool,
 }
 
 /// Script SHAs upstream force-flags (buggy clients, see `script_mgr.cc:284`).
@@ -268,6 +283,25 @@ impl ScriptMgr {
     #[must_use]
     pub fn new() -> Self {
         ScriptMgr::default()
+    }
+
+    /// Apply the Lua-related CLI flags, called once at startup (`main.rs`).
+    /// `default_lua_flags` is parsed like a script's `--!df flags=` line and
+    /// errors exactly like `ScriptParams::ApplyFlags`.
+    pub fn configure(
+        &mut self,
+        default_lua_flags: &str,
+        undeclared_keys_shas: Vec<String>,
+        float_as_int_shas: Vec<String>,
+        lua_allow_undeclared_auto_correct: bool,
+        lua_resp2_legacy_float: bool,
+    ) -> Result<(), String> {
+        self.default_params.apply_flags(default_lua_flags)?;
+        self.undeclared_keys_shas = undeclared_keys_shas;
+        self.float_as_int_shas = float_as_int_shas;
+        self.lua_allow_undeclared_auto_correct = lua_allow_undeclared_auto_correct;
+        self.lua_resp2_legacy_float = lua_resp2_legacy_float;
+        Ok(())
     }
 
     /// Parse the `--!df flags=` prefix a script may start with
@@ -366,13 +400,44 @@ impl ScriptMgr {
         Ok(())
     }
 
-    /// Full `ScriptParams` for a body, applying the hardcoded SHA overrides
-    /// (`ScriptMgr::Insert`).
-    pub fn deduce_and_override(body: &[u8]) -> Result<ScriptParams, String> {
+    /// Full `ScriptParams` for a body, applying the hardcoded SHA overrides and
+    /// the CLI `--lua_undeclared_keys_shas`/`--lua_float_as_int_shas` lists
+    /// (`ScriptMgr::Insert`). Scripts without a `--!df flags=` line inherit
+    /// `--default_lua_flags` (`params_opt->value_or(default_params_)`).
+    pub fn deduce_and_override(&self, body: &[u8]) -> Result<ScriptParams, String> {
         let sha = sha1_hex(body);
-        let mut params = ScriptMgr::deduce_params(body)?.unwrap_or_default();
+        let mut params = ScriptMgr::deduce_params(body)?.unwrap_or(self.default_params);
         Self::apply_hardcoded_overrides(&sha, &mut params);
+        self.apply_cli_sha_overrides(&sha, &mut params);
         Ok(params)
+    }
+
+    /// Apply the `--lua_undeclared_keys_shas`/`--lua_float_as_int_shas` lists,
+    /// mirroring the else-if in `ScriptMgr::Insert` (the hardcoded list takes
+    /// precedence for undeclared keys).
+    fn apply_cli_sha_overrides(&self, sha: &str, params: &mut ScriptParams) {
+        if !HARDCODED_UNDECLARED.contains(&sha)
+            && self.undeclared_keys_shas.iter().any(|s| s == sha)
+        {
+            params.undeclared_keys = true;
+        }
+        if self.float_as_int_shas.iter().any(|s| s == sha) {
+            params.float_as_int = true;
+        }
+    }
+
+    /// `ScriptMgr::OnScriptError`: with `--lua_allow_undeclared_auto_correct`,
+    /// an undeclared-key run error flips the cached script's flag so the next
+    /// run is allowed to touch undeclared keys. Flag-only entries are left
+    /// alone (the reference only rewrites loaded scripts).
+    pub fn on_script_error(&mut self, sha: &str, error: &str) {
+        if !self.lua_allow_undeclared_auto_correct || !error.contains(UNDECLARED_KEY_ERR) {
+            return;
+        }
+        if let Some(script) = self.scripts.get_mut(sha) {
+            script.params.undeclared_keys = true;
+            self.params.insert(sha.to_string(), script.params);
+        }
     }
 
     /// Force flags for known buggy client scripts (`ScriptMgr::Insert`):
@@ -1608,7 +1673,7 @@ fn prepare_args(args: &MultiValue) -> mlua::Result<Vec<Vec<u8>>> {
         match v {
             Value::String(s) => out.push(s.as_bytes().to_vec()),
             Value::Integer(i) => out.push(itoa(*i)),
-            Value::Number(d) => out.push(format_double(*d).into_bytes()),
+            Value::Number(d) => out.push(format_lua_float(*d).into_bytes()),
             _ => return Err(mlua::Error::runtime(ARG_TYPE_ERR)),
         }
     }
@@ -1624,7 +1689,13 @@ fn resp_to_lua(lua: &Lua, r: RespValue) -> mlua::Result<Value> {
         RespValue::Bool(b) => Value::Boolean(b),
         RespValue::Integer(i) => Value::Integer(i),
         RespValue::Double(d) => {
-            if d.fract() == 0.0 && (i64::MIN as f64..=i64::MAX as f64).contains(&d) {
+            // `RedisTranslator::OnDouble` (interpreter.cc): convert to an
+            // integer only when the fraction is within `epsilon` of an integer
+            // and the value is strictly inside the Lua integer range; anything
+            // else (including exactly 2^63) stays a number.
+            const EPS: f64 = f64::EPSILON;
+            let fract = d.fract();
+            if fract.abs() < EPS && d < i64::MAX as f64 && d > i64::MIN as f64 {
                 Value::Integer(d as i64)
             } else {
                 Value::Number(d)
@@ -1820,6 +1891,89 @@ mod tests {
     }
 
     #[test]
+    fn cli_sha_lists_and_default_flags() {
+        let mut mgr = ScriptMgr::new();
+        mgr.configure(
+            "allow-undeclared-keys",
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()],
+            vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()],
+            false,
+            false,
+        )
+        .unwrap();
+
+        // `--default_lua_flags` applies to scripts without their own flags line.
+        let mut p = mgr.deduce_and_override(b"return 1").unwrap();
+        assert!(p.undeclared_keys, "default flags must apply");
+        assert!(p.atomic);
+        // A script with its own `--!df flags=` keeps them (no merge).
+        p = mgr
+            .deduce_and_override(b"--!df flags=disable-atomicity\nreturn 1")
+            .unwrap();
+        assert!(!p.atomic);
+        assert!(!p.undeclared_keys, "own flags win over defaults");
+
+        // The CLI SHA lists force flags, after the hardcoded else-if.
+        let mut p = ScriptParams::default();
+        mgr.apply_cli_sha_overrides("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &mut p);
+        assert!(p.undeclared_keys);
+        let mut p = ScriptParams::default();
+        mgr.apply_cli_sha_overrides("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", &mut p);
+        assert!(p.float_as_int);
+        // A hardcoded SHA is not re-checked against the undeclared list.
+        let mut p = ScriptParams::default();
+        mgr.undeclared_keys_shas = vec![HARDCODED_UNDECLARED[0].into()];
+        mgr.apply_cli_sha_overrides(HARDCODED_UNDECLARED[0], &mut p);
+        assert!(!p.undeclared_keys, "hardcoded list takes precedence");
+    }
+
+    #[test]
+    fn on_script_error_auto_corrects_undeclared_keys() {
+        let mut mgr = ScriptMgr::new();
+        mgr.configure("", vec![], vec![], true, false).unwrap();
+        let body = b"return KEYS[1]";
+        let sha = sha1_hex(body);
+        let params = ScriptParams::default();
+        mgr.store(sha.clone(), body.to_vec(), params);
+        assert!(!mgr.params(&sha).unwrap().undeclared_keys);
+
+        // An unrelated error leaves the flag alone.
+        mgr.on_script_error(&sha, "boom");
+        assert!(!mgr.params(&sha).unwrap().undeclared_keys);
+
+        // The undeclared-key message flips the cached script's flag.
+        mgr.on_script_error(&sha, "script tried accessing undeclared key, key: x");
+        assert!(mgr.params(&sha).unwrap().undeclared_keys);
+        assert!(mgr.find(&sha).unwrap().params.undeclared_keys);
+
+        // Flag-only entries are untouched (`OnScriptError` looks up loaded scripts).
+        mgr.params
+            .insert("flagonly".into(), ScriptParams::default());
+        mgr.on_script_error("flagonly", "script tried accessing undeclared key, key: x");
+        assert!(!mgr.params("flagonly").unwrap().undeclared_keys);
+
+        // With the flag off, nothing is auto-corrected.
+        let mut off = ScriptMgr::new();
+        let sha2 = sha1_hex(b"return 2");
+        off.store(sha2.clone(), b"return 2".to_vec(), ScriptParams::default());
+        off.on_script_error(&sha2, "script tried accessing undeclared key, key: y");
+        assert!(!off.params(&sha2).unwrap().undeclared_keys);
+    }
+
+    #[test]
+    fn resp2_legacy_float_converts_script_floats() {
+        let interp = SandboxedInterpreter::new().unwrap();
+        interp.define("aaaa", b"return 3.7").unwrap();
+        // float_as_int=false alone keeps the double.
+        let v = interp.run("aaaa", &mut Noop, false, &no_kill()).unwrap();
+        assert_eq!(v, RespValue::Double(3.7));
+        // The caller ORs `lua_resp2_legacy_float` into `float_as_int`, so the
+        // flag makes every float floor/ceil like `EvalSerializer::OnDouble`.
+        let v = interp.run("aaaa", &mut Noop, true, &no_kill()).unwrap();
+        assert_eq!(v, RespValue::Integer(3));
+    }
+
+    #[test]
     fn deep_return_table_hits_stack_limit() {
         let interp = SandboxedInterpreter::new().unwrap();
         interp
@@ -1834,6 +1988,35 @@ mod tests {
         // `serialize_value` caps at depth 128; the coordinator sends this
         // message bare (no `Error running script` wrapper).
         assert_eq!(err, "reached lua stack limit");
+    }
+
+    #[test]
+    fn resp_double_to_lua_uses_epsilon() {
+        let interp = SandboxedInterpreter::new().unwrap();
+        let lua = &interp.lua;
+        let to_int = |d: f64| {
+            matches!(
+                resp_to_lua(lua, RespValue::Double(d)).unwrap(),
+                Value::Integer(_)
+            )
+        };
+        assert!(to_int(5.0));
+        assert!(to_int(-0.0));
+        assert!(!to_int(1.5));
+        assert!(!to_int(0.300_000_000_000_000_04));
+        // `OnDouble` converts when |fract| < epsilon: 1e-17 truncates to 0.
+        assert!(to_int(1e-17), "fraction within epsilon converts to integer");
+        assert!(to_int(4_503_599_627_370_496.0));
+        // Strict bounds: exactly +/-2^63 stays a Lua number.
+        assert!(!to_int(9_223_372_036_854_775_808.0), "2^63 stays a number");
+        assert!(
+            !to_int(-9_223_372_036_854_775_808.0),
+            "-2^63 stays a number"
+        );
+        match resp_to_lua(lua, RespValue::Double(1e-17)).unwrap() {
+            Value::Integer(i) => assert_eq!(i, 0),
+            v => panic!("expected integer 0, got {v:?}"),
+        }
     }
 
     #[test]

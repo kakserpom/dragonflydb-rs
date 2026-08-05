@@ -120,7 +120,7 @@ pub fn local_script(mgr: &mut ScriptMgr, args: &[Vec<u8>]) -> RespValue {
                 return RespValue::Error(format!("ERR {e}"));
             }
             let sha = sha1_hex(body);
-            let params = match ScriptMgr::deduce_and_override(body) {
+            let params = match mgr.deduce_and_override(body) {
                 Ok(p) => p,
                 Err(e) => return RespValue::Error(format!("ERR {e}")),
             };

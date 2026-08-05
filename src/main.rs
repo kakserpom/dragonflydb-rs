@@ -18,6 +18,11 @@ fn main() {
         .map_or(4, std::num::NonZero::get)
         .max(1);
     let mut lua_auto_async = false;
+    let mut default_lua_flags = String::new();
+    let mut lua_undeclared_keys_shas = Vec::new();
+    let mut lua_float_as_int_shas = Vec::new();
+    let mut lua_allow_undeclared_auto_correct = false;
+    let mut lua_resp2_legacy_float = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -37,6 +42,33 @@ fn main() {
             }
             "--lua_auto_async" => lua_auto_async = true,
             "--lua_auto_async=false" => lua_auto_async = false,
+            "--default_lua_flags" => {
+                i += 1;
+                if i >= args.len() {
+                    usage();
+                }
+                default_lua_flags.clone_from(&args[i]);
+            }
+            "--lua_undeclared_keys_shas" => {
+                i += 1;
+                if i >= args.len() {
+                    usage();
+                }
+                lua_undeclared_keys_shas = args[i].split(',').map(str::to_string).collect();
+            }
+            "--lua_float_as_int_shas" => {
+                i += 1;
+                if i >= args.len() {
+                    usage();
+                }
+                lua_float_as_int_shas = args[i].split(',').map(str::to_string).collect();
+            }
+            "--lua_allow_undeclared_auto_correct" => lua_allow_undeclared_auto_correct = true,
+            "--lua_allow_undeclared_auto_correct=false" => {
+                lua_allow_undeclared_auto_correct = false;
+            }
+            "--lua_resp2_legacy_float" => lua_resp2_legacy_float = true,
+            "--lua_resp2_legacy_float=false" => lua_resp2_legacy_float = false,
             "--help" | "-h" => {
                 usage();
                 return;
@@ -81,6 +113,16 @@ fn main() {
     let (gc_tx, gc_rx) = mpsc::channel();
     let mut mgr = ScriptMgr::new();
     mgr.lua_auto_async = lua_auto_async;
+    if let Err(e) = mgr.configure(
+        &default_lua_flags,
+        lua_undeclared_keys_shas,
+        lua_float_as_int_shas,
+        lua_allow_undeclared_auto_correct,
+        lua_resp2_legacy_float,
+    ) {
+        eprintln!("invalid --default_lua_flags: {e}");
+        std::process::exit(1);
+    }
     let script_mgr = Arc::new(std::sync::Mutex::new(mgr));
     coordinator::spawn(
         num_shards,
@@ -125,7 +167,10 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "usage: dragonflydb [--port PORT] [--num-shards N] [--lua_auto_async[=false]] [--help]"
+        "usage: dragonflydb [--port PORT] [--num-shards N] [--lua_auto_async[=false]] \
+         [--default_lua_flags FLAGS] [--lua_undeclared_keys_shas SHA,...] \
+         [--lua_float_as_int_shas SHA,...] [--lua_allow_undeclared_auto_correct[=false]] \
+         [--lua_resp2_legacy_float[=false]] [--help]"
     );
 }
 

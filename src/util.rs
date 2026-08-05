@@ -167,6 +167,66 @@ pub fn format_double(f: f64) -> String {
     format!("{f}")
 }
 
+/// Format a Lua numeric argument like the reference's `%.17g` in
+/// `Interpreter::PrepareArgs` (interpreter.cc): 17 significant digits with
+/// trailing zeros stripped, fixed notation when the base-10 exponent is in
+/// `[-4, 17)`, otherwise scientific with a signed, zero-padded exponent. This
+/// differs from [`format_double`] (shortest round-trip, RESP double replies):
+/// `redis.call('SET', 'k', 0.1)` must send `"0.10000000000000001"` verbatim.
+#[must_use]
+pub fn format_lua_float(f: f64) -> String {
+    if f.is_nan() {
+        return "nan".into();
+    }
+    if f.is_infinite() {
+        return if f < 0.0 { "-inf".into() } else { "inf".into() };
+    }
+    if f == 0.0 {
+        return if f.is_sign_negative() {
+            "-0".into()
+        } else {
+            "0".into()
+        };
+    }
+    // `{:.16e}` is correctly rounded to 17 significant digits, the same value
+    // `%.17g` starts from.
+    let sci = format!("{f:.16e}");
+    let (mant, exp) = sci.split_once('e').unwrap();
+    let exp: i32 = exp.parse().unwrap();
+    let mut digits: String = mant.chars().filter(|&c| c != '.').collect();
+    while digits.len() > 1 && digits.ends_with('0') {
+        digits.pop();
+    }
+    if (-4..17).contains(&exp) {
+        let ip = exp as i64 + 1;
+        if ip >= digits.len() as i64 {
+            format!(
+                "{}{}",
+                digits,
+                "0".repeat((ip - digits.len() as i64) as usize)
+            )
+        } else if ip <= 0 {
+            format!("0.{}{}", "0".repeat((-ip) as usize), digits)
+        } else {
+            let (a, b) = digits.split_at(ip as usize);
+            format!("{a}.{b}")
+        }
+    } else {
+        let mantissa = if digits.len() == 1 {
+            digits
+        } else {
+            let mut m = digits;
+            m.insert(1, '.');
+            m
+        };
+        format!(
+            "{mantissa}e{}{:02}",
+            if exp < 0 { "-" } else { "+" },
+            exp.abs()
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +272,36 @@ mod tests {
         assert_eq!(format_double(f64::INFINITY), "inf");
         assert_eq!(format_double(f64::NEG_INFINITY), "-inf");
         assert_eq!(format_double(f64::NAN), "nan");
+    }
+
+    #[test]
+    fn format_lua_float_matches_c_percent_17g() {
+        // Reference outputs captured from `printf("%.17g", v)` (glibc).
+        let cases: &[(f64, &str)] = &[
+            (1.5, "1.5"),
+            (2.0, "2"),
+            (0.1, "0.10000000000000001"),
+            (100.0, "100"),
+            (0.0, "0"),
+            (-0.0, "-0"),
+            (3_673_983_950_397_063.0, "3673983950397063"),
+            (1e16, "10000000000000000"),
+            (1e17, "1e+17"),
+            (0.0001, "0.0001"),
+            (1e-5, "1.0000000000000001e-05"),
+            (2.5e-5, "2.5000000000000001e-05"),
+            (0.300_000_000_000_000_04, "0.30000000000000004"),
+            (123.456, "123.456"),
+            (123_456_789_012_345_678.0, "1.2345678901234568e+17"),
+            (f64::MIN_POSITIVE, "2.2250738585072014e-308"),
+            (f64::MAX, "1.7976931348623157e+308"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+        ];
+        for (v, want) in cases {
+            assert_eq!(format_lua_float(*v), *want, "%.17g mismatch for {v}");
+        }
+        assert_eq!(format_lua_float(f64::NAN), "nan");
     }
 
     #[test]
