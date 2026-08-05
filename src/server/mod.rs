@@ -596,11 +596,20 @@ pub struct CoordMsg {
     pub no_block: bool,
 }
 
+/// `SCRIPT GC`: a request for the coordinator to run a full Lua GC over its
+/// interpreter (`ScriptMgr::GCCmd`). The coordinator ackowledges on `ack` once
+/// the collection finished, so the IO thread can reply `+OK`.
+#[derive(Debug)]
+pub struct GcRequest {
+    pub ack: mpsc::Sender<()>,
+}
+
 /// Shared handles owned by the IO thread.
 pub struct ServerEnv {
     pub num_shards: usize,
     pub shard_txs: Vec<mpsc::Sender<ShardMsg>>,
     pub coord_tx: mpsc::Sender<CoordMsg>,
+    pub gc_tx: mpsc::Sender<GcRequest>,
     pub reply_bus_tx: ReplyBus,
     /// Shared script cache: SCRIPT subcommands (IO thread) and EVAL
     /// (coordinator) both read/write it.

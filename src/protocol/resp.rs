@@ -213,7 +213,12 @@ pub fn encode_reply(value: &RespValue, out: &mut Vec<u8>) {
             out.extend_from_slice(b"\r\n");
         }
         RespValue::Error(e) => {
-            out.extend_from_slice(b"-");
+            // Error strings carry their prefix inline ("ERR ...", "NOSCRIPT ...",
+            // or a leading "-" added by the script error-table formatter); never
+            // emit a double dash (helio `SendError` only prefixes when missing).
+            if !e.starts_with('-') {
+                out.extend_from_slice(b"-");
+            }
             out.extend_from_slice(e.as_bytes());
             out.extend_from_slice(b"\r\n");
         }
@@ -334,5 +339,24 @@ mod tests {
             &mut out,
         );
         assert_eq!(out, b"*2\r\n:1\r\n$1\r\na\r\n");
+    }
+
+    #[test]
+    fn encode_error_never_double_dashes() {
+        // Inline prefix ("ERR ...") -> one dash from the encoder.
+        let mut out = Vec::new();
+        encode_reply(&RespValue::Error("ERR syntax error".into()), &mut out);
+        assert_eq!(out, b"-ERR syntax error\r\n");
+        // Prefixless message -> encoder dash.
+        let mut out = Vec::new();
+        encode_reply(
+            &RespValue::Error("NOSCRIPT No matching script. Please use EVAL.".into()),
+            &mut out,
+        );
+        assert_eq!(out, b"-NOSCRIPT No matching script. Please use EVAL.\r\n");
+        // Leading dash already present (script error-table formatter) -> verbatim.
+        let mut out = Vec::new();
+        encode_reply(&RespValue::Error("-oops".into()), &mut out);
+        assert_eq!(out, b"-oops\r\n");
     }
 }

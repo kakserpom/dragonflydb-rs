@@ -852,7 +852,7 @@ pub static CMD_TIME: Command = Command {
 pub static CMD_MULTI: Command = Command {
     name: "MULTI",
     arity: 1,
-    flags: FLAG_FAST | FLAG_LOCAL,
+    flags: FLAG_FAST | FLAG_LOCAL | FLAG_NOSCRIPT,
     key_range: KeyRange::NONE,
     exec: local_stub,
     merge: None,
@@ -860,7 +860,7 @@ pub static CMD_MULTI: Command = Command {
 pub static CMD_EXEC: Command = Command {
     name: "EXEC",
     arity: 1,
-    flags: FLAG_FAST | FLAG_LOCAL,
+    flags: FLAG_FAST | FLAG_LOCAL | FLAG_NOSCRIPT,
     key_range: KeyRange::NONE,
     exec: local_stub,
     merge: None,
@@ -868,7 +868,7 @@ pub static CMD_EXEC: Command = Command {
 pub static CMD_DISCARD: Command = Command {
     name: "DISCARD",
     arity: 1,
-    flags: FLAG_FAST | FLAG_LOCAL,
+    flags: FLAG_FAST | FLAG_LOCAL | FLAG_NOSCRIPT,
     key_range: KeyRange::NONE,
     exec: local_stub,
     merge: None,
@@ -892,7 +892,7 @@ pub static CMD_UNWATCH: Command = Command {
 pub static CMD_RESET: Command = Command {
     name: "RESET",
     arity: 1,
-    flags: FLAG_FAST | FLAG_LOCAL,
+    flags: FLAG_FAST | FLAG_LOCAL | FLAG_NOSCRIPT,
     key_range: KeyRange::NONE,
     exec: local_stub,
     merge: None,
@@ -1124,7 +1124,7 @@ pub static CMD_MODULE: Command = Command {
 pub static CMD_FUNCTION: Command = Command {
     name: "FUNCTION",
     arity: -2,
-    flags: FLAG_LOCAL,
+    flags: FLAG_LOCAL | FLAG_NOSCRIPT,
     key_range: KeyRange::NONE,
     exec: local_stub,
     merge: None,
@@ -1132,7 +1132,7 @@ pub static CMD_FUNCTION: Command = Command {
 pub static CMD_SCRIPT: Command = Command {
     name: "SCRIPT",
     arity: -2,
-    flags: FLAG_LOCAL,
+    flags: FLAG_LOCAL | FLAG_NOSCRIPT,
     key_range: KeyRange::NONE,
     exec: local_stub,
     merge: None,
@@ -1754,6 +1754,14 @@ mod tests {
         );
         let sha40 = "0123456789012345678901234567890123456789";
         assert_eq!(r(&mut mgr, &["SCRIPT", "FLAGS", sha40]), "OK");
+        // SCRIPT LIST includes flag-only entries (no body yet) like the
+        // reference's `GetAll`, which iterates the superset map.
+        let listed = r(&mut mgr, &["SCRIPT", "LIST"]);
+        assert!(listed.contains(sha40), "{listed}");
+        assert!(
+            listed.contains(&format!("[{sha40}, ]")),
+            "flag-only sha must render an empty body: {listed}"
+        );
         assert_eq!(
             r(&mut mgr, &["SCRIPT", "FLAGS", "short", "x"]),
             "ERR syntax error"
@@ -1769,6 +1777,19 @@ mod tests {
         );
         assert!(r(&mut mgr, &["SCRIPT", "LOAD", "return {"]).starts_with("ERR syntax error"));
         assert!(r(&mut mgr, &["SCRIPT", "HELP"]).contains("SCRIPT <subcommand>"));
+    }
+
+    #[test]
+    fn admin_commands_are_noscript() {
+        use crate::commands::FLAG_NOSCRIPT;
+        for name in ["MULTI", "EXEC", "DISCARD", "RESET", "SCRIPT", "FUNCTION"] {
+            let cmd = crate::commands::lookup(name.as_bytes())
+                .unwrap_or_else(|| panic!("{name} not in command table"));
+            assert!(
+                cmd.has_flag(FLAG_NOSCRIPT),
+                "{name} must be flagged NOSCRIPT like the reference's CO::NOSCRIPT"
+            );
+        }
     }
 
     #[test]

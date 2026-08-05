@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::sync::mpsc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use std::fmt::Write as _;
 
@@ -12,8 +12,9 @@ use crate::error::RespValue;
 use crate::protocol::resp::RespParser;
 use crate::server::pubsub::{self, ChannelStore, SubscribeInfo};
 use crate::server::{
-    CoordMsg, Reply, ServerEnv, ShardMsg, SingleOp, WatchState, command_for, encode_value,
-    extract_keys, is_eval_cmd, is_function_cmd, keys_per_shard, local_function, local_script,
+    CoordMsg, GcRequest, Reply, ServerEnv, ShardMsg, SingleOp, WatchState, command_for,
+    encode_value, extract_keys, is_eval_cmd, is_function_cmd, keys_per_shard, local_function,
+    local_script,
 };
 
 const EV_READ: i16 = libc::EVFILT_READ;
@@ -1012,8 +1013,19 @@ impl IoLoop {
     }
 
     /// SCRIPT subcommands against the shared script cache (see
-    /// `server::local_script`).
+    /// `server::local_script`). GC runs a real collection on the coordinator's
+    /// interpreter (`ScriptMgr::GCCmd`), so it is routed there; the ack comes
+    /// back over a one-shot channel.
     fn local_script(&self, args: &[Vec<u8>]) -> RespValue {
+        if args.get(1).is_some_and(|a| a.eq_ignore_ascii_case(b"GC")) {
+            let (ack_tx, ack_rx) = mpsc::channel();
+            if self.env.gc_tx.send(GcRequest { ack: ack_tx }).is_ok() {
+                // Block until the coordinator finished collecting; the reply is
+                // `+OK` either way (`SendOk`).
+                let _ = ack_rx.recv_timeout(Duration::from_secs(10));
+            }
+            return RespValue::Simple("OK".into());
+        }
         local_script(&mut self.env.script_mgr.lock().unwrap(), args)
     }
 

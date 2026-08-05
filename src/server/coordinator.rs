@@ -13,8 +13,9 @@ use crate::commands::lua::{
 use crate::commands::{Command, FLAG_GLOBAL, FLAG_NOSCRIPT, FLAG_WRITE, ShardPart};
 use crate::error::{CmdResult, RespValue};
 use crate::server::{
-    CoordMsg, Reply, ReplyBus, ScriptBatchEntry, ShardMsg, blocking_timeout_ms, command_for,
-    encode_result, extract_keys, is_eval_cmd, is_function_cmd, keys_per_shard, shard_for_key,
+    CoordMsg, GcRequest, Reply, ReplyBus, ScriptBatchEntry, ShardMsg, blocking_timeout_ms,
+    command_for, encode_result, extract_keys, is_eval_cmd, is_function_cmd, keys_per_shard,
+    shard_for_key,
 };
 
 /// A blocking command (XREAD/XREADGROUP) waiting for data or a timeout. The
@@ -27,6 +28,7 @@ struct PendingTx {
 pub fn spawn(
     num_shards: usize,
     rx: mpsc::Receiver<CoordMsg>,
+    gc_rx: mpsc::Receiver<GcRequest>,
     shard_txs: Vec<mpsc::Sender<ShardMsg>>,
     reply_bus: ReplyBus,
     script_mgr: Arc<Mutex<ScriptMgr>>,
@@ -47,6 +49,7 @@ pub fn spawn(
             Coordinator {
                 num_shards,
                 rx,
+                gc_rx,
                 shard_txs,
                 reply_bus,
                 script_mgr,
@@ -64,6 +67,7 @@ pub fn spawn(
 struct Coordinator {
     num_shards: usize,
     rx: mpsc::Receiver<CoordMsg>,
+    gc_rx: mpsc::Receiver<GcRequest>,
     shard_txs: Vec<mpsc::Sender<ShardMsg>>,
     reply_bus: ReplyBus,
     script_mgr: Arc<Mutex<ScriptMgr>>,
@@ -86,11 +90,29 @@ impl Coordinator {
         const POLL: Duration = Duration::from_millis(20);
         loop {
             match self.rx.recv_timeout(POLL) {
-                Ok(msg) => self.handle(msg),
-                Err(RecvTimeoutError::Timeout) => {}
+                Ok(msg) => {
+                    self.drain_gc_requests();
+                    self.handle(msg);
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    self.drain_gc_requests();
+                }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
             self.retry_pending(now_ms());
+        }
+    }
+
+    /// `SCRIPT GC`: run a full GC over the coordinator's interpreter and ack
+    /// (`ScriptMgr::GCCmd`, which does the same on every interpreter across all
+    /// fibers before replying `+OK`). Requests are drained before pending
+    /// commands so a GC never waits behind a queued blocking command.
+    fn drain_gc_requests(&mut self) {
+        while let Ok(req) = self.gc_rx.try_recv() {
+            if let Some(sandbox) = &self.sandbox {
+                let _ = sandbox.run_gc();
+            }
+            let _ = req.ack.send(());
         }
     }
 
@@ -414,6 +436,11 @@ impl Coordinator {
 
         match result {
             Ok(v) => CmdResult::Ok(v),
+            // `IsResultSafe` failing sends the message bare, without the
+            // `Error running script (call to ...)` wrapper.
+            Err(e) if e == "reached lua stack limit" => {
+                CmdResult::err("ERR reached lua stack limit")
+            }
             Err(e) => CmdResult::err(format!("ERR Error running script (call to {sha}): {e}")),
         }
     }
@@ -552,6 +579,9 @@ impl Coordinator {
 
         match result {
             Ok(v) => CmdResult::Ok(v),
+            Err(e) if e == "reached lua stack limit" => {
+                CmdResult::err("ERR reached lua stack limit")
+            }
             Err(e) => CmdResult::err(format!("ERR Error running function (call to {name}): {e}")),
         }
     }
@@ -742,12 +772,13 @@ impl ScriptDispatch for ScriptDispatchCtx<'_> {
     fn dispatch_async(&mut self, args: Vec<Vec<u8>>, abort_on_error: bool) -> Result<(), String> {
         if command_for(&args).is_none() {
             if abort_on_error {
-                // acall: an unknown command is fatal (`early_async_error`). The
+                // acall: an unknown command is fatal (`early_async_error` =
+                // `ReportUnknownCmd`, which uppercases and uses backticks). The
                 // pending batch is still flushed first, so its errors win.
                 self.flush_pending(true)?;
                 return Err(format!(
-                    "ERR unknown command '{}'",
-                    String::from_utf8_lossy(&args[0])
+                    "unknown command `{}`",
+                    String::from_utf8_lossy(&args[0]).to_ascii_uppercase()
                 ));
             }
             // apcall: drop the unknown command silently, but keep the budget.
@@ -895,14 +926,24 @@ impl ScriptDispatchCtx<'_> {
     }
 
     /// Validate a script subcommand before it touches a shard: known command,
-    /// not NOSCRIPT/GLOBAL, no writes in read-only scripts, declared keys.
+    /// arity, not NOSCRIPT/GLOBAL, no writes in read-only scripts, declared
+    /// keys.
     fn verify_script_cmd(&self, args: &[Vec<u8>]) -> Result<&'static Command, String> {
         let cmd = command_for(args).ok_or_else(|| {
+            // `ReportUnknownCmd` uppercases the name and wraps it in backticks
+            // (`unknown command \`FOO\``); the inline "ERR " keeps the port's
+            // error-table rendering byte-identical to the reference's.
             format!(
-                "ERR unknown command '{}'",
-                String::from_utf8_lossy(&args[0])
+                "ERR unknown command `{}`",
+                String::from_utf8_lossy(&args[0]).to_ascii_uppercase()
             )
         })?;
+        // The reference's `DispatchCommand` arity check runs for script
+        // subcommands too; without it a keyless subcommand with too few args
+        // would reach the executor and panic (`GET` -> `owned_keys[0]`).
+        if let Some(e) = cmd.check_arity(args.len()) {
+            return Err(e);
+        }
         if cmd.has_flag(FLAG_NOSCRIPT) || cmd.has_flag(FLAG_GLOBAL) {
             return Err("This Redis command is not allowed from script".to_string());
         }

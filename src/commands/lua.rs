@@ -260,6 +260,10 @@ const HARDCODED_UNDECLARED: &[&str] = &[
     "6990147f5d1999b936dac3b6f7e5d2071908bcf3",
 ];
 
+/// SHA forced `atomic` because the script's own `--!df flags=` says otherwise
+/// and the script breaks without it (buggy client, see `script_mgr.cc:284`).
+const HARDCODED_ATOMIC: &str = "f8133be7f04abd9dfefa83c3b29a9d837cfbda86";
+
 impl ScriptMgr {
     #[must_use]
     pub fn new() -> Self {
@@ -322,13 +326,22 @@ impl ScriptMgr {
             .or_else(|| self.params.get(sha).copied())
     }
 
-    /// `(sha, body)` for every cached script, unordered (`ScriptMgr::GetAll`).
+    /// `(sha, body)` for every cached script, plus flag-only entries (no body)
+    /// created by SCRIPT FLAGS before the script was loaded, unordered
+    /// (`ScriptMgr::GetAll`).
     #[must_use]
     pub fn get_all(&self) -> Vec<(String, Vec<u8>)> {
-        self.scripts
+        let mut out: Vec<(String, Vec<u8>)> = self
+            .scripts
             .iter()
             .map(|(sha, s)| (sha.clone(), s.body.clone()))
-            .collect()
+            .collect();
+        for sha in self.params.keys() {
+            if !self.scripts.contains_key(sha) {
+                out.push((sha.clone(), Vec::new()));
+            }
+        }
+        out
     }
 
     /// SCRIPT FLUSH: clears the cache (`FlushAllScript`).
@@ -358,10 +371,21 @@ impl ScriptMgr {
     pub fn deduce_and_override(body: &[u8]) -> Result<ScriptParams, String> {
         let sha = sha1_hex(body);
         let mut params = ScriptMgr::deduce_params(body)?.unwrap_or_default();
-        if HARDCODED_UNDECLARED.contains(&sha.as_str()) {
+        Self::apply_hardcoded_overrides(&sha, &mut params);
+        Ok(params)
+    }
+
+    /// Force flags for known buggy client scripts (`ScriptMgr::Insert`):
+    /// allow undeclared keys for the `kUndeclaredShas` list, and restore
+    /// atomicity for the Sidekiq script of issue #4522 even when its own
+    /// `--!df flags=` disables it.
+    fn apply_hardcoded_overrides(sha: &str, params: &mut ScriptParams) {
+        if HARDCODED_UNDECLARED.contains(&sha) {
             params.undeclared_keys = true;
         }
-        Ok(params)
+        if !params.atomic && sha == HARDCODED_ATOMIC {
+            params.atomic = true;
+        }
     }
 
     /// The body to compile and cache for a script, applying the `lua_auto_async`
@@ -1018,6 +1042,18 @@ impl SandboxedInterpreter {
         self.setup_redis_table()?;
         self.setup_function_table()?;
         Ok(())
+    }
+
+    /// Force a full Lua GC cycle, returning bytes freed (`Interpreter::RunGC`).
+    /// The reference measures in KiB via `LUA_GCCOUNT`; the port uses mlua's
+    /// byte-accurate `used_memory` instead, so this only mirrors the behavior
+    /// (free unused objects), not the exact figure.
+    #[must_use]
+    pub fn run_gc(&self) -> i64 {
+        let before = self.lua.used_memory();
+        let _ = self.lua.gc_collect();
+        let after = self.lua.used_memory();
+        i64::try_from(before.saturating_sub(after)).unwrap_or(i64::MAX)
     }
 
     /// The `__dfly_functions__` table: every registered function callback, keyed
@@ -1758,6 +1794,46 @@ mod tests {
             None
         );
         assert!(ScriptMgr::deduce_params(b"--!df flags=bogus\nreturn 1").is_err());
+    }
+
+    #[test]
+    fn hardcoded_sha_overrides() {
+        let mut p = ScriptParams {
+            atomic: false,
+            ..Default::default()
+        };
+        // The Sidekiq script of issue #4522 is forced atomic even though its
+        // own flags say otherwise.
+        ScriptMgr::apply_hardcoded_overrides(HARDCODED_ATOMIC, &mut p);
+        assert!(p.atomic, "sha_4522 must be forced atomic");
+        // An unrelated sha keeps its declared flags.
+        let mut p2 = ScriptParams {
+            atomic: false,
+            ..Default::default()
+        };
+        ScriptMgr::apply_hardcoded_overrides("deadbeef", &mut p2);
+        assert!(!p2.atomic);
+        // The undeclared-keys list forces the flag.
+        let mut p3 = ScriptParams::default();
+        ScriptMgr::apply_hardcoded_overrides(HARDCODED_UNDECLARED[0], &mut p3);
+        assert!(p3.undeclared_keys);
+    }
+
+    #[test]
+    fn deep_return_table_hits_stack_limit() {
+        let interp = SandboxedInterpreter::new().unwrap();
+        interp
+            .define(
+                "aaaa",
+                b"local t = {}\nlocal cur = t\nfor i = 1, 200 do cur[1] = {} cur = cur[1] end\nreturn t",
+            )
+            .unwrap();
+        let err = interp
+            .run("aaaa", &mut Noop, false, &no_kill())
+            .unwrap_err();
+        // `serialize_value` caps at depth 128; the coordinator sends this
+        // message bare (no `Error running script` wrapper).
+        assert_eq!(err, "reached lua stack limit");
     }
 
     #[test]

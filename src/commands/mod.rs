@@ -195,4 +195,16 @@ mod tests {
             assert!(seen.insert(cmd.name), "duplicate command name {}", cmd.name);
         }
     }
+
+    #[test]
+    fn arity_check_message_format() {
+        // The script dispatch path rejects bad arities with this exact message
+        // (`redis.call('GET')` would otherwise reach the executor and panic).
+        let get = lookup(b"GET").unwrap();
+        assert_eq!(
+            get.check_arity(1),
+            Some("ERR wrong number of arguments for 'get' command".into())
+        );
+        assert_eq!(get.check_arity(2), None);
+    }
 }

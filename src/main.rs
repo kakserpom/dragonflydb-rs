@@ -78,12 +78,14 @@ fn main() {
 
     // Transaction coordinator thread.
     let (coord_tx, coord_rx) = mpsc::channel();
+    let (gc_tx, gc_rx) = mpsc::channel();
     let mut mgr = ScriptMgr::new();
     mgr.lua_auto_async = lua_auto_async;
     let script_mgr = Arc::new(std::sync::Mutex::new(mgr));
     coordinator::spawn(
         num_shards,
         coord_rx,
+        gc_rx,
         shard_txs.clone(),
         reply_bus.clone(),
         script_mgr.clone(),
@@ -101,6 +103,7 @@ fn main() {
         num_shards,
         shard_txs,
         coord_tx,
+        gc_tx,
         reply_bus_tx: reply_bus,
         script_mgr,
     };
