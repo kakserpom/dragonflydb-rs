@@ -459,7 +459,12 @@ fn struct_unpack(lua: &Lua, args: &MultiValue) -> mlua::Result<MultiValue> {
             b'c' => {
                 if size == 0 {
                     // `c0` reuses the previous numeric result as the length.
-                    let Some(Value::Number(prev)) = results.pop() else {
+                    // C checks `lua_isnumber`, which also coerces numeric strings.
+                    let prev = match results.pop() {
+                        Some(v) => lua.coerce_number(v)?,
+                        None => None,
+                    };
+                    let Some(prev) = prev else {
                         return Err(mlua::Error::runtime("format 'c0' needs a previous size"));
                     };
                     size = prev as usize;
@@ -629,11 +634,10 @@ fn mp_encode_map(out: &mut Vec<u8>, n: usize) {
     }
 }
 
-/// `table_is_an_array`: the C version returns true only for tables whose keys
-/// are a contiguous integer run. An empty table is a map; `max == count` is a
-/// dense array; a sparse table still counts when it has more than `2*count`
-/// holes and the raw length equals the max key, or when key `max - count`
-/// exists (the keys form a contiguous run ending at `max`).
+/// `table_is_an_array`: the C version returns `max == count` when every key is
+/// a positive integer (`lua_isinteger`), which is exactly "contiguous keys
+/// 1..N". An empty table therefore packs as an empty array; a sparse table
+/// packs as a map.
 fn table_is_an_array(t: &Table) -> mlua::Result<bool> {
     let mut count = 0i64;
     let mut max = 0i64;
@@ -659,23 +663,7 @@ fn table_is_an_array(t: &Table) -> mlua::Result<bool> {
         max = max.max(k);
         count += 1;
     }
-    if count == 0 {
-        return Ok(false);
-    }
-    if max == count {
-        return Ok(true);
-    }
-    if max <= i64::from(i32::MAX) / 2 && count < max / 2 && t.raw_len() as i64 == max {
-        return Ok(true);
-    }
-    for pair in t.pairs::<Value, Value>() {
-        if let (Value::Integer(i), _) = pair?
-            && i == max - count
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(max == count)
 }
 
 fn mp_encode_value(v: Value, level: usize, out: &mut Vec<u8>) -> mlua::Result<()> {
@@ -1156,12 +1144,18 @@ fn json_check_encode_depth(ctx: &mut EncodeCtx, depth: i32) -> mlua::Result<()> 
 }
 
 /// `lua_array_length`: -1 for a non-array, otherwise the largest index.
-fn lua_array_length(lua: &Lua, ctx: &mut EncodeCtx, t: &Table) -> mlua::Result<Option<i32>> {
+fn lua_array_length(ctx: &mut EncodeCtx, t: &Table) -> mlua::Result<Option<i32>> {
     let mut max = 0i32;
     let mut items = 0i32;
     for pair in t.pairs::<Value, Value>() {
         let (k, _) = pair?;
-        let k = lua.coerce_number(k)?.unwrap_or(0.0);
+        // C checks `lua_type == LUA_TNUMBER`: only actual number keys count.
+        // String keys like `"1"` make the table an object, never an array.
+        let k = match &k {
+            Value::Integer(i) => *i as f64,
+            Value::Number(d) => *d,
+            _ => return Ok(None),
+        };
         if k.fract() == 0.0 && k >= 1.0 {
             max = max.max(k as i32);
             items += 1;
@@ -1258,7 +1252,7 @@ fn json_append_data(lua: &Lua, ctx: &mut EncodeCtx, depth: i32, v: &Value) -> ml
             let depth = depth + 1;
             json_check_encode_depth(ctx, depth)?;
             // `len > 0` decides array vs object, so an empty table is "{}".
-            match lua_array_length(lua, ctx, t)? {
+            match lua_array_length(ctx, t)? {
                 Some(len) if len > 0 => json_append_array(lua, ctx, depth, t, len),
                 _ => json_append_object(lua, ctx, depth, t),
             }
@@ -1966,11 +1960,12 @@ fn cfg_single_integer(
     args: &MultiValue,
     field: impl Fn(&mut CjsonConfig) -> &mut i32,
     min: i32,
+    max: i32,
 ) -> mlua::Result<Value> {
     cfg_arg_check(args.len(), 1)?;
     let mut c = cfg.lock().unwrap();
     let setting = *field(&mut c);
-    let (v, out) = integer_option(lua, &arg(args, 0), setting, min, i32::MAX)?;
+    let (v, out) = integer_option(lua, &arg(args, 0), setting, min, max)?;
     *field(&mut c) = v;
     Ok(out)
 }
@@ -2004,7 +1999,7 @@ fn cfg_encode_invalid_numbers(
         lua,
         &arg(args, 0),
         &["off", "on", "null"],
-        0,
+        1,
         c.encode_invalid_numbers,
     )?;
     c.encode_invalid_numbers = v;
@@ -2022,7 +2017,7 @@ fn cfg_decode_invalid_numbers(
         lua,
         &arg(args, 0),
         &["off", "on"],
-        0,
+        1,
         c.decode_invalid_numbers as i32,
     )?;
     c.decode_invalid_numbers = v != 0;
@@ -2067,7 +2062,7 @@ fn cjson_table(lua: &Lua, cfg: &Arc<Mutex<CjsonConfig>>) -> mlua::Result<Table> 
     t.set(
         "encode_max_depth",
         lib_fn(lua, move |lua, args: MultiValue| {
-            cfg_single_integer(lua, &c, &args, |c| &mut c.encode_max_depth, 1)
+            cfg_single_integer(lua, &c, &args, |c| &mut c.encode_max_depth, 1, i32::MAX)
         })?,
     )?;
 
@@ -2075,7 +2070,7 @@ fn cjson_table(lua: &Lua, cfg: &Arc<Mutex<CjsonConfig>>) -> mlua::Result<Table> 
     t.set(
         "decode_max_depth",
         lib_fn(lua, move |lua, args: MultiValue| {
-            cfg_single_integer(lua, &c, &args, |c| &mut c.decode_max_depth, 1)
+            cfg_single_integer(lua, &c, &args, |c| &mut c.decode_max_depth, 1, i32::MAX)
         })?,
     )?;
 
@@ -2083,7 +2078,7 @@ fn cjson_table(lua: &Lua, cfg: &Arc<Mutex<CjsonConfig>>) -> mlua::Result<Table> 
     t.set(
         "encode_number_precision",
         lib_fn(lua, move |lua, args: MultiValue| {
-            cfg_single_integer(lua, &c, &args, |c| &mut c.encode_number_precision, 1)
+            cfg_single_integer(lua, &c, &args, |c| &mut c.encode_number_precision, 1, 14)
         })?,
     )?;
 
@@ -2321,6 +2316,12 @@ mod tests {
             eval("local a, p = struct.unpack('>B c0', '\\3abc'); return {a, p}").unwrap(),
             RespValue::Array(vec![bulk("abc"), integer(5)])
         );
+        // `lua_isnumber` also accepts a previous string convertible to a
+        // number; the previous result is still consumed (replaced) by `c0`.
+        assert_eq!(
+            eval("local a, p = struct.unpack('c1c0', '5abcde'); return {a, p}").unwrap(),
+            RespValue::Array(vec![bulk("abcde"), integer(7)])
+        );
     }
 
     #[test]
@@ -2357,8 +2358,9 @@ mod tests {
             eval("return cmsgpack.pack(1, 'a', {1, 2})").unwrap(),
             bulk(b"\x01\xa1\x61\x92\x01\x02")
         );
-        // Empty tables are maps, exactly like the C library.
-        assert_eq!(eval("return cmsgpack.pack({})").unwrap(), bulk(b"\x80"));
+        // An empty table packs as an empty array, exactly like the C library
+        // (`table_is_an_array` returns `max == count`).
+        assert_eq!(eval("return cmsgpack.pack({})").unwrap(), bulk(b"\x90"));
         assert_eq!(eval("return cmsgpack.pack(true)").unwrap(), bulk(b"\xc3"));
         assert_eq!(eval("return cmsgpack.pack(false)").unwrap(), bulk(b"\xc2"));
         assert_eq!(eval("return cmsgpack.pack(nil)").unwrap(), bulk(b"\xc0"));
@@ -2379,6 +2381,14 @@ mod tests {
         assert_eq!(
             eval("return cmsgpack.pack(1.5)").unwrap(),
             bulk(b"\xca\x3f\xc0\x00\x00")
+        );
+        // A sparse table packs as a map, not an array with holes.
+        let RespValue::Bulk(sparse) = eval("return cmsgpack.pack({1, [3] = 3})").unwrap() else {
+            panic!("expected bulk");
+        };
+        assert_eq!(
+            sparse[0], 0x82,
+            "sparse table must pack as a map: {sparse:02x?}"
         );
         assert_eq!(
             eval("return cmsgpack.pack({a = 1})").unwrap(),
@@ -2616,6 +2626,90 @@ mod tests {
             eval("return cjson.encode_number_precision()").unwrap(),
             integer(14)
         );
+        // Upper bound is 14, matching `json_integer_option(..., 1, 14)`.
+        let err = eval("cjson.encode_number_precision(100)").unwrap_err();
+        assert!(err.contains("expected integer between 1 and 14"), "{err}");
+    }
+
+    #[test]
+    fn cjson_config_getters() {
+        // `json_enum_option` with bool_true=1: getters return booleans for
+        // off/on and the option string only for the third state.
+        assert_eq!(
+            eval("return tostring(cjson.encode_invalid_numbers())").unwrap(),
+            bulk("false")
+        );
+        assert_eq!(
+            eval("cjson.encode_invalid_numbers('on'); return tostring(cjson.encode_invalid_numbers())")
+                .unwrap(),
+            bulk("true")
+        );
+        assert_eq!(
+            eval("cjson.encode_invalid_numbers('null'); return cjson.encode_invalid_numbers()")
+                .unwrap(),
+            bulk("null")
+        );
+        assert_eq!(
+            eval("return tostring(cjson.decode_invalid_numbers())").unwrap(),
+            bulk("true")
+        );
+        assert_eq!(
+            eval("return tostring(cjson.encode_keep_buffer())").unwrap(),
+            bulk("true")
+        );
+        assert_eq!(
+            eval("cjson.encode_keep_buffer(false); return tostring(cjson.encode_keep_buffer())")
+                .unwrap(),
+            bulk("false")
+        );
+        // Booleans are accepted as setter values.
+        assert_eq!(
+            eval("cjson.encode_invalid_numbers(true); return cjson.encode(1/0)").unwrap(),
+            bulk("inf")
+        );
+        let err =
+            eval("cjson.decode_invalid_numbers(false); return cjson.decode('[nan]')").unwrap_err();
+        assert!(err.contains("invalid token"), "{err}");
+        // `encode_sparse_array()` returns convert (bool), ratio, safe.
+        assert_eq!(
+            eval("local c, r, s = cjson.encode_sparse_array(); return {tostring(c), r, s}")
+                .unwrap(),
+            RespValue::Array(vec![bulk("false"), integer(2), integer(10)])
+        );
+        assert_eq!(
+            eval("cjson.encode_sparse_array('on'); local c, r, s = cjson.encode_sparse_array(); return {tostring(c), r, s}")
+                .unwrap(),
+            RespValue::Array(vec![bulk("true"), integer(2), integer(10)])
+        );
+    }
+
+    #[test]
+    fn cjson_string_keys_are_objects() {
+        // `lua_array_length` only counts LUA_TNUMBER keys; a string key that
+        // looks like an index still makes the table an object.
+        assert_eq!(
+            eval("return cjson.encode({[\"1\"] = 2})").unwrap(),
+            bulk("{\"1\":2}")
+        );
+        // A string key that looks like an index still forces an object (not an
+        // array), even alongside real numeric keys.
+        let RespValue::Bulk(b) =
+            eval("return cjson.encode({[\"1\"] = \"a\", [2] = \"b\"})").unwrap()
+        else {
+            panic!("expected bulk");
+        };
+        assert!(
+            b.starts_with(b"{\""),
+            "expected object: {:?}",
+            String::from_utf8_lossy(&b)
+        );
+        for k in [b"\"1\":\"a\"".as_slice(), b"\"2\":\"b\"".as_slice()] {
+            assert!(
+                b.windows(k.len()).any(|w| w == k),
+                "missing {k:?} in {}",
+                String::from_utf8_lossy(&b)
+            );
+        }
     }
 
     #[test]
