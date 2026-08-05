@@ -21,7 +21,7 @@ simd-json = { version = "0.17", default-features = false, features = [
   "swar-number-parsing",
   "value-no-dup-keys",
 ] }
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+xxhash-rust = { version = "0.8", features = ["xxh3", "xxh64"] }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

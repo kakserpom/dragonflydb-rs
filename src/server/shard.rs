@@ -143,6 +143,9 @@ impl Shard {
                         self.run_watch_query(&keys, db_idx, &tx);
                     }
                 }
+                // Drop any leftover tx context (e.g. a script subcommand that
+                // locked the shard without ever dispatching a `TxExec`).
+                self.tx_ctx.remove(&tx_id);
             }
             ShardMsg::WatchQuery {
                 keys,

@@ -369,33 +369,30 @@ impl Coordinator {
                 .store(sha.clone(), body.clone(), params);
         }
 
-        // Lock the shards of the declared keys (like `execute_tx` phase 1).
+        // `DetermineMultiMode` (main_service.cc): atomic scripts (`LOCK_AHEAD`)
+        // lock the declared-key shards for the whole body; `disable-atomicity`
+        // scripts (`NON_ATOMIC`) hold no locks up front — each subcommand locks
+        // its own shards only for the call, and `dragonfly.lock`/`unlock`
+        // manage the held set explicitly.
+        let atomic = params.atomic;
         let tx_id = self.next_tx_id();
-        let per = keys_per_shard(args, &key_idxs, self.num_shards);
-        let shards: Vec<usize> = per.iter().map(|(s, _)| *s).collect();
-        let mut ack_rxs = Vec::new();
-        for &s in &shards {
-            let (ack_tx, ack_rx) = mpsc::channel();
-            if self.shard_txs[s]
-                .send(ShardMsg::TxLock {
-                    tx_id,
-                    conn_id: msg.conn_id,
-                    seq: msg.seq,
-                    args: args.clone(),
-                    owned_key_idxs: owned_for(&per, s),
-                    first_key_idx: 0,
-                    db_idx: msg.db_idx,
-                    owns_all_keys: false,
-                    ack: ack_tx,
-                })
-                .is_ok()
-            {
-                ack_rxs.push(ack_rx);
-            }
-        }
-        for rx in &ack_rxs {
-            let _ = rx.recv();
-        }
+        let (shards, locked_shards) = if atomic {
+            let per = keys_per_shard(args, &key_idxs, self.num_shards);
+            let per = if params.undeclared_keys {
+                // GLOBAL mode (`DetermineMultiMode`): undeclared keys may land
+                // on any shard, so lock them all up front.
+                (0..self.num_shards)
+                    .map(|s| (s, owned_for(&per, s)))
+                    .collect()
+            } else {
+                per
+            };
+            let shards: Vec<usize> = per.iter().map(|(s, _)| *s).collect();
+            let locked = self.lock_shards(tx_id, msg, &per);
+            (shards, locked)
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         // Run the script on the coordinator. The interpreter is taken out of
         // `self` so the dispatch context can borrow the whole coordinator.
@@ -425,6 +422,10 @@ impl Coordinator {
             read_only,
             num_shards: self.num_shards,
             db_idx: msg.db_idx,
+            atomic,
+            tx_id,
+            locked_shards,
+            pinned_shards: Vec::new(),
             async_cmds: Vec::new(),
             async_bytes: 0,
         };
@@ -433,15 +434,17 @@ impl Coordinator {
         let kill = Arc::clone(&self.kill);
         let float_as_int =
             params.float_as_int || self.script_mgr.lock().unwrap().lua_resp2_legacy_float;
-        let result = {
+        let (result, held) = {
             let mut dctx = ScriptDispatchCtx { coord: self, ctx };
             let run = sandbox.run(&sha, &mut dctx, float_as_int, &kill);
             // Force-flush pending `redis.acall` commands; a flush error
             // overrides the script's own result (`FlushEvalAsyncCmds(true)`).
-            match dctx.flush() {
+            let flushed = dctx.flush();
+            let held = std::mem::take(&mut dctx.ctx.locked_shards);
+            (match flushed {
                 Ok(()) => run,
                 Err(e) => Err(e),
-            }
+            }, held)
         };
         let elapsed_usec = started.elapsed().as_micros() as u64;
         self.script_mgr
@@ -449,7 +452,7 @@ impl Coordinator {
             .unwrap()
             .record_latency(&sha, elapsed_usec);
         self.sandbox = Some(sandbox);
-        self.unlock_script(tx_id, &shards);
+        self.unlock_script(tx_id, &held);
 
         match result {
             Ok(v) => CmdResult::Ok(v),
@@ -541,33 +544,27 @@ impl Coordinator {
                 .insert(lib.name.clone(), (lib.sha.clone(), names));
         }
 
-        // Lock the shards of the declared keys (like `execute_script`).
+        // Lock the shards of the declared keys (like `execute_script`). Library
+        // functions follow the library's script params (`DetermineMultiMode`).
+        let atomic = params.atomic;
         let tx_id = self.next_tx_id();
-        let per = keys_per_shard(args, &key_idxs, self.num_shards);
-        let shards: Vec<usize> = per.iter().map(|(s, _)| *s).collect();
-        let mut ack_rxs = Vec::new();
-        for &s in &shards {
-            let (ack_tx, ack_rx) = mpsc::channel();
-            if self.shard_txs[s]
-                .send(ShardMsg::TxLock {
-                    tx_id,
-                    conn_id: msg.conn_id,
-                    seq: msg.seq,
-                    args: args.clone(),
-                    owned_key_idxs: owned_for(&per, s),
-                    first_key_idx: 0,
-                    db_idx: msg.db_idx,
-                    owns_all_keys: false,
-                    ack: ack_tx,
-                })
-                .is_ok()
-            {
-                ack_rxs.push(ack_rx);
-            }
-        }
-        for rx in &ack_rxs {
-            let _ = rx.recv();
-        }
+        let (_shards, locked_shards) = if atomic {
+            let per = keys_per_shard(args, &key_idxs, self.num_shards);
+            let per = if undeclared {
+                // GLOBAL mode (`DetermineMultiMode`): undeclared keys may land
+                // on any shard, so lock them all up front.
+                (0..self.num_shards)
+                    .map(|s| (s, owned_for(&per, s)))
+                    .collect()
+            } else {
+                per
+            };
+            let shards: Vec<usize> = per.iter().map(|(s, _)| *s).collect();
+            let locked = self.lock_shards(tx_id, msg, &per);
+            (shards, locked)
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         // Record the running function so `FUNCTION STATS` (IO thread) can see it.
         self.script_mgr.lock().unwrap().set_running(
@@ -582,10 +579,14 @@ impl Coordinator {
             read_only,
             num_shards: self.num_shards,
             db_idx: msg.db_idx,
+            atomic,
+            tx_id,
+            locked_shards,
+            pinned_shards: Vec::new(),
             async_cmds: Vec::new(),
             async_bytes: 0,
         };
-        let result = {
+        let (result, held) = {
             let kill = Arc::clone(&self.kill);
             let float_as_int =
                 params.float_as_int || self.script_mgr.lock().unwrap().lua_resp2_legacy_float;
@@ -593,14 +594,16 @@ impl Coordinator {
             let run = sandbox.run_function(&name, &keys, &argv, &mut dctx, float_as_int, &kill);
             // Force-flush pending `redis.acall` commands; a flush error
             // overrides the function's own result (`FlushEvalAsyncCmds(true)`).
-            match dctx.flush() {
+            let flushed = dctx.flush();
+            let held = std::mem::take(&mut dctx.ctx.locked_shards);
+            (match flushed {
                 Ok(()) => run,
                 Err(e) => Err(e),
-            }
+            }, held)
         };
         self.script_mgr.lock().unwrap().clear_running();
         self.sandbox = Some(sandbox);
-        self.unlock_script(tx_id, &shards);
+        self.unlock_script(tx_id, &held);
 
         match result {
             Ok(v) => CmdResult::Ok(v),
@@ -626,6 +629,38 @@ impl Coordinator {
         for &s in shards {
             let _ = self.shard_txs[s].send(ShardMsg::TxUnlock { tx_id });
         }
+    }
+
+    /// Phase 1 of a transaction: lock every shard in `per` and wait until all
+    /// have acked, returning the shards that acknowledged. Used for the
+    /// upfront `LOCK_AHEAD` lock of atomic scripts (and `execute_tx`).
+    fn lock_shards(&mut self, tx_id: u64, msg: &CoordMsg, per: &[(usize, Vec<usize>)]) -> Vec<usize> {
+        let mut ack_rxs = Vec::new();
+        let mut shards = Vec::new();
+        for &(s, _) in per {
+            let (ack_tx, ack_rx) = mpsc::channel();
+            if self.shard_txs[s]
+                .send(ShardMsg::TxLock {
+                    tx_id,
+                    conn_id: msg.conn_id,
+                    seq: msg.seq,
+                    args: msg.args.clone(),
+                    owned_key_idxs: owned_for(per, s),
+                    first_key_idx: 0,
+                    db_idx: msg.db_idx,
+                    owns_all_keys: false,
+                    ack: ack_tx,
+                })
+                .is_ok()
+            {
+                shards.push(s);
+                ack_rxs.push(ack_rx);
+            }
+        }
+        for rx in &ack_rxs {
+            let _ = rx.recv();
+        }
+        shards
     }
 
     /// Dispatch a single `redis.call(...)` subcommand to one shard and wait for
@@ -715,6 +750,18 @@ struct ScriptCtx {
     num_shards: usize,
     /// The DB all subcommands run in (the connection's selected DB).
     db_idx: usize,
+    /// `ScriptParams::atomic` (i.e. `DetermineMultiMode`): atomic scripts hold
+    /// their declared-key shards locked for the whole body (`LOCK_AHEAD`);
+    /// `disable-atomicity` scripts lock each subcommand's shards only for the
+    /// call (`NON_ATOMIC`).
+    atomic: bool,
+    /// `tx_id` shared by every lock the script's transaction takes.
+    tx_id: u64,
+    /// Shards currently TxLocked by this script (the transaction's lock set).
+    locked_shards: Vec<usize>,
+    /// Shards explicitly pinned via `dragonfly.lock`, surviving the per-call
+    /// release in non-atomic mode.
+    pinned_shards: Vec<usize>,
     /// Pending `redis.acall`/`redis.apcall` commands batched for one squashed
     /// flush (`ConnectionState::ScriptInfo::async_cmds`).
     async_cmds: Vec<AsyncCmd>,
@@ -793,7 +840,54 @@ impl ScriptDispatch for ScriptDispatchCtx<'_> {
         // error aborts this call too (`requested_abort` in TryEnqueueEvalAsyncCmd).
         self.flush_pending(true)?;
         let cmd = self.verify_script_cmd(&args)?;
+        // A NON_ATOMIC script (`disable-atomicity`) locks the subcommand's
+        // shards only for the call (`CallFromScript` -> `DispatchCommand` ->
+        // `ScheduleSingleHop`), releasing them again afterwards; atomic scripts
+        // already hold the declared-key shards for the whole body.
+        if !self.ctx.atomic {
+            let shards = self.cmd_shards(cmd, &args);
+            self.ensure_locked(&shards)?;
+            let r = self.execute_script_cmd(cmd, &args);
+            self.release_unpinned();
+            return Ok(r.into_resp_value());
+        }
         Ok(self.execute_script_cmd(cmd, &args).into_resp_value())
+    }
+
+    fn lock(&mut self, keys: Vec<Vec<u8>>) -> Result<(), String> {
+        // `CallFromScript` LOCK: an atomic transaction is already locked ahead,
+        // so the call is a no-op.
+        if self.ctx.atomic {
+            return Ok(());
+        }
+        // The keys are already stringified (`key_backing`); lock their shards
+        // and pin them so the per-call release keeps them held
+        // (`StartMultiLockedAhead`).
+        let key_idxs: Vec<usize> = (0..keys.len()).collect();
+        let mut shards: Vec<usize> = Vec::new();
+        for (s, _) in keys_per_shard(&keys, &key_idxs, self.ctx.num_shards) {
+            if !shards.contains(&s) {
+                shards.push(s);
+            }
+        }
+        self.ensure_locked(&shards)?;
+        for &s in &shards {
+            if !self.ctx.pinned_shards.contains(&s) {
+                self.ctx.pinned_shards.push(s);
+            }
+        }
+        Ok(())
+    }
+
+    fn unlock(&mut self) -> Result<(), String> {
+        // `CallFromScript` UNLOCK: flush the pending async batch, release every
+        // lock the transaction holds and continue non-atomically
+        // (`UnlockMulti(true)` + `StartMultiNonAtomic`).
+        self.flush_pending(true)?;
+        self.release_all();
+        self.ctx.pinned_shards.clear();
+        self.ctx.atomic = false;
+        Ok(())
     }
 
     fn dispatch_async(&mut self, args: Vec<Vec<u8>>, abort_on_error: bool) -> Result<(), String> {
@@ -833,6 +927,71 @@ impl ScriptDispatch for ScriptDispatchCtx<'_> {
 }
 
 impl ScriptDispatchCtx<'_> {
+    /// The shards owning a subcommand's keys (`keys_per_shard`), deduplicated.
+    fn cmd_shards(&self, cmd: &'static Command, args: &[Vec<u8>]) -> Vec<usize> {
+        let keys = extract_keys(cmd, args);
+        let mut out = Vec::new();
+        for (s, _) in keys_per_shard(args, &keys, self.ctx.num_shards) {
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+        out
+    }
+
+    /// TxLock the shards the script's transaction does not already hold,
+    /// recording them in `locked_shards`. Messages are FIFO per shard, so a
+    /// lock is in effect before any subsequent `script_op` to the same shard
+    /// without waiting for acks (`MultiSwitchCmd(EVAL)` +
+    /// `StartMultiLockedAhead` / a squashed hop's shard scheduling).
+    fn ensure_locked(&mut self, shards: &[usize]) -> Result<(), String> {
+        for &s in shards {
+            if self.ctx.locked_shards.contains(&s) {
+                continue;
+            }
+            let (ack_tx, _ack_rx) = mpsc::channel();
+            if self.coord.shard_txs[s]
+                .send(ShardMsg::TxLock {
+                    tx_id: self.ctx.tx_id,
+                    conn_id: 0,
+                    seq: 0,
+                    args: Vec::new(),
+                    owned_key_idxs: Vec::new(),
+                    first_key_idx: 0,
+                    db_idx: self.ctx.db_idx,
+                    owns_all_keys: false,
+                    ack: ack_tx,
+                })
+                .is_err()
+            {
+                return Err("ERR internal: shard thread exited".into());
+            }
+            self.ctx.locked_shards.push(s);
+        }
+        Ok(())
+    }
+
+    /// Release the locks that were taken per-call (not pinned by
+    /// `dragonfly.lock`) — the NON_ATOMIC mode's per-subcommand scheduling.
+    fn release_unpinned(&mut self) {
+        let mut still = Vec::new();
+        for s in std::mem::take(&mut self.ctx.locked_shards) {
+            if self.ctx.pinned_shards.contains(&s) {
+                still.push(s);
+            } else {
+                self.coord.unlock_script(self.ctx.tx_id, &[s]);
+            }
+        }
+        self.ctx.locked_shards = still;
+    }
+
+    /// Release every lock the script's transaction holds (`UnlockMulti(true)`).
+    fn release_all(&mut self) {
+        for s in std::mem::take(&mut self.ctx.locked_shards) {
+            self.coord.unlock_script(self.ctx.tx_id, &[s]);
+        }
+    }
+
     /// Execute the pending async batch as a squashed phase (`FlushEvalAsyncCmds`
     /// + `MultiCommandSquasher::Execute` with `error_abort=true`).
     ///
@@ -865,6 +1024,26 @@ impl ScriptDispatchCtx<'_> {
         }
         let cmds = std::mem::take(&mut self.ctx.async_cmds);
         self.ctx.async_bytes = 0;
+
+        if !self.ctx.atomic {
+            // A NON_ATOMIC batch locks every shard it touches for the duration
+            // of the flush and releases them again afterwards (a squashed hop's
+            // shard scheduling).
+            let mut shards: Vec<usize> = Vec::new();
+            for cmd in &cmds {
+                let exec = command_for(&cmd.args).expect("verified async command");
+                for (s, _) in keys_per_shard(
+                    &cmd.args,
+                    &extract_keys(exec, &cmd.args),
+                    self.ctx.num_shards,
+                ) {
+                    if !shards.contains(&s) {
+                        shards.push(s);
+                    }
+                }
+            }
+            self.ensure_locked(&shards)?;
+        }
 
         let mut batches: Vec<Vec<BatchEntry>> =
             (0..self.ctx.num_shards).map(|_| Vec::new()).collect();
@@ -947,6 +1126,9 @@ impl ScriptDispatchCtx<'_> {
                 }
             }
         }
+        if !self.ctx.atomic {
+            self.release_unpinned();
+        }
         match fatal {
             Some(msg) => Err(msg),
             None => Ok(()),
@@ -972,14 +1154,22 @@ impl ScriptDispatchCtx<'_> {
         if let Some(e) = cmd.check_arity(args.len()) {
             return Err(e);
         }
-        if cmd.has_flag(FLAG_NOSCRIPT) || cmd.has_flag(FLAG_GLOBAL) {
+        // `DispatchCommand` (main_service.cc): GLOBAL_TRANS / NO_KEY_TRANSACTIONAL
+        // commands may run only when the script schedules globally or re-schedules
+        // per operation (GLOBAL / NON_ATOMIC); NOSCRIPT commands never run.
+        if cmd.has_flag(FLAG_NOSCRIPT)
+            || (cmd.has_flag(FLAG_GLOBAL) && self.ctx.atomic && !self.ctx.undeclared_keys)
+        {
             return Err("This Redis command is not allowed from script".to_string());
         }
         if self.ctx.read_only && cmd.has_flag(FLAG_WRITE) {
             return Err("Write commands are not allowed from read-only scripts".to_string());
         }
+        // `CheckKeysDeclared` runs only in LOCK_AHEAD mode (atomic without the
+        // allow-undeclared-keys flag): GLOBAL and NON_ATOMIC scripts schedule
+        // per operation, so undeclared keys are unrestricted.
         let keys = extract_keys(cmd, args);
-        if !self.ctx.undeclared_keys {
+        if self.ctx.atomic && !self.ctx.undeclared_keys {
             for &ki in &keys {
                 if !self.ctx.declared.contains(&args[ki]) {
                     return Err(format!(

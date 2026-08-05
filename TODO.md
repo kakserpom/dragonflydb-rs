@@ -135,6 +135,13 @@ Legend:
   exact `redis.register_function can only be called on FUNCTION LOAD command`;
   library and function names are validated (`[A-Za-z0-9_.-]`, like
   `functionVerifyName`).
+- Blocking commands in scripts: NOSCRIPT ones (BLPOP, BRPOP, BRPOPLPUSH,
+  BZPOPMIN, BZPOPMAX) are rejected with `This Redis command is not allowed from
+  script` (mirrors the reference's `CO::NOSCRIPT` mask); BLMOVE, BLMPOP and
+  BZMPOP are not NOSCRIPT and run with blocking disabled — a script transaction
+  is a multi (`tx->IsMulti()` in the reference), so an empty source replies
+  null immediately instead of suspending. The coordinator maps
+  `CmdResult::Blocked` to `Ok(RespValue::Nil)` in `execute_script_cmd`.
 
 ## Replication (`replication.cc`/`replica.cc`/`dflycmd.cc`/`journal_slice.cc`)
 - [x] Master side: `ReplicationManager` (`src/server/replication.rs`) with

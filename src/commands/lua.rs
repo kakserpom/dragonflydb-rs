@@ -20,6 +20,8 @@ use crate::core::histogram::Histogram;
 use crate::error::RespValue;
 use crate::util::{format_lua_float, itoa, lua_tolstring};
 
+use xxhash_rust::xxh64::xxh64;
+
 /// Error returned when a script/EVALSHA SHA is unknown.
 pub const NOSCRIPT_ERR: &str = "NOSCRIPT No matching script. Please use EVAL.";
 /// Error raised by a script accessing a key it did not declare.
@@ -1120,6 +1122,7 @@ impl SandboxedInterpreter {
         lua_libs::install_all(&self.lua).map_err(|e| e.to_string())?;
         self.exec(RUNNER, "@dfly_runner")?;
         self.setup_redis_table(enable_redis_log)?;
+        self.setup_dragonfly_table()?;
         self.setup_function_table()?;
         Ok(())
     }
@@ -1320,6 +1323,25 @@ impl SandboxedInterpreter {
         Ok(())
     }
 
+    /// The `dragonfly.*` global table (`Interpreter`'s constructor registers
+    /// `ihash`, `randstr`, `lock` and `unlock`). `randstr` is static; `ihash`,
+    /// `lock` and `unlock` close over the per-run dispatch context and are
+    /// (re)installed like `redis.call`/`redis.pcall`.
+    fn setup_dragonfly_table(&self) -> Result<(), String> {
+        let t = self.lua.create_table().map_err(|e| e.to_string())?;
+        let randstr = self
+            .lua
+            .create_function(|lua, args: MultiValue| -> mlua::Result<Value> {
+                dragonfly_randstr(lua, &args)
+            })
+            .map_err(|e| e.to_string())?;
+        t.raw_set("randstr", randstr).map_err(|e| e.to_string())?;
+        self.lua
+            .globals()
+            .set("dragonfly", t)
+            .map_err(|e| e.to_string())
+    }
+
     /// Install a global string array (KEYS / ARGV), like
     /// `SetGlobalArrayInternal`.
     pub fn set_global_array(&self, name: &str, vals: &[Vec<u8>]) -> Result<(), String> {
@@ -1418,6 +1440,7 @@ impl SandboxedInterpreter {
             redis.set("pcall", pcall)?;
             redis.set("acall", acall)?;
             redis.set("apcall", apcall)?;
+            install_dragonfly_functions(lua, scope, dispatch)?;
             let runner: Function = lua.globals().get("__dfly__run")?;
             let v: Value = with_kill_hook(lua, kill, || runner.call(sha))?;
             serialize_value(v, float_as_int, 0)
@@ -1456,7 +1479,13 @@ impl SandboxedInterpreter {
             redis.set("call", no_call.clone())?;
             redis.set("pcall", no_call.clone())?;
             redis.set("acall", no_call.clone())?;
-            redis.set("apcall", no_call)?;
+            redis.set("apcall", no_call.clone())?;
+            // Overwrite any per-run `dragonfly.*` closures (which borrow a
+            // dispatch context) so a library body cannot reach them.
+            let dragonfly: Table = lua.globals().get("dragonfly")?;
+            dragonfly.set("ihash", no_call.clone())?;
+            dragonfly.set("lock", no_call.clone())?;
+            dragonfly.set("unlock", no_call)?;
             let res = lua
                 .load(body)
                 .set_name("@user_function")
@@ -1556,6 +1585,7 @@ impl SandboxedInterpreter {
             redis.set("pcall", pcall)?;
             redis.set("acall", acall)?;
             redis.set("apcall", apcall)?;
+            install_dragonfly_functions(lua, scope, dispatch)?;
             let funcs: Table = lua.named_registry_value(DFLY_FUNCTIONS)?;
             let f: Function = funcs.get(name)?;
             let keys_t = lua.create_table()?;
@@ -1717,6 +1747,21 @@ pub trait ScriptDispatch {
     fn flush(&mut self) -> Result<(), String> {
         Ok(())
     }
+
+    /// `dragonfly.lock(keys...)`: transactionally lock the keys' shards until
+    /// `dragonfly.unlock()` or the end of the run (`DragonflyLockCommand`). A
+    /// no-op in atomic mode, like the reference's early return for a
+    /// non-NON_ATOMIC transaction.
+    fn lock(&mut self, keys: Vec<Vec<u8>>) -> Result<(), String> {
+        let _ = keys;
+        Ok(())
+    }
+
+    /// `dragonfly.unlock()`: release every lock held by the script's
+    /// transaction and continue non-atomically (`DragonflyUnlockCommand`).
+    fn unlock(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Convert `redis.call` args to command argument bytes
@@ -1732,6 +1777,215 @@ fn prepare_args(args: &MultiValue) -> mlua::Result<Vec<Vec<u8>>> {
         }
     }
     Ok(out)
+}
+
+/// `absl::AlphaNum(double)`: `%.6g` formatting (SixDigitsToBuffer), used by
+/// `StringCollectorTranslator::OnDouble` for `dragonfly.ihash` reply strings.
+fn g6_format(d: f64) -> String {
+    let mut buf = [0u8; 64];
+    let len = unsafe {
+        libc::snprintf(
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            c"%.6g".as_ptr(),
+            d,
+        )
+    };
+    let len = if len < 0 { 0 } else { (len as usize).min(buf.len()) };
+    String::from_utf8_lossy(&buf[..len]).into_owned()
+}
+
+/// Flatten a subcommand reply into the strings `StringCollectorTranslator`
+/// (interpreter.cc:147) would emit for `dragonfly.ihash`. Errors are logged
+/// and contribute nothing, nil maps to the empty string, and maps visit key
+/// then value.
+fn collect_reply_bytes(values: &mut Vec<Vec<u8>>, r: &RespValue) {
+    match r {
+        RespValue::Nil => values.push(Vec::new()),
+        RespValue::Bool(b) => values.push(if *b { b"1".to_vec() } else { b"0".to_vec() }),
+        RespValue::Integer(i) => values.push(itoa(*i)),
+        RespValue::Double(d) => values.push(g6_format(*d).into_bytes()),
+        RespValue::Simple(s) => values.push(s.as_bytes().to_vec()),
+        RespValue::Error(_) => {}
+        RespValue::Bulk(b) => values.push(b.clone()),
+        RespValue::Array(items) => items.iter().for_each(|v| collect_reply_bytes(values, v)),
+        RespValue::Map(pairs) => pairs.iter().for_each(|(k, v)| {
+            collect_reply_bytes(values, k);
+            collect_reply_bytes(values, v);
+        }),
+    }
+}
+
+/// `DragonflyRandstrCommand` (interpreter.cc:569): generate a random string of
+/// `size` bytes, or a table of `count` of them. Bytes follow glibc `rand()`
+/// (an LCG with seed 1, `rand()` returning `(state >> 16) & 0x7fff`) and the
+/// repeating `DRAGONFLY` pattern, so output matches the reference byte-for-byte.
+fn dragonfly_randstr(lua: &Lua, args: &MultiValue) -> mlua::Result<Value> {
+    const K_MAX_RANDSTR_SIZE: i64 = 16 << 20;
+    const K_MAX_RANDSTR_COUNT: i64 = 32 << 10;
+    const ALPHANUM: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const PATTERN: &[u8] = b"DRAGONFLY";
+    const PATTERN_LEN: i64 = PATTERN.len() as i64;
+    const PATTERN_INTERVAL: i64 = 53;
+
+    let argc = args.len();
+    if !(1..=2).contains(&argc) || !matches!(&args[0], Value::Integer(_) | Value::Number(_)) {
+        raise_string_error(lua, "randstr: expected randstr(size) or randstr(size, count)".into())
+    }
+    let dsize = match &args[0] {
+        Value::Integer(i) => *i,
+        Value::Number(f) => *f as i64,
+        _ => 0,
+    };
+    if !(1..=K_MAX_RANDSTR_SIZE).contains(&dsize) {
+        raise_string_error(
+            lua,
+            format!("randstr: size must be between 1 and {K_MAX_RANDSTR_SIZE}"),
+        )
+    }
+    let count = if argc == 2 {
+        let c = match &args[1] {
+            Value::Integer(i) => *i,
+            Value::Number(f) => *f as i64,
+            _ => 0,
+        };
+        if !(1..=K_MAX_RANDSTR_COUNT).contains(&c) {
+            raise_string_error(
+                lua,
+                format!("randstr: count must be between 1 and {K_MAX_RANDSTR_COUNT}"),
+            )
+        }
+        c
+    } else {
+        1
+    };
+
+    // glibc `rand()`: `state = (state * 1103515245 + 12345)` mod 2^32 (signed
+    // wrap), returning `(state >> 16) & 0x7fff`. The default seed is 1.
+    let mut state: i32 = 1;
+    let mut next_rand = move || -> i64 {
+        state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        (((state as u32) >> 16) & 0x7fff) as i64
+    };
+
+    let mut buf = Vec::with_capacity(dsize as usize);
+    let mut push_str = || -> mlua::Result<Value> {
+        buf.clear();
+        buf.resize(dsize as usize, b' ');
+        let mut i = 0i64;
+        while i < dsize {
+            if i % PATTERN_INTERVAL == 0 && i + PATTERN_LEN <= dsize {
+                buf[i as usize..(i + PATTERN_LEN) as usize].copy_from_slice(PATTERN);
+                i += PATTERN_LEN - 1;
+            } else {
+                buf[i as usize] = ALPHANUM[(next_rand() % 62) as usize];
+            }
+            i += 1;
+        }
+        lua.create_string(&buf).map(Value::String)
+    };
+
+    if count == 1 {
+        push_str()
+    } else {
+        let t = lua.create_table()?;
+        for i in 1..=count {
+            t.raw_set(i, push_str()?)?;
+        }
+        Ok(Value::Table(t))
+    }
+}
+
+/// `DragonflyHashCommand` (interpreter.cc:531): `dragonfly.ihash(seed, sort,
+/// cmd, args...)` dispatches the command with PCALL semantics and folds the
+/// flattened reply strings into an XXH64 hash seeded with `seed` (bit-cast)
+/// and the command's keys (all keys for MGET, otherwise the first). Returns
+/// the hash as an integer. A command error contributes nothing.
+fn dragonfly_ihash<D: ScriptDispatch>(
+    lua: &Lua,
+    dispatch: &RefCell<&mut D>,
+    args: MultiValue,
+) -> mlua::Value {
+    // `lua_tointeger`/`lua_toboolean` are lenient about non-number/boolean
+    // args; mirror that by defaulting to 0 / false.
+    let seed: u64 = match args.front() {
+        Some(Value::Integer(i)) => *i as u64,
+        Some(Value::Number(f)) => *f as i64 as u64,
+        _ => 0,
+    };
+    let requires_sort = matches!(args.get(1), Some(Value::Boolean(true)));
+    let tail: MultiValue = args.into_iter().skip(2).collect();
+    let Ok(cmd_args) = prepare_args(&tail) else {
+        raise_string_error(lua, ARG_TYPE_ERR.into())
+    };
+    if cmd_args.is_empty() {
+        // `RedisGenericCommand` pushes an error for an empty arg list but the
+        // reference ignores it; the hash stays the seed.
+        return Value::Integer(seed as i64);
+    }
+
+    // Compute the key hash: all key arguments for MGET, otherwise just the
+    // first (`lua_tolstring` on a missing index hashes empty bytes).
+    let cmd = &cmd_args[0];
+    let key_end = if cmd.eq_ignore_ascii_case(b"mget") {
+        cmd_args.len()
+    } else {
+        2
+    };
+    let mut hash = seed;
+    for i in 2..=key_end {
+        let key: &[u8] = cmd_args.get(i - 1).map(Vec::as_slice).unwrap_or_default();
+        hash = xxh64(key, hash);
+    }
+
+    let mut values: Vec<Vec<u8>> = Vec::new();
+    if let Ok(v) = dispatch.borrow_mut().dispatch(cmd_args) {
+        collect_reply_bytes(&mut values, &v);
+    }
+    if requires_sort {
+        values.sort();
+    }
+    for s in &values {
+        hash = xxh64(s, hash);
+    }
+    Value::Integer(hash as i64)
+}
+
+/// Install the per-run `dragonfly.*` helpers that close over the dispatch
+/// context (`ihash`, `lock`, `unlock`), mirroring how `redis.call`/`pcall`
+/// are reinstalled per run.
+fn install_dragonfly_functions<'a, D: ScriptDispatch>(
+    lua: &Lua,
+    scope: &'a mlua::Scope<'a, '_>,
+    dispatch: &'a RefCell<&mut D>,
+) -> mlua::Result<()> {
+    let ihash = scope.create_function_mut(move |lua, args: MultiValue| {
+        Ok(dragonfly_ihash(lua, dispatch, args))
+    })?;
+    let lock = scope.create_function_mut(move |lua, args: MultiValue| {
+        let Ok(keys) = prepare_args(&args) else {
+            raise_string_error(lua, ARG_TYPE_ERR.into())
+        };
+        if keys.is_empty() {
+            // `RedisGenericCommand`: `backed_args_.empty()` with no UNLOCK bit.
+            raise_string_error(lua, "Please specify at least one argument for this call".into())
+        }
+        match dispatch.borrow_mut().lock(keys) {
+            Ok(()) => Ok(Value::Nil),
+            Err(msg) => raise_string_error(lua, msg),
+        }
+    })?;
+    let unlock = scope.create_function_mut(move |lua, _: MultiValue| {
+        match dispatch.borrow_mut().unlock() {
+            Ok(()) => Ok(Value::Nil),
+            Err(msg) => raise_string_error(lua, msg),
+        }
+    })?;
+    let dragonfly: Table = lua.globals().get("dragonfly")?;
+    dragonfly.set("ihash", ihash)?;
+    dragonfly.set("lock", lock)?;
+    dragonfly.set("unlock", unlock)?;
+    Ok(())
 }
 
 /// Convert a subcommand reply into the Lua value a script observes
@@ -2722,5 +2976,146 @@ mod tests {
         // `PushError` prefixes `source:currentline` (interpreter.cc).
         assert!(s.starts_with("@user_script:"), "{s}");
         assert!(s.ends_with(": wrong number or type of arguments"), "{s}");
+    }
+
+    #[test]
+    fn dragonfly_randstr_matches_reference() {
+        // Byte-for-byte against glibc `rand()` (seed 1) with the DRAGONFLY
+        // pattern every 53 bytes (`DragonflyRandstrCommand`).
+        let interp = SandboxedInterpreter::new().unwrap();
+        interp.define("aaaa", b"return dragonfly.randstr(16)").unwrap();
+        assert_eq!(
+            interp.run("aaaa", &mut Noop, false, &no_kill()).unwrap(),
+            RespValue::Bulk(b"DRAGONFLYas7Vpl8".to_vec())
+        );
+        interp.define("bbbb", b"return dragonfly.randstr(7)").unwrap();
+        assert_eq!(
+            interp.run("bbbb", &mut Noop, false, &no_kill()).unwrap(),
+            RespValue::Bulk(b"as7Vpl8".to_vec())
+        );
+        // A table of `count` strings; the LCG advances across calls like the
+        // reference's global `rand()`, so each string differs.
+        interp.define("cccc", b"return dragonfly.randstr(7, 3)").unwrap();
+        assert_eq!(
+            interp.run("cccc", &mut Noop, false, &no_kill()).unwrap(),
+            RespValue::Array(vec![
+                RespValue::Bulk(b"as7Vpl8".to_vec()),
+                RespValue::Bulk(b"fUuLvWW".to_vec()),
+                RespValue::Bulk(b"lxffRMw".to_vec()),
+            ])
+        );
+        // Bounds mirror the reference (`kMaxRandstrSize`/`kMaxRandstrCount`).
+        interp.define("dddd", b"return dragonfly.randstr(0)").unwrap();
+        let err = interp
+            .run("dddd", &mut Noop, false, &no_kill())
+            .unwrap_err();
+        assert!(
+            err.contains("randstr: size must be between 1 and 16777216"),
+            "{err}"
+        );
+        interp.define("eeee", b"return dragonfly.randstr(16, 0)").unwrap();
+        let err = interp
+            .run("eeee", &mut Noop, false, &no_kill())
+            .unwrap_err();
+        assert!(
+            err.contains("randstr: count must be between 1 and 32768"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn dragonfly_ihash_hashes_keys_and_reply() {
+        // Reply with the subcommand's key arguments so the folded values are
+        // deterministic.
+        struct Echo;
+        impl ScriptDispatch for Echo {
+            fn dispatch(&mut self, args: Vec<Vec<u8>>) -> Result<RespValue, String> {
+                Ok(RespValue::Array(
+                    args.iter()
+                        .skip(1)
+                        .map(|a| RespValue::Bulk(a.clone()))
+                        .collect(),
+                ))
+            }
+        }
+        // A command error contributes nothing; the hash stays the seed + keys.
+        struct Boom;
+        impl ScriptDispatch for Boom {
+            fn dispatch(&mut self, _: Vec<Vec<u8>>) -> Result<RespValue, String> {
+                Err("boom".into())
+            }
+        }
+
+        let interp = SandboxedInterpreter::new().unwrap();
+        // Non-MGET: only the first key is hashed (`key_end = 2`).
+        interp
+            .define("aaaa", b"return dragonfly.ihash(0, false, 'get', 'k1', 'k2')")
+            .unwrap();
+        let mut h = xxh64(b"k1", 0);
+        h = xxh64(b"k1", h);
+        h = xxh64(b"k2", h);
+        assert_eq!(
+            interp.run("aaaa", &mut Echo, false, &no_kill()).unwrap(),
+            RespValue::Integer(h as i64)
+        );
+        // MGET hashes all keys; `requires_sort` sorts the collected reply
+        // strings before folding.
+        interp
+            .define("bbbb", b"return dragonfly.ihash(0, true, 'mget', 'b', 'a')")
+            .unwrap();
+        let mut h = xxh64(b"b", 0);
+        h = xxh64(b"a", h);
+        h = xxh64(b"a", h);
+        h = xxh64(b"b", h);
+        assert_eq!(
+            interp.run("bbbb", &mut Echo, false, &no_kill()).unwrap(),
+            RespValue::Integer(h as i64)
+        );
+        interp
+            .define("cccc", b"return dragonfly.ihash(5, false, 'get', 'k')")
+            .unwrap();
+        assert_eq!(
+            interp.run("cccc", &mut Boom, false, &no_kill()).unwrap(),
+            RespValue::Integer(xxh64(b"k", 5) as i64)
+        );
+    }
+
+    #[test]
+    fn dragonfly_lock_unlock_reach_dispatch() {
+        #[derive(Default)]
+        struct Recording {
+            locks: Vec<Vec<Vec<u8>>>,
+            unlocks: usize,
+        }
+        impl ScriptDispatch for Recording {
+            fn dispatch(&mut self, _: Vec<Vec<u8>>) -> Result<RespValue, String> {
+                Ok(RespValue::Integer(0))
+            }
+            fn lock(&mut self, keys: Vec<Vec<u8>>) -> Result<(), String> {
+                self.locks.push(keys);
+                Ok(())
+            }
+            fn unlock(&mut self) -> Result<(), String> {
+                self.unlocks += 1;
+                Ok(())
+            }
+        }
+
+        let interp = SandboxedInterpreter::new().unwrap();
+        interp
+            .define(
+                "aaaa",
+                b"dragonfly.lock('k1', 'k2') dragonfly.unlock() return 1",
+            )
+            .unwrap();
+        let mut rec = Recording::default();
+        assert_eq!(
+            interp
+                .run("aaaa", &mut rec, false, &no_kill())
+                .unwrap(),
+            RespValue::Integer(1)
+        );
+        assert_eq!(rec.locks, vec![vec![b"k1".to_vec(), b"k2".to_vec()]]);
+        assert_eq!(rec.unlocks, 1);
     }
 }
