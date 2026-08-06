@@ -299,6 +299,9 @@ fn exec_scard(ctx: &mut OpContext) -> CmdResult {
 fn exec_spop(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
+    if ctx.args.len() > key_idx + 2 {
+        return CmdResult::Err(RespError::syntax());
+    }
     let with_count = ctx.args.len() > key_idx + 1;
     let count = if with_count {
         let Some(c) = parse_i64(&ctx.args[key_idx + 1]) else {
@@ -352,6 +355,9 @@ fn exec_spop(ctx: &mut OpContext) -> CmdResult {
 fn exec_srandmember(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
+    if ctx.args.len() > key_idx + 2 {
+        return CmdResult::Err(RespError::syntax());
+    }
     let with_count = ctx.args.len() > key_idx + 1;
     let count = if with_count {
         match parse_i64(&ctx.args[key_idx + 1]) {
@@ -372,29 +378,19 @@ fn exec_srandmember(ctx: &mut OpContext) -> CmdResult {
                     None => RespValue::Nil,
                 });
             }
-            let len = s.len() as i64;
-            let mut out = Vec::new();
-            if count < 0 {
-                // allow duplicates, exactly |count| elements
-                for _ in 0..(-count) {
-                    if let Some(m) = s.rand_member() {
-                        out.push(RespValue::Bulk(m.as_bytes().to_vec()));
-                    }
-                }
+            let members = if count < 0 {
+                // Allow duplicates, exactly |count| elements.
+                s.rand_members(count.unsigned_abs() as usize)
             } else {
-                let n = count.min(len);
-                let mut taken = HashSet::new();
-                for _ in 0..n {
-                    let m = s.rand_member().unwrap().clone();
-                    if taken.insert(m.clone()) {
-                        out.push(RespValue::Bulk(m.as_bytes().to_vec()));
-                    }
-                    if taken.len() as i64 == len {
-                        break;
-                    }
-                }
-            }
-            CmdResult::Ok(RespValue::Array(out))
+                // Unique picks, at most the set size.
+                s.rand_members_unique(count as usize)
+            };
+            CmdResult::Ok(RespValue::Array(
+                members
+                    .into_iter()
+                    .map(|m| RespValue::Bulk(m.as_bytes().to_vec()))
+                    .collect(),
+            ))
         }
         Some(_) => CmdResult::Err(RespError::wrong_type()),
         None => CmdResult::Ok(if with_count {

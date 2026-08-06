@@ -1,6 +1,7 @@
 use hashbrown::{HashMap, HashSet};
 
 use crate::core::compact::CompactString;
+use crate::core::hash::SplitMix;
 
 const SET_MAX_SMALL: usize = 128;
 
@@ -178,11 +179,57 @@ impl Set {
         if len == 0 {
             return None;
         }
-        let idx = (crate::util::shard_hash(&self.sample_seed()) as usize) % len;
+        let idx = (self.rng().next() as usize) % len;
+        self.member_at(idx)
+    }
+
+    /// Return `count` random members, duplicates allowed (SRANDMEMBER with a
+    /// negative COUNT).
+    #[must_use]
+    pub fn rand_members(&self, count: usize) -> Vec<CompactString> {
+        let len = self.len();
+        if len == 0 || count == 0 {
+            return vec![];
+        }
+        let mut rng = self.rng();
+        (0..count)
+            .map(|_| {
+                let idx = (rng.next() as usize) % len;
+                self.member_at(idx).cloned().expect("non-empty set")
+            })
+            .collect()
+    }
+
+    /// Return `count` distinct random members, at most the set size
+    /// (SRANDMEMBER with a non-negative COUNT).
+    #[must_use]
+    pub fn rand_members_unique(&self, count: usize) -> Vec<CompactString> {
+        let len = self.len();
+        if len == 0 || count == 0 {
+            return vec![];
+        }
+        let count = count.min(len);
+        let mut all: Vec<CompactString> = self.members();
+        let mut rng = self.rng();
+        for i in 0..count {
+            let j = i + (rng.next() as usize) % (len - i);
+            all.swap(i, j);
+        }
+        all.truncate(count);
+        all
+    }
+
+    fn member_at(&self, idx: usize) -> Option<&CompactString> {
         match &self.repr {
             SetRepr::Small(v) => v.get(idx),
             SetRepr::Large(s) => s.iter().nth(idx),
         }
+    }
+
+    /// Deterministic splitmix64 PRNG seeded from the set contents so that
+    /// SRANDMEMBER results are stable for a given set.
+    fn rng(&self) -> SplitMix {
+        SplitMix(crate::util::shard_hash(&self.sample_seed()))
     }
 
     fn sample_seed(&self) -> Vec<u8> {
