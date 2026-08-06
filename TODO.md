@@ -231,8 +231,21 @@ integration tests (`tests/*.rs`) that run against the in-process server
   before running the queue, which previously made queued BLPOP with timeout 0
   block forever); a blocked command that wakes to a wrong-type key stays
   blocked instead of erroring (`WrongTypeDoesNotWake`).
-- [ ] Remaining families (hash, set, zset, stream, hll, geo, server,
+- [ ] Remaining families (set, zset, stream, hll, geo, server,
   scripting, json) still to be ported from `*_test.cc`.
+- [x] `hset_family_test.cc` → `tests/hset_family.rs` (44 tests). Adaptations:
+  real wall clock (field-TTL assertions use ranges where a second boundary can
+  land between commands; `hexpire_no_expire_early` widens the TTL to 10s with a
+  1.2s sleep), RESP3 parameterized cases (Get/HRandFieldRespFormat) assert only
+  the RESP2 replies, DEBUG OBJECT encoding assertions dropped, SHRINK is a stub
+  replying 0. Source fixes: HINCRBY replies "hash value is not an integer" for
+  non-integer stored values and "increment or decrement would overflow" on
+  i64 overflow; HINCRBYFLOAT rejects non-finite deltas ("increment would
+  produce NaN or Infinity"), rejects stored NaN/out-of-range values ("hash
+  value is not a float") while routing stored ±inf through the finite check;
+  HSCAN scans small (listpack) hashes whole, ignoring COUNT; shared
+  `parse_double` now rejects f64 overflow ("1e999", "1.8E+308") like the
+  reference `ParseDouble`/`TryParseNum`.
 
 ## Priority order
 1. Core data types: bitops, keys/generic, string, list, hash, set, zset, stream

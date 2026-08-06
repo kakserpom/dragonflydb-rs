@@ -123,12 +123,14 @@ pub fn parse_double(s: &[u8]) -> Option<f64> {
     match t.as_str() {
         "inf" | "+inf" | "infinity" | "+infinity" => return Some(f64::INFINITY),
         "-inf" | "-infinity" => return Some(f64::NEG_INFINITY),
-        "nan" => return Some(f64::NAN),
         _ => {}
     }
     let f: f64 = t.parse().ok()?;
-    if f.is_infinite() && t.len() > 4 {
-        // "1e999" overflows to inf; Redis rejects this in some contexts. Accept.
+    if f.is_infinite() {
+        // Values that overflow f64 ("1e999", "1.8E+308") are out of range: the
+        // reference `ParseDouble` (fast_float from_chars result_out_of_range) and
+        // `TryParseNum` (absl::SimpleAtod) both reject them.
+        return None;
     }
     Some(f)
 }

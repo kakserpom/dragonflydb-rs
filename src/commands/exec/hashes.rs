@@ -307,12 +307,16 @@ fn exec_hincrby(ctx: &mut OpContext) -> CmdResult {
         Some(v) if v.is_empty() => 0i64,
         Some(v) => match parse_i64(v.as_bytes()) {
             Some(n) => n,
-            None => return CmdResult::Err(RespError::integer()),
+            None => {
+                return CmdResult::Err(RespError::new("ERR hash value is not an integer"));
+            }
         },
         None => 0,
     };
     let Some(new_val) = cur.checked_add(delta) else {
-        return CmdResult::Err(RespError::integer());
+        return CmdResult::Err(RespError::new(
+            "ERR increment or decrement would overflow",
+        ));
     };
     h.set(
         field,
@@ -328,6 +332,11 @@ fn exec_hincrbyfloat(ctx: &mut OpContext) -> CmdResult {
     let Some(delta) = parse_double(&ctx.args[key_idx + 2]) else {
         return CmdResult::Err(RespError::float());
     };
+    if !delta.is_finite() {
+        return CmdResult::Err(RespError::new(
+            "ERR increment would produce NaN or Infinity",
+        ));
+    }
     let h = match ensure_hash(ctx, key) {
         Ok(h) => h,
         Err(e) => return CmdResult::Err(e),
@@ -335,8 +344,12 @@ fn exec_hincrbyfloat(ctx: &mut OpContext) -> CmdResult {
     let cur = match h.get(field.as_bytes()) {
         Some(v) if v.is_empty() => 0.0,
         Some(v) => match parse_double(v.as_bytes()) {
-            Some(n) => n,
-            None => return CmdResult::Err(RespError::float()),
+            // The reference ParseDouble (common.cc) rejects "nan" and
+            // out-of-range strings but accepts "+inf"/"-inf", which then fail
+            // the finite check below ("increment would produce NaN or
+            // Infinity").
+            Some(n) if !n.is_nan() => n,
+            _ => return CmdResult::Err(RespError::new("ERR hash value is not a float")),
         },
         None => 0.0,
     };
@@ -966,6 +979,20 @@ fn exec_hscan(ctx: &mut OpContext) -> CmdResult {
     let Some(PrimeValue::Hash(h)) = ctx.db.find(&key, ctx.now_ms) else {
         return CmdResult::Ok(hscan_reply(0, vec![]));
     };
+    if h.is_small() {
+        // The reference scans listpack hashes whole (OpScan listpack branch):
+        // every matching pair is returned and COUNT is ignored.
+        let mut out = Vec::new();
+        for (f, v) in h.iter() {
+            if pattern.is_none_or(|p| glob_match(p, f.as_bytes())) {
+                out.push(RespValue::Bulk(f.as_bytes().to_vec()));
+                if !novalues {
+                    out.push(RespValue::Bulk(v.as_bytes().to_vec()));
+                }
+            }
+        }
+        return CmdResult::Ok(hscan_reply(0, out));
+    }
     let mut entries: Vec<(CompactString, CompactString)> =
         h.iter().map(|(f, v)| (f.clone(), v.clone())).collect();
     if entries.is_empty() {
