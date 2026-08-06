@@ -208,7 +208,10 @@ integration tests (`tests/*.rs`) that run against the in-process server
   like `command_registry.cc:232`), and SETRANGE empty-value no-op; shared
   `redis_range` now clamps negative stops to 0 and rejects `start<0 && stop<start`
   (matches `OpGetRange`).
-- [ ] Remaining families (keys, list, hash, set, zset, bitops, stream, hll, geo,
+- [x] `bitops_family_test.cc` → `tests/bitops_family.rs` (27 tests: BITCOUNT,
+  BITPOS, GETBIT/SETBIT, BITOP, BITFIELD/BITFIELD_RO). Port needed no source
+  fixes; only the test harness's binary helper (`set_b`) was added.
+- [ ] Remaining families (keys, list, hash, set, zset, stream, hll, geo,
   server, scripting, json) still to be ported from `*_test.cc`.
 
 ## Priority order
