@@ -101,11 +101,7 @@ fn pop(ctx: &mut OpContext, front: bool) -> CmdResult {
         Some(_) => return CmdResult::Err(RespError::wrong_type()),
         None => None,
     }) else {
-        return CmdResult::Ok(if with_count {
-            RespValue::Array(vec![])
-        } else {
-            RespValue::Nil
-        });
+        return CmdResult::Ok(RespValue::Nil);
     };
     let mut out = Vec::new();
     for _ in 0..count {
@@ -289,10 +285,13 @@ fn exec_lpos(ctx: &mut OpContext) -> CmdResult {
                 count = Some(c);
             }
             b"MAXLEN" => {
-                maxlen = Some(match parse_i64(&ctx.args[i + 1]) {
-                    Some(v) => v as usize,
-                    None => return CmdResult::Err(RespError::integer()),
-                });
+                let Some(m) = parse_i64(&ctx.args[i + 1]) else {
+                    return CmdResult::Err(RespError::integer());
+                };
+                if m < 0 {
+                    return CmdResult::Err(RespError::new("ERR MAXLEN can't be negative"));
+                }
+                maxlen = Some(m as usize);
             }
             _ => return CmdResult::Err(RespError::syntax()),
         }
@@ -300,6 +299,7 @@ fn exec_lpos(ctx: &mut OpContext) -> CmdResult {
     }
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::List(l)) => {
+            let len = l.len();
             let items: Vec<&ListItem> = if rank < 0 {
                 let mut v: Vec<&ListItem> = l.iter().collect();
                 v.reverse();
@@ -312,8 +312,10 @@ fn exec_lpos(ctx: &mut OpContext) -> CmdResult {
             let skip = rank.unsigned_abs().saturating_sub(1) as usize;
             for (pos, item) in items.iter().enumerate().take(maxlen) {
                 if item.as_bytes() == *value && matches.len() >= skip {
-                    matches.push(pos as i64);
-                    if count.is_some_and(|c| matches.len() as i64 >= c) {
+                    // Report real list indices; with RANK < 0 these come out in
+                    // descending order (matches are reported from the tail).
+                    matches.push(if rank < 0 { len - 1 - pos } else { pos } as i64);
+                    if count.is_some_and(|c| c > 0 && matches.len() as i64 >= c) {
                         break;
                     }
                 }

@@ -346,13 +346,49 @@ impl Ctx {
     }
 
     /// Run a command with string arguments, unwrapping the reply.
+    #[track_caller]
     pub fn run(&mut self, args: &[&str]) -> Value {
-        self.c.cmd(args).expect("command failed")
+        self.c
+            .cmd(args)
+            .unwrap_or_else(|e| panic!("{e} for command {args:?}"))
     }
 
     /// Run a command with binary arguments, unwrapping the reply.
     pub fn run_b(&mut self, args: &[Vec<u8>]) -> Value {
         self.c.cmd_bytes(args).expect("command failed")
+    }
+
+    /// Run a command on a fresh connection in a background thread (for blocking
+    /// commands like BLPOP that must not tie up the primary connection).
+    #[must_use]
+    pub fn spawn(&self, args: &[&str]) -> JoinHandle<Value> {
+        let bytes: Vec<Vec<u8>> = args.iter().map(|a| a.as_bytes().to_vec()).collect();
+        self.spawn_b(&bytes)
+    }
+
+    /// Like [`Self::spawn`] but with binary arguments.
+    #[must_use]
+    pub fn spawn_b(&self, args: &[Vec<u8>]) -> JoinHandle<Value> {
+        let port = self.server.port();
+        let args: Vec<Vec<u8>> = args.to_vec();
+        std::thread::spawn(move || {
+            let mut c = Client::connect(port).expect("connect to test server");
+            c.cmd_bytes(&args).expect("command failed")
+        })
+    }
+
+    /// Run `f` on a fresh connection in a background thread, returning its
+    /// last reply. Useful for sequences like `SELECT` + a blocking command.
+    #[must_use]
+    pub fn spawn_fn(
+        &self,
+        f: impl FnOnce(&mut Client) -> Value + Send + 'static,
+    ) -> JoinHandle<Value> {
+        let port = self.server.port();
+        std::thread::spawn(move || {
+            let mut c = Client::connect(port).expect("connect to test server");
+            f(&mut c)
+        })
     }
 
     pub fn ok(&mut self, args: &[&str]) {
@@ -407,11 +443,13 @@ impl Ctx {
     }
 
     /// Assert the reply is `+OK`.
+    #[track_caller]
     pub fn assert_ok(&mut self, args: &[&str]) {
         self.ok(args);
     }
 
     /// Assert the reply is the integer `n`.
+    #[track_caller]
     pub fn assert_int(&mut self, args: &[&str], n: i64) {
         let v = self.run(args);
         expect_int(&v, n);
@@ -443,17 +481,20 @@ impl Ctx {
 }
 
 /// Assert that a reply is `+OK` (or a bulk `OK`).
+#[track_caller]
 pub fn expect_ok(v: &Value) {
     assert!(v.text().as_deref() == Some("OK"), "expected OK, got {v:?}");
 }
 
 /// Assert that a reply is an integer with the given value.
+#[track_caller]
 pub fn expect_int(v: &Value, n: i64) {
     assert_eq!(v.int(), Some(n), "expected integer {n}, got {v:?}");
 }
 
 /// Assert that a reply is an error containing `substr` (case-sensitive on the
 /// full error text after `ERR `).
+#[track_caller]
 pub fn expect_err(v: &Value, substr: &str) {
     match v {
         Value::Error(e) => assert!(

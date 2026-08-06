@@ -220,7 +220,18 @@ integration tests (`tests/*.rs`) that run against the in-process server
   `QUEUED`, multi-shard RM drains to cursor "0", and `QuickList::from_bytes`
   int-encoding strict Redis integers only (matches `lpStringToInt64`; keeps
   `-0`/leading zeros as raw strings).
-- [ ] Remaining families (list, hash, set, zset, stream, hll, geo, server,
+- [x] `list_family_test.cc` → `tests/list_family.rs` (46 tests). Adaptations:
+  real wall clock, background-thread connections for blocking commands
+  (`Ctx::spawn`/`spawn_b`/`spawn_fn`), controller-internals assertions dropped,
+  scheduler-stress tests skipped. Source fixes: `pop` replies nil (not an empty
+  array) for a missing key even with a count, `exec_lpos` rejects negative
+  MAXLEN ("ERR MAXLEN can't be negative"), reports real (descending) indices
+  for RANK < 0, and treats COUNT 0 as unlimited; MULTI-queued blocking commands
+  reply nil via a new `exec_multi` flag on the connection (EXEC resets `multi`
+  before running the queue, which previously made queued BLPOP with timeout 0
+  block forever); a blocked command that wakes to a wrong-type key stays
+  blocked instead of erroring (`WrongTypeDoesNotWake`).
+- [ ] Remaining families (hash, set, zset, stream, hll, geo, server,
   scripting, json) still to be ported from `*_test.cc`.
 
 ## Priority order

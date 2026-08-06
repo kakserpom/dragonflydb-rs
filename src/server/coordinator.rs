@@ -11,7 +11,7 @@ use crate::commands::lua::{
     FUNCTION_KILLED_ERR, SandboxedInterpreter, ScriptDispatch, ScriptMgr, sha1_hex,
 };
 use crate::commands::{Command, FLAG_GLOBAL, FLAG_NOSCRIPT, FLAG_WRITE, ShardPart};
-use crate::error::{CmdResult, RespValue};
+use crate::error::{CmdResult, RespError, RespValue};
 use crate::server::{
     CoordMsg, GcRequest, Reply, ReplyBus, ScriptBatchEntry, ShardMsg, blocking_timeout_ms,
     command_for, encode_result, extract_keys, is_eval_cmd, is_function_cmd, keys_per_shard,
@@ -23,6 +23,15 @@ use crate::server::{
 struct PendingTx {
     msg: CoordMsg,
     deadline_ms: Option<u64>,
+}
+
+/// Whether a re-ran blocked command found its key holding the wrong type, in
+/// which case it remains blocked rather than erroring (`WrongTypeDoesNotWake`).
+fn is_blocked_wrong_type(msg: &CoordMsg, err: &RespError) -> bool {
+    let Some(cmd) = command_for(&msg.args) else {
+        return false;
+    };
+    blocking_timeout_ms(cmd, &msg.args).is_some() && err.message.starts_with("WRONGTYPE")
 }
 
 pub fn spawn(
@@ -180,6 +189,11 @@ impl Coordinator {
             }
             match self.execute_tx(&p.msg) {
                 CmdResult::Blocked => remaining.push(p),
+                // A blocked command that wakes to find its key holding the
+                // wrong type stays blocked (e.g. BLPOP blocked on `x`, then
+                // `SET x str`): the wake is deferred until the key holds the
+                // right type again (`WrongTypeDoesNotWake`).
+                CmdResult::Err(e) if is_blocked_wrong_type(&p.msg, &e) => remaining.push(p),
                 other => self.reply_result(p.msg.conn_id, p.msg.seq, other),
             }
         }

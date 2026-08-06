@@ -103,6 +103,10 @@ struct Conn {
     db_idx: usize,
     /// MULTI/EXEC transaction state.
     multi: MultiState,
+    /// True while EXEC runs the queued commands: their blocking commands must
+    /// reply nil instead of waiting (upstream `IsMulti` during exec). The
+    /// `multi` state is reset before the queue runs, so this carries the flag.
+    exec_multi: bool,
     /// Keys this connection is watching (WATCH/UNWATCH).
     watched: Vec<WatchedKey>,
     /// Latch mirroring upstream `ExecInfo::watched_dirty`: set when any
@@ -293,6 +297,7 @@ impl IoLoop {
                 buffered: BTreeMap::new(),
                 db_idx: 0,
                 multi: MultiState::default(),
+                exec_multi: false,
                 watched: Vec::new(),
                 watched_dirty: false,
                 sub: SubscribeInfo::default(),
@@ -564,6 +569,14 @@ impl IoLoop {
             .is_some_and(|c| c.multi.phase == MultiPhase::Collect)
     }
 
+    /// Whether the connection is inside a MULTI block or currently executing
+    /// its queued commands, i.e. blocking commands must reply nil.
+    fn no_block(&self, conn_id: u64) -> bool {
+        self.conns
+            .get(&conn_id)
+            .is_some_and(|c| c.multi.phase == MultiPhase::Collect || c.exec_multi)
+    }
+
     fn handle_local(&mut self, conn_id: u64, cmd: &Command, args: &[Vec<u8>]) -> RespValue {
         // Single-reply pub/sub commands reach this path both from `dispatch`
         // (FLAG_LOCAL) and from `run_queued` when executed inside EXEC.
@@ -817,8 +830,14 @@ impl IoLoop {
         // concatenate into the EXEC RESP array.
         let header = format!("*{}\r\n", queue.len()).into_bytes();
         self.deliver(conn_id, seq, header);
+        if let Some(conn) = self.conns.get_mut(&conn_id) {
+            conn.exec_multi = true;
+        }
         for args in queue {
             self.run_queued(conn_id, &args);
+        }
+        if let Some(conn) = self.conns.get_mut(&conn_id) {
+            conn.exec_multi = false;
         }
     }
 
@@ -1613,7 +1632,7 @@ impl IoLoop {
             shards,
             first_key_idx,
             db_idx,
-            no_block: self.in_multi(conn_id),
+            no_block: self.no_block(conn_id),
         };
         let _ = self.env.coord_tx.send(msg);
     }
