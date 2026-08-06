@@ -3,9 +3,9 @@
 //! Adaptations from the C++ original:
 //! - `GetMetrics` / `GetDebugInfo` / `ExpectUsedKeys` assertions are dropped
 //!   (the port exposes no equivalent counters / shard-count introspection).
-//! - `AdvanceTime` tests use real short expiries with sleeps instead of the
-//!   fake clock (`TEST_current_time_ms`), because tests run in parallel and a
-//!   global clock override would leak across servers.
+//! - `AdvanceTime` is served by the process-global test clock from `common`:
+//!   time-dependent tests run one at a time under `clock_guard` and assert
+//!   exact TTLs instead of second-boundary ranges.
 //! - Internal `CompactObj` pin/orphan/drain tests (they probe C++ memory
 //!   mechanics) and `cache_mode`/`cluster_mode` flag-dependent tests are
 //!   skipped; the observable RESP behavior they assert is covered here.
@@ -13,8 +13,6 @@
 mod common;
 
 use common::*;
-use std::thread::sleep;
-use std::time::Duration;
 
 /// `ToIntArr` from the C++ harness: assert an array of integer-formatted
 /// bulk strings and return the parsed values.
@@ -75,15 +73,16 @@ fn append() {
 #[test]
 fn expire() {
     let mut t = Ctx::new();
+    let _clock = clock_guard();
     t.ok(&["set", "key", "val", "PX", "100"]);
-    sleep(Duration::from_millis(20));
+    advance(20);
     t.assert_text(&["get", "key"], "val");
-    sleep(Duration::from_millis(120));
+    advance(120);
     t.assert_null(&["get", "key"]);
 
     t.ok(&["set", "i", "1", "PX", "100"]);
     t.assert_int(&["incr", "i"], 2);
-    sleep(Duration::from_millis(150));
+    advance(150);
     t.assert_int(&["incr", "i"], 1);
 }
 
@@ -329,6 +328,7 @@ fn mset_incr() {
 #[test]
 fn set_ex() {
     let mut t = Ctx::new();
+    let _clock = clock_guard();
     t.ok(&["setex", "key", "1", "val"]);
     t.ok(&["setex", "key", "10", "val"]);
     assert_eq!(t.int(&["ttl", "key"]), 10);
@@ -424,14 +424,9 @@ fn set_nx() {
 #[test]
 fn set_px_at_ex_at() {
     let mut t = Ctx::new();
-    let now_s = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
+    let _clock = clock_guard();
+    let now_s = clock_ms() / 1000;
+    let now_ms = clock_ms();
 
     t.assert_err(&["set", "foo", "bar", "EXAT", "-1"], "invalid expire time");
     t.ok(&["set", "foo", "bar", "EXAT", &(now_s - 1).to_string()]);
@@ -466,10 +461,8 @@ fn get_del() {
 #[test]
 fn get_ex() {
     let mut t = Ctx::new();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
+    let _clock = clock_guard();
+    let now_ms = clock_ms();
 
     t.ok(&["set", "foo", "bar"]);
     t.assert_err(&["getex", "foo", "EX"], "syntax error");
@@ -500,7 +493,7 @@ fn get_ex() {
     t.ok(&["set", "foo", "bar"]);
     t.assert_text(&["getex", "foo", "PX", "150"], "bar");
     t.assert_text(&["getex", "foo"], "bar");
-    sleep(Duration::from_millis(200));
+    advance(200);
     t.assert_null(&["getex", "foo"]);
 }
 

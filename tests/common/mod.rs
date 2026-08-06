@@ -537,3 +537,39 @@ pub fn wait_for(timeout: Duration, mut f: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+/// Serializes the tests that observe time: the fake clock is process-global
+/// (like the reference's `TEST_current_time_ms`), so time-dependent tests must
+/// run one at a time, pinning their own base and advancing it alone. Tests
+/// without TTL assertions run in parallel and ignore the clock.
+//
+// The clock helpers are only used by the families with TTL tests
+// (hset/generic/string/list); bitops_family includes `common` but never
+// advances the clock.
+#[allow(dead_code)]
+static CLOCK: Mutex<()> = Mutex::new(());
+
+/// Pin the fake clock (idempotent; keeps a base a previous test advanced) and
+/// hold the serialization lock for the rest of the test.
+#[allow(dead_code)]
+pub fn clock_guard() -> std::sync::MutexGuard<'static, ()> {
+    let g = CLOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = dragonflydb::commands::exec::server::pin_test_clock();
+    g
+}
+
+/// Advance the pinned fake clock by `ms` (the reference's `AdvanceTime`).
+#[allow(dead_code)]
+pub fn advance(ms: u64) {
+    dragonflydb::commands::exec::server::advance_test_clock(ms);
+}
+
+/// The pinned clock's current value, in epoch milliseconds.
+// `clock_ms` is only used by the families that read absolute timestamps
+// (hset/generic/string); list_family only advances.
+#[allow(dead_code)]
+pub fn clock_ms() -> u64 {
+    dragonflydb::commands::exec::server::test_clock_ms()
+}

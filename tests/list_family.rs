@@ -2,8 +2,8 @@
 //! harness (`tests/common/mod.rs`).
 //!
 //! Adaptations from the reference:
-//! - Real wall clock instead of the fake clock, so `AdvanceTime` becomes a
-//!   `sleep`.
+//! - `AdvanceTime` is served by the process-global test clock from `common`
+//!   (see `clock_guard`); blocking-fiber coordination still uses real sleeps.
 //! - Internal blocking-controller state (`IsLocked`, `NumWatched`,
 //!   `HasAwakened`, `WaitUntilLocked`) is not observable over the socket and
 //!   the assertions are dropped; behavior is asserted instead (blocking
@@ -71,9 +71,10 @@ fn basic() {
 #[test]
 fn expire() {
     let mut t = Ctx::new();
+    let _clock = clock_guard();
     t.assert_int(&["lpush", "x", "1"], 1);
     t.assert_int(&["expire", "x", "1"], 1);
-    sleep(Duration::from_millis(1100));
+    advance(1100);
     t.assert_int(&["lpush", "x", "1"], 1);
 }
 

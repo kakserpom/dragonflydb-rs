@@ -3,10 +3,10 @@
 //! Adaptations from the C++ original:
 //! - `GetMetrics` / `GetDebugInfo` / `last_cmd_dbg_info_` / shard-count
 //!   assertions are dropped (the port exposes no such introspection).
-//! - `AdvanceTime` (the fake clock) is replaced with real sleeps because tests
-//!   run in parallel and a global clock override would leak across servers.
-//!   `pttl`/`ttl` magnitudes that the fake clock pinned exactly are asserted
-//!   within a small tolerance instead.
+//! - `AdvanceTime` (the fake clock) is served by the process-global test clock
+//!   from `common`: time-dependent tests run one at a time under `clock_guard`,
+//!   so `pttl`/`ttl`/`expiretime` replies are exact values instead of
+//!   second-boundary ranges.
 //! - Fiber/concurrency tests (parallel `Del`, concurrent `Rename`/`Copy`,
 //!   blocking-ops interplay) are reduced to their sequential observable
 //!   behavior.
@@ -23,15 +23,6 @@
 mod common;
 
 use common::*;
-use std::thread::sleep;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 /// Parse an array of integer-formatted bulk strings (`ToIntArr`).
 fn int_arr(v: &Value) -> Vec<i64> {
@@ -73,16 +64,6 @@ fn bulks(v: &Value) -> Vec<String> {
                 .unwrap_or_else(|| panic!("expected text, got {x:?}"))
         })
         .collect()
-}
-
-/// Assert `pttl key` is within `tolerance_ms` of `expected_ms` (real-clock
-/// adaptation of the reference's exact `pttl` assertions).
-fn assert_pttl(t: &mut Ctx, key: &str, expected_ms: i64) {
-    let p = t.int(&["pttl", key]);
-    assert!(
-        p <= expected_ms && p >= expected_ms - 2000,
-        "pttl {key} = {p}, expected ~{expected_ms}"
-    );
 }
 
 #[test]
@@ -141,36 +122,38 @@ fn del() {
 #[test]
 fn expire() {
     let mut t = Ctx::new();
+    let _clock = clock_guard();
     t.ok(&["set", "key", "val"]);
     // 5 years — well within the kMaxExpireDeadlineMs cap.
     t.assert_int(&["expire", "key", "157680000"], 1);
     t.assert_int(&["expire", "key", "1"], 1);
-    sleep(Duration::from_millis(1100));
+    advance(1100);
     t.assert_null(&["get", "key"]);
 
     // pexpireat override
     t.ok(&["set", "key", "val"]);
-    let now = now_ms();
+    let now = clock_ms();
     t.assert_int(&["pexpireat", "key", &(now + 2000).to_string()], 1);
     t.assert_int(&["pexpireat", "key", &(now + 3000).to_string()], 1);
-    sleep(Duration::from_millis(2800));
+    advance(2800);
     t.assert_text(&["get", "key"], "val");
-    sleep(Duration::from_millis(400));
+    advance(400);
     t.assert_null(&["get", "key"]);
 
     // pexpire override
     t.ok(&["set", "key", "val"]);
     t.assert_int(&["pexpire", "key", "2000"], 1);
     t.assert_int(&["pexpire", "key", "3000"], 1);
-    sleep(Duration::from_millis(2800));
+    advance(2800);
     t.assert_text(&["get", "key"], "val");
-    sleep(Duration::from_millis(400));
+    advance(400);
     t.assert_null(&["get", "key"]);
 }
 
 #[test]
 fn expire_corner_cases() {
     let mut t = Ctx::new();
+    let _clock = clock_guard();
     // Non-positive relative TTL deletes the key immediately and reports success.
     for ttl in ["-1", "0", "-100"] {
         t.ok(&["set", "key", "val"]);
@@ -212,11 +195,7 @@ fn expire_corner_cases() {
     let ttl = t.int(&["ttl", "key"]);
     assert!(ttl == 268435455, "ttl {ttl}, expected 268435455");
     t.assert_int(&["pexpire", "key", "2684354550000"], 1);
-    let pttl = t.int(&["pttl", "key"]);
-    assert!(
-        pttl <= 268435455000 && pttl >= 268435454000,
-        "pttl {pttl}, expected ~268435455000"
-    );
+    t.assert_int(&["pttl", "key"], 268435455000);
 
     // Missing key -> 0 regardless of the TTL value.
     t.assert_int(&["del", "missing"], 0);
@@ -229,6 +208,7 @@ fn expire_corner_cases() {
 #[test]
 fn expire_options() {
     let mut t = Ctx::new();
+    let _clock = clock_guard();
     t.ok(&["set", "key", "val"]);
 
     t.assert_err(
@@ -293,7 +273,8 @@ fn expire_options() {
 #[test]
 fn expire_at_options() {
     let mut t = Ctx::new();
-    let time_s = (now_ms() + 500) / 1000;
+    let _clock = clock_guard();
+    let time_s = clock_ms() / 1000;
 
     t.ok(&["set", "key", "val"]);
     t.assert_err(
@@ -318,7 +299,7 @@ fn expire_at_options() {
         &[
             "expireat",
             "key",
-            &((now_ms() / 1000 - 10).to_string()),
+            &((clock_ms() / 1000 - 10).to_string()),
             "NX",
         ],
         0,
@@ -352,6 +333,7 @@ fn expire_at_options() {
 #[test]
 fn pexpire_options() {
     let mut t = Ctx::new();
+    let _clock = clock_guard();
     t.ok(&["set", "key", "val"]);
     t.assert_err(
         &["pexpire", "key", "3600", "NX", "XX"],
@@ -363,7 +345,7 @@ fn pexpire_options() {
     );
 
     t.assert_int(&["pexpire", "key", "3600000", "NX"], 1);
-    assert_pttl(&mut t, "key", 3600000);
+    t.assert_int(&["pttl", "key"], 3600000);
     t.assert_int(&["pexpire", "key", "42", "NX"], 0);
 
     t.ok(&["set", "key2", "val"]);
@@ -372,21 +354,22 @@ fn pexpire_options() {
 
     t.assert_int(&["pexpire", "key", "101000"], 1);
     t.assert_int(&["pexpire", "key", "100000", "GT"], 0);
-    assert_pttl(&mut t, "key", 101000);
+    t.assert_int(&["pttl", "key"], 101000);
     t.assert_int(&["pexpire", "key", "102000", "GT"], 1);
-    assert_pttl(&mut t, "key", 102000);
+    t.assert_int(&["pttl", "key"], 102000);
     t.assert_int(&["pexpire", "key", "101000", "GT"], 0);
-    assert_pttl(&mut t, "key", 102000);
+    t.assert_int(&["pttl", "key"], 102000);
     t.assert_int(&["pexpire", "key", "101000", "LT"], 1);
-    assert_pttl(&mut t, "key", 101000);
+    t.assert_int(&["pttl", "key"], 101000);
     t.assert_int(&["pexpire", "key", "102000", "LT"], 0);
-    assert_pttl(&mut t, "key", 101000);
+    t.assert_int(&["pttl", "key"], 101000);
 }
 
 #[test]
 fn pexpire_at_options() {
     let mut t = Ctx::new();
-    let now = now_ms();
+    let _clock = clock_guard();
+    let now = clock_ms();
 
     t.ok(&["set", "key", "val"]);
     t.assert_err(
@@ -432,6 +415,7 @@ fn pexpire_at_options() {
 #[test]
 fn expiretime() {
     let mut t = Ctx::new();
+    let _clock = clock_guard();
     t.assert_int(&["expiretime", "foo"], -2);
     t.assert_int(&["pexpiretime", "foo"], -2);
 
@@ -439,7 +423,7 @@ fn expiretime() {
     t.assert_int(&["expiretime", "foo"], -1);
     t.assert_int(&["pexpiretime", "foo"], -1);
 
-    let at = now_ms() + 5000;
+    let at = clock_ms() + 5000;
     t.assert_int(&["pexpireat", "foo", &at.to_string()], 1);
     t.assert_int(&["pexpiretime", "foo"], at as i64);
     t.assert_int(&["expiretime", "foo"], ((at + 500) / 1000) as i64);
@@ -448,6 +432,7 @@ fn expiretime() {
 #[test]
 fn persist() {
     let mut t = Ctx::new();
+    let _clock = clock_guard();
     t.ok(&["set", "mykey", "somevalue"]);
     t.assert_int(&["persist", "mykey"], 0);
     t.assert_int(&["ttl", "mykey"], -1);
@@ -619,10 +604,10 @@ fn copy_binary() {
 #[test]
 fn copy_ttl() {
     let mut t = Ctx::new();
+    let _clock = clock_guard();
     t.ok(&["setex", "k1", "10", "bar"]);
     t.assert_int(&["copy", "k1", "k2"], 1);
-    let ttl = t.int(&["ttl", "k2"]);
-    assert!(ttl == 10, "ttl {ttl}, expected 10");
+    t.assert_int(&["ttl", "k2"], 10);
 }
 
 #[test]
@@ -1371,6 +1356,7 @@ fn dump() {
 #[test]
 fn restore() {
     let mut t = Ctx::new();
+    let _clock = clock_guard();
 
     // A Redis 6 string dump (RDB_VERSION 9) for "1234".
     let string_dump: Vec<u8> = vec![
@@ -1441,10 +1427,10 @@ fn restore() {
         b"REPLACE".to_vec(),
     ]);
     t.assert_text(&["get", "string-key"], "1234");
-    assert_pttl(&mut t, "string-key", 7000);
+    t.assert_int(&["pttl", "string-key"], 7000);
 
     // ABSTTL with a future timestamp.
-    let at = now_ms() + 2000;
+    let at = clock_ms() + 2000;
     t.ok_b(&[
         b"restore".to_vec(),
         b"string-key".to_vec(),
@@ -1454,7 +1440,7 @@ fn restore() {
         b"REPLACE".to_vec(),
     ]);
     t.assert_text(&["get", "string-key"], "hello world");
-    assert_pttl(&mut t, "string-key", 2000);
+    t.assert_int(&["pttl", "string-key"], 2000);
 
     // No TTL.
     t.ok_b(&[
@@ -1592,7 +1578,6 @@ fn time_cmd() {
     // TIME inside MULTI/EXEC replies an array of two TIME arrays.
     t.ok(&["multi"]);
     t.run(&["time"]);
-    sleep(Duration::from_millis(2));
     t.run(&["time"]);
     let v = t.arr(&["exec"]);
     assert_eq!(v.len(), 2);

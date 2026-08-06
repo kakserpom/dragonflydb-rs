@@ -19,10 +19,12 @@ use crate::server::{
 };
 
 /// A blocking command (XREAD/XREADGROUP) waiting for data or a timeout. The
-/// coordinator re-runs it until it returns data or the deadline passes.
+/// coordinator re-runs it until it returns data or the deadline passes. The
+/// deadline uses the real wall clock (`Instant`): blocking waits observe real
+/// time, independent of the test fake clock that drives TTL expiry.
 struct PendingTx {
     msg: CoordMsg,
-    deadline_ms: Option<u64>,
+    deadline: Option<Instant>,
 }
 
 /// Whether a re-ran blocked command found its key holding the wrong type, in
@@ -109,7 +111,7 @@ impl Coordinator {
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
-            self.retry_pending(now_ms());
+            self.retry_pending(Instant::now());
         }
     }
 
@@ -158,29 +160,29 @@ impl Coordinator {
                     return;
                 }
                 let cmd = command_for(&msg.args);
-                let deadline_ms = cmd.and_then(|c| blocking_timeout_ms(c, &msg.args)).map_or(
-                    Some(now_ms()),
+                let deadline = cmd.and_then(|c| blocking_timeout_ms(c, &msg.args)).map_or(
+                    Some(Instant::now()),
                     |ms| {
                         if ms == 0 {
                             None // wait forever
                         } else {
-                            Some(now_ms().saturating_add(ms))
+                            Some(Instant::now() + Duration::from_millis(ms))
                         }
                     },
                 );
-                self.pending.push_back(PendingTx { msg, deadline_ms });
+                self.pending.push_back(PendingTx { msg, deadline });
             }
             other => self.reply_result(msg.conn_id, msg.seq, other),
         }
     }
 
-    fn retry_pending(&mut self, now: u64) {
+    fn retry_pending(&mut self, now: Instant) {
         if self.pending.is_empty() {
             return;
         }
         let mut remaining = Vec::with_capacity(self.pending.len());
         while let Some(p) = self.pending.pop_front() {
-            if let Some(dl) = p.deadline_ms
+            if let Some(dl) = p.deadline
                 && now >= dl
             {
                 let bytes = encode_result(CmdResult::Ok(RespValue::Nil));

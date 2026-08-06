@@ -3,12 +3,12 @@
 //!
 //! Adaptations from the reference:
 //! - The reference's `TEST_current_time_ms` global + `AdvanceTime` become the
-//!   port's process-global fake clock: [`clock_guard`] pins `now_ms()` to a
-//!   whole-second base and [`advance`] moves it forward, so TTL replies are
-//!   exact values instead of second-boundary ranges. Time-dependent tests run
-//!   one at a time under a global mutex (the fake clock is process-wide, like
-//!   the reference); tests without TTL assertions run in parallel and never
-//!   observe it.
+//!   port's process-global fake clock from `common` (`clock_guard` pins
+//!   `now_ms()` to a whole-second base, `advance` moves it forward), so TTL
+//!   replies are exact values instead of second-boundary ranges. Time-dependent
+//!   tests run one at a time under a global mutex (the fake clock is
+//!   process-wide, like the reference); tests without TTL assertions run in
+//!   parallel and never observe it.
 //! - The internal listpack/string-map encodings are not observable; DEBUG
 //!   OBJECT encoding assertions are dropped and HSCAN's listpack behavior
 //!   (returning every matching pair regardless of COUNT) is asserted instead.
@@ -21,31 +21,6 @@
 mod common;
 
 use common::*;
-use std::sync::Mutex;
-
-/// Serializes the tests that observe time: the fake clock is process-global
-/// (like the reference's `TEST_current_time_ms`), so time-dependent tests must
-/// run one at a time, pinning their own base and advancing it alone. Tests
-/// without TTL assertions run in parallel and ignore the clock.
-static CLOCK: Mutex<()> = Mutex::new(());
-
-/// Pin the clock (idempotent; keeps a base a previous test advanced) and hold
-/// the serialization lock for the rest of the test.
-fn clock_guard() -> std::sync::MutexGuard<'static, ()> {
-    let g = CLOCK.lock().unwrap_or_else(|p| p.into_inner());
-    dragonflydb::commands::exec::server::pin_test_clock();
-    g
-}
-
-/// Advance the pinned fake clock by `ms` (the reference's `AdvanceTime`).
-fn advance(ms: u64) {
-    dragonflydb::commands::exec::server::advance_test_clock(ms);
-}
-
-/// The pinned clock's current value, in epoch milliseconds.
-fn clock_ms() -> u64 {
-    dragonflydb::commands::exec::server::test_clock_ms()
-}
 
 /// Text entries of an array reply in their reply order (`GetVec`).
 fn strs(v: &Value) -> Vec<String> {
