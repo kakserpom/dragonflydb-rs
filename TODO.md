@@ -131,6 +131,14 @@ Legend:
   and flag enforcement) and are recreated on first FCALL or when a library's
   sha changes, purging names the replacement dropped;
   `FUNCTION DUMP`/`RESTORE` use an opaque local binary format.
+- The whole FUNCTION family (LOAD [REPLACE], DELETE, LIST [WITHCODE], STATS,
+  DUMP, RESTORE [FLUSH|APPEND|REPLACE], KILL, HELP) plus FCALL/FCALL_RO is a
+  deliberate superset: the reference's `Service::Function` is a stub
+  (`main_service.cc:2708`) that only accepts `FUNCTION FLUSH` (returns OK) and
+  rejects every other subcommand with
+  `Unknown subcommand or wrong number of arguments for '<subcmd>'. Try FUNCTION HELP.`
+  The port keeps the full Redis-compatible implementation (for real clients)
+  rather than mirroring the stub; `FUNCTION FLUSH` behavior matches.
 - `redis.register_function` outside a `FUNCTION LOAD` body errors with Redis's
   exact `redis.register_function can only be called on FUNCTION LOAD command`;
   library and function names are validated (`[A-Za-z0-9_.-]`, like
@@ -188,10 +196,20 @@ Legend:
   paths)
 
 ## Test porting backlog
-Reference C++ tests in `dragonfly/src/server/*_test.cc` should be ported to
-Rust unit tests (`#[cfg(test)]` modules in the matching `src/commands/exec/*.rs`),
-mirroring how `StringFamilyTest.ClThrottle` was ported (virtual clock, pure core
-function + thin exec wrapper).
+Reference C++ tests in `dragonfly/src/server/*_test.cc` are ported as Rust
+integration tests (`tests/*.rs`) that run against the in-process server
+(spawned shards/coordinator/IO loop over a real 127.0.0.1 socket, RESP2
+`Client` + `Ctx` helpers in `tests/common/mod.rs`).
+- [x] `string_family_test.cc` → `tests/string_family.rs` (34 tests). Fixes to
+  the port's `SET` (STICK/GET, expiry validation + kMaxExpireDeadlineMs cap,
+  past-absolute → NegativeExpire), SETEX/PSETEX (TTL clamp + sec→ms overflow),
+  DECRBY i64::MIN overflow, INCRBYFLOAT strict float parse, MSET/MSETNX
+  odd-args (`interleave_step_ = 2` parity now enforced in `Command::check_arity`
+  like `command_registry.cc:232`), and SETRANGE empty-value no-op; shared
+  `redis_range` now clamps negative stops to 0 and rejects `start<0 && stop<start`
+  (matches `OpGetRange`).
+- [ ] Remaining families (keys, list, hash, set, zset, bitops, stream, hll, geo,
+  server, scripting, json) still to be ported from `*_test.cc`.
 
 ## Priority order
 1. Core data types: bitops, keys/generic, string, list, hash, set, zset, stream

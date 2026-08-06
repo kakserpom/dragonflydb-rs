@@ -93,13 +93,19 @@ pub fn redis_range(start: i64, stop: i64, len: i64) -> Option<(i64, i64)> {
     if len <= 0 {
         return None;
     }
+    // Reference `OpGetRange`: `if (start < 0 && end < start) return ""`.
+    if start < 0 && stop < start {
+        return None;
+    }
     let mut s = if start < 0 { len + start } else { start };
     let mut e = if stop < 0 { len + stop } else { stop };
     if s < 0 {
         s = 0;
     }
     if e < 0 {
-        return None;
+        // Reference clamps a negative `end` to 0 (`max(strlen + end, 0)`),
+        // e.g. `getrange key 0 -100` returns the first character.
+        e = 0;
     }
     if e >= len {
         e = len - 1;

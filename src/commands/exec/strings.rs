@@ -5,12 +5,27 @@ use crate::commands::{
 use crate::core::PrimeValue;
 use crate::core::compact::CompactString;
 use crate::error::{CmdResult, RespError, RespValue};
-use crate::util::{format_double, parse_double, parse_i64, parse_u64, redis_range};
+use crate::util::{format_double, parse_i64, parse_u64, redis_range};
 use xxhash_rust::xxh3::xxh3_64;
 
 // ---------------------------------------------------------------------------
 // SET
 // ---------------------------------------------------------------------------
+
+const K_MAX_EXPIRE_DEADLINE_MS: i64 = 268_435_455_000; // kMaxExpireDeadlineSec * 1000
+
+fn invalid_expire(cmd: &str) -> RespError {
+    RespError::new(format!("ERR invalid expire time in '{cmd}' command"))
+}
+
+/// Absolute expiry (ms) for a relative (`Rel`) or absolute (`Abs`) SET expiry
+/// option, mirroring `DbSlice::ExpireParams` overflow semantics: a relative
+/// value that overflows `now_ms + ms` is an error.
+#[derive(Debug, Clone, Copy)]
+enum SetExpire {
+    Rel(i64),
+    Abs(i64),
+}
 
 fn parse_set_args(args: &[Vec<u8>]) -> Result<SetOpts, RespError> {
     let mut opts = SetOpts::default();
@@ -22,18 +37,31 @@ fn parse_set_args(args: &[Vec<u8>]) -> Result<SetOpts, RespError> {
             b"XX" => opts.xx = true,
             b"KEEPTTL" => opts.keepttl = true,
             b"GET" => opts.get = true,
+            b"STICK" => opts.stick = true,
             b"EX" | b"PX" | b"EXAT" | b"PXAT" => {
                 if i + 1 >= args.len() {
                     return Err(RespError::syntax());
                 }
-                let n = parse_i64(&args[i + 1]).ok_or_else(RespError::integer)?;
-                match t.as_slice() {
-                    b"EX" => opts.expire_ms = Some(n.saturating_mul(1000)),
-                    b"PX" => opts.expire_ms = Some(n),
-                    b"EXAT" => opts.expire_at = Some(n.saturating_mul(1000)),
-                    b"PXAT" => opts.expire_at = Some(n),
-                    _ => unreachable!(),
+                // "We can set expiry only once": a second expiry option, in any
+                // combination, is a syntax error (`CmdSet`).
+                if opts.expire.is_some() {
+                    return Err(RespError::syntax());
                 }
+                let n = parse_i64(&args[i + 1]).ok_or_else(RespError::integer)?;
+                if n <= 0 {
+                    return Err(invalid_expire("set"));
+                }
+                let sec = t.as_slice() == b"EX" || t.as_slice() == b"EXAT";
+                let abs = t.as_slice() == b"EXAT" || t.as_slice() == b"PXAT";
+                let ms = if sec {
+                    if n > i64::MAX / 1000 {
+                        return Err(invalid_expire("set"));
+                    }
+                    n * 1000
+                } else {
+                    n
+                };
+                opts.expire = Some(if abs { SetExpire::Abs(ms) } else { SetExpire::Rel(ms) });
                 i += 1;
             }
             _ => return Err(RespError::syntax()),
@@ -41,13 +69,10 @@ fn parse_set_args(args: &[Vec<u8>]) -> Result<SetOpts, RespError> {
         i += 1;
     }
     if opts.nx && opts.xx {
-        return Err(RespError::new("ERR syntax error"));
+        return Err(RespError::syntax());
     }
-    if opts.keepttl && (opts.expire_ms.is_some() || opts.expire_at.is_some()) {
-        return Err(RespError::new("ERR syntax error"));
-    }
-    if opts.expire_ms.is_some() && opts.expire_at.is_some() {
-        return Err(RespError::new("ERR syntax error"));
+    if opts.keepttl && opts.expire.is_some() {
+        return Err(RespError::syntax());
     }
     Ok(opts)
 }
@@ -58,8 +83,8 @@ struct SetOpts {
     xx: bool,
     keepttl: bool,
     get: bool,
-    expire_ms: Option<i64>,
-    expire_at: Option<i64>,
+    stick: bool,
+    expire: Option<SetExpire>,
 }
 
 fn exec_set(ctx: &mut OpContext) -> CmdResult {
@@ -69,6 +94,28 @@ fn exec_set(ctx: &mut OpContext) -> CmdResult {
     let opts = match parse_set_args(ctx.args) {
         Ok(o) => o,
         Err(e) => return CmdResult::Err(e),
+    };
+
+    // Resolve the expiry to a relative ms offset. A relative offset that
+    // overflows `now + ms` is "invalid expire time" (`ExpireParams` kOverflow);
+    // an absolute offset in the past is the NegativeExpire path: delete the key
+    // and reply OK without writing the new value.
+    let rel_ms = match opts.expire {
+        Some(SetExpire::Rel(ms)) => {
+            let now = ctx.now_ms as i64;
+            match now.checked_add(ms) {
+                Some(_) => Some(ms),
+                None => return CmdResult::Err(invalid_expire("set")),
+            }
+        }
+        Some(SetExpire::Abs(at)) => {
+            if at < ctx.now_ms as i64 {
+                ctx.db.remove(key);
+                return CmdResult::Ok(ok());
+            }
+            Some(at - ctx.now_ms as i64)
+        }
+        None => None,
     };
 
     let old = ctx.db.find(key, ctx.now_ms);
@@ -101,17 +148,21 @@ fn exec_set(ctx: &mut OpContext) -> CmdResult {
     }
     ctx.db
         .insert(key, PrimeValue::Str(CompactString::from_bytes(value)));
-
-    if let Some(ms) = opts.expire_ms {
-        let at = ctx.now_ms as i64 + ms;
-        ctx.db.set_expiry(key, at.max(0) as u64, ctx.now_ms);
-    } else if let Some(at) = opts.expire_at {
-        ctx.db.set_expiry(key, at.max(0) as u64, ctx.now_ms);
+    if opts.stick {
+        ctx.db.set_sticky(key, ctx.now_ms);
+    }
+    if let Some(rel) = rel_ms {
+        // Cap the relative TTL to kMaxExpireDeadlineMs (`Calculate(now, true)`).
+        let rel = rel.min(K_MAX_EXPIRE_DEADLINE_MS);
+        ctx.db
+            .set_expiry(key, (ctx.now_ms as i64 + rel) as u64, ctx.now_ms);
     }
 
-    CmdResult::Ok(match old_value {
-        Some(v) => RespValue::Bulk(v),
-        None => RespValue::Simple("OK".into()),
+    // With GET the reply is always the previous value (nil when absent).
+    CmdResult::Ok(match (opts.get, old_value) {
+        (true, Some(v)) => RespValue::Bulk(v),
+        (true, None) => RespValue::Nil,
+        (false, _) => RespValue::Simple("OK".into()),
     })
 }
 
@@ -173,21 +224,32 @@ fn exec_setnx(ctx: &mut OpContext) -> CmdResult {
 fn exec_setex_common(ctx: &mut OpContext, unit_ms: bool) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
+    let cmd_name = if unit_ms { "psetex" } else { "setex" };
     let Some(ttl) = parse_i64(&ctx.args[key_idx + 1]) else {
         return CmdResult::Err(RespError::integer());
     };
     if ttl <= 0 {
-        return CmdResult::Err(RespError::new("ERR invalid expire time in 'setex' command"));
+        return CmdResult::Err(invalid_expire(cmd_name));
     }
     let ms = if unit_ms {
         ttl
     } else {
-        ttl.saturating_mul(1000)
+        if ttl > i64::MAX / 1000 {
+            return CmdResult::Err(invalid_expire("set"));
+        }
+        ttl * 1000
     };
+    // `ExpireParams` overflow: `now + ms` must fit an i64 (kOverflow -> error).
+    let now = ctx.now_ms as i64;
+    match now.checked_add(ms) {
+        Some(_) => {}
+        None => return CmdResult::Err(invalid_expire("set")),
+    }
     let value = CompactString::from_bytes(&ctx.args[key_idx + 2]);
     ctx.db.insert(key, PrimeValue::Str(value));
-    ctx.db
-        .set_expiry(key, (ctx.now_ms as i64 + ms) as u64, ctx.now_ms);
+    // Clamp the relative TTL to kMaxExpireDeadlineMs (`Calculate(now, true)`).
+    let rel = ms.min(K_MAX_EXPIRE_DEADLINE_MS);
+    ctx.db.set_expiry(key, (now + rel) as u64, ctx.now_ms);
     CmdResult::Ok(ok())
 }
 
@@ -402,6 +464,16 @@ fn exec_setrange(ctx: &mut OpContext) -> CmdResult {
         return CmdResult::Err(RespError::new("ERR offset is out of range"));
     }
     let val = &ctx.args[key_idx + 2];
+    // An empty value is a no-op: return the current length without creating
+    // or modifying the key (reference `OpSetRange` -> `OpStrLen`).
+    if val.is_empty() {
+        let len = match ctx.db.find(key, ctx.now_ms) {
+            Some(PrimeValue::Str(s)) => s.len(),
+            Some(_) => return CmdResult::Err(RespError::wrong_type()),
+            None => 0,
+        };
+        return CmdResult::Ok(integer(len as i64));
+    }
     let new_len = match ctx.db.find_mut(key, ctx.now_ms) {
         Some(PrimeValue::Str(s)) => {
             let mut v = s.as_bytes().to_vec();
@@ -449,12 +521,16 @@ fn incr_by(ctx: &mut OpContext, delta: i64) -> CmdResult {
         None => 0,
     };
     let Some(new_val) = cur.checked_add(delta) else {
-        return CmdResult::Err(RespError::integer());
+        return CmdResult::Err(incr_overflow());
     };
     let s = crate::util::itoa(new_val);
     ctx.db
         .insert(key, PrimeValue::Str(CompactString::from_bytes(&s)));
     CmdResult::Ok(integer(new_val))
+}
+
+fn incr_overflow() -> RespError {
+    RespError::new("ERR increment or decrement would overflow")
 }
 
 fn exec_incr(ctx: &mut OpContext) -> CmdResult {
@@ -475,26 +551,36 @@ fn exec_decrby(ctx: &mut OpContext) -> CmdResult {
     let Some(delta) = parse_i64(&ctx.args[key_idx + 1]) else {
         return CmdResult::Err(RespError::integer());
     };
-    incr_by(ctx, -delta)
+    // DECRBY with INT64_MIN cannot be negated; the reference rejects it at
+    // parse time (`Validated<int64_t, NotEq<INT64_MIN, kIncrOverflow>>`).
+    let Some(delta) = delta.checked_neg() else {
+        return CmdResult::Err(incr_overflow());
+    };
+    incr_by(ctx, delta)
+}
+
+/// Strict float parse matching `ParseDouble` in the reference: no leading or
+/// trailing whitespace (fast_float::from_chars semantics) and no NaN.
+fn parse_float_strict(s: &[u8]) -> Option<f64> {
+    let t = std::str::from_utf8(s).ok()?;
+    let f: f64 = t.parse().ok()?;
+    if f.is_nan() {
+        return None;
+    }
+    Some(f)
 }
 
 fn exec_incrbyfloat(ctx: &mut OpContext) -> CmdResult {
     let key_idx = ctx.owned_keys[0];
     let key = &ctx.args[key_idx];
-    let Some(delta) = parse_double(&ctx.args[key_idx + 1]) else {
+    let Some(delta) = parse_float_strict(&ctx.args[key_idx + 1]) else {
         return CmdResult::Err(RespError::float());
     };
     let cur = match ctx.db.find_mut(key, ctx.now_ms) {
-        Some(PrimeValue::Str(s)) => {
-            if s.is_empty() {
-                0.0
-            } else {
-                match parse_double(s.as_bytes()) {
-                    Some(v) => v,
-                    None => return CmdResult::Err(RespError::float()),
-                }
-            }
-        }
+        Some(PrimeValue::Str(s)) => match parse_float_strict(s.as_bytes()) {
+            Some(v) => v,
+            None => return CmdResult::Err(RespError::float()),
+        },
         Some(_) => return CmdResult::Err(RespError::wrong_type()),
         None => 0.0,
     };
@@ -517,6 +603,11 @@ fn exec_incrbyfloat(ctx: &mut OpContext) -> CmdResult {
 // ---------------------------------------------------------------------------
 
 fn exec_mset(ctx: &mut OpContext) -> CmdResult {
+    if !(ctx.args.len() - 1).is_multiple_of(2) {
+        return CmdResult::Err(RespError::new(
+            "ERR wrong number of arguments for 'mset' command",
+        ));
+    }
     for &ki in ctx.owned_keys {
         let key = CompactString::from_bytes(&ctx.args[ki]);
         let value = CompactString::from_bytes(&ctx.args[ki + 1]);
@@ -535,6 +626,11 @@ fn merge_mset(parts: &[ShardPart], _args: &[Vec<u8>], _keys: &[usize], _now: u64
 }
 
 fn exec_msetnx(ctx: &mut OpContext) -> CmdResult {
+    if !(ctx.args.len() - 1).is_multiple_of(2) {
+        return CmdResult::Err(RespError::new(
+            "ERR wrong number of arguments for 'msetnx' command",
+        ));
+    }
     let mut set = 0usize;
     for &ki in ctx.owned_keys {
         let key = &ctx.args[ki];

@@ -138,7 +138,11 @@ impl Command {
         } else {
             argc >= (-self.arity) as usize
         };
-        if ok {
+        // MSET/MSETNX declare interleaved key/value args (`KeyRange::PAIRS`);
+        // an odd tail is a wrong-number-of-arguments error, enforced before
+        // sharding (reference: `command_registry.cc` `interleave_step_ = 2`).
+        let interleaved = self.key_range.step != 2 || (argc > 0 && (argc - 1).is_multiple_of(2));
+        if ok && interleaved {
             None
         } else {
             Some(format!(
