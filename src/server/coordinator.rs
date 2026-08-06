@@ -13,9 +13,9 @@ use crate::commands::lua::{
 use crate::commands::{Command, FLAG_GLOBAL, FLAG_NOSCRIPT, FLAG_WRITE, ShardPart};
 use crate::error::{CmdResult, RespError, RespValue};
 use crate::server::{
-    CoordMsg, GcRequest, Reply, ReplyBus, ScriptBatchEntry, ShardMsg, blocking_timeout_ms,
-    command_for, encode_result, extract_keys, is_eval_cmd, is_function_cmd, keys_per_shard,
-    shard_for_key,
+    CoordMsg, GcRequest, Reply, ReplyBus, ScriptBatchEntry, ShardMsg,
+    blocking_timeout_is_nil_array, blocking_timeout_ms, command_for, encode_result, extract_keys,
+    is_eval_cmd, is_function_cmd, keys_per_shard, shard_for_key,
 };
 
 /// A blocking command (XREAD/XREADGROUP) waiting for data or a timeout. The
@@ -185,7 +185,14 @@ impl Coordinator {
             if let Some(dl) = p.deadline
                 && now >= dl
             {
-                let bytes = encode_result(CmdResult::Ok(RespValue::Nil));
+                // The timeout reply is command-specific: BLPOP/BRPOP/BZPOPMIN/
+                // BZPOPMAX/XREAD/XREADGROUP send a null *array* (`*-1`), the
+                // rest a null bulk (`$-1`) (see `blocking_timeout_is_nil_array`).
+                let bytes = if command_for(&p.msg.args).is_some_and(blocking_timeout_is_nil_array) {
+                    crate::protocol::resp::encode_nil_array()
+                } else {
+                    encode_result(CmdResult::Ok(RespValue::Nil))
+                };
                 self.reply(p.msg.conn_id, p.msg.seq, bytes);
                 continue;
             }

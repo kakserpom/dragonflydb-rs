@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use hashbrown::HashMap;
 
 use crate::core::compact::CompactString;
@@ -426,6 +428,84 @@ impl ZSet {
                 }
             }
             out.push(item);
+        }
+        out
+    }
+
+    /// Lexicographic range mirroring the C++ `SortedMap::GetLexRange` (Redis
+    /// `zslFirstInLexRange`): the underlying (score, member) order is scanned,
+    /// member bounds are compared member-only, and iteration *breaks* at the far
+    /// bound — so a mixed-score set stops early even though later members would
+    /// satisfy the predicate. `min`/`max` are `(member, inclusive)`; `None` is
+    /// an unbounded low/high bound (`-`/`+`). Equally-scored sets behave like a
+    /// plain member-filtered range.
+    #[must_use]
+    pub fn lex_range(
+        &self,
+        min: Option<(&[u8], bool)>,
+        max: Option<(&[u8], bool)>,
+        rev: bool,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<(CompactString, f64)> {
+        if limit == 0 || self.len <= offset {
+            return Vec::new();
+        }
+        let near: Option<(&[u8], bool)> = if rev { max } else { min };
+        let far: Option<(&[u8], bool)> = if rev { min } else { max };
+        let mut it: Box<dyn Iterator<Item = (CompactString, f64)> + '_> = if rev {
+            Box::new(self.rev_iter())
+        } else {
+            Box::new(self.iter())
+        };
+        // Locate the first element that passes the near bound (member-only
+        // compare), then apply the exclusive adjustment and the offset exactly
+        // like the C++ rank path: rank = found + (exclusive?1:0) + offset.
+        let positioned: Box<dyn Iterator<Item = (CompactString, f64)> + '_> = match near {
+            None => Box::new(it.skip(offset)),
+            Some((b, incl)) => {
+                let mut skip = offset;
+                let mut found = None;
+                for item in it.by_ref() {
+                    let beyond = item.0.as_bytes().cmp(b)
+                        == if rev {
+                            Ordering::Greater
+                        } else {
+                            Ordering::Less
+                        };
+                    if beyond {
+                        continue;
+                    }
+                    if !incl && item.0.as_bytes() == b {
+                        skip += 1;
+                    }
+                    found = Some(item);
+                    break;
+                }
+                let Some(f) = found else {
+                    return Vec::new();
+                };
+                Box::new(std::iter::once(f).chain(it).skip(skip))
+            }
+        };
+        // Emit with *break* semantics at the far bound.
+        let mut out = Vec::new();
+        for (m, s) in positioned {
+            if let Some((b, incl)) = far {
+                let ord = m.as_bytes().cmp(b);
+                let beyond = if rev {
+                    ord == Ordering::Less || (ord == Ordering::Equal && !incl)
+                } else {
+                    ord == Ordering::Greater || (ord == Ordering::Equal && !incl)
+                };
+                if beyond {
+                    break;
+                }
+            }
+            out.push((m, s));
+            if out.len() >= limit {
+                break;
+            }
         }
         out
     }

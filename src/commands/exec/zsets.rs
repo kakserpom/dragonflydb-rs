@@ -274,11 +274,25 @@ fn exec_zrevrank(ctx: &mut OpContext) -> CmdResult {
 }
 
 fn rank_common(ctx: &mut OpContext, rev: bool) -> CmdResult {
+    let cmd = if rev { "zrevrank" } else { "zrank" };
     let key_idx = ctx.owned_keys[0];
+    if ctx.args.len() > key_idx + 3 {
+        // The reference checks the number of arguments before parsing (`WrongNumArgsError`).
+        return CmdResult::Err(RespError::new(format!(
+            "ERR wrong number of arguments for '{cmd}' command"
+        )));
+    }
     let key = &ctx.args[key_idx];
     let member = &ctx.args[key_idx + 1];
-    let with_score =
-        ctx.args.len() > key_idx + 2 && ctx.args[key_idx + 2].eq_ignore_ascii_case(b"WITHSCORE");
+    let with_score = if ctx.args.len() == key_idx + 3 {
+        if ctx.args[key_idx + 2].eq_ignore_ascii_case(b"WITHSCORE") {
+            true
+        } else {
+            return CmdResult::Err(RespError::syntax());
+        }
+    } else {
+        false
+    };
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::ZSet(z)) => match z.score(member) {
             Some(s) => {
@@ -363,7 +377,14 @@ fn parse_range_opts(
                 };
                 i += 2;
             }
-            _ => return Err(RespError::syntax()),
+            _ => {
+                // Legacy and unified handlers reject an unknown option with the
+                // parser's Finalize("unsupported option ") message.
+                return Err(RespError::new(format!(
+                    "ERR unsupported option {}",
+                    String::from_utf8_lossy(&args[i])
+                )));
+            }
         }
         i += 1;
     }
@@ -387,14 +408,22 @@ fn parse_range_opts(
     Ok(o)
 }
 
-/// Lexicographic lower-bound check; an empty bound means -inf (unbounded low).
+/// Lexicographic lower-bound check (mirrors `zslLexValueGteMin`): an empty
+/// bound is `-` (incl=true, unbounded low) or `+` (incl=false, matches nothing).
 fn lex_ge(m: &[u8], lo: &[u8], incl: bool) -> bool {
-    lo.is_empty() || (if incl { m >= lo } else { m > lo })
+    if lo.is_empty() {
+        return incl;
+    }
+    if incl { m >= lo } else { m > lo }
 }
 
-/// Lexicographic upper-bound check; an empty bound means +inf (unbounded high).
+/// Lexicographic upper-bound check (mirrors `zslLexValueLteMax`): an empty
+/// bound is `+` (incl=false, unbounded high) or `-` (incl=true, matches nothing).
 fn lex_le(m: &[u8], hi: &[u8], incl: bool) -> bool {
-    hi.is_empty() || (if incl { m <= hi } else { m < hi })
+    if hi.is_empty() {
+        return !incl;
+    }
+    if incl { m <= hi } else { m < hi }
 }
 
 fn parse_score_bound(s: &[u8]) -> Result<(f64, bool), RespError> {
@@ -402,7 +431,13 @@ fn parse_score_bound(s: &[u8]) -> Result<(f64, bool), RespError> {
         Some(b'(') => (true, &s[1..]),
         _ => (false, s),
     };
-    let v = parse_double(body).ok_or_else(err_float)?;
+    // The reference `ParseScoreBound` fails on NaN and anything unparseable
+    // with the same "min or max is not a float" message (ParseDouble rejects
+    // NaN, unlike ZADD which parses it and then rejects the resulting score).
+    let v = parse_double(body).ok_or_else(|| RespError::new("ERR min or max is not a float"))?;
+    if v.is_nan() {
+        return Err(RespError::new("ERR min or max is not a float"));
+    }
     Ok((v, excl))
 }
 
@@ -443,13 +478,27 @@ fn zrange_items_with(
                     opts.limit,
                 )
             } else if opts.bylex {
-                let (lo, lo_incl, hi, hi_incl) =
+                let (l, li, h, hi) =
                     parse_lex_range(&ctx.args[key_idx + 1], &ctx.args[key_idx + 2])?;
-                z.range_by_member_filtered(
-                    |m| lex_ge(m.as_bytes(), &lo, lo_incl) && lex_le(m.as_bytes(), &hi, hi_incl),
-                    opts.rev,
-                    opts.limit,
-                )
+                // With REV the first bound is the maximum and the second the
+                // minimum (the reference passes them swapped to the parser).
+                let (lo, lo_incl, hi, hi_incl) = if opts.rev {
+                    (h, hi, l, li)
+                } else {
+                    (l, li, h, hi)
+                };
+                let min = if lo.is_empty() && lo_incl {
+                    None
+                } else {
+                    Some((lo.as_slice(), lo_incl))
+                };
+                let max = if hi.is_empty() && !hi_incl {
+                    None
+                } else {
+                    Some((hi.as_slice(), hi_incl))
+                };
+                let (offset, limit) = opts.limit.map_or((0, usize::MAX), |(o, c)| (o, c));
+                z.lex_range(min, max, opts.rev, offset, limit)
             } else {
                 let start = parse_i64(&ctx.args[key_idx + 1]).ok_or_else(RespError::integer)?;
                 let stop = parse_i64(&ctx.args[key_idx + 2]).ok_or_else(RespError::integer)?;
@@ -1852,7 +1901,8 @@ fn merge_zmpop(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64
 
 fn exec_bzpop(ctx: &mut OpContext, is_max: bool) -> CmdResult {
     let Some(timeout_arg) = ctx.args.last() else {
-        return CmdResult::err("ERR wrong number of arguments for 'bzpopmin' command");
+        let cmd = String::from_utf8_lossy(&ctx.args[0]).to_ascii_lowercase();
+        return CmdResult::err(format!("ERR wrong number of arguments for '{cmd}' command"));
     };
     if let Err(e) = parse_list_timeout(timeout_arg) {
         return CmdResult::Err(RespError::new(e));
@@ -1952,18 +2002,27 @@ fn lex_range_common(ctx: &mut OpContext, rev: bool) -> CmdResult {
     if opts.empty_offset {
         return CmdResult::Ok(RespValue::Array(vec![]));
     }
-    let (lo, lo_incl, hi, hi_incl) =
-        match parse_lex_range(&ctx.args[key_idx + 1], &ctx.args[key_idx + 2]) {
-            Ok(x) => x,
-            Err(e) => return CmdResult::Err(e),
-        };
+    let (l, li, h, hi) = match parse_lex_range(&ctx.args[key_idx + 1], &ctx.args[key_idx + 2]) {
+        Ok(x) => x,
+        Err(e) => return CmdResult::Err(e),
+    };
+    // The REV variants pass the max bound first; the reference swaps them
+    // before selection (GetLexRange), yielding a [min, max] interval.
+    let (lo, lo_incl, hi, hi_incl) = if rev { (h, hi, l, li) } else { (l, li, h, hi) };
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::ZSet(z)) => {
-            let items = z.range_by_member_filtered(
-                |m| lex_ge(m.as_bytes(), &lo, lo_incl) && lex_le(m.as_bytes(), &hi, hi_incl),
-                opts.rev || rev,
-                opts.limit,
-            );
+            let min = if lo.is_empty() && lo_incl {
+                None
+            } else {
+                Some((lo.as_slice(), lo_incl))
+            };
+            let max = if hi.is_empty() && !hi_incl {
+                None
+            } else {
+                Some((hi.as_slice(), hi_incl))
+            };
+            let (offset, limit) = opts.limit.map_or((0, usize::MAX), |(o, c)| (o, c));
+            let items = z.lex_range(min, max, opts.rev || rev, offset, limit);
             CmdResult::Ok(build_range_output(items, opts.withscores))
         }
         Some(_) => CmdResult::Err(RespError::wrong_type()),
@@ -2791,7 +2850,7 @@ mod tests {
                 0,
                 &b_args(&["ZRANGESTORE", "dest", "src", "0", "-1", "FOO"])
             ))
-            .contains("syntax error")
+            .contains("unsupported option")
         );
     }
 
@@ -4305,12 +4364,13 @@ mod tests {
             "z",
             &[("1", "a"), ("2", "b"), ("3", "c"), ("4", "d")],
         );
-        // Descending lex order within the range.
+        // Legacy ZREVRANGEBYLEX takes the max bound first; the reference swaps
+        // the bounds before selection and iterates in descending order.
         assert_eq!(
             flat(dispatch_at(
                 &mut db,
                 0,
-                &b_args(&["ZREVRANGEBYLEX", "z", "-", "+"])
+                &b_args(&["ZREVRANGEBYLEX", "z", "+", "-"])
             )),
             ["d", "c", "b", "a"]
         );
@@ -4318,7 +4378,7 @@ mod tests {
             flat(dispatch_at(
                 &mut db,
                 0,
-                &b_args(&["ZREVRANGEBYLEX", "z", "[b", "+"])
+                &b_args(&["ZREVRANGEBYLEX", "z", "+", "[b"])
             )),
             ["d", "c", "b"]
         );
@@ -4326,18 +4386,18 @@ mod tests {
             flat(dispatch_at(
                 &mut db,
                 0,
-                &b_args(&["ZREVRANGEBYLEX", "z", "(b", "[d"])
+                &b_args(&["ZREVRANGEBYLEX", "z", "[d", "(b"])
             )),
             ["d", "c"]
         );
-        // REV keeps the legacy direction (it only re-asserts the flag upstream).
+        // REV re-asserts the flag upstream; the interval stays the same.
         assert_eq!(
             flat(dispatch_at(
                 &mut db,
                 0,
-                &b_args(&["ZREVRANGEBYLEX", "z", "[b", "+", "REV"])
+                &b_args(&["ZREVRANGEBYLEX", "z", "[d", "(b", "REV"])
             )),
-            ["d", "c", "b"]
+            ["d", "c"]
         );
         // WITHSCORES + LIMIT.
         assert_eq!(
@@ -4347,8 +4407,8 @@ mod tests {
                 &b_args(&[
                     "ZREVRANGEBYLEX",
                     "z",
+                    "[d",
                     "-",
-                    "+",
                     "WITHSCORES",
                     "LIMIT",
                     "0",
@@ -4362,7 +4422,7 @@ mod tests {
             flat(dispatch_at(
                 &mut db,
                 0,
-                &b_args(&["ZREVRANGEBYLEX", "z", "-", "+", "LIMIT", "-1", "1"])
+                &b_args(&["ZREVRANGEBYLEX", "z", "[d", "-", "LIMIT", "-1", "1"])
             )),
             Vec::<String>::new()
         );
@@ -4389,7 +4449,7 @@ mod tests {
             flat(dispatch_at(
                 &mut db,
                 0,
-                &b_args(&["ZREVRANGEBYLEX", "nope", "-", "+"])
+                &b_args(&["ZREVRANGEBYLEX", "nope", "+", "-"])
             )),
             Vec::<String>::new()
         );

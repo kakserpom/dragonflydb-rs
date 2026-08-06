@@ -263,6 +263,14 @@ pub fn encode_reply(value: &RespValue, out: &mut Vec<u8>) {
     }
 }
 
+/// A null multi-bulk reply (`*-1\r\n`), distinct from a null bulk string
+/// (`$-1\r\n`). Blocking commands time out with this, as the reference's
+/// `NIL_ARRAY` (Redis `addReplyNullArray`).
+#[must_use]
+pub fn encode_nil_array() -> Vec<u8> {
+    b"*-1\r\n".to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

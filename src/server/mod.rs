@@ -857,6 +857,18 @@ pub fn blocking_timeout_ms(cmd: &Command, args: &[Vec<u8>]) -> Option<u64> {
     }
 }
 
+/// Whether a blocked command times out with a null *array* (`*-1`) rather than
+/// a null bulk (`$-1`), mirroring the reference: BLPOP/BRPOP/BZPOPMIN/BZPOPMAX/
+/// XREAD/XREADGROUP send `SendNullArray`, while BRPOPLPUSH/BLMOVE/BLMPOP/BZMPOP
+/// send `SendNull` (list_family.cc, zset_family.cc, stream_family.cc).
+#[must_use]
+pub fn blocking_timeout_is_nil_array(cmd: &Command) -> bool {
+    matches!(
+        cmd.name,
+        "BLPOP" | "BRPOP" | "BZPOPMIN" | "BZPOPMAX" | "XREAD" | "XREADGROUP"
+    )
+}
+
 fn secs_to_ms(secs: f64) -> u64 {
     ((secs * 1000.0) as u64).min(u64::from(u32::MAX))
 }
