@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::commands::{
-    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_GLOBAL, FLAG_MOVABLEKEYS, FLAG_MULTI_KEY, FLAG_NO_REDUCED,
-    FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext, ShardPart, integer, ok,
+    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_GLOBAL, FLAG_MOVABLEKEYS, FLAG_MULTI_KEY,
+    FLAG_NO_REDUCED, FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext, ShardPart, integer, ok,
 };
 use crate::core::PrimeValue;
 use crate::core::compact::CompactString;
@@ -13,6 +13,8 @@ use crate::core::value::ObjType;
 use crate::error::{CmdResult, RespError, RespValue};
 use crate::util::{parse_double, parse_i64, parse_u64, shard_hash};
 use xxhash_rust::xxh3::xxh3_64;
+
+const K_MAX_EXPIRE_DEADLINE_MS: i64 = 268_435_455_000; // kMaxExpireDeadlineSec * 1000
 
 // ---------------------------------------------------------------------------
 // DEL / EXISTS
@@ -109,59 +111,93 @@ fn expire_common(ctx: &mut OpContext, unit_ms: bool, is_at: bool) -> CmdResult {
     let Some(t) = parse_i64(&ctx.args[key_idx + 1]) else {
         return CmdResult::Err(RespError::integer());
     };
-    // condition flags: NX XX GT LT
-    let mut cond = None;
-    if ctx.args.len() > key_idx + 2 {
-        let c = ctx.args[key_idx + 2].to_ascii_uppercase();
-        cond = match c.as_slice() {
-            b"NX" => Some("NX"),
-            b"XX" => Some("XX"),
-            b"GT" => Some("GT"),
-            b"LT" => Some("LT"),
-            _ => return CmdResult::Err(RespError::syntax()),
-        };
+    // Condition flags NX XX GT LT, accumulated across all trailing options
+    // (mirrors `ParseExpireArgs`; duplicate flags are tolerated).
+    let mut nx = false;
+    let mut xx = false;
+    let mut gt = false;
+    let mut lt = false;
+    for opt in &ctx.args[key_idx + 2..] {
+        match opt.to_ascii_uppercase().as_slice() {
+            b"NX" => nx = true,
+            b"XX" => xx = true,
+            b"GT" => gt = true,
+            b"LT" => lt = true,
+            _ => {
+                return CmdResult::Err(RespError::new(format!(
+                    "Unsupported option: {}",
+                    String::from_utf8_lossy(opt)
+                )));
+            }
+        }
     }
+    if nx && xx {
+        return CmdResult::Err(RespError::new(
+            "NX and XX options at the same time are not compatible",
+        ));
+    }
+    if gt && lt {
+        return CmdResult::Err(RespError::new(
+            "GT and LT options at the same time are not compatible",
+        ));
+    }
+
     let expire_at_ms: i64 = if is_at {
         if unit_ms { t } else { t.saturating_mul(1000) }
     } else {
+        // Relative TTLs are silently capped to kMaxExpireDeadlineMs; a
+        // non-positive TTL means "expire immediately" (the key is deleted).
         let delta = if unit_ms { t } else { t.saturating_mul(1000) };
-        (ctx.now_ms as i64).saturating_add(delta)
+        if delta <= 0 {
+            0
+        } else {
+            (ctx.now_ms as i64).saturating_add(delta.min(K_MAX_EXPIRE_DEADLINE_MS))
+        }
     };
+
+    // Absolute timestamps beyond the deadline cap surface OUT_OF_RANGE
+    // ("expiry is out of range"); past timestamps fall through to deletion.
+    if is_at && expire_at_ms.saturating_sub(ctx.now_ms as i64) > K_MAX_EXPIRE_DEADLINE_MS {
+        return CmdResult::Err(RespError::new("expiry is out of range"));
+    }
+
     if !ctx.db.contains(key, ctx.now_ms) {
         return CmdResult::Ok(integer(0));
     }
-    // apply condition
-    if let Some(cond) = cond {
-        match cond {
-            "NX" => {
-                if ctx.db.has_expiry(key, ctx.now_ms) {
-                    return CmdResult::Ok(integer(0));
-                }
+
+    // `UpdateExpire`'s satisfaction test: the options are OR-ed with the
+    // always-true default, GT/LT compare against the current expiry (infinite
+    // when unset).
+    let has_expiry = ctx.db.has_expiry(key, ctx.now_ms);
+    let mut satisfied = !nx && !xx && !gt && !lt; // EXPIRE_ALWAYS (no options)
+    if nx && !has_expiry {
+        satisfied = true;
+    }
+    if xx && has_expiry {
+        satisfied = true;
+    }
+    match ctx.db.expire_at(key) {
+        Some(cur) => {
+            let cur = cur as i64;
+            if lt && expire_at_ms < cur {
+                satisfied = true;
             }
-            "XX" => {
-                if !ctx.db.has_expiry(key, ctx.now_ms) {
-                    return CmdResult::Ok(integer(0));
-                }
+            if gt && expire_at_ms > cur {
+                satisfied = true;
             }
-            "GT" | "LT" => {
-                if let Some(cur) = ctx.db.expire_at(key) {
-                    let cur = cur as i64;
-                    let ok = if cond == "GT" {
-                        expire_at_ms > cur
-                    } else {
-                        expire_at_ms < cur
-                    };
-                    if !ok {
-                        return CmdResult::Ok(integer(0));
-                    }
-                } else if cond == "GT" {
-                    // no TTL set: GT treats as infinite TTL, so never larger
-                    return CmdResult::Ok(integer(0));
-                }
+        }
+        None => {
+            // No expiry set: LT applies (infinite current TTL), GT never does.
+            if lt {
+                satisfied = true;
             }
-            _ => unreachable!(),
         }
     }
+    if !satisfied {
+        return CmdResult::Ok(integer(0));
+    }
+
+    // `set_expiry` deletes the key when `expire_at_ms` is in the past.
     ctx.db
         .set_expiry(key, expire_at_ms.max(0) as u64, ctx.now_ms);
     CmdResult::Ok(integer(1))
@@ -268,6 +304,12 @@ fn exec_restore(ctx: &mut OpContext) -> CmdResult {
     };
 
     let key_cs = CompactString::from_bytes(key);
+    // Mirror `OpRestore`: with REPLACE the old key (and any expiry on it) is
+    // removed before the restored value is inserted, so a TTL of 0 yields a
+    // key without an expiry even if the previous value had one.
+    if replace && ctx.db.contains(key, ctx.now_ms) {
+        ctx.db.remove_if_exists(key);
+    }
     ctx.db.insert(&key_cs, value);
     if ttl > 0 {
         let expire_at_ms = if absttl {

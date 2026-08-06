@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 
 use crate::core::compact::CompactString;
-use crate::util::{itoa, parse_i64};
+use crate::core::intset;
+use crate::util::itoa;
 
 /// A single element stored in a list chunk. Mirrors Dragonfly's listpack entries
 /// which can be integers or strings.
@@ -22,8 +23,12 @@ impl ListItem {
 
     #[must_use]
     pub fn from_bytes(b: &[u8]) -> Self {
-        // Redis encodes integers when possible; we try to detect them too.
-        if let Some(i) = parse_i64(b) {
+        // Mirror Dragonfly's listpack int detection (`lpStringToInt64`): only
+        // canonical integers ("0", "-0" and leading zeros are not) are stored
+        // as ints, everything else keeps its exact bytes as a string.
+        if let Some(i) = intset::string2ll(b)
+            && itoa(i) == b
+        {
             ListItem::Int(i)
         } else {
             ListItem::Str(CompactString::from_bytes(b))

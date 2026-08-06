@@ -211,8 +211,17 @@ integration tests (`tests/*.rs`) that run against the in-process server
 - [x] `bitops_family_test.cc` → `tests/bitops_family.rs` (27 tests: BITCOUNT,
   BITPOS, GETBIT/SETBIT, BITOP, BITFIELD/BITFIELD_RO). Port needed no source
   fixes; only the test harness's binary helper (`set_b`) was added.
-- [ ] Remaining families (keys, list, hash, set, zset, stream, hll, geo,
-  server, scripting, json) still to be ported from `*_test.cc`.
+- [x] `generic_family_test.cc` → `tests/generic_family.rs` (47 tests). Source
+  fixes: `expiretime_common` rounding (`(at+500)/1000` for EXPIRETIME, raw ms
+  for PEXPIRETIME), `parse_scan_opts` accepting `MINMSZ` (reference
+  `common.cc:196`), `exec_restore` deleting the old key before insert on
+  REPLACE (clears stale expiry), integer-returning commands left unasserted
+  (del/lpush/rpush/sadd/hset/zadd/unlink/stick/rm), TIME inside MULTI replies
+  `QUEUED`, multi-shard RM drains to cursor "0", and `QuickList::from_bytes`
+  int-encoding strict Redis integers only (matches `lpStringToInt64`; keeps
+  `-0`/leading zeros as raw strings).
+- [ ] Remaining families (list, hash, set, zset, stream, hll, geo, server,
+  scripting, json) still to be ported from `*_test.cc`.
 
 ## Priority order
 1. Core data types: bitops, keys/generic, string, list, hash, set, zset, stream
