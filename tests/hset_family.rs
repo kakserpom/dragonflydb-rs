@@ -2,12 +2,13 @@
 //! harness (`tests/common/mod.rs`).
 //!
 //! Adaptations from the reference:
-//! - Real wall clock instead of the fake clock, so `AdvanceTime` becomes a
-//!   `sleep`. TTLs are sized so that the operations immediately around an
-//!   expiry are unambiguous (a field set with a 1-2s TTL cannot expire within
-//!   the sub-second gap between two commands).
-//! - The reference asserts exact TTL values after a fixed advance; the port
-//!   asserts ranges where a second-boundary could land between commands.
+//! - The reference's `TEST_current_time_ms` global + `AdvanceTime` become the
+//!   port's process-global fake clock: [`clock_guard`] pins `now_ms()` to a
+//!   whole-second base and [`advance`] moves it forward, so TTL replies are
+//!   exact values instead of second-boundary ranges. Time-dependent tests run
+//!   one at a time under a global mutex (the fake clock is process-wide, like
+//!   the reference); tests without TTL assertions run in parallel and never
+//!   observe it.
 //! - The internal listpack/string-map encodings are not observable; DEBUG
 //!   OBJECT encoding assertions are dropped and HSCAN's listpack behavior
 //!   (returning every matching pair regardless of COUNT) is asserted instead.
@@ -20,8 +21,31 @@
 mod common;
 
 use common::*;
-use std::thread::sleep;
-use std::time::Duration;
+use std::sync::Mutex;
+
+/// Serializes the tests that observe time: the fake clock is process-global
+/// (like the reference's `TEST_current_time_ms`), so time-dependent tests must
+/// run one at a time, pinning their own base and advancing it alone. Tests
+/// without TTL assertions run in parallel and ignore the clock.
+static CLOCK: Mutex<()> = Mutex::new(());
+
+/// Pin the clock (idempotent; keeps a base a previous test advanced) and hold
+/// the serialization lock for the rest of the test.
+fn clock_guard() -> std::sync::MutexGuard<'static, ()> {
+    let g = CLOCK.lock().unwrap_or_else(|p| p.into_inner());
+    dragonflydb::commands::exec::server::pin_test_clock();
+    g
+}
+
+/// Advance the pinned fake clock by `ms` (the reference's `AdvanceTime`).
+fn advance(ms: u64) {
+    dragonflydb::commands::exec::server::advance_test_clock(ms);
+}
+
+/// The pinned clock's current value, in epoch milliseconds.
+fn clock_ms() -> u64 {
+    dragonflydb::commands::exec::server::test_clock_ms()
+}
 
 /// Text entries of an array reply in their reply order (`GetVec`).
 fn strs(v: &Value) -> Vec<String> {
@@ -80,13 +104,6 @@ fn hex_str(rng: &mut Lcg, len: usize) -> String {
 #[track_caller]
 fn fieldttl(t: &mut Ctx, key: &str, field: &str) -> i64 {
     t.int(&["FIELDTTL", key, field])
-}
-
-/// Assert `FIELDTTL key field` is within `[lo, hi]`.
-#[track_caller]
-fn fieldttl_in(t: &mut Ctx, key: &str, field: &str, lo: i64, hi: i64) {
-    let v = fieldttl(t, key, field);
-    assert!((lo..=hi).contains(&v), "FIELDTTL {key} {field} = {v}, expected {lo}..={hi}");
 }
 
 #[test]
@@ -252,18 +269,19 @@ fn hincr_respected() {
 
 #[test]
 fn hincr_cmds_preserve_ttl() {
+    let _clock = clock_guard();
     let mut t = Ctx::new();
     t.assert_int(&["hsetex", "key", "2", "a", "1"], 1);
     let before = fieldttl(&mut t, "key", "a");
-    assert!((1..=2).contains(&before), "fieldttl = {before}");
+    assert_eq!(before, 2, "fieldttl = {before}");
     t.assert_int(&["hincrby", "key", "a", "1"], 2);
-    // hincrby must preserve the field TTL (allowing one second of drift).
+    // hincrby must preserve the field TTL exactly.
     let after = fieldttl(&mut t, "key", "a");
-    assert!((before - 1..=before).contains(&after), "fieldttl = {after}, before = {before}");
+    assert_eq!(after, before, "fieldttl = {after}, before = {before}");
 
     // Once the field expires, the next hincrby starts from a fresh TTL-less
     // field.
-    sleep(Duration::from_millis(2200));
+    advance(2000);
     t.assert_int(&["hincrby", "key", "a", "1"], 1);
     t.assert_int(&["fieldttl", "key", "a"], -1);
 
@@ -485,11 +503,12 @@ fn hrand_field() {
 
 #[test]
 fn hsetex() {
+    let _clock = clock_guard();
     let mut t = Ctx::new();
     t.assert_int(&["HSETEX", "k", "1", "f", "v"], 1);
 
-    // f has a 1s TTL and must be gone shortly after.
-    sleep(Duration::from_millis(1100));
+    // f has a 1s TTL and must be gone after the clock advances one second.
+    advance(1000);
     t.assert_null(&["HGET", "k", "f"]);
 
     let long_time = "100";
@@ -504,43 +523,43 @@ fn hsetex() {
     // Re-setting with a shorter TTL replaces the old expiration.
     t.assert_int(&["HSETEX", "k", long_time, "field3", "value"], 1);
     t.assert_int(&["HSETEX", "k", "1", "field3", "value"], 0);
-    sleep(Duration::from_millis(1100));
+    advance(1000);
     t.assert_null(&["HGET", "k", "field3"]);
 
     // NX keeps the old expiration even when a short TTL is supplied.
     t.assert_int(&["HSETEX", "k", long_time, "field4", "value"], 1);
     t.assert_int(&["HSETEX", "k", "NX", "1", "field4", "value"], 0);
-    sleep(Duration::from_millis(1100));
+    advance(1000);
     t.assert_text(&["HGET", "k", "field4"], "value");
 
     // KEEPTTL resets the value but preserves the TTL.
     t.assert_int(&["HSETEX", "k", long_time, "kttlfield", "value"], 1);
     t.assert_text(&["HGET", "k", "kttlfield"], "value");
-    fieldttl_in(&mut t, "k", "kttlfield", 99, 100);
+    assert_eq!(fieldttl(&mut t, "k", "kttlfield"), 100);
 
     // afield is added with a 2s TTL; kttlfield keeps its 100s TTL.
     t.assert_int(
         &["HSETEX", "k", "KEEPTTL", "2", "kttlfield", "resetvalue", "afield", "aval"],
         1,
     );
-    fieldttl_in(&mut t, "k", "kttlfield", 99, 100);
-    fieldttl_in(&mut t, "k", "afield", 1, 2);
+    assert_eq!(fieldttl(&mut t, "k", "kttlfield"), 100);
+    assert_eq!(fieldttl(&mut t, "k", "afield"), 2);
     t.assert_text(&["HGET", "k", "afield"], "aval");
 
     // Let afield expire; kttlfield remains with its updated value.
-    sleep(Duration::from_millis(2200));
+    advance(2000);
     t.assert_null(&["HGET", "k", "afield"]);
     t.assert_text(&["HGET", "k", "kttlfield"], "resetvalue");
-    fieldttl_in(&mut t, "k", "kttlfield", 97, 98);
+    assert_eq!(fieldttl(&mut t, "k", "kttlfield"), 98);
 
     // NX, with or without KEEPTTL, updates neither value nor expiry.
     t.assert_int(&["HSETEX", "k", "NX", "KEEPTTL", "2", "kttlfield", "value"], 0);
     t.assert_text(&["HGET", "k", "kttlfield"], "resetvalue");
-    fieldttl_in(&mut t, "k", "kttlfield", 97, 98);
+    assert_eq!(fieldttl(&mut t, "k", "kttlfield"), 98);
 
     t.assert_int(&["HSETEX", "k", "NX", "2", "kttlfield", "value"], 0);
     t.assert_text(&["HGET", "k", "kttlfield"], "resetvalue");
-    fieldttl_in(&mut t, "k", "kttlfield", 97, 98);
+    assert_eq!(fieldttl(&mut t, "k", "kttlfield"), 98);
 
     // Invalid TTL.
     t.assert_err(
@@ -551,7 +570,7 @@ fn hsetex() {
     // KEEPTTL with no prior TTL applies the new one.
     t.assert_int(&["HSET", "k", "nottl", "val"], 1);
     t.assert_int(&["HSETEX", "k", "KEEPTTL", long_time, "nottl", "newval"], 0);
-    fieldttl_in(&mut t, "k", "nottl", 99, 100);
+    assert_eq!(fieldttl(&mut t, "k", "nottl"), 100);
 
     // Repeated flags are syntax errors.
     t.assert_err(&["HSETEX", "k", "NX", "KEEPTTL", "NX", "1", "v", "v2"], "syntax error");
@@ -567,24 +586,25 @@ fn hsetex() {
 // format while keeping the Dragonfly reply (number of created fields).
 #[test]
 fn hsetex_dragonfly_condition() {
+    let _clock = clock_guard();
     let mut t = Ctx::new();
 
     // FNX on a fresh key sets everything.
     t.assert_int(&["HSETEX", "dk", "FNX", "100", "a", "1", "b", "2"], 2);
     t.assert_text(&["HGET", "dk", "a"], "1");
-    fieldttl_in(&mut t, "dk", "a", 99, 100);
+    assert_eq!(fieldttl(&mut t, "dk", "a"), 100);
 
     // FNX fails because a/b already exist -> nothing set.
     t.assert_int(&["HSETEX", "dk", "FNX", "50", "a", "x"], 0);
     t.assert_text(&["HGET", "dk", "a"], "1");
-    fieldttl_in(&mut t, "dk", "a", 99, 100);
+    assert_eq!(fieldttl(&mut t, "dk", "a"), 100);
     t.assert_int(&["HSETEX", "dk", "FNX", "50", "a", "x", "newf", "y"], 0);
     t.assert_int(&["HEXISTS", "dk", "newf"], 0);
 
     // FXX applies because all fields exist; it overwrites value and TTL.
     t.assert_int(&["HSETEX", "dk", "FXX", "50", "a", "x"], 0);
     t.assert_text(&["HGET", "dk", "a"], "x");
-    fieldttl_in(&mut t, "dk", "a", 49, 50);
+    assert_eq!(fieldttl(&mut t, "dk", "a"), 50);
     // FXX fails because a field is missing -> nothing set.
     t.assert_int(&["HSETEX", "dk", "FXX", "50", "missing", "y"], 0);
     t.assert_int(&["HEXISTS", "dk", "missing"], 0);
@@ -595,7 +615,7 @@ fn hsetex_dragonfly_condition() {
     // KEEPTTL composes with the condition.
     t.assert_int(&["HSETEX", "dk", "FXX", "KEEPTTL", "10", "a", "z"], 0);
     t.assert_text(&["HGET", "dk", "a"], "z");
-    fieldttl_in(&mut t, "dk", "a", 49, 50);
+    assert_eq!(fieldttl(&mut t, "dk", "a"), 50);
 
     // NX and the collective conditions are mutually exclusive; so are repeats.
     t.assert_err(&["HSETEX", "dk", "NX", "FNX", "100", "a", "1"], "syntax error");
@@ -605,6 +625,7 @@ fn hsetex_dragonfly_condition() {
 
 #[test]
 fn hsetex_redis_format() {
+    let _clock = clock_guard();
     let mut t = Ctx::new();
 
     // Basic Redis format without expiry.
@@ -615,24 +636,21 @@ fn hsetex_redis_format() {
 
     // EX seconds.
     t.assert_int(&["HSETEX", "k", "EX", "100", "FIELDS", "1", "exf", "v"], 1);
-    fieldttl_in(&mut t, "k", "exf", 99, 100);
+    assert_eq!(fieldttl(&mut t, "k", "exf"), 100);
 
     // PX milliseconds round up to whole seconds.
     t.assert_int(&["HSETEX", "k", "PX", "100000", "FIELDS", "1", "pxf", "v"], 1);
-    fieldttl_in(&mut t, "k", "pxf", 99, 100);
+    assert_eq!(fieldttl(&mut t, "k", "pxf"), 100);
 
-    // EXAT/PXAT absolute timestamps.
-    let now_s = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    // EXAT/PXAT absolute timestamps, computed against the pinned clock.
+    let now_s = clock_ms() / 1000;
     t.assert_int(&["HSETEX", "k", "EXAT", &(now_s + 100).to_string(), "FIELDS", "1", "exatf", "v"], 1);
-    fieldttl_in(&mut t, "k", "exatf", 99, 100);
+    assert_eq!(fieldttl(&mut t, "k", "exatf"), 100);
     t.assert_int(
         &["HSETEX", "k", "PXAT", &((now_s + 100) * 1000).to_string(), "FIELDS", "1", "pxatf", "v"],
         1,
     );
-    fieldttl_in(&mut t, "k", "pxatf", 99, 100);
+    assert_eq!(fieldttl(&mut t, "k", "pxatf"), 100);
 
     // Setting a field again without an expiry option removes its TTL.
     t.assert_int(&["HSETEX", "k", "FIELDS", "1", "exf", "v2"], 1);
@@ -640,10 +658,10 @@ fn hsetex_redis_format() {
 
     // KEEPTTL retains the existing TTL while updating the value.
     t.assert_int(&["HSETEX", "k", "EX", "50", "FIELDS", "1", "kf", "v1"], 1);
-    fieldttl_in(&mut t, "k", "kf", 49, 50);
+    assert_eq!(fieldttl(&mut t, "k", "kf"), 50);
     t.assert_int(&["HSETEX", "k", "KEEPTTL", "FIELDS", "1", "kf", "v2"], 1);
     t.assert_text(&["HGET", "k", "kf"], "v2");
-    fieldttl_in(&mut t, "k", "kf", 49, 50);
+    assert_eq!(fieldttl(&mut t, "k", "kf"), 50);
 
     // FNX: only when none of the fields exist.
     t.assert_int(&["HSETEX", "k", "FNX", "FIELDS", "1", "fnxf", "v1"], 1);
@@ -706,7 +724,7 @@ fn hsetex_redis_format() {
 
     // A field expiring during the FNX/FXX check must not leave an empty hash.
     t.assert_int(&["HSETEX", "exp", "1", "only", "v"], 1);
-    sleep(Duration::from_millis(1100));
+    advance(1000);
     t.assert_int(&["HSETEX", "exp", "FXX", "FIELDS", "1", "only", "v2"], 0);
     t.assert_int(&["EXISTS", "exp"], 0);
 }
@@ -749,31 +767,33 @@ fn issue_1140() {
 
 #[test]
 fn issue_2102() {
+    let _clock = clock_guard();
     let mut t = Ctx::new();
     t.assert_int(&["HSETEX", "key", "1", "k1", "v1"], 1);
-    sleep(Duration::from_millis(1100));
+    advance(1000);
     assert_eq!(t.run(&["HGETALL", "key"]), Value::Array(Some(vec![])));
 }
 
 #[test]
 fn hexpire() {
+    let _clock = clock_guard();
     let mut t = Ctx::new();
     // All fields expire together.
     t.assert_int(&["HSET", "key", "k0", "v0", "k1", "v1", "k2", "v2"], 3);
     let v = t.run(&["HEXPIRE", "key", "1", "FIELDS", "3", "k0", "k1", "k2"]);
     assert_eq!(ints(&v), vec![1, 1, 1]);
-    sleep(Duration::from_millis(1100));
+    advance(1000);
     assert_eq!(t.run(&["HGETALL", "key"]), Value::Array(Some(vec![])));
 
     t.assert_int(&["HSETEX", "key2", "1", "k0", "v0", "k1", "v2"], 2);
     let v = t.run(&["HEXPIRE", "key2", "1", "FIELDS", "2", "k0", "k1"]);
     assert_eq!(ints(&v), vec![1, 1]);
-    sleep(Duration::from_millis(1100));
+    advance(1000);
     assert_eq!(t.run(&["HGETALL", "key2"]), Value::Array(Some(vec![])));
 
     // Per-field conditions. TTLs are scaled from the reference's 10/8/12s to
     // 4/2/6s so the tiers (k3=2s < k0/k1/k5=4s < k2=6s, k4 without a TTL)
-    // stay distinguishable with whole-second sleeps.
+    // stay distinguishable with whole-second advances.
     t.assert_int(
         &["HSET", "key3", "k0", "v0", "k1", "v1", "k2", "v2", "k3", "v3", "k4", "v4", "k5", "v5"],
         6,
@@ -791,15 +811,15 @@ fn hexpire() {
     assert_eq!(ints(&t.run(&["HEXPIRE", "key3", "4", "GT", "FIELDS", "1", "k4"])), vec![0]);
     assert_eq!(ints(&t.run(&["HEXPIRE", "key3", "4", "LT", "FIELDS", "1", "k5"])), vec![1]);
 
-    sleep(Duration::from_millis(2200));
+    advance(2000);
     // k3 (2s) expired; k0,k1,k2,k4,k5 remain (sorted reply).
     assert_eq!(sorted(&t.run(&["HGETALL", "key3"])), vec![
         "k0", "k1", "k2", "k4", "k5", "v0", "v1", "v2", "v4", "v5"
     ]);
-    sleep(Duration::from_millis(2000));
+    advance(2000);
     // k0,k1,k5 (4s) expired; k2 (6s) and k4 (no TTL) remain (sorted reply).
     assert_eq!(sorted(&t.run(&["HGETALL", "key3"])), vec!["k2", "k4", "v2", "v4"]);
-    sleep(Duration::from_millis(2000));
+    advance(2000);
     // k2 (6s) expired; only k4 remains.
     assert_eq!(sorted(&t.run(&["HGETALL", "key3"])), vec!["k4", "v4"]);
 
@@ -841,15 +861,14 @@ fn hexpire_num_fields_errors() {
 
 #[test]
 fn hexpire_no_expire_early() {
+    let _clock = clock_guard();
     let mut t = Ctx::new();
     t.assert_int(&["HSET", "key", "k0", "v0", "k1", "v1"], 2);
-    // The reference uses a 2s TTL against a 1s advance (fake clock); the port
-    // needs a wider margin so the real wall-clock sleep can't outlive the TTL.
     let v = t.run(&["HEXPIRE", "key", "10", "FIELDS", "2", "k0", "k1"]);
     assert_eq!(ints(&v), vec![1, 1]);
-    sleep(Duration::from_millis(1200));
+    advance(1000);
     // The fields must not be pruned early; the remaining TTL proves it.
-    fieldttl_in(&mut t, "key", "k0", 8, 9);
+    assert_eq!(fieldttl(&mut t, "key", "k0"), 9);
     assert_eq!(sorted(&t.run(&["HGETALL", "key"])), vec!["k0", "k1", "v0", "v1"]);
 }
 
@@ -896,6 +915,7 @@ fn hexpire_with_null_char() {
 
 #[test]
 fn httl() {
+    let _clock = clock_guard();
     let mut t = Ctx::new();
     // Non-existent key returns -2 for all fields.
     let v = t.run(&["HTTL", "nokey", "FIELDS", "2", "f1", "f2"]);
@@ -910,15 +930,14 @@ fn httl() {
     assert_eq!(ints(&t.run(&["HEXPIRE", "key", "10", "FIELDS", "1", "k0"])), vec![1]);
     let v = t.run(&["HTTL", "key", "FIELDS", "2", "k0", "k1"]);
     let (t0, k1) = (ints(&v)[0], ints(&v)[1]);
-    assert!((9..=10).contains(&t0), "httl(k0) = {t0}");
+    assert_eq!(t0, 10, "httl(k0) = {t0}");
     assert_eq!(k1, -1);
 
-    // The TTL decreases as time passes (remaining 8.8s of a 10s TTL reports 8
-    // or 9 depending on second-boundary alignment).
-    sleep(Duration::from_millis(1200));
+    // The TTL decreases as the clock advances (remaining 9s of a 10s TTL).
+    advance(1000);
     let v = t.run(&["HTTL", "key", "FIELDS", "1", "k0"]);
     let ttl = ints(&v)[0];
-    assert!((8..=9).contains(&ttl), "httl = {ttl}");
+    assert_eq!(ttl, 9, "httl = {ttl}");
 
     // Wrong type.
     t.ok(&["SET", "strkey", "val"]);
@@ -931,6 +950,7 @@ fn httl() {
 
 #[test]
 fn hpexpire_time() {
+    let _clock = clock_guard();
     let mut t = Ctx::new();
     // Non-existent key returns -2 for all fields.
     let v = t.run(&["HPEXPIRETIME", "nokey", "FIELDS", "2", "f1", "f2"]);
@@ -943,16 +963,13 @@ fn hpexpire_time() {
 
     // Set an expiry and verify the absolute Unix-ms timestamp.
     assert_eq!(ints(&t.run(&["HEXPIRE", "key", "100", "FIELDS", "1", "k0"])), vec![1]);
-    let now_s = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let now_s = clock_ms() / 1000;
     let expected_ms = ((now_s + 100) as i64) * 1000;
     let v = t.run(&["HPEXPIRETIME", "key", "FIELDS", "2", "k0", "k1"]);
     assert_eq!(ints(&v), vec![expected_ms, -1]);
 
-    // The absolute timestamp does not change as time passes.
-    sleep(Duration::from_millis(1100));
+    // The absolute timestamp does not change as the clock advances.
+    advance(1000);
     let v = t.run(&["HPEXPIRETIME", "key", "FIELDS", "1", "k0"]);
     assert_eq!(ints(&v), vec![expected_ms]);
 
@@ -980,6 +997,7 @@ fn hpexpire_time() {
 
 #[test]
 fn hgetex() {
+    let _clock = clock_guard();
     let mut t = Ctx::new();
     // Missing key -> array of nils.
     let v = t.run(&["HGETEX", "nokey", "FIELDS", "2", "f1", "f2"]);
@@ -999,27 +1017,24 @@ fn hgetex() {
 
     // EX sets a relative TTL and still returns the value.
     assert_eq!(strs(&t.run(&["HGETEX", "key", "EX", "100", "FIELDS", "1", "f1"])), vec!["v1"]);
-    fieldttl_in(&mut t, "key", "f1", 99, 100);
+    assert_eq!(fieldttl(&mut t, "key", "f1"), 100);
 
     // PX rounds up to whole seconds.
     assert_eq!(strs(&t.run(&["HGETEX", "key", "PX", "100000", "FIELDS", "1", "f2"])), vec!["v2"]);
-    fieldttl_in(&mut t, "key", "f2", 99, 100);
+    assert_eq!(fieldttl(&mut t, "key", "f2"), 100);
 
-    // EXAT / PXAT set a TTL relative to now.
-    let now_s = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    // EXAT / PXAT set a TTL relative to the pinned clock.
+    let now_s = clock_ms() / 1000;
     assert_eq!(
         strs(&t.run(&["HGETEX", "key", "EXAT", &(now_s + 200).to_string(), "FIELDS", "1", "f1"])),
         vec!["v1"]
     );
-    fieldttl_in(&mut t, "key", "f1", 199, 200);
+    assert_eq!(fieldttl(&mut t, "key", "f1"), 200);
     assert_eq!(
         strs(&t.run(&["HGETEX", "key", "PXAT", &((now_s + 300) * 1000).to_string(), "FIELDS", "1", "f2"])),
         vec!["v2"]
     );
-    fieldttl_in(&mut t, "key", "f2", 299, 300);
+    assert_eq!(fieldttl(&mut t, "key", "f2"), 300);
 
     // PERSIST removes the TTL and returns the value.
     assert_eq!(strs(&t.run(&["HGETEX", "key", "PERSIST", "FIELDS", "1", "f1"])), vec!["v1"]);
@@ -1110,23 +1125,25 @@ fn hgetex_errors() {
 
 #[test]
 fn random_field_all_expired() {
+    let _clock = clock_guard();
     let mut t = Ctx::new();
     for i in 0..10 {
         t.assert_int(&["HSETEX", "key", "1", &format!("k{i}"), "v"], 1);
     }
-    sleep(Duration::from_millis(1100));
+    advance(1000);
     t.assert_null(&["HRANDFIELD", "key"]);
 }
 
 #[test]
 fn random_field_1_not_expired() {
+    let _clock = clock_guard();
     let mut t = Ctx::new();
     for i in 0..10 {
         t.assert_int(&["HSETEX", "key", "1", &format!("k{i}"), "v"], 1);
     }
     t.assert_int(&["HSET", "key", "keep", "v"], 1);
 
-    sleep(Duration::from_millis(1100));
+    advance(1000);
     t.assert_text(&["HRANDFIELD", "key"], "keep");
 }
 
@@ -1134,13 +1151,14 @@ fn random_field_1_not_expired() {
 // an out-of-bounds access when UpperBoundSize() > SizeSlow()).
 #[test]
 fn hrand_field_count_with_expired_fields() {
+    let _clock = clock_guard();
     let mut t = Ctx::new();
     for i in 0..10 {
         t.assert_int(&["HSETEX", "key", "1", &format!("k{i}"), "v"], 1);
     }
     t.assert_int(&["HSET", "key", "keep", "v"], 1);
 
-    sleep(Duration::from_millis(1100));
+    advance(1000);
 
     // Request count=42 with expired fields: only "keep" remains.
     let v = t.run(&["HRANDFIELD", "key", "42"]);
@@ -1151,12 +1169,13 @@ fn hrand_field_count_with_expired_fields() {
 
 #[test]
 fn empty_hash_bug() {
+    let _clock = clock_guard();
     let mut t = Ctx::new();
     t.assert_int(&["HSET", "foo", "a_field", "a_value"], 1);
     t.assert_int(&["HSETEX", "foo", "1", "b_field", "b_value"], 1);
     t.assert_int(&["HDEL", "foo", "a_field"], 1);
 
-    sleep(Duration::from_millis(1100));
+    advance(1000);
 
     assert_eq!(t.run(&["HGETALL", "foo"]), Value::Array(Some(vec![])));
     t.assert_int(&["EXISTS", "foo"], 0);
@@ -1175,11 +1194,12 @@ fn scan_after_expire_set() {
 
 #[test]
 fn key_removed_when_empty() {
+    let _clock = clock_guard();
     let mut t = Ctx::new();
     let test_cmd = |t: &mut Ctx, f: &dyn Fn(&mut Ctx), tag: &str| {
         t.assert_int(&["HSET", "a", "afield", "avalue"], 1);
         assert_eq!(ints(&t.run(&["HEXPIRE", "a", "1", "FIELDS", "1", "afield"])), vec![1]);
-        sleep(Duration::from_millis(1100));
+        advance(1000);
 
         // The expired field is still in the key until a hash command prunes it.
         t.assert_int(&["EXISTS", "a"], 1);
@@ -1227,11 +1247,12 @@ fn hrand_field_resp_format() {
 // key, leaving a zombie hash in the DB.
 #[test]
 fn httl_deletes_empty_hash() {
+    let _clock = clock_guard();
     let mut t = Ctx::new();
     t.assert_int(&["HSETEX", "key", "1", "f1", "v1"], 1);
     t.assert_int(&["EXISTS", "key"], 1);
 
-    sleep(Duration::from_millis(1100));
+    advance(1000);
 
     // HTTL triggers the lazy expiry of f1 and must remove the now-empty key.
     let v = t.run(&["HTTL", "key", "FIELDS", "1", "f1"]);
@@ -1272,6 +1293,7 @@ fn hincr_by_float_nan_does_not_create_key() {
 // asserted to run cleanly.
 #[test]
 fn shrink_memory_accounting_hash() {
+    let _clock = clock_guard();
     let mut t = Ctx::new();
     for i in 0..60 {
         t.assert_int(&["HSETEX", "h1", "1000", &format!("temp{i}"), &format!("v{i}")], 1);
@@ -1283,7 +1305,7 @@ fn shrink_memory_accounting_hash() {
         t.assert_int(&["HSETEX", "h1", "1", &format!("exp{i}"), &format!("v{i}")], 1);
     }
 
-    sleep(Duration::from_millis(1100));
+    advance(1000);
 
     let v = t.run(&["SHRINK", "h1"]);
     assert_eq!(v.int(), Some(0), "SHRINK replies 0 for the port's single-encoding hash");

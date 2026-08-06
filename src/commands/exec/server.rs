@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -247,12 +248,53 @@ pub fn local_time(_args: &[Vec<u8>]) -> RespValue {
     ])
 }
 
-#[must_use]
-pub fn now_ms() -> u64 {
+/// Test-only fake clock, mirroring the reference `TEST_current_time_ms` +
+/// `AdvanceTime`. The binary never touches it; integration tests pin it with
+/// [`pin_test_clock`] and move it with [`advance_test_clock`]. Every thread
+/// (shard, coordinator, IO) reads the same value through [`now_ms`], so a
+/// pinned clock makes TTL math fully deterministic.
+static TEST_CLOCK: OnceLock<AtomicU64> = OnceLock::new();
+
+fn wall_clock_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[must_use]
+pub fn now_ms() -> u64 {
+    match TEST_CLOCK.get() {
+        Some(c) => c.load(Ordering::Relaxed),
+        None => wall_clock_ms(),
+    }
+}
+
+/// Pin the clock to the current wall-clock time, rounded down to a whole
+/// second, and return that value. Idempotent: re-pinning never rewinds a clock
+/// a previous test already advanced. Every expiry is stored relative to the
+/// returned base, so `field_ttl_ms`/`httl`/`hpexpiretime` replies are exact.
+#[must_use]
+pub fn pin_test_clock() -> u64 {
+    let c = TEST_CLOCK.get_or_init(|| AtomicU64::new((wall_clock_ms() / 1000) * 1000));
+    c.load(Ordering::Relaxed)
+}
+
+/// Current test-clock value. Panics when the clock was never pinned.
+#[must_use]
+pub fn test_clock_ms() -> u64 {
+    TEST_CLOCK
+        .get()
+        .expect("test clock not pinned")
+        .load(Ordering::Relaxed)
+}
+
+/// Advance the test clock by `ms`. Panics when the clock was never pinned.
+pub fn advance_test_clock(ms: u64) {
+    TEST_CLOCK
+        .get()
+        .expect("test clock not pinned")
+        .fetch_add(ms, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
