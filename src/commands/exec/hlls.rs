@@ -242,9 +242,12 @@ fn exec_pfmerge(ctx: &mut OpContext) -> CmdResult {
         Ok(h) => h,
         Err(e) => return CmdResult::Err(e),
     };
-    let (result, stored) = merge_into(&dest, &collected);
 
     if single {
+        // Single-shard fast path: perform the merge and store the result here.
+        let (result, stored) = merge_into(&dest, &collected);
+        // Even on a failed merge the reference writes the fresh (empty) dense
+        // HLL, so the store happens regardless of `result`.
         ctx.db
             .insert(&dest, PrimeValue::Str(CompactString::from_bytes(&stored)));
         if result != 0 {
@@ -253,16 +256,9 @@ fn exec_pfmerge(ctx: &mut OpContext) -> CmdResult {
         return CmdResult::Ok(ok());
     }
 
-    // Multi-shard: hand the merged value back to the coordinator. Even on a
-    // failed merge the reference writes the fresh (empty) dense HLL, so the
-    // deferred store always happens.
-    let value = Some(PrimeValue::Str(CompactString::from_bytes(&stored)));
-    let reply = if result != 0 {
-        RespValue::Error(invalid_hll().message)
-    } else {
-        ok()
-    };
-    CmdResult::deferred_store(dest, value, reply)
+    // Multi-shard: report the per-shard dense values; `merge_pfmerge` combines
+    // them on the coordinator and stores the union on the destination's shard.
+    CmdResult::Ok(dense_values_to_resp(collected))
 }
 
 fn merge_pfmerge(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u64) -> CmdResult {
@@ -275,6 +271,8 @@ fn merge_pfmerge(parts: &[ShardPart], args: &[Vec<u8>], keys: &[usize], _now: u6
         }
     }
     let (result, stored) = merge_into(&dest, &collected);
+    // Even on a failed merge the reference writes the fresh (empty) dense HLL,
+    // so the deferred store always happens.
     let value = Some(PrimeValue::Str(CompactString::from_bytes(&stored)));
     let reply = if result != 0 {
         RespValue::Error(invalid_hll().message)
