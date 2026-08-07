@@ -290,14 +290,35 @@ integration tests (`tests/*.rs`) that run against the in-process server
   between them, so MULTI is not atomic with respect to the woken reader.
 - [ ] Remaining families (server, scripting, json) still to be ported from
   `*_test.cc`.
+- [x] Scripting end-to-end coverage in `tests/functions.rs` (11 tests). There is
+  no upstream `function_family_test.cc` (and no FUNCTION tests in dragonfly's
+  tree at all), so these are authored from the port's own documented semantics
+  (`local_function` in `src/server/mod.rs` + the coordinator's
+  `execute_function` in `src/server/coordinator.rs`). They run over the socket
+  through the shared `ScriptMgr`, exercising both dispatch halves: FUNCTION
+  admin on the IO thread (`handle_local`) and FCALL/FCALL_RO on the coordinator
+  (`is_function_cmd`). Coverage: LOAD/REPLACE/DELETE/FLUSH round-trips,
+  duplicate library/function-name enforcement, the REPLACE purge path for
+  dropped names (coordinator `loaded_libs` + `purge_functions`), LIST
+  LIBRARYNAME/WITHCODE (maps flatten to RESP2 arrays), STATS fields, HELP,
+  NOTBUSY KILL, bad payloads (missing metadata / no functions / invalid engine /
+  missing name / non-function callback / top-level redis.call), FCALL errors
+  (unknown function, bad numkeys, numkeys>args, wrapped runtime error),
+  multi-key writes over declared keys, undeclared-key rejection in atomic mode,
+  no-writes + FCALL_RO write rejection, FUNCTION/FCALL NOSCRIPT from EVAL and
+  from inside a function, and DFLY replication-control rejection
+  ("ERR DFLY replication control is not supported"; FLOW/SYNC/STARTSTABLE live
+  in `tests/replication.rs`).
 
 ## Priority order
 1. Core data types: bitops, keys/generic, string, list, hash, set, zset, stream
    (biggest day-to-day surface, fits existing architecture).
 2. GEO (self-contained, well-specified).
 3. Scripting (EVAL/FUNCTION/MULTI) + pub/sub (need connection/runtime hooks).
-   - Done: EVAL family + SCRIPT + pub/sub are ported; FUNCTION and the
-     replication-related DFLY remain.
+   - Done: EVAL family + SCRIPT + pub/sub are ported, FUNCTION/FCALL have
+     end-to-end coverage in `tests/functions.rs`, and the replication-related
+     DFLY rejection is asserted; only the live-replication paths remain
+     (covered by `tests/replication.rs`).
 4. Server/admin + SORT.
 5. Probabilistic structures (BF/CF/CMS/TOPK) and JSON (large; need new value
    types in `src/core/value.rs`).

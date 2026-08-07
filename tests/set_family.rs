@@ -92,6 +92,7 @@ fn s_union_store() {
 // SUNIONSTORE overwrites a value including resetting its expiration.
 #[test]
 fn s_union_store_expiration() {
+    let _clock = clock_guard();
     let mut t = Ctx::new();
     t.int(&["sadd", "s1", "a", "b"]);
     t.int(&["sadd", "s2", "c", "d"]);
