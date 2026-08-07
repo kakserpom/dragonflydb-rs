@@ -384,7 +384,14 @@ impl IoLoop {
             self.deliver(conn_id, seq, encode_value(&RespValue::Error(msg)));
             return;
         };
-        if let Some(e) = cmd.check_arity(args.len()) {
+        // `XGROUP HELP` resolves to the hidden `_XGROUP_HELP` command (arity 2,
+        // NOSCRIPT) before the arity check (command_registry.cc:347-352), so the
+        // 2-arg HELP form bypasses XGROUP's -3 arity.
+        let xgroup_help =
+            cmd.name == "XGROUP" && args.len() == 2 && args[1].eq_ignore_ascii_case(b"HELP");
+        if !xgroup_help
+            && let Some(e) = cmd.check_arity(args.len())
+        {
             // A validation failure while collecting poisons the transaction so
             // EXEC will abort (EXECABORT). Unknown commands do not poison it.
             if let Some(conn) = self.conns.get_mut(&conn_id)

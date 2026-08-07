@@ -2621,6 +2621,7 @@ mod tests {
             args: argv,
             owned_keys: &owned,
             first_key_idx,
+            conn_id: 0,
             now_ms,
         };
         let r = (exec)(&mut ctx);
@@ -2920,6 +2921,7 @@ mod tests {
             args: argv,
             owned_keys: owned,
             first_key_idx: 2,
+            conn_id: 0,
             now_ms: 0,
         };
         exec_zintercard(&mut ctx)
@@ -3165,6 +3167,7 @@ mod tests {
             args: argv,
             owned_keys: owned,
             first_key_idx,
+            conn_id: 0,
             now_ms: 0,
         };
         let r = (exec)(&mut ctx);
@@ -3194,6 +3197,7 @@ mod tests {
             args: argv,
             owned_keys: owned,
             first_key_idx,
+            conn_id: 0,
             now_ms: 0,
         };
         let r = (exec)(&mut ctx);
@@ -4247,6 +4251,7 @@ mod tests {
             args: &argv,
             owned_keys: &[1usize],
             first_key_idx: 1,
+            conn_id: 0,
             now_ms: 0,
         };
         let exec_r = exec_bzpopmin(&mut ctx);

@@ -30,7 +30,9 @@ use crate::core::listpack;
 use crate::core::lzf;
 use crate::core::quicklist::{ListItem, QuickList};
 use crate::core::set::Set;
-use crate::core::stream::{Consumer, ConsumerGroup, PendingEntry, Stream, StreamEntry, StreamId};
+use crate::core::stream::{
+    Consumer, ConsumerGroup, PendingEntry, Stream, StreamEntry, StreamId, SCG_INVALID_ENTRIES_READ,
+};
 use crate::core::topk::Topk;
 use crate::core::value::PrimeValue;
 use crate::core::zset::ZSet;
@@ -462,7 +464,9 @@ fn save_stream(out: &mut Vec<u8>, s: &Stream) {
         save_string(out, name.as_bytes());
         write_len(out, cg.last_delivered.ms);
         write_len(out, cg.last_delivered.seq);
-        write_len(out, cg.entries_read);
+        // entries_read is signed (SCG_INVALID_ENTRIES_READ == -1); follow Redis
+        // and store entries_read + 1 so -1 round-trips through the u64 varint.
+        write_len(out, (cg.entries_read + 1) as u64);
         write_len(out, cg.pel.len() as u64);
         for (eid, pe) in &cg.pel {
             out.extend_from_slice(&encode_stream_id(eid));
@@ -1157,9 +1161,9 @@ fn load_stream(r: &mut impl Rd, typ: u8) -> Result<Stream, RestoreError> {
             ms: r.read_len()?.0,
             seq: r.read_len()?.0,
         };
-        let mut entries_read = 0;
+        let mut entries_read = SCG_INVALID_ENTRIES_READ;
         if typ >= RDB_TYPE_STREAM_LISTPACKS_2 {
-            entries_read = r.read_len()?.0;
+            entries_read = r.read_len()?.0 as i64 - 1;
         }
 
         let pel_size = r.read_len()?.0;
@@ -1213,7 +1217,7 @@ fn load_stream(r: &mut impl Rd, typ: u8) -> Result<Stream, RestoreError> {
                 cname,
                 Consumer {
                     seen_time,
-                    active_time,
+                    active_time: active_time as i64,
                     pending: cpel_size,
                 },
             );
@@ -1626,7 +1630,7 @@ mod tests {
         save_string(&mut expected, b"g1");
         write_len(&mut expected, 1); // last_delivered.ms
         write_len(&mut expected, 0); // last_delivered.seq
-        write_len(&mut expected, 1); // entries_read
+        write_len(&mut expected, 2); // entries_read (1), stored as +1 (rdb.rs:468)
         write_len(&mut expected, 1); // global PEL count
         expected.extend_from_slice(&id_bytes); // PEL entry ID 1.0
         expected.extend_from_slice(&now_ms.to_le_bytes()); // delivery_time

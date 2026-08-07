@@ -36,6 +36,27 @@ fn is_blocked_wrong_type(msg: &CoordMsg, err: &RespError) -> bool {
     blocking_timeout_ms(cmd, &msg.args).is_some() && err.message.starts_with("WRONGTYPE")
 }
 
+fn is_xreadgroup(msg: &CoordMsg) -> bool {
+    command_for(&msg.args).is_some_and(|c| c.name == "XREADGROUP")
+}
+
+/// Reply to a blocked XREADGROUP that woke: the wake only serves the woken
+/// key (`SendStreamRecords` on `wake_key` alone), so sibling streams that
+/// still hold no entries are dropped from the reply. Each item is one
+/// `[key, [entries]]` pair.
+fn wake_xreadgroup_reply(items: Vec<RespValue>) -> Vec<RespValue> {
+    items
+        .into_iter()
+        .filter(|item| {
+            matches!(
+                item,
+                RespValue::Array(pair)
+                    if matches!(pair.get(1), Some(RespValue::Array(v)) if !v.is_empty())
+            )
+        })
+        .collect()
+}
+
 pub fn spawn(
     num_shards: usize,
     rx: mpsc::Receiver<CoordMsg>,
@@ -154,8 +175,14 @@ impl Coordinator {
                 if msg.no_block {
                     // Inside MULTI a blocking command never waits: it returns
                     // nil immediately (mirrors `RunCbOnFirstNonEmptyBlocking`'s
-                    // `IsMulti` -> TIMED_OUT path).
-                    let bytes = encode_result(CmdResult::Ok(RespValue::Nil));
+                    // `IsMulti` -> TIMED_OUT path). List/blocks and XREAD send
+                    // a null *array*, the rest a null bulk.
+                    let bytes = if command_for(&msg.args).is_some_and(blocking_timeout_is_nil_array)
+                    {
+                        crate::protocol::resp::encode_nil_array()
+                    } else {
+                        encode_result(CmdResult::Ok(RespValue::Nil))
+                    };
                     self.reply(msg.conn_id, msg.seq, bytes);
                     return;
                 }
@@ -203,6 +230,29 @@ impl Coordinator {
                 // `SET x str`): the wake is deferred until the key holds the
                 // right type again (`WrongTypeDoesNotWake`).
                 CmdResult::Err(e) if is_blocked_wrong_type(&p.msg, &e) => remaining.push(p),
+                // A blocked XREADGROUP that wakes to find its group destroyed
+                // replies with the wake-specific NOGROUP text (the generic
+                // first-run message would be misleading; stream_family.cc:3160).
+                CmdResult::Err(e) if is_xreadgroup(&p.msg) && e.message.starts_with("NOGROUP ") => {
+                    let bytes = encode_result(CmdResult::Err(RespError::new(
+                        "NOGROUP the consumer group this client was blocked on no longer exists",
+                    )));
+                    self.reply(p.msg.conn_id, p.msg.seq, bytes);
+                }
+                // A woken XREADGROUP only reports the stream that carries new
+                // entries (`XReadGroupBlock` asserts a single `[key, n]` pair).
+                CmdResult::Ok(RespValue::Array(items)) if is_xreadgroup(&p.msg) => {
+                    let filtered = wake_xreadgroup_reply(items);
+                    if filtered.is_empty() {
+                        remaining.push(p);
+                    } else {
+                        self.reply_result(
+                            p.msg.conn_id,
+                            p.msg.seq,
+                            CmdResult::Ok(RespValue::Array(filtered)),
+                        );
+                    }
+                }
                 other => self.reply_result(p.msg.conn_id, p.msg.seq, other),
             }
         }
@@ -1180,6 +1230,16 @@ impl ScriptDispatchCtx<'_> {
         // `DispatchCommand` (main_service.cc): GLOBAL_TRANS / NO_KEY_TRANSACTIONAL
         // commands may run only when the script schedules globally or re-schedules
         // per operation (GLOBAL / NON_ATOMIC); NOSCRIPT commands never run.
+        // `XGROUP HELP` resolves to the hidden `_XGROUP_HELP` command which is
+        // NOSCRIPT (command_registry.cc:347-352, issue #854), so scripts must
+        // be rejected even though the top-level XGROUP is not flagged — and
+        // before the arity check, since the rewritten command's arity is 2.
+        if args.len() == 2 && cmd.name == "XGROUP" && args[1].eq_ignore_ascii_case(b"HELP") {
+            return Err("This Redis command is not allowed from script".to_string());
+        }
+        if let Some(e) = cmd.check_arity(args.len()) {
+            return Err(e);
+        }
         if cmd.has_flag(FLAG_NOSCRIPT)
             || (cmd.has_flag(FLAG_GLOBAL) && self.ctx.atomic && !self.ctx.undeclared_keys)
         {

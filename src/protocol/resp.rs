@@ -235,6 +235,7 @@ pub fn encode_reply(value: &RespValue, out: &mut Vec<u8>) {
             out.extend_from_slice(b"\r\n");
         }
         RespValue::Nil => out.extend_from_slice(b"$-1\r\n"),
+        RespValue::NilArray => out.extend_from_slice(b"*-1\r\n"),
         RespValue::Array(items) => {
             out.extend_from_slice(b"*");
             out.extend_from_slice(&crate::util::itoa(items.len() as i64));

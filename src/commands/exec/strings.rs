@@ -1282,6 +1282,7 @@ mod tests {
             args: argv,
             owned_keys: &owned,
             first_key_idx,
+            conn_id: 0,
             now_ms,
         };
         exec(&mut ctx)

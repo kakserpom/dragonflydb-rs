@@ -1712,6 +1712,7 @@ mod tests {
             args: argv,
             owned_keys: &owned,
             first_key_idx: 1,
+            conn_id: 0,
             now_ms: now,
         };
         (cmd.exec)(&mut ctx)
@@ -1725,6 +1726,7 @@ mod tests {
             RespValue::Integer(i) => i.to_string(),
             RespValue::Double(f) => format_double(*f),
             RespValue::Nil => "(nil)".into(),
+            RespValue::NilArray => "(nil)".into(),
             RespValue::Error(e) => e.clone(),
             RespValue::Bool(b) => b.to_string(),
             RespValue::Array(a) => {

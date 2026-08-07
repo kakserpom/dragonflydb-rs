@@ -381,6 +381,7 @@ mod tests {
             args: argv,
             owned_keys: &owned,
             first_key_idx: 1,
+            conn_id: 0,
             now_ms: 0,
         };
         (cmd.exec)(&mut ctx)

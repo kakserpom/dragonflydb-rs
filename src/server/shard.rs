@@ -12,6 +12,7 @@ use crate::server::{MAX_DB, Reply, ShardMsg, SingleOp, WatchState, command_for, 
 /// Context for an active transaction on this shard, stored between `TxLock` and
 /// `TxExec`.
 struct TxCtx {
+    conn_id: u64,
     args: Vec<Vec<u8>>,
     owned_key_idxs: Vec<usize>,
     first_key_idx: usize,
@@ -84,6 +85,7 @@ impl Shard {
             }
             ShardMsg::TxLock {
                 tx_id,
+                conn_id,
                 args,
                 owned_key_idxs,
                 first_key_idx,
@@ -96,6 +98,7 @@ impl Shard {
                 self.tx_ctx.insert(
                     tx_id,
                     TxCtx {
+                        conn_id,
                         args,
                         owned_key_idxs,
                         first_key_idx,
@@ -114,6 +117,7 @@ impl Shard {
                             ctx.first_key_idx,
                             ctx.db_idx,
                             ctx.owns_all_keys,
+                            ctx.conn_id,
                             tx_id,
                         );
                         ShardPart {
@@ -200,6 +204,7 @@ impl Shard {
                     db_idx,
                     owns_all_keys,
                     0,
+                    0,
                 );
                 let _ = result_tx.send(result);
             }
@@ -216,6 +221,7 @@ impl Shard {
                             c.first_key_idx,
                             c.db_idx,
                             c.owns_all_keys,
+                            0,
                             0,
                         )
                     })
@@ -343,6 +349,7 @@ impl Shard {
             first_key_idx,
             op.db_idx,
             true,
+            op.conn_id,
             0,
         );
         let reply = Reply {
@@ -385,13 +392,14 @@ impl Shard {
         first_key_idx: usize,
         db_idx: usize,
         owns_all_keys: bool,
+        conn_id: u64,
         txid: u64,
     ) -> CmdResult {
         let Some(cmd) = command_for(args) else {
             return CmdResult::err("ERR unknown command");
         };
         let journal_enabled = self.journal.is_some();
-        let (result, spop) = self.exec_core(args, owned, first_key_idx, db_idx);
+        let (result, spop) = self.exec_core(args, owned, first_key_idx, db_idx, conn_id);
         // SPOP pops random members, so the journal can't replay it verbatim:
         // journal the deterministic rewrite (SREM of the popped members, or DEL
         // when the pop drained the set) instead. `exec_core` computes the
@@ -425,6 +433,7 @@ impl Shard {
         owned: &[usize],
         first_key_idx: usize,
         db_idx: usize,
+        conn_id: u64,
     ) -> (CmdResult, Option<Vec<Vec<u8>>>) {
         let Some(cmd) = command_for(args) else {
             return (CmdResult::err("ERR unknown command"), None);
@@ -445,6 +454,7 @@ impl Shard {
             args,
             owned_keys: owned,
             first_key_idx,
+            conn_id,
             now_ms: now_ms(),
         };
         let result = (cmd.exec)(&mut ctx);
@@ -477,7 +487,7 @@ impl Shard {
             return CmdResult::err("ERR unknown command");
         };
         let owned = crate::server::extract_keys(cmd, args);
-        self.exec_core(args, &owned, cmd.key_range.first, db_idx).0
+        self.exec_core(args, &owned, cmd.key_range.first, db_idx, 0).0
     }
 
     /// Record a write command into the replication journal, if one is enabled.

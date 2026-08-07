@@ -1802,6 +1802,7 @@ fn g6_format(d: f64) -> String {
 fn collect_reply_bytes(values: &mut Vec<Vec<u8>>, r: &RespValue) {
     match r {
         RespValue::Nil => values.push(Vec::new()),
+        RespValue::NilArray => values.push(Vec::new()),
         RespValue::Bool(b) => values.push(if *b { b"1".to_vec() } else { b"0".to_vec() }),
         RespValue::Integer(i) => values.push(itoa(*i)),
         RespValue::Double(d) => values.push(g6_format(*d).into_bytes()),
@@ -1994,6 +1995,7 @@ fn install_dragonfly_functions<'a, D: ScriptDispatch>(
 fn resp_to_lua(lua: &Lua, r: RespValue) -> mlua::Result<Value> {
     Ok(match r {
         RespValue::Nil => Value::Boolean(false),
+        RespValue::NilArray => Value::Boolean(false),
         RespValue::Bool(b) => Value::Boolean(b),
         RespValue::Integer(i) => Value::Integer(i),
         RespValue::Double(d) => {

@@ -106,6 +106,9 @@ pub struct OpContext<'a> {
     pub owned_keys: &'a [usize],
     /// The index of the first key for the command overall (KeyRange.first).
     pub first_key_idx: usize,
+    /// The connection executing the command. Distinguishes per-connection
+    /// state, e.g. the resolved `$` watermark of a blocked XREAD.
+    pub conn_id: u64,
     pub now_ms: u64,
 }
 

@@ -294,6 +294,7 @@ mod tests {
             RespValue::Simple(s) => s.clone(),
             RespValue::Integer(i) => i.to_string(),
             RespValue::Nil => "(nil)".into(),
+            RespValue::NilArray => "(nil)".into(),
             RespValue::Error(e) => e.clone(),
             RespValue::Array(a) => {
                 format!("[{}]", a.iter().map(render).collect::<Vec<_>>().join(", "))

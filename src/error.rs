@@ -148,6 +148,8 @@ pub enum RespValue {
     Integer(i64),
     Bulk(Vec<u8>),
     Nil,
+    /// A null array reply (`*-1\r\n`), distinct from a null bulk string.
+    NilArray,
     Array(Vec<RespValue>),
     Double(f64),
     Bool(bool),
@@ -161,6 +163,13 @@ impl RespValue {
     #[must_use]
     pub fn array(v: Vec<RespValue>) -> Self {
         RespValue::Array(v)
+    }
+    #[must_use]
+    pub fn as_array(&self) -> Option<&Vec<RespValue>> {
+        match self {
+            RespValue::Array(v) => Some(v),
+            _ => None,
+        }
     }
     #[must_use]
     pub fn ok() -> Self {

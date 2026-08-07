@@ -21,7 +21,8 @@ pub struct DbSlice {
     /// Resolved stream IDs for blocking XREAD `$` arguments: a blocked read
     /// resolves `$` once (to the stream's last ID at call time) and the
     /// coordinator re-runs the command, so we remember the resolved ID here.
-    stream_block_watermarks: HashMap<Vec<u8>, StreamId>,
+    /// Resolved `$` watermarks for blocking XREAD, keyed by connection.
+    stream_block_watermarks: HashMap<(u64, Vec<u8>), StreamId>,
     /// Monotonic per-key version, bumped on every modification. Backs WATCH:
     /// EXEC re-queries a watched key's version and aborts if it moved.
     versions: HashMap<CompactString, u64>,
@@ -277,18 +278,19 @@ impl DbSlice {
         self.prime_table.iter()
     }
 
-    /// The resolved last ID for a blocking XREAD `$` on `key`, if one is pending.
+    /// The resolved last ID for a blocking XREAD `$` on `key` issued by
+    /// connection `conn_id`, if one is pending.
     #[must_use]
-    pub fn stream_watermark(&self, key: &[u8]) -> Option<StreamId> {
-        self.stream_block_watermarks.get(key).copied()
+    pub fn stream_watermark(&self, conn_id: u64, key: &[u8]) -> Option<StreamId> {
+        self.stream_block_watermarks.get(&(conn_id, key.to_vec())).copied()
     }
 
-    pub fn set_stream_watermark(&mut self, key: Vec<u8>, id: StreamId) {
-        self.stream_block_watermarks.insert(key, id);
+    pub fn set_stream_watermark(&mut self, conn_id: u64, key: Vec<u8>, id: StreamId) {
+        self.stream_block_watermarks.insert((conn_id, key), id);
     }
 
-    pub fn remove_stream_watermark(&mut self, key: &[u8]) {
-        self.stream_block_watermarks.remove(key);
+    pub fn remove_stream_watermark(&mut self, conn_id: u64, key: &[u8]) {
+        self.stream_block_watermarks.remove(&(conn_id, key.to_vec()));
     }
 
     fn refresh_stats(&mut self) {

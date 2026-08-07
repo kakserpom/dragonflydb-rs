@@ -793,7 +793,11 @@ pub fn extract_movable_keys(args: &[Vec<u8>]) -> Vec<usize> {
         if args[i].eq_ignore_ascii_case(b"STREAMS") {
             let remaining = args.len() - i - 1;
             if remaining == 0 || !remaining.is_multiple_of(2) {
-                return vec![];
+                // The STREAMS marker may be preceded by stray option arguments
+                // (e.g. a consumer literally named "STREAMS" in XREADGROUP
+                // `GROUP <g> <consumer> STREAMS COUNT 2 STREAMS <key> >`), so
+                // scan on to the next marker instead of failing extraction.
+                continue;
             }
             let n = remaining / 2;
             return (i + 1..i + 1 + n).collect();
@@ -934,4 +938,28 @@ pub fn encode_value(v: &RespValue) -> Vec<u8> {
 #[must_use]
 pub fn encode_result(r: CmdResult) -> Vec<u8> {
     encode_value(&r.into_resp_value())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mv(args: &[&str]) -> Vec<usize> {
+        extract_movable_keys(&args.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn movable_keys_first_even_streams() {
+        // Plain XREAD: keys after the only STREAMS marker.
+        assert_eq!(mv(&["XREAD", "COUNT", "2", "STREAMS", "a", "b", "0", "0"]), vec![4, 5]);
+        // XREADGROUP: the first STREAMS marker (an odd tail) is a consumer
+        // named "STREAMS"; extraction falls through to the real marker.
+        assert_eq!(
+            mv(&["XREADGROUP", "GROUP", "grp1", "STREAMS", "COUNT", "2", "STREAMS", "xp1", ">"]),
+            vec![7]
+        );
+        // No well-formed marker: malformed, executor reports the error.
+        assert!(mv(&["XREADGROUP", "GROUP", "grp1", "STREAMS", "a"]).is_empty());
+        assert!(mv(&["XREAD", "STREAMS"]).is_empty());
+    }
 }

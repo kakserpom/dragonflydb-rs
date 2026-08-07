@@ -1259,6 +1259,7 @@ mod tests {
             args: argv,
             owned_keys: &owned,
             first_key_idx,
+            conn_id: 0,
             now_ms,
         };
         exec(&mut ctx)
@@ -1626,6 +1627,7 @@ mod tests {
             args: &argv,
             owned_keys: &owned0,
             first_key_idx: 2,
+            conn_id: 0,
             now_ms: 0,
         };
         let p0 = exec_sintercard(&mut ctx0);
@@ -1634,6 +1636,7 @@ mod tests {
             args: &argv,
             owned_keys: &owned1,
             first_key_idx: 2,
+            conn_id: 0,
             now_ms: 0,
         };
         let p1 = exec_sintercard(&mut ctx1);
@@ -1673,6 +1676,7 @@ mod tests {
             args: &argv,
             owned_keys: &owned0,
             first_key_idx: 2,
+            conn_id: 0,
             now_ms: 0,
         };
         let p0 = exec_sintercard(&mut ctx0);
@@ -1681,6 +1685,7 @@ mod tests {
             args: &argv,
             owned_keys: &owned1,
             first_key_idx: 2,
+            conn_id: 0,
             now_ms: 0,
         };
         let p1 = exec_sintercard(&mut ctx1);
@@ -1721,6 +1726,7 @@ mod tests {
             args: &argv,
             owned_keys: &owned0,
             first_key_idx: 2,
+            conn_id: 0,
             now_ms: 0,
         };
         let p0 = exec_sintercard(&mut ctx0);
@@ -1729,6 +1735,7 @@ mod tests {
             args: &argv,
             owned_keys: &owned1,
             first_key_idx: 2,
+            conn_id: 0,
             now_ms: 0,
         };
         let p1 = exec_sintercard(&mut ctx1);
