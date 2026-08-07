@@ -22,6 +22,10 @@
 //!   the port tracks no allocator arenas, so each section contains only the
 //!   header and totals rows.
 //! - `ClientPause` is not ported yet: the port has no `CLIENT PAUSE`.
+//! - `ReadTcpInfo` / `GetTcpSocketInfoIPv6` are not ported: they exercise the
+//!   Linux-only `/proc/net/{tcp,tcp6}` socket-info reporting.
+//! - The `ClientTracking*` tests (tracking push messages) are not ported: they
+//!   require RESP3 and the push-message reply API.
 
 mod common;
 
