@@ -51,27 +51,42 @@ impl Client {
 
     fn read_value(&mut self) -> Result<Value, String> {
         let mut line = String::new();
-        self.reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        self.reader
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
         let bytes = line.as_bytes();
         match bytes[0] {
             b'+' => Ok(Value::Simple(line[1..].trim_end().to_string())),
             b'-' => Ok(Value::Error),
             b':' => {
-                let n = line[1..].trim().parse().map_err(|_| "bad int".to_string())?;
+                let n = line[1..]
+                    .trim()
+                    .parse()
+                    .map_err(|_| "bad int".to_string())?;
                 Ok(Value::Integer(n))
             }
             b'$' => {
-                let n: i64 = line[1..].trim().parse().map_err(|_| "bad len".to_string())?;
+                let n: i64 = line[1..]
+                    .trim()
+                    .parse()
+                    .map_err(|_| "bad len".to_string())?;
                 if n < 0 {
                     return Ok(Value::Bulk(None));
                 }
                 let mut buf = vec![0u8; n as usize];
-                self.reader.read_exact(&mut buf).map_err(|e| e.to_string())?;
-                self.reader.read_line(&mut line).map_err(|e| e.to_string())?;
+                self.reader
+                    .read_exact(&mut buf)
+                    .map_err(|e| e.to_string())?;
+                self.reader
+                    .read_line(&mut line)
+                    .map_err(|e| e.to_string())?;
                 Ok(Value::Bulk(Some(buf)))
             }
             b'*' => {
-                let n: i64 = line[1..].trim().parse().map_err(|_| "bad count".to_string())?;
+                let n: i64 = line[1..]
+                    .trim()
+                    .parse()
+                    .map_err(|_| "bad count".to_string())?;
                 if n < 0 {
                     return Ok(Value::Array(None));
                 }
@@ -107,7 +122,12 @@ fn free_port() -> u16 {
 
 fn spawn(port: u16, shards: usize) -> Child {
     Command::new(BIN)
-        .args(["--port", &port.to_string(), "--num-shards", &shards.to_string()])
+        .args([
+            "--port",
+            &port.to_string(),
+            "--num-shards",
+            &shards.to_string(),
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -210,7 +230,10 @@ fn master_to_replica_replication() {
     ok(&mut m, &["SET", "with-ttl", "v", "EX", "100"]);
 
     // Attach the replica.
-    ok(&mut r, &["REPLICAOF", "localhost", &master_port.to_string()]);
+    ok(
+        &mut r,
+        &["REPLICAOF", "localhost", &master_port.to_string()],
+    );
     wait_replica_state(replica_port, "connected");
 
     // Full-sync snapshot reproduced.
@@ -249,7 +272,9 @@ fn master_to_replica_replication() {
     ok(&mut m, &["MSET", "k3", "v3", "k4", "v4"]);
 
     // Give the journal a moment to drain, then check everything.
-    wait_for(Duration::from_secs(10), || bulk(&mut r, &["GET", "renamed"]) == "newbar");
+    wait_for(Duration::from_secs(10), || {
+        bulk(&mut r, &["GET", "renamed"]) == "newbar"
+    });
     assert_eq!(bulk(&mut r, &["GET", "renamed"]), "newbar");
     assert_eq!(bulk(&mut r, &["GET", "num"]), "43");
     assert_eq!(list(&mut r, &["LRANGE", "mylist", "0", "-1"]), "abcd");
@@ -265,7 +290,9 @@ fn master_to_replica_replication() {
 
     // Global command with the per-shard barrier.
     ok(&mut m, &["FLUSHALL"]);
-    wait_for(Duration::from_secs(10), || bulk(&mut r, &["GET", "k1"]) == "<nil>");
+    wait_for(Duration::from_secs(10), || {
+        bulk(&mut r, &["GET", "k1"]) == "<nil>"
+    });
     assert_eq!(bulk(&mut r, &["GET", "k1"]), "<nil>");
     assert_eq!(bulk(&mut r, &["GET", "renamed"]), "<nil>");
 
@@ -315,18 +342,27 @@ fn writes_during_full_sync_converge() {
     for i in 0..BASE_KEYS {
         ok(
             &mut m,
-            &["SET", &format!("base:{i}"), &format!("v-{i:04}-{}", "x".repeat(24))],
+            &[
+                "SET",
+                &format!("base:{i}"),
+                &format!("v-{i:04}-{}", "x".repeat(24)),
+            ],
         );
     }
 
     // Attach, then hammer the master with writes while the snapshot streams.
     ok(&mut m, &["SET", "counter", "1000"]);
-    ok(&mut r, &["REPLICAOF", "localhost", &master_port.to_string()]);
+    ok(
+        &mut r,
+        &["REPLICAOF", "localhost", &master_port.to_string()],
+    );
     let writer_port = master_port;
     let writer = std::thread::spawn(move || {
         let mut w = Client::connect(writer_port).unwrap();
         for i in 0..DURING_KEYS {
-            if w.cmd(&["SET", &format!("during:{i}"), &format!("w-{i}")]).is_err() {
+            if w.cmd(&["SET", &format!("during:{i}"), &format!("w-{i}")])
+                .is_err()
+            {
                 break;
             }
             if i % 50 == 0 {
@@ -371,7 +407,9 @@ fn writes_during_full_sync_converge() {
     assert_eq!(replica_counter, master_counter, "counter diverged");
     // A baseline key overwritten mid-snapshot must show the new value.
     ok(&mut m, &["SET", "base:7", "overwritten"]);
-    wait_for(Duration::from_secs(10), || bulk(&mut r, &["GET", "base:7"]) == "overwritten");
+    wait_for(Duration::from_secs(10), || {
+        bulk(&mut r, &["GET", "base:7"]) == "overwritten"
+    });
     assert_eq!(bulk(&mut r, &["GET", "base:7"]), "overwritten");
 
     drop(r);

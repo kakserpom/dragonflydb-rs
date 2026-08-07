@@ -90,12 +90,18 @@ fn function_load_fcall_roundtrip() {
 fn function_duplicates_replace_delete() {
     let mut ctx = Ctx::new();
     ctx.assert_text(&["FUNCTION", "LOAD", LIB_ECHO], "lib1");
-    ctx.assert_err(&["FUNCTION", "LOAD", LIB_ECHO], "Library 'lib1' already exists");
+    ctx.assert_err(
+        &["FUNCTION", "LOAD", LIB_ECHO],
+        "Library 'lib1' already exists",
+    );
 
     // A duplicate function name in another library is rejected.
     let lib2 = "#!lua name=lib2\n\
         redis.register_function('echo', function(keys, args) return 2 end)";
-    ctx.assert_err(&["FUNCTION", "LOAD", lib2], "Function 'echo' already exists");
+    ctx.assert_err(
+        &["FUNCTION", "LOAD", lib2],
+        "Function 'echo' already exists",
+    );
 
     // REPLACE redefines the same library without the duplicate error.
     ctx.assert_text(&["FUNCTION", "LOAD", "REPLACE", LIB_ECHO], "lib1");
@@ -134,8 +140,14 @@ fn function_admin_over_socket() {
     assert!(t.iter().any(|s| s == "lib1"), "{t:?}");
     assert!(t.iter().any(|s| s == "echo"), "{t:?}");
     // LIBRARYNAME filters; a miss yields an empty list.
-    assert_eq!(ctx.arr(&["FUNCTION", "LIST", "LIBRARYNAME", "lib1"]).len(), 1);
-    assert_eq!(ctx.arr(&["FUNCTION", "LIST", "LIBRARYNAME", "nope"]).len(), 0);
+    assert_eq!(
+        ctx.arr(&["FUNCTION", "LIST", "LIBRARYNAME", "lib1"]).len(),
+        1
+    );
+    assert_eq!(
+        ctx.arr(&["FUNCTION", "LIST", "LIBRARYNAME", "nope"]).len(),
+        0
+    );
     // WITHCODE carries the source.
     let with_code = ctx.arr(&["FUNCTION", "LIST", "LIBRARYNAME", "lib1", "WITHCODE"]);
     let mut t = Vec::new();
@@ -185,15 +197,28 @@ fn function_replace_purges_dropped_names() {
 #[test]
 fn function_bad_payloads() {
     let mut ctx = Ctx::new();
-    ctx.assert_err(&["FUNCTION", "LOAD", "return 1"], "Missing library metadata");
-    ctx.assert_err(&["FUNCTION", "LOAD", "#!lua name=empty"], "No functions registered");
-    ctx.assert_err(&["FUNCTION", "LOAD", "#!js name=x\n"], "Invalid engine type");
+    ctx.assert_err(
+        &["FUNCTION", "LOAD", "return 1"],
+        "Missing library metadata",
+    );
+    ctx.assert_err(
+        &["FUNCTION", "LOAD", "#!lua name=empty"],
+        "No functions registered",
+    );
+    ctx.assert_err(
+        &["FUNCTION", "LOAD", "#!js name=x\n"],
+        "Invalid engine type",
+    );
     ctx.assert_err(
         &["FUNCTION", "LOAD", "#!lua\nredis.register_function('x', 1)"],
         "Missing library name",
     );
     ctx.assert_err(
-        &["FUNCTION", "LOAD", "#!lua name=l\nredis.register_function('x', 5)"],
+        &[
+            "FUNCTION",
+            "LOAD",
+            "#!lua name=l\nredis.register_function('x', 5)",
+        ],
         "Function callback must be a function",
     );
     ctx.assert_err(
@@ -208,10 +233,19 @@ fn fcall_error_paths() {
     // Unknown function.
     ctx.assert_err(&["FCALL", "nope", "0"], "Function not found");
     // Malformed numkeys.
-    ctx.assert_err(&["FCALL", "nope", "x"], "value is not an integer or out of range");
-    ctx.assert_err(&["FCALL", "nope", "-1"], "value is not an integer or out of range");
+    ctx.assert_err(
+        &["FCALL", "nope", "x"],
+        "value is not an integer or out of range",
+    );
+    ctx.assert_err(
+        &["FCALL", "nope", "-1"],
+        "value is not an integer or out of range",
+    );
     // numkeys greater than the available args.
-    ctx.assert_err(&["FCALL", "nope", "2", "only"], "Number of keys can't be greater than number of args");
+    ctx.assert_err(
+        &["FCALL", "nope", "2", "only"],
+        "Number of keys can't be greater than number of args",
+    );
 
     ctx.assert_text(&["FUNCTION", "LOAD", LIB_ECHO], "lib1");
     ctx.assert_text(&["FCALL", "echo", "1", "k", "v"], "k:v");
@@ -271,7 +305,11 @@ fn function_and_fcall_noscript_from_script() {
     );
     // FCALL is NOSCRIPT: not callable from EVAL.
     ctx.assert_err(
-        &["EVAL", "return redis.call('fcall', 'echo', 1, 'k', 'v')", "0"],
+        &[
+            "EVAL",
+            "return redis.call('fcall', 'echo', 1, 'k', 'v')",
+            "0",
+        ],
         "is not allowed from script",
     );
     // Nor from inside a running function.
@@ -288,7 +326,10 @@ fn dfly_replication_control_rejected() {
     // The replication-control protocol (`dflycmd.cc`) is unsupported; every
     // unrecognized path is rejected explicitly.
     ctx.assert_err(&["DFLY"], "wrong number of arguments");
-    ctx.assert_err(&["DFLY", "BOGUS"], "DFLY replication control is not supported");
+    ctx.assert_err(
+        &["DFLY", "BOGUS"],
+        "DFLY replication control is not supported",
+    );
     ctx.assert_err(
         &["DFLY", "FLOW"],
         "wrong number of arguments for 'DFLY FLOW' command",

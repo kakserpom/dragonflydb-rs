@@ -89,7 +89,10 @@ fn promote() {
     // error rate of 0.81%. Set it to 5% so this test won't fail unless
     // something went wrong badly.
     let count = t.int(&["pfcount", "key"]);
-    assert!((count as f64 - 20000.0).abs() / 20000.0 < 0.05, "count {count}");
+    assert!(
+        (count as f64 - 20000.0).abs() / 20000.0 < 0.05,
+        "count {count}"
+    );
 }
 
 #[test]
@@ -189,7 +192,10 @@ fn count_multiple() {
     t.assert_int(&["pfcount", "key1", "key3"], 3);
     t.assert_int(&["pfcount", "key1", "key2", "key3"], 3);
     t.assert_int(&["pfcount", "key1", "key2", "key3", "key4"], 5);
-    t.assert_int(&["pfcount", "key1", "key2", "key3", "key4", "non-existing"], 5);
+    t.assert_int(
+        &["pfcount", "key1", "key2", "key3", "key4", "non-existing"],
+        5,
+    );
     t.assert_int(&["pfcount", "key1", "key4"], 5);
 }
 
@@ -329,8 +335,7 @@ fn count_multiple_agrees_with_merge() {
 
     // Sanity check that the shared estimate is in the right ballpark.
     assert!(
-        (merged as f64 - 2.0 * K_VALUES_PER_KEY as f64).abs()
-            / (2.0 * K_VALUES_PER_KEY as f64)
+        (merged as f64 - 2.0 * K_VALUES_PER_KEY as f64).abs() / (2.0 * K_VALUES_PER_KEY as f64)
             < 0.05,
         "merged {merged}"
     );

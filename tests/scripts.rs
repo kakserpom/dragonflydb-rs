@@ -54,27 +54,42 @@ impl Client {
 
     fn read_value(&mut self) -> Result<Value, String> {
         let mut line = String::new();
-        self.reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        self.reader
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
         let bytes = line.as_bytes();
         match bytes[0] {
             b'+' => Ok(Value::Simple(line[1..].trim_end().to_string())),
             b'-' => Ok(Value::Error(line[1..].trim_end().to_string())),
             b':' => {
-                let n = line[1..].trim().parse().map_err(|_| "bad int".to_string())?;
+                let n = line[1..]
+                    .trim()
+                    .parse()
+                    .map_err(|_| "bad int".to_string())?;
                 Ok(Value::Integer(n))
             }
             b'$' => {
-                let n: i64 = line[1..].trim().parse().map_err(|_| "bad len".to_string())?;
+                let n: i64 = line[1..]
+                    .trim()
+                    .parse()
+                    .map_err(|_| "bad len".to_string())?;
                 if n < 0 {
                     return Ok(Value::Bulk(None));
                 }
                 let mut buf = vec![0u8; n as usize];
-                self.reader.read_exact(&mut buf).map_err(|e| e.to_string())?;
-                self.reader.read_line(&mut line).map_err(|e| e.to_string())?;
+                self.reader
+                    .read_exact(&mut buf)
+                    .map_err(|e| e.to_string())?;
+                self.reader
+                    .read_line(&mut line)
+                    .map_err(|e| e.to_string())?;
                 Ok(Value::Bulk(Some(buf)))
             }
             b'*' => {
-                let n: i64 = line[1..].trim().parse().map_err(|_| "bad count".to_string())?;
+                let n: i64 = line[1..]
+                    .trim()
+                    .parse()
+                    .map_err(|_| "bad count".to_string())?;
                 if n < 0 {
                     return Ok(Value::Array(None));
                 }
@@ -106,7 +121,12 @@ fn free_port() -> u16 {
 
 fn spawn(port: u16, shards: usize) -> Child {
     Command::new(BIN)
-        .args(["--port", &port.to_string(), "--num-shards", &shards.to_string()])
+        .args([
+            "--port",
+            &port.to_string(),
+            "--num-shards",
+            &shards.to_string(),
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -232,12 +252,20 @@ fn dragonfly_helpers_work_end_to_end() {
     // ihash: a deterministic integer, stable across runs; MGET hashes all keys.
     ok(&mut c, &["SET", "k1", "v1"]);
     ok(&mut c, &["SET", "k2", "v2"]);
-    let h = match c.cmd(&["EVAL", "return dragonfly.ihash(0, false, 'mget', 'k1', 'k2')", "0"]) {
+    let h = match c.cmd(&[
+        "EVAL",
+        "return dragonfly.ihash(0, false, 'mget', 'k1', 'k2')",
+        "0",
+    ]) {
         Ok(Value::Integer(h)) => h,
         other => panic!("expected ihash integer, got {other:?}"),
     };
     assert_eq!(
-        match c.cmd(&["EVAL", "return dragonfly.ihash(0, false, 'mget', 'k1', 'k2')", "0"]) {
+        match c.cmd(&[
+            "EVAL",
+            "return dragonfly.ihash(0, false, 'mget', 'k1', 'k2')",
+            "0"
+        ]) {
             Ok(Value::Integer(h)) => h,
             other => panic!("expected ihash integer, got {other:?}"),
         },
@@ -275,8 +303,14 @@ fn blocking_commands_in_scripts_match_reference() {
             "return redis.call('blmove', KEYS[1], KEYS[2], 'left', 'right', 0)",
             &["a", "b"][..],
         ),
-        ("return redis.call('blmpop', 0, 1, KEYS[1], 'left')", &["a"][..]),
-        ("return redis.call('bzmpop', 0, 1, KEYS[1], 'min')", &["z"][..]),
+        (
+            "return redis.call('blmpop', 0, 1, KEYS[1], 'left')",
+            &["a"][..],
+        ),
+        (
+            "return redis.call('bzmpop', 0, 1, KEYS[1], 'min')",
+            &["z"][..],
+        ),
     ] {
         let n = keys.len().to_string();
         let mut args = vec!["EVAL", body, &n];
@@ -288,9 +322,21 @@ fn blocking_commands_in_scripts_match_reference() {
     }
 
     // With data present the same commands operate normally.
-    assert!(matches!(c.cmd(&["RPUSH", "a", "x", "y"]), Ok(Value::Integer(2))));
-    assert!(matches!(c.cmd(&["ZADD", "z", "1", "m1"]), Ok(Value::Integer(1))));
-    let moved = c.cmd(&["EVAL", "return redis.call('blmove', KEYS[1], KEYS[2], 'left', 'right', 0)", "2", "a", "b"]);
+    assert!(matches!(
+        c.cmd(&["RPUSH", "a", "x", "y"]),
+        Ok(Value::Integer(2))
+    ));
+    assert!(matches!(
+        c.cmd(&["ZADD", "z", "1", "m1"]),
+        Ok(Value::Integer(1))
+    ));
+    let moved = c.cmd(&[
+        "EVAL",
+        "return redis.call('blmove', KEYS[1], KEYS[2], 'left', 'right', 0)",
+        "2",
+        "a",
+        "b",
+    ]);
     assert_eq!(moved.unwrap().text().as_deref(), Some("x"));
     let dest = c.cmd(&["LRANGE", "b", "0", "-1"]);
     assert!(matches!(dest, Ok(Value::Array(Some(items))) if items.len() == 1));

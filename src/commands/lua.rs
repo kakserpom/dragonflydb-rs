@@ -1783,15 +1783,12 @@ fn prepare_args(args: &MultiValue) -> mlua::Result<Vec<Vec<u8>>> {
 /// `StringCollectorTranslator::OnDouble` for `dragonfly.ihash` reply strings.
 fn g6_format(d: f64) -> String {
     let mut buf = [0u8; 64];
-    let len = unsafe {
-        libc::snprintf(
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-            c"%.6g".as_ptr(),
-            d,
-        )
+    let len = unsafe { libc::snprintf(buf.as_mut_ptr().cast(), buf.len(), c"%.6g".as_ptr(), d) };
+    let len = if len < 0 {
+        0
+    } else {
+        (len as usize).min(buf.len())
     };
-    let len = if len < 0 { 0 } else { (len as usize).min(buf.len()) };
     String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 
@@ -1831,7 +1828,10 @@ fn dragonfly_randstr(lua: &Lua, args: &MultiValue) -> mlua::Result<Value> {
 
     let argc = args.len();
     if !(1..=2).contains(&argc) || !matches!(&args[0], Value::Integer(_) | Value::Number(_)) {
-        raise_string_error(lua, "randstr: expected randstr(size) or randstr(size, count)".into())
+        raise_string_error(
+            lua,
+            "randstr: expected randstr(size) or randstr(size, count)".into(),
+        )
     }
     let dsize = match &args[0] {
         Value::Integer(i) => *i,
@@ -1969,7 +1969,10 @@ fn install_dragonfly_functions<'a, D: ScriptDispatch>(
         };
         if keys.is_empty() {
             // `RedisGenericCommand`: `backed_args_.empty()` with no UNLOCK bit.
-            raise_string_error(lua, "Please specify at least one argument for this call".into())
+            raise_string_error(
+                lua,
+                "Please specify at least one argument for this call".into(),
+            )
         }
         match dispatch.borrow_mut().lock(keys) {
             Ok(()) => Ok(Value::Nil),
@@ -2985,19 +2988,25 @@ mod tests {
         // Byte-for-byte against glibc `rand()` (seed 1) with the DRAGONFLY
         // pattern every 53 bytes (`DragonflyRandstrCommand`).
         let interp = SandboxedInterpreter::new().unwrap();
-        interp.define("aaaa", b"return dragonfly.randstr(16)").unwrap();
+        interp
+            .define("aaaa", b"return dragonfly.randstr(16)")
+            .unwrap();
         assert_eq!(
             interp.run("aaaa", &mut Noop, false, &no_kill()).unwrap(),
             RespValue::Bulk(b"DRAGONFLYas7Vpl8".to_vec())
         );
-        interp.define("bbbb", b"return dragonfly.randstr(7)").unwrap();
+        interp
+            .define("bbbb", b"return dragonfly.randstr(7)")
+            .unwrap();
         assert_eq!(
             interp.run("bbbb", &mut Noop, false, &no_kill()).unwrap(),
             RespValue::Bulk(b"as7Vpl8".to_vec())
         );
         // A table of `count` strings; the LCG advances across calls like the
         // reference's global `rand()`, so each string differs.
-        interp.define("cccc", b"return dragonfly.randstr(7, 3)").unwrap();
+        interp
+            .define("cccc", b"return dragonfly.randstr(7, 3)")
+            .unwrap();
         assert_eq!(
             interp.run("cccc", &mut Noop, false, &no_kill()).unwrap(),
             RespValue::Array(vec![
@@ -3007,7 +3016,9 @@ mod tests {
             ])
         );
         // Bounds mirror the reference (`kMaxRandstrSize`/`kMaxRandstrCount`).
-        interp.define("dddd", b"return dragonfly.randstr(0)").unwrap();
+        interp
+            .define("dddd", b"return dragonfly.randstr(0)")
+            .unwrap();
         let err = interp
             .run("dddd", &mut Noop, false, &no_kill())
             .unwrap_err();
@@ -3015,7 +3026,9 @@ mod tests {
             err.contains("randstr: size must be between 1 and 16777216"),
             "{err}"
         );
-        interp.define("eeee", b"return dragonfly.randstr(16, 0)").unwrap();
+        interp
+            .define("eeee", b"return dragonfly.randstr(16, 0)")
+            .unwrap();
         let err = interp
             .run("eeee", &mut Noop, false, &no_kill())
             .unwrap_err();
@@ -3051,7 +3064,10 @@ mod tests {
         let interp = SandboxedInterpreter::new().unwrap();
         // Non-MGET: only the first key is hashed (`key_end = 2`).
         interp
-            .define("aaaa", b"return dragonfly.ihash(0, false, 'get', 'k1', 'k2')")
+            .define(
+                "aaaa",
+                b"return dragonfly.ihash(0, false, 'get', 'k1', 'k2')",
+            )
             .unwrap();
         let mut h = xxh64(b"k1", 0);
         h = xxh64(b"k1", h);
@@ -3112,9 +3128,7 @@ mod tests {
             .unwrap();
         let mut rec = Recording::default();
         assert_eq!(
-            interp
-                .run("aaaa", &mut rec, false, &no_kill())
-                .unwrap(),
+            interp.run("aaaa", &mut rec, false, &no_kill()).unwrap(),
             RespValue::Integer(1)
         );
         assert_eq!(rec.locks, vec![vec![b"k1".to_vec(), b"k2".to_vec()]]);

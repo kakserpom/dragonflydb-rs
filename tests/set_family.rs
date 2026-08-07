@@ -150,13 +150,28 @@ fn s_inter_card() {
     t.assert_int(&["sintercard", "1", "s1"], 4);
 
     // Redis does not throw this message, but SimpleAtoi does.
-    t.assert_err(&["sintercard", "a", "s1", "s2"], "value is not an integer or out of range");
+    t.assert_err(
+        &["sintercard", "a", "s1", "s2"],
+        "value is not an integer or out of range",
+    );
     t.assert_err(&["sintercard", "2", "s1", "s2", "LIMIT"], "syntax error");
-    t.assert_err(&["sintercard", "2", "s1", "s2", "LIMIT", "a"], "limit can't be negative");
-    t.assert_err(&["sintercard", "2", "s1", "s2", "LIMIT", "-1"], "limit can't be negative");
+    t.assert_err(
+        &["sintercard", "2", "s1", "s2", "LIMIT", "a"],
+        "limit can't be negative",
+    );
+    t.assert_err(
+        &["sintercard", "2", "s1", "s2", "LIMIT", "-1"],
+        "limit can't be negative",
+    );
     t.assert_err(&["sintercard", "2", "s1"], "syntax error");
-    t.assert_err(&["sintercard", "0", "LIMIT", "0"], "at least 1 input key is needed");
-    t.assert_err(&["sintercard", "-1", "s1"], "value is not an integer or out of range");
+    t.assert_err(
+        &["sintercard", "0", "LIMIT", "0"],
+        "at least 1 input key is needed",
+    );
+    t.assert_err(
+        &["sintercard", "-1", "s1"],
+        "value is not an integer or out of range",
+    );
 }
 
 #[test]
@@ -304,13 +319,25 @@ fn s_m_is_member() {
     t.assert_err(&["smismember", "foo"], "wrong number of arguments");
 
     let v = t.arr(&["smismember", "foo1", "a", "b"]);
-    assert_eq!(v.iter().map(Value::int).collect::<Vec<_>>(), vec![Some(0), Some(0)]);
+    assert_eq!(
+        v.iter().map(Value::int).collect::<Vec<_>>(),
+        vec![Some(0), Some(0)]
+    );
     let v = t.arr(&["smismember", "foo", "a", "c"]);
-    assert_eq!(v.iter().map(Value::int).collect::<Vec<_>>(), vec![Some(1), Some(0)]);
+    assert_eq!(
+        v.iter().map(Value::int).collect::<Vec<_>>(),
+        vec![Some(1), Some(0)]
+    );
     let v = t.arr(&["smismember", "foo", "a", "b"]);
-    assert_eq!(v.iter().map(Value::int).collect::<Vec<_>>(), vec![Some(1), Some(1)]);
+    assert_eq!(
+        v.iter().map(Value::int).collect::<Vec<_>>(),
+        vec![Some(1), Some(1)]
+    );
     let v = t.arr(&["smismember", "foo", "d", "e"]);
-    assert_eq!(v.iter().map(Value::int).collect::<Vec<_>>(), vec![Some(0), Some(0)]);
+    assert_eq!(
+        v.iter().map(Value::int).collect::<Vec<_>>(),
+        vec![Some(0), Some(0)]
+    );
     let v = t.arr(&["smismember", "foo", "b"]);
     assert_eq!(v.iter().map(Value::int).collect::<Vec<_>>(), vec![Some(1)]);
     let v = t.arr(&["smismember", "foo", "x"]);
@@ -365,7 +392,10 @@ fn s_scan() {
 
     let v = t.arr(&["sscan", "mystrset", "0", "match", "str-1*", "count", "3"]);
     let members = v[1].arr().unwrap();
-    assert_all_in(members, &["str-1", "str-10", "str-11", "str-12", "str-13", "str-14"]);
+    assert_all_in(
+        members,
+        &["str-1", "str-10", "str-11", "str-12", "str-13", "str-14"],
+    );
     assert_eq!(members.len(), 3);
 
     // Nothing should match this.
@@ -374,7 +404,10 @@ fn s_scan() {
 
     // An invalid (non-numeric) cursor must be rejected without crashing.
     t.assert_err(&["sscan", "mystrset", "abc"], "invalid cursor");
-    t.assert_err(&["sscan", "mystrset", "{\"a\":1}", "LIST"], "invalid cursor");
+    t.assert_err(
+        &["sscan", "mystrset", "{\"a\":1}", "LIST"],
+        "invalid cursor",
+    );
 
     // The server must still be responsive after the rejected cursors.
     let v = t.arr(&["sscan", "mystrset", "0", "match", "str-1*"]);
@@ -418,7 +451,10 @@ fn s_add_ex() {
     advance(1000);
     t.assert_int(&["sismember", "key", "val"], 1);
 
-    t.assert_err(&["saddex", "k", "one", "v"], "value is not an integer or out of range");
+    t.assert_err(
+        &["saddex", "k", "one", "v"],
+        "value is not an integer or out of range",
+    );
 
     // KEEPTTL: add member orig with TTL=10.
     t.assert_int(&["saddex", "key", "10", "orig"], 1);
@@ -436,7 +472,10 @@ fn s_add_ex() {
     assert!(v <= 2, "orig member TTL {v}");
 
     // At least one member argument is expected.
-    t.assert_err(&["saddex", "key", "KEEPTTL", "2"], "wrong number of arguments");
+    t.assert_err(
+        &["saddex", "key", "KEEPTTL", "2"],
+        "wrong number of arguments",
+    );
 }
 
 #[test]

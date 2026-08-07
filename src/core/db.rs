@@ -282,7 +282,9 @@ impl DbSlice {
     /// connection `conn_id`, if one is pending.
     #[must_use]
     pub fn stream_watermark(&self, conn_id: u64, key: &[u8]) -> Option<StreamId> {
-        self.stream_block_watermarks.get(&(conn_id, key.to_vec())).copied()
+        self.stream_block_watermarks
+            .get(&(conn_id, key.to_vec()))
+            .copied()
     }
 
     pub fn set_stream_watermark(&mut self, conn_id: u64, key: Vec<u8>, id: StreamId) {
@@ -290,7 +292,8 @@ impl DbSlice {
     }
 
     pub fn remove_stream_watermark(&mut self, conn_id: u64, key: &[u8]) {
-        self.stream_block_watermarks.remove(&(conn_id, key.to_vec()));
+        self.stream_block_watermarks
+            .remove(&(conn_id, key.to_vec()));
     }
 
     fn refresh_stats(&mut self) {

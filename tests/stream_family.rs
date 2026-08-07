@@ -74,12 +74,28 @@ fn probe_xread_format() {
     // returned with an empty entry list (history reads serve the key even when
     // nothing is pending; HasEntries2 -> serve_history).
     t.ok(&["xgroup", "create", "foo", "group", "0"]);
-    let outer = t.arr(&["xreadgroup", "group", "group", "alice", "streams", "foo", "0"]);
+    let outer = t.arr(&[
+        "xreadgroup",
+        "group",
+        "group",
+        "alice",
+        "streams",
+        "foo",
+        "0",
+    ]);
     assert_eq!(outer.len(), 1, "history read serves the key");
     assert_eq!(pair(&outer[0], "foo").len(), 0);
 
     // XREADGROUP `>` delivers everything since last_id 0-0.
-    let outer = t.arr(&["xreadgroup", "group", "group", "alice", "streams", "foo", ">"]);
+    let outer = t.arr(&[
+        "xreadgroup",
+        "group",
+        "group",
+        "alice",
+        "streams",
+        "foo",
+        ">",
+    ]);
     assert_eq!(outer.len(), 1);
     let entries = pair(&outer[0], "foo");
     assert_eq!(entries.len(), 2);
@@ -87,12 +103,28 @@ fn probe_xread_format() {
 
     // Nothing new: null array.
     assert!(matches!(
-        t.run(&["xreadgroup", "group", "group", "alice", "streams", "foo", ">"]),
+        t.run(&[
+            "xreadgroup",
+            "group",
+            "group",
+            "alice",
+            "streams",
+            "foo",
+            ">"
+        ]),
         Value::Array(None)
     ));
 
     // XREADGROUP PEL read (id 0) now has both entries, nested format.
-    let outer = t.arr(&["xreadgroup", "group", "group", "alice", "streams", "foo", "0"]);
+    let outer = t.arr(&[
+        "xreadgroup",
+        "group",
+        "group",
+        "alice",
+        "streams",
+        "foo",
+        "0",
+    ]);
     assert_eq!(outer.len(), 1);
     let entries = pair(&outer[0], "foo");
     assert_eq!(entries.len(), 2);
@@ -156,17 +188,47 @@ fn xread_group_block() {
     // Timeout.
     assert!(matches!(
         t.run(&[
-            "xreadgroup", "group", "group", "alice", "block", "1", "streams", "foo", "bar", ">", ">",
+            "xreadgroup",
+            "group",
+            "group",
+            "alice",
+            "block",
+            "1",
+            "streams",
+            "foo",
+            "bar",
+            ">",
+            ">",
         ]),
         Value::Array(None)
     ));
 
     // Run XREADGROUP BLOCK from 2 fibers.
     let fb0 = t.spawn(&[
-        "xreadgroup", "group", "group", "alice", "block", "0", "streams", "foo", "bar", ">", ">",
+        "xreadgroup",
+        "group",
+        "group",
+        "alice",
+        "block",
+        "0",
+        "streams",
+        "foo",
+        "bar",
+        ">",
+        ">",
     ]);
     let fb1 = t.spawn(&[
-        "xreadgroup", "group", "group", "alice", "block", "0", "streams", "foo", "bar", ">", ">",
+        "xreadgroup",
+        "group",
+        "group",
+        "alice",
+        "block",
+        "0",
+        "streams",
+        "foo",
+        "bar",
+        ">",
+        ">",
     ]);
     sleep(Duration::from_millis(100));
 
@@ -192,15 +254,33 @@ fn xread_group_block() {
     }
 
     // Call XGROUP DESTROY while blocking.
-    t.ok(&["xgroup", "create", "to-delete", "to-delete", "0", "MKSTREAM"]);
+    t.ok(&[
+        "xgroup",
+        "create",
+        "to-delete",
+        "to-delete",
+        "0",
+        "MKSTREAM",
+    ]);
     let fb = t.spawn(&[
-        "xreadgroup", "group", "to-delete", "consumer", "block", "0", "streams", "to-delete", ">",
+        "xreadgroup",
+        "group",
+        "to-delete",
+        "consumer",
+        "block",
+        "0",
+        "streams",
+        "to-delete",
+        ">",
     ]);
     sleep(Duration::from_millis(100));
 
     t.assert_int(&["xgroup", "destroy", "to-delete", "to-delete"], 1);
     let resp = fb.join().unwrap();
-    expect_err(&resp, "consumer group this client was blocked on no longer exists");
+    expect_err(
+        &resp,
+        "consumer group this client was blocked on no longer exists",
+    );
 }
 
 /// Port of `StreamFamilyTest.XReadGroupBlockDelconsumer`
@@ -211,7 +291,15 @@ fn xread_group_block_delconsumer() {
     t.ok(&["xgroup", "create", "foo", "group", "0", "MKSTREAM"]);
 
     let fb = t.spawn(&[
-        "xreadgroup", "group", "group", "alice", "block", "0", "streams", "foo", ">",
+        "xreadgroup",
+        "group",
+        "group",
+        "alice",
+        "block",
+        "0",
+        "streams",
+        "foo",
+        ">",
     ]);
     sleep(Duration::from_millis(100));
 
@@ -243,13 +331,33 @@ fn xread_block_on_emptied_stream() {
 
     t.ok(&["xgroup", "create", "foo", "group", "0"]);
     assert!(matches!(
-        t.run(&["xreadgroup", "group", "group", "alice", "block", "1", "streams", "foo", ">"]),
+        t.run(&[
+            "xreadgroup",
+            "group",
+            "group",
+            "alice",
+            "block",
+            "1",
+            "streams",
+            "foo",
+            ">"
+        ]),
         Value::Array(None)
     ));
 
     // A new entry is still served once it arrives.
     t.text(&["xadd", "foo", "2-0", "k", "v"]);
-    let resp = t.arr(&["xreadgroup", "group", "group", "alice", "block", "1", "streams", "foo", ">"]);
+    let resp = t.arr(&[
+        "xreadgroup",
+        "group",
+        "group",
+        "alice",
+        "block",
+        "1",
+        "streams",
+        "foo",
+        ">",
+    ]);
     let entries = pair(&resp[0], "foo");
     assert_eq!(entries.len(), 1);
     entry(&entries[0], "2-0", "k", "v");
@@ -287,7 +395,14 @@ fn xread_block_on_max_ms_id() {
     let mut t = Ctx::new();
     t.text(&["xadd", "foo", "1-0", "k", "v"]);
 
-    let reader = t.spawn(&["xread", "block", "0", "streams", "foo", "18446744073709551615-0"]);
+    let reader = t.spawn(&[
+        "xread",
+        "block",
+        "0",
+        "streams",
+        "foo",
+        "18446744073709551615-0",
+    ]);
     sleep(Duration::from_millis(100));
 
     t.text(&["xadd", "foo", "18446744073709551615-2", "k", "v"]);
@@ -307,13 +422,24 @@ fn xread_group_block_wake_on_deleted_stream() {
     t.ok(&["xgroup", "create", "foo", "group", "$", "MKSTREAM"]);
 
     let reader = t.spawn(&[
-        "xreadgroup", "group", "group", "alice", "block", "0", "streams", "foo", ">",
+        "xreadgroup",
+        "group",
+        "group",
+        "alice",
+        "block",
+        "0",
+        "streams",
+        "foo",
+        ">",
     ]);
     sleep(Duration::from_millis(100));
 
     t.assert_int(&["del", "foo"], 1);
     let resp = reader.join().unwrap();
-    expect_err(&resp, "consumer group this client was blocked on no longer exists");
+    expect_err(
+        &resp,
+        "consumer group this client was blocked on no longer exists",
+    );
 }
 
 /// Port of `StreamFamilyTest.XReadBlockStaysBlockedOnDeletedStream`
@@ -347,7 +473,15 @@ fn xread_group_block_wake_on_retyped_stream() {
     t.ok(&["xgroup", "create", "foo", "group", "$", "MKSTREAM"]);
 
     let reader = t.spawn(&[
-        "xreadgroup", "group", "group", "alice", "block", "0", "streams", "foo", ">",
+        "xreadgroup",
+        "group",
+        "group",
+        "alice",
+        "block",
+        "0",
+        "streams",
+        "foo",
+        ">",
     ]);
     sleep(Duration::from_millis(100));
 
@@ -364,13 +498,24 @@ fn xread_group_block_wake_on_flushdb() {
     t.ok(&["xgroup", "create", "foo", "group", "0", "MKSTREAM"]);
 
     let reader = t.spawn(&[
-        "xreadgroup", "group", "group", "alice", "block", "200", "streams", "foo", ">",
+        "xreadgroup",
+        "group",
+        "group",
+        "alice",
+        "block",
+        "200",
+        "streams",
+        "foo",
+        ">",
     ]);
     sleep(Duration::from_millis(100));
 
     t.ok(&["flushdb"]);
     let resp = reader.join().unwrap();
-    expect_err(&resp, "consumer group this client was blocked on no longer exists");
+    expect_err(
+        &resp,
+        "consumer group this client was blocked on no longer exists",
+    );
 }
 
 /// Port of `StreamFamilyTest.Issue854` (stream_family_test.cc:693): `XGROUP
@@ -396,7 +541,17 @@ fn xread_group_block_honors_count() {
 
     // Block a consumer with COUNT 1.
     let fb0 = t.spawn(&[
-        "xreadgroup", "group", "group", "alice", "count", "1", "block", "0", "streams", "foo", ">",
+        "xreadgroup",
+        "group",
+        "group",
+        "alice",
+        "count",
+        "1",
+        "block",
+        "0",
+        "streams",
+        "foo",
+        ">",
     ]);
     sleep(Duration::from_millis(100));
 
@@ -419,7 +574,15 @@ fn xread_group_block_honors_count() {
 
     // The entries beyond COUNT stay undelivered, available to other consumers.
     let resp = t.arr(&[
-        "xreadgroup", "group", "group", "bob", "count", "10", "streams", "foo", ">",
+        "xreadgroup",
+        "group",
+        "group",
+        "bob",
+        "count",
+        "10",
+        "streams",
+        "foo",
+        ">",
     ]);
     let entries = pair(&resp[0], "foo");
     assert_eq!(entries.len(), 2);

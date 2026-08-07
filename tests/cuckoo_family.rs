@@ -52,13 +52,26 @@ fn reserve() {
     t.assert_text(&["type", "cf1"], "MBbloomCF");
 
     t.assert_err(&["cf.reserve", "cf1", "1000"], "item exists");
-    t.assert_err(&["cf.reserve", "cf2", "0"], "capacity must be greater than 0");
+    t.assert_err(
+        &["cf.reserve", "cf2", "0"],
+        "capacity must be greater than 0",
+    );
 }
 
 #[test]
 fn reserve_with_options() {
     let mut t = Ctx::new();
-    t.ok(&["cf.reserve", "cf1", "1000", "bucketsize", "4", "maxiterations", "10", "expansion", "2"]);
+    t.ok(&[
+        "cf.reserve",
+        "cf1",
+        "1000",
+        "bucketsize",
+        "4",
+        "maxiterations",
+        "10",
+        "expansion",
+        "2",
+    ]);
 
     t.assert_err(
         &["cf.reserve", "cf2", "1000", "bucketsize", "0"],
@@ -88,7 +101,17 @@ fn wrong_type() {
 #[test]
 fn dump_and_restore() {
     let mut t = Ctx::new();
-    t.ok(&["cf.reserve", "cf1", "1000", "bucketsize", "4", "maxiterations", "10", "expansion", "2"]);
+    t.ok(&[
+        "cf.reserve",
+        "cf1",
+        "1000",
+        "bucketsize",
+        "4",
+        "maxiterations",
+        "10",
+        "expansion",
+        "2",
+    ]);
     t.assert_int(&["cf.add", "cf1", "foo"], 1);
     t.assert_int(&["cf.add", "cf1", "foo"], 1);
     t.assert_int(&["cf.add", "cf1", "bar"], 1);
@@ -185,7 +208,11 @@ fn insert_filter_full() {
     // CF.INSERTNX: -1 for full, 0 for existing, 1 for inserted.
     t.ok(&["cf.reserve", "cfnx", "4", "expansion", "0"]);
     for i in 0..4 {
-        arr_ints(&mut t, &["cf.insertnx", "cfnx", "items", &format!("{i}")], &[1]);
+        arr_ints(
+            &mut t,
+            &["cf.insertnx", "cfnx", "items", &format!("{i}")],
+            &[1],
+        );
     }
     // Item 0 already exists -> 0; overflow -> -1.
     arr_ints(
@@ -227,7 +254,11 @@ fn m_exists() {
     t.assert_int(&["cf.add", "f1", "bar"], 1);
     t.assert_int(&["cf.add", "f1", "baz"], 1);
 
-    arr_ints(&mut t, &["cf.mexists", "f1", "foo", "bar", "baz"], &[1, 1, 1]);
+    arr_ints(
+        &mut t,
+        &["cf.mexists", "f1", "foo", "bar", "baz"],
+        &[1, 1, 1],
+    );
     arr_ints(&mut t, &["cf.mexists", "f1", "foo", "nope"], &[1, 0]);
 
     // Missing key returns an all-zero array, not an error.
@@ -251,7 +282,17 @@ fn m_exists_wrong_type() {
 #[test]
 fn info() {
     let mut t = Ctx::new();
-    t.ok(&["cf.reserve", "cf1", "1000", "bucketsize", "4", "maxiterations", "10", "expansion", "2"]);
+    t.ok(&[
+        "cf.reserve",
+        "cf1",
+        "1000",
+        "bucketsize",
+        "4",
+        "maxiterations",
+        "10",
+        "expansion",
+        "2",
+    ]);
     t.assert_int(&["cf.add", "cf1", "foo"], 1);
 
     assert_cf_info(&mut t, "cf1", (1, 1, 0, 4, 2, 10));
@@ -334,7 +375,11 @@ fn compact_missing_key() {
 #[test]
 fn insert() {
     let mut t = Ctx::new();
-    arr_ints(&mut t, &["cf.insert", "cf", "items", "a", "b", "c"], &[1, 1, 1]);
+    arr_ints(
+        &mut t,
+        &["cf.insert", "cf", "items", "a", "b", "c"],
+        &[1, 1, 1],
+    );
     t.assert_text(&["type", "cf"], "MBbloomCF");
 
     // Duplicates are allowed (like CF.ADD).
@@ -344,7 +389,11 @@ fn insert() {
 #[test]
 fn insert_with_capacity() {
     let mut t = Ctx::new();
-    arr_ints(&mut t, &["cf.insert", "cf", "capacity", "500", "items", "x"], &[1]);
+    arr_ints(
+        &mut t,
+        &["cf.insert", "cf", "capacity", "500", "items", "x"],
+        &[1],
+    );
 }
 
 #[test]
@@ -364,7 +413,10 @@ fn insert_zero_capacity() {
 fn insert_nocreate() {
     // NOCREATE on missing key returns an error.
     let mut t = Ctx::new();
-    t.assert_err(&["cf.insert", "cf", "nocreate", "items", "a"], "no such key");
+    t.assert_err(
+        &["cf.insert", "cf", "nocreate", "items", "a"],
+        "no such key",
+    );
 
     // NOCREATE on existing key works fine.
     t.ok(&["cf.reserve", "cf", "1000"]);
@@ -387,7 +439,11 @@ fn insert_wrong_type() {
 #[test]
 fn insert_nx() {
     let mut t = Ctx::new();
-    arr_ints(&mut t, &["cf.insertnx", "cf", "items", "a", "b", "c"], &[1, 1, 1]);
+    arr_ints(
+        &mut t,
+        &["cf.insertnx", "cf", "items", "a", "b", "c"],
+        &[1, 1, 1],
+    );
 
     // Existing items return 0 (like CF.ADDNX).
     arr_ints(&mut t, &["cf.insertnx", "cf", "items", "a", "d"], &[0, 1]);
@@ -396,10 +452,17 @@ fn insert_nx() {
 #[test]
 fn insert_nx_nocreate() {
     let mut t = Ctx::new();
-    t.assert_err(&["cf.insertnx", "cf", "nocreate", "items", "a"], "no such key");
+    t.assert_err(
+        &["cf.insertnx", "cf", "nocreate", "items", "a"],
+        "no such key",
+    );
 
     t.ok(&["cf.reserve", "cf", "1000"]);
-    arr_ints(&mut t, &["cf.insertnx", "cf", "nocreate", "items", "a"], &[1]);
+    arr_ints(
+        &mut t,
+        &["cf.insertnx", "cf", "nocreate", "items", "a"],
+        &[1],
+    );
 }
 
 #[test]

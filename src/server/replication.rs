@@ -196,7 +196,11 @@ pub fn flow_consumer(
 /// The `REPLCONF CAPA dragonfly` reply: `[master_replid, sync_id, flow_count,
 /// version, lineage_id]`.
 #[must_use]
-pub fn capa_dragonfly_reply(repl: &ReplicationManager, sync_id: u32, flow_count: usize) -> RespValue {
+pub fn capa_dragonfly_reply(
+    repl: &ReplicationManager,
+    sync_id: u32,
+    flow_count: usize,
+) -> RespValue {
     RespValue::Array(vec![
         RespValue::bulk(repl.master_replid.as_str()),
         RespValue::bulk(format!("SYNC{sync_id}")),

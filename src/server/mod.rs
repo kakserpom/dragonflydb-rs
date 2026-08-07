@@ -5,6 +5,7 @@ pub mod pubsub;
 pub mod replica;
 pub mod replication;
 pub mod shard;
+pub mod slowlog;
 
 /// Number of logical databases (matches upstream `FLAGS_dbnum` default).
 pub const MAX_DB: usize = 16;
@@ -442,6 +443,11 @@ pub struct Reply {
     pub conn_id: u64,
     pub seq: u64,
     pub bytes: ReplyBytes,
+    /// For EXEC/EVAL/FCALL replies, the augmented slowlog arguments the
+    /// command's SLOWLOG entry should carry (`FormatExecSlowlog` /
+    /// `FormatEvalSlowlog`). Other commands send `None` and their raw tail is
+    /// used instead.
+    pub slowlog_args: Option<Vec<Vec<u8>>>,
 }
 
 /// The watched-state snapshot of a single key, backing WATCH/EXEC.
@@ -678,6 +684,10 @@ pub struct CoordMsg {
     /// True when the command runs inside a MULTI block: a blocking command must
     /// not wait, so the coordinator replies nil instead of re-queueing it.
     pub no_block: bool,
+    /// The `slowlog_log_slower_than` threshold at dispatch time, in usec. The
+    /// coordinator uses it to count a script's slow subcommands
+    /// (`stats.slow_commands`).
+    pub slowlog_threshold_usec: u64,
 }
 
 /// `SCRIPT GC`: a request for the coordinator to run a full Lua GC over its
@@ -966,17 +976,35 @@ mod tests {
     use super::*;
 
     fn mv(args: &[&str]) -> Vec<usize> {
-        extract_movable_keys(&args.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>())
+        extract_movable_keys(
+            &args
+                .iter()
+                .map(|s| s.as_bytes().to_vec())
+                .collect::<Vec<_>>(),
+        )
     }
 
     #[test]
     fn movable_keys_first_even_streams() {
         // Plain XREAD: keys after the only STREAMS marker.
-        assert_eq!(mv(&["XREAD", "COUNT", "2", "STREAMS", "a", "b", "0", "0"]), vec![4, 5]);
+        assert_eq!(
+            mv(&["XREAD", "COUNT", "2", "STREAMS", "a", "b", "0", "0"]),
+            vec![4, 5]
+        );
         // XREADGROUP: the first STREAMS marker (an odd tail) is a consumer
         // named "STREAMS"; extraction falls through to the real marker.
         assert_eq!(
-            mv(&["XREADGROUP", "GROUP", "grp1", "STREAMS", "COUNT", "2", "STREAMS", "xp1", ">"]),
+            mv(&[
+                "XREADGROUP",
+                "GROUP",
+                "grp1",
+                "STREAMS",
+                "COUNT",
+                "2",
+                "STREAMS",
+                "xp1",
+                ">"
+            ]),
             vec![7]
         );
         // No well-formed marker: malformed, executor reports the error.

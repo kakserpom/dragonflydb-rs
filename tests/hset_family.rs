@@ -122,7 +122,11 @@ fn hset() {
             args.push(key);
             args.push(value);
         }
-        let argv: Vec<&str> = cmd.iter().copied().chain(args.iter().map(String::as_str)).collect();
+        let argv: Vec<&str> = cmd
+            .iter()
+            .copied()
+            .chain(args.iter().map(String::as_str))
+            .collect();
         let v = t.run(&argv);
         expect_int(&v, new_values);
     }
@@ -140,7 +144,10 @@ fn hset() {
     // Wrong arity cases.
     t.assert_err(&["HSET", "key"], "wrong number of arguments");
     t.assert_err(&["HSET", "key", "key"], "wrong number of arguments");
-    t.assert_err(&["HSET", "key", "key", "value", "key2"], "wrong number of arguments");
+    t.assert_err(
+        &["HSET", "key", "key", "value", "key2"],
+        "wrong number of arguments",
+    );
 }
 
 #[test]
@@ -182,31 +189,43 @@ fn get() {
     t.assert_int(&["hset", "x", "a", "1", "b", "2", "c", "3"], 3);
 
     let v = t.run(&["hmget", "unkwn", "a", "c"]);
-    assert_eq!(v.arr().map(<[Value]>::to_vec), Some(vec![Value::Bulk(None), Value::Bulk(None)]));
+    assert_eq!(
+        v.arr().map(<[Value]>::to_vec),
+        Some(vec![Value::Bulk(None), Value::Bulk(None)])
+    );
 
     assert_eq!(sorted(&t.run(&["hkeys", "x"])), vec!["a", "b", "c"]);
     assert_eq!(sorted(&t.run(&["hvals", "x"])), vec!["1", "2", "3"]);
 
     let v = t.run(&["hmget", "x", "a", "c", "d"]);
-    assert_eq!(v.arr().map(<[Value]>::to_vec), Some(vec![
-        Value::Bulk(Some(b"1".to_vec())),
-        Value::Bulk(Some(b"3".to_vec())),
-        Value::Bulk(None),
-    ]));
+    assert_eq!(
+        v.arr().map(<[Value]>::to_vec),
+        Some(vec![
+            Value::Bulk(Some(b"1".to_vec())),
+            Value::Bulk(Some(b"3".to_vec())),
+            Value::Bulk(None),
+        ])
+    );
 
     let v = t.run(&["hmget", "x", "a", "c", "d", "d", "c", "a"]);
-    assert_eq!(v.arr().map(<[Value]>::to_vec), Some(vec![
-        Value::Bulk(Some(b"1".to_vec())),
-        Value::Bulk(Some(b"3".to_vec())),
-        Value::Bulk(None),
-        Value::Bulk(None),
-        Value::Bulk(Some(b"3".to_vec())),
-        Value::Bulk(Some(b"1".to_vec())),
-    ]));
+    assert_eq!(
+        v.arr().map(<[Value]>::to_vec),
+        Some(vec![
+            Value::Bulk(Some(b"1".to_vec())),
+            Value::Bulk(Some(b"3".to_vec())),
+            Value::Bulk(None),
+            Value::Bulk(None),
+            Value::Bulk(Some(b"3".to_vec())),
+            Value::Bulk(Some(b"1".to_vec())),
+        ])
+    );
 
     // The small hash keeps insertion order, so the reply is the exact
     // key/value interleave (the reference asserts the same order).
-    assert_eq!(strs(&t.run(&["hgetall", "x"])), vec!["a", "1", "b", "2", "c", "3"]);
+    assert_eq!(
+        strs(&t.run(&["hgetall", "x"])),
+        vec!["a", "1", "b", "2", "c", "3"]
+    );
 }
 
 #[test]
@@ -224,12 +243,23 @@ fn hincrby() {
     }
 
     // Overflow.
-    t.assert_int(&["hset", "key", "field2", &i64::MAX.saturating_sub(1).to_string()], 1);
+    t.assert_int(
+        &[
+            "hset",
+            "key",
+            "field2",
+            &i64::MAX.saturating_sub(1).to_string(),
+        ],
+        1,
+    );
     t.assert_err(&["hincrby", "key", "field2", "2"], "would overflow");
 
     // Error case: a stored value that is not an integer.
     t.assert_int(&["hset", "key", "a", " 1"], 1);
-    t.assert_err(&["hincrby", "key", "a", "10"], "hash value is not an integer");
+    t.assert_err(
+        &["hincrby", "key", "a", "10"],
+        "hash value is not an integer",
+    );
 }
 
 #[test]
@@ -268,13 +298,21 @@ fn hincr_cmds_preserve_ttl() {
 fn hscan() {
     let mut t = Ctx::new();
     let v = t.run(&["hscan", "non-existing-key", "100", "count", "5"]);
-    assert_eq!(v.arr().map(<[Value]>::to_vec), Some(vec![
-        Value::Bulk(Some(b"0".to_vec())),
-        Value::Array(Some(vec![])),
-    ]));
+    assert_eq!(
+        v.arr().map(<[Value]>::to_vec),
+        Some(vec![
+            Value::Bulk(Some(b"0".to_vec())),
+            Value::Array(Some(vec![])),
+        ])
+    );
 
     for i in 0..10 {
-        t.run(&["HSET", "myhash", &format!("Field-{i}"), &format!("Value-{i}")]);
+        t.run(&[
+            "HSET",
+            "myhash",
+            &format!("Field-{i}"),
+            &format!("Value-{i}"),
+        ]);
     }
 
     // The small hash is scanned whole: even though COUNT is 4, all 10 fields
@@ -283,7 +321,10 @@ fn hscan() {
     assert_eq!(v.arr().map(<[Value]>::to_vec).map(|x| x.len()), Some(2));
     let mut vec = strs(&v.arr().unwrap()[1]);
     assert_eq!(vec.len(), 20);
-    assert!(vec.iter().all(|s| s.starts_with("Field") || s.starts_with("Value")));
+    assert!(
+        vec.iter()
+            .all(|s| s.starts_with("Field") || s.starts_with("Value"))
+    );
 
     // A pattern matching nothing.
     let v = t.run(&["hscan", "myhash", "0", "match", "*x*"]);
@@ -297,14 +338,23 @@ fn hscan() {
 
     // A large hash limits the number of returned entries.
     for i in 0..200 {
-        t.run(&["HSET", "largehash", &format!("KeyNum-{i}"), &format!("KeyValue-{i}")]);
+        t.run(&[
+            "HSET",
+            "largehash",
+            &format!("KeyNum-{i}"),
+            &format!("KeyValue-{i}"),
+        ]);
     }
     let v = t.run(&["hscan", "largehash", "0", "count", "20"]);
     assert_eq!(v.arr().map(<[Value]>::to_vec).map(|x| x.len()), Some(2));
     vec = strs(&v.arr().unwrap()[1]);
     // COUNT is a hint, not an exact limit; the reference returns between 40
     // and 60 entries for COUNT 20.
-    assert!((40..60).contains(&vec.len()), "largehash scan size = {}", vec.len());
+    assert!(
+        (40..60).contains(&vec.len()),
+        "largehash scan size = {}",
+        vec.len()
+    );
 
     // NOVALUES returns only the fields.
     let v = t.run(&["hscan", "myhash", "0", "NOVALUES"]);
@@ -317,7 +367,9 @@ fn hscan() {
 #[test]
 fn hscan_no_values_combinations() {
     let mut t = Ctx::new();
-    t.run(&["HSET", "h_combos", "user:1", "v1", "user:2", "v2", "admin:1", "v3"]);
+    t.run(&[
+        "HSET", "h_combos", "user:1", "v1", "user:2", "v2", "admin:1", "v3",
+    ]);
 
     // MATCH + NOVALUES.
     let v = t.run(&["HSCAN", "h_combos", "0", "MATCH", "user:*", "NOVALUES"]);
@@ -366,18 +418,45 @@ fn hincrby_float() {
 fn hincrby_float_corner_cases() {
     let mut t = Ctx::new();
     t.assert_int(
-        &["hset", "k", "mhv", "-1.8E+308", "phv", "1.8E+308", "nd", "-+-inf", "+inf", "+inf", "nan", "nan", "-inf", "-inf"],
+        &[
+            "hset",
+            "k",
+            "mhv",
+            "-1.8E+308",
+            "phv",
+            "1.8E+308",
+            "nd",
+            "-+-inf",
+            "+inf",
+            "+inf",
+            "nan",
+            "nan",
+            "-inf",
+            "-inf",
+        ],
         6,
     );
     // Long doubles are not supported: all these stored values fail to parse.
-    t.assert_err(&["hincrbyfloat", "k", "mhv", "-1"], "ERR hash value is not a float");
-    t.assert_err(&["hincrbyfloat", "k", "phv", "1"], "ERR hash value is not a float");
-    t.assert_err(&["hincrbyfloat", "k", "nd", "1"], "ERR hash value is not a float");
+    t.assert_err(
+        &["hincrbyfloat", "k", "mhv", "-1"],
+        "ERR hash value is not a float",
+    );
+    t.assert_err(
+        &["hincrbyfloat", "k", "phv", "1"],
+        "ERR hash value is not a float",
+    );
+    t.assert_err(
+        &["hincrbyfloat", "k", "nd", "1"],
+        "ERR hash value is not a float",
+    );
     t.assert_err(
         &["hincrbyfloat", "k", "+inf", "1"],
         "increment would produce NaN or Infinity",
     );
-    t.assert_err(&["hincrbyfloat", "k", "nan", "1"], "ERR hash value is not a float");
+    t.assert_err(
+        &["hincrbyfloat", "k", "nan", "1"],
+        "ERR hash value is not a float",
+    );
     t.assert_err(
         &["hincrbyfloat", "k", "-inf", "1"],
         "increment would produce NaN or Infinity",
@@ -457,7 +536,11 @@ fn hrand_field() {
         assert!((0..num_entries as i64).contains(&n));
     }
 
-    let fields = strs(&t.run(&["hrandfield", "largehash", &(-(num_entries as i64) - 1).to_string()]));
+    let fields = strs(&t.run(&[
+        "hrandfield",
+        "largehash",
+        &(-(num_entries as i64) - 1).to_string(),
+    ]));
     assert_eq!(fields.len(), num_entries + 1);
     let unique: std::collections::HashSet<&String> = fields.iter().collect();
     assert!(unique.len() < fields.len(), "negative COUNT repeats fields");
@@ -466,7 +549,12 @@ fn hrand_field() {
         assert!((0..num_entries as i64).contains(&n));
     }
 
-    let v = t.run(&["hrandfield", "largehash", &(-(num_entries as i64) - 1).to_string(), "withvalues"]);
+    let v = t.run(&[
+        "hrandfield",
+        "largehash",
+        &(-(num_entries as i64) - 1).to_string(),
+        "withvalues",
+    ]);
     let items = strs(&v);
     assert_eq!(items.len(), (num_entries + 1) * 2);
     for pair in items.chunks(2) {
@@ -514,7 +602,16 @@ fn hsetex() {
 
     // afield is added with a 2s TTL; kttlfield keeps its 100s TTL.
     t.assert_int(
-        &["HSETEX", "k", "KEEPTTL", "2", "kttlfield", "resetvalue", "afield", "aval"],
+        &[
+            "HSETEX",
+            "k",
+            "KEEPTTL",
+            "2",
+            "kttlfield",
+            "resetvalue",
+            "afield",
+            "aval",
+        ],
         1,
     );
     assert_eq!(fieldttl(&mut t, "k", "kttlfield"), 100);
@@ -528,7 +625,10 @@ fn hsetex() {
     assert_eq!(fieldttl(&mut t, "k", "kttlfield"), 98);
 
     // NX, with or without KEEPTTL, updates neither value nor expiry.
-    t.assert_int(&["HSETEX", "k", "NX", "KEEPTTL", "2", "kttlfield", "value"], 0);
+    t.assert_int(
+        &["HSETEX", "k", "NX", "KEEPTTL", "2", "kttlfield", "value"],
+        0,
+    );
     t.assert_text(&["HGET", "k", "kttlfield"], "resetvalue");
     assert_eq!(fieldttl(&mut t, "k", "kttlfield"), 98);
 
@@ -548,13 +648,22 @@ fn hsetex() {
     assert_eq!(fieldttl(&mut t, "k", "nottl"), 100);
 
     // Repeated flags are syntax errors.
-    t.assert_err(&["HSETEX", "k", "NX", "KEEPTTL", "NX", "1", "v", "v2"], "syntax error");
-    t.assert_err(&["HSETEX", "k", "KEEPTTL", "KEEPTTL", "1", "v", "v2"], "syntax error");
+    t.assert_err(
+        &["HSETEX", "k", "NX", "KEEPTTL", "NX", "1", "v", "v2"],
+        "syntax error",
+    );
+    t.assert_err(
+        &["HSETEX", "k", "KEEPTTL", "KEEPTTL", "1", "v", "v2"],
+        "syntax error",
+    );
 
     // No field-value pairs.
     t.assert_err(&["HSETEX", "k", "100"], "wrong number of arguments");
     t.assert_err(&["HSETEX", "k", "NX", "100"], "wrong number of arguments");
-    t.assert_err(&["HSETEX", "k", "NX", "KEEPTTL", "100"], "wrong number of arguments");
+    t.assert_err(
+        &["HSETEX", "k", "NX", "KEEPTTL", "100"],
+        "wrong number of arguments",
+    );
 }
 
 // FNX/FXX apply the collective set-all-or-nothing condition of the Redis
@@ -593,9 +702,18 @@ fn hsetex_dragonfly_condition() {
     assert_eq!(fieldttl(&mut t, "dk", "a"), 50);
 
     // NX and the collective conditions are mutually exclusive; so are repeats.
-    t.assert_err(&["HSETEX", "dk", "NX", "FNX", "100", "a", "1"], "syntax error");
-    t.assert_err(&["HSETEX", "dk", "FNX", "FXX", "100", "a", "1"], "syntax error");
-    t.assert_err(&["HSETEX", "dk", "FNX", "FNX", "100", "a", "1"], "syntax error");
+    t.assert_err(
+        &["HSETEX", "dk", "NX", "FNX", "100", "a", "1"],
+        "syntax error",
+    );
+    t.assert_err(
+        &["HSETEX", "dk", "FNX", "FXX", "100", "a", "1"],
+        "syntax error",
+    );
+    t.assert_err(
+        &["HSETEX", "dk", "FNX", "FNX", "100", "a", "1"],
+        "syntax error",
+    );
 }
 
 #[test]
@@ -614,15 +732,39 @@ fn hsetex_redis_format() {
     assert_eq!(fieldttl(&mut t, "k", "exf"), 100);
 
     // PX milliseconds round up to whole seconds.
-    t.assert_int(&["HSETEX", "k", "PX", "100000", "FIELDS", "1", "pxf", "v"], 1);
+    t.assert_int(
+        &["HSETEX", "k", "PX", "100000", "FIELDS", "1", "pxf", "v"],
+        1,
+    );
     assert_eq!(fieldttl(&mut t, "k", "pxf"), 100);
 
     // EXAT/PXAT absolute timestamps, computed against the pinned clock.
     let now_s = clock_ms() / 1000;
-    t.assert_int(&["HSETEX", "k", "EXAT", &(now_s + 100).to_string(), "FIELDS", "1", "exatf", "v"], 1);
+    t.assert_int(
+        &[
+            "HSETEX",
+            "k",
+            "EXAT",
+            &(now_s + 100).to_string(),
+            "FIELDS",
+            "1",
+            "exatf",
+            "v",
+        ],
+        1,
+    );
     assert_eq!(fieldttl(&mut t, "k", "exatf"), 100);
     t.assert_int(
-        &["HSETEX", "k", "PXAT", &((now_s + 100) * 1000).to_string(), "FIELDS", "1", "pxatf", "v"],
+        &[
+            "HSETEX",
+            "k",
+            "PXAT",
+            &((now_s + 100) * 1000).to_string(),
+            "FIELDS",
+            "1",
+            "pxatf",
+            "v",
+        ],
         1,
     );
     assert_eq!(fieldttl(&mut t, "k", "pxatf"), 100);
@@ -642,7 +784,12 @@ fn hsetex_redis_format() {
     t.assert_int(&["HSETEX", "k", "FNX", "FIELDS", "1", "fnxf", "v1"], 1);
     t.assert_int(&["HSETEX", "k", "FNX", "FIELDS", "1", "fnxf", "v2"], 0);
     t.assert_text(&["HGET", "k", "fnxf"], "v1");
-    t.assert_int(&["HSETEX", "k", "FNX", "FIELDS", "2", "fnxf", "x", "newf", "y"], 0);
+    t.assert_int(
+        &[
+            "HSETEX", "k", "FNX", "FIELDS", "2", "fnxf", "x", "newf", "y",
+        ],
+        0,
+    );
     t.assert_int(&["HEXISTS", "k", "newf"], 0);
 
     // FXX: only when all the fields exist.
@@ -650,7 +797,12 @@ fn hsetex_redis_format() {
     t.assert_text(&["HGET", "k", "fnxf"], "v3");
     t.assert_int(&["HSETEX", "k", "FXX", "FIELDS", "1", "missing", "v"], 0);
     t.assert_int(&["HEXISTS", "k", "missing"], 0);
-    t.assert_int(&["HSETEX", "k", "FXX", "FIELDS", "2", "fnxf", "a", "missing2", "b"], 0);
+    t.assert_int(
+        &[
+            "HSETEX", "k", "FXX", "FIELDS", "2", "fnxf", "a", "missing2", "b",
+        ],
+        0,
+    );
     t.assert_text(&["HGET", "k", "fnxf"], "v3");
 
     // FNX on a fresh key succeeds; FXX on a fresh key fails.
@@ -659,31 +811,74 @@ fn hsetex_redis_format() {
     t.assert_int(&["EXISTS", "nk2"], 0);
 
     // Condition flags are mutually exclusive / may not be repeated.
-    t.assert_err(&["HSETEX", "k", "FNX", "FXX", "FIELDS", "1", "f", "v"], "syntax error");
-    t.assert_err(&["HSETEX", "k", "FNX", "FNX", "FIELDS", "1", "f", "v"], "syntax error");
-    t.assert_err(&["HSETEX", "k", "FXX", "FXX", "FIELDS", "1", "f", "v"], "syntax error");
+    t.assert_err(
+        &["HSETEX", "k", "FNX", "FXX", "FIELDS", "1", "f", "v"],
+        "syntax error",
+    );
+    t.assert_err(
+        &["HSETEX", "k", "FNX", "FNX", "FIELDS", "1", "f", "v"],
+        "syntax error",
+    );
+    t.assert_err(
+        &["HSETEX", "k", "FXX", "FXX", "FIELDS", "1", "f", "v"],
+        "syntax error",
+    );
 
     // Only one expiry option allowed.
-    t.assert_err(&["HSETEX", "k", "EX", "10", "KEEPTTL", "FIELDS", "1", "f", "v"], "syntax error");
-    t.assert_err(&["HSETEX", "k", "EX", "10", "PX", "10", "FIELDS", "1", "f", "v"], "syntax error");
+    t.assert_err(
+        &[
+            "HSETEX", "k", "EX", "10", "KEEPTTL", "FIELDS", "1", "f", "v",
+        ],
+        "syntax error",
+    );
+    t.assert_err(
+        &[
+            "HSETEX", "k", "EX", "10", "PX", "10", "FIELDS", "1", "f", "v",
+        ],
+        "syntax error",
+    );
 
     // Out-of-range / overflow-inducing expiries are rejected for every unit.
     t.assert_err(
-        &["HSETEX", "k", "PX", "9223372036854775807", "FIELDS", "1", "f", "v"],
+        &[
+            "HSETEX",
+            "k",
+            "PX",
+            "9223372036854775807",
+            "FIELDS",
+            "1",
+            "f",
+            "v",
+        ],
         "invalid expire time",
     );
     t.assert_err(
-        &["HSETEX", "k", "EXAT", "9223372036854775", "FIELDS", "1", "f", "v"],
+        &[
+            "HSETEX",
+            "k",
+            "EXAT",
+            "9223372036854775",
+            "FIELDS",
+            "1",
+            "f",
+            "v",
+        ],
         "invalid expire time",
     );
-    t.assert_err(&["HSETEX", "k", "EX", "0", "FIELDS", "1", "f", "v"], "invalid expire time");
+    t.assert_err(
+        &["HSETEX", "k", "EX", "0", "FIELDS", "1", "f", "v"],
+        "invalid expire time",
+    );
     // A non-integer expiry reports the integer error.
     t.assert_err(
         &["HSETEX", "k", "EX", "abc", "FIELDS", "1", "f", "v"],
         "value is not an integer or out of range",
     );
     // A past EXAT is rejected.
-    t.assert_err(&["HSETEX", "k", "EXAT", "1", "FIELDS", "1", "f", "v"], "invalid expire time");
+    t.assert_err(
+        &["HSETEX", "k", "EXAT", "1", "FIELDS", "1", "f", "v"],
+        "invalid expire time",
+    );
 
     // numfields must match the number of field/value pairs.
     t.assert_err(&["HSETEX", "k", "FIELDS", "2", "f", "v"], "must match");
@@ -691,11 +886,20 @@ fn hsetex_redis_format() {
 
     // A Redis-only flag without FIELDS falls through to the Dragonfly path,
     // where the non-numeric ttl_sec is rejected.
-    t.assert_err(&["HSETEX", "k", "FNX", "f", "v"], "value is not an integer or out of range");
+    t.assert_err(
+        &["HSETEX", "k", "FNX", "f", "v"],
+        "value is not an integer or out of range",
+    );
 
     // EX/PX/EXAT/PXAT without FIELDS are a syntax error, not a positional ttl.
-    t.assert_err(&["HSETEX", "k", "EX", "10", "100", "f", "v"], "syntax error");
-    t.assert_err(&["HSETEX", "k", "PX", "10", "100", "f", "v"], "syntax error");
+    t.assert_err(
+        &["HSETEX", "k", "EX", "10", "100", "f", "v"],
+        "syntax error",
+    );
+    t.assert_err(
+        &["HSETEX", "k", "PX", "10", "100", "f", "v"],
+        "syntax error",
+    );
 
     // A field expiring during the FNX/FXX check must not leave an empty hash.
     t.assert_int(&["HSETEX", "exp", "1", "only", "v"], 1);
@@ -709,7 +913,12 @@ fn trigger_convert_to_str_map() {
     let mut t = Ctx::new();
     let k_elements = 200usize;
     for i in 0..k_elements {
-        t.run(&["HSET", "hk", &(100_500_700u64 + i as u64).to_string(), "100500700"]);
+        t.run(&[
+            "HSET",
+            "hk",
+            &(100_500_700u64 + i as u64).to_string(),
+            "100500700",
+        ]);
     }
     t.assert_int(&["HLEN", "hk"], k_elements as i64);
 }
@@ -728,7 +937,10 @@ fn single_field_large_value_remains_listpack() {
     t.assert_int(&["HSET", "hmap", "field", &"y".repeat(2000)], 0);
     t.assert_text(&["HGET", "hmap", "field"], &"y".repeat(2000));
 
-    t.assert_int(&["HSET", "hmap", "field1", &large_value, "field2", "val"], 2);
+    t.assert_int(
+        &["HSET", "hmap", "field1", &large_value, "field2", "val"],
+        2,
+    );
     t.assert_text(&["HGET", "hmap", "field1"], &large_value);
     t.assert_text(&["HGET", "hmap", "field2"], "val");
 }
@@ -770,52 +982,113 @@ fn hexpire() {
     // 4/2/6s so the tiers (k3=2s < k0/k1/k5=4s < k2=6s, k4 without a TTL)
     // stay distinguishable with whole-second advances.
     t.assert_int(
-        &["HSET", "key3", "k0", "v0", "k1", "v1", "k2", "v2", "k3", "v3", "k4", "v4", "k5", "v5"],
+        &[
+            "HSET", "key3", "k0", "v0", "k1", "v1", "k2", "v2", "k3", "v3", "k4", "v4", "k5", "v5",
+        ],
         6,
     );
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key3", "4", "XX", "FIELDS", "1", "k0"])), vec![0]);
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key3", "4", "NX", "FIELDS", "1", "k0"])), vec![1]);
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key3", "4", "NX", "FIELDS", "1", "k0"])), vec![0]);
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key3", "4", "XX", "FIELDS", "1", "k0"])), vec![1]);
-    let v = t.run(&["HEXPIRE", "key3", "4", "NX", "FIELDS", "3", "k1", "k2", "k3"]);
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key3", "4", "XX", "FIELDS", "1", "k0"])),
+        vec![0]
+    );
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key3", "4", "NX", "FIELDS", "1", "k0"])),
+        vec![1]
+    );
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key3", "4", "NX", "FIELDS", "1", "k0"])),
+        vec![0]
+    );
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key3", "4", "XX", "FIELDS", "1", "k0"])),
+        vec![1]
+    );
+    let v = t.run(&[
+        "HEXPIRE", "key3", "4", "NX", "FIELDS", "3", "k1", "k2", "k3",
+    ]);
     assert_eq!(ints(&v), vec![1, 1, 1]);
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key3", "2", "GT", "FIELDS", "1", "k2"])), vec![0]);
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key3", "6", "GT", "FIELDS", "1", "k2"])), vec![1]);
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key3", "2", "LT", "FIELDS", "1", "k3"])), vec![1]);
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key3", "6", "LT", "FIELDS", "1", "k3"])), vec![0]);
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key3", "4", "GT", "FIELDS", "1", "k4"])), vec![0]);
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key3", "4", "LT", "FIELDS", "1", "k5"])), vec![1]);
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key3", "2", "GT", "FIELDS", "1", "k2"])),
+        vec![0]
+    );
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key3", "6", "GT", "FIELDS", "1", "k2"])),
+        vec![1]
+    );
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key3", "2", "LT", "FIELDS", "1", "k3"])),
+        vec![1]
+    );
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key3", "6", "LT", "FIELDS", "1", "k3"])),
+        vec![0]
+    );
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key3", "4", "GT", "FIELDS", "1", "k4"])),
+        vec![0]
+    );
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key3", "4", "LT", "FIELDS", "1", "k5"])),
+        vec![1]
+    );
 
     advance(2000);
     // k3 (2s) expired; k0,k1,k2,k4,k5 remain (sorted reply).
-    assert_eq!(sorted(&t.run(&["HGETALL", "key3"])), vec![
-        "k0", "k1", "k2", "k4", "k5", "v0", "v1", "v2", "v4", "v5"
-    ]);
+    assert_eq!(
+        sorted(&t.run(&["HGETALL", "key3"])),
+        vec!["k0", "k1", "k2", "k4", "k5", "v0", "v1", "v2", "v4", "v5"]
+    );
     advance(2000);
     // k0,k1,k5 (4s) expired; k2 (6s) and k4 (no TTL) remain (sorted reply).
-    assert_eq!(sorted(&t.run(&["HGETALL", "key3"])), vec!["k2", "k4", "v2", "v4"]);
+    assert_eq!(
+        sorted(&t.run(&["HGETALL", "key3"])),
+        vec!["k2", "k4", "v2", "v4"]
+    );
     advance(2000);
     // k2 (6s) expired; only k4 remains.
     assert_eq!(sorted(&t.run(&["HGETALL", "key3"])), vec!["k4", "v4"]);
 
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key3", "4", "FIELDS", "1", "k4"])), vec![1]);
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key3", "0", "XX", "FIELDS", "1", "k4"])), vec![2]);
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key3", "4", "FIELDS", "1", "k4"])),
+        vec![1]
+    );
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key3", "0", "XX", "FIELDS", "1", "k4"])),
+        vec![2]
+    );
     assert_eq!(t.run(&["HGETALL", "key3"]), Value::Array(Some(vec![])));
 
     // TTL 0 with the per-field conditions.
     t.assert_int(
-        &["HSET", "key4", "k0", "v0", "k1", "v1", "k2", "v2", "k3", "v3", "k4", "v4"],
+        &[
+            "HSET", "key4", "k0", "v0", "k1", "v1", "k2", "v2", "k3", "v3", "k4", "v4",
+        ],
         5,
     );
     let v = t.run(&["HEXPIRE", "key4", "0", "NX", "FIELDS", "2", "k0", "k1"]);
     assert_eq!(ints(&v), vec![2, 2]);
     let v = t.run(&["HEXPIRE", "key4", "0", "LT", "FIELDS", "2", "k2", "k3"]);
     assert_eq!(ints(&v), vec![2, 2]);
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key4", "0", "XX", "FIELDS", "1", "k4"])), vec![0]);
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key4", "4", "NX", "FIELDS", "1", "k4"])), vec![1]);
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key4", "0", "NX", "FIELDS", "1", "k4"])), vec![0]);
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key4", "0", "GT", "FIELDS", "1", "k4"])), vec![0]);
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key4", "0", "FIELDS", "1", "k4"])), vec![2]);
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key4", "0", "XX", "FIELDS", "1", "k4"])),
+        vec![0]
+    );
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key4", "4", "NX", "FIELDS", "1", "k4"])),
+        vec![1]
+    );
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key4", "0", "NX", "FIELDS", "1", "k4"])),
+        vec![0]
+    );
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key4", "0", "GT", "FIELDS", "1", "k4"])),
+        vec![0]
+    );
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key4", "0", "FIELDS", "1", "k4"])),
+        vec![2]
+    );
     assert_eq!(t.run(&["HGETALL", "key4"]), Value::Array(Some(vec![])));
 }
 
@@ -825,11 +1098,17 @@ fn hexpire_num_fields_errors() {
     t.assert_int(&["HSET", "key", "k0", "v0", "k1", "v1"], 2);
 
     // Missing FIELDS keyword.
-    t.assert_err(&["HEXPIRE", "key", "10", "1", "k0"], "Mandatory argument FIELDS");
+    t.assert_err(
+        &["HEXPIRE", "key", "10", "1", "k0"],
+        "Mandatory argument FIELDS",
+    );
 
     // A wrong number of provided fields reports the must-match message.
     t.assert_err(&["HEXPIRE", "key", "10", "FIELDS", "2", "k0"], "numfields");
-    t.assert_err(&["HEXPIRE", "key", "10", "FIELDS", "1", "k0", "k1"], "numfields");
+    t.assert_err(
+        &["HEXPIRE", "key", "10", "FIELDS", "1", "k0", "k1"],
+        "numfields",
+    );
     t.assert_err(&["HEXPIRE", "key", "10", "FIELDS", "0", "k0"], "numfields");
     t.assert_err(&["HEXPIRE", "key", "10", "FIELDS", "0"], "numfields");
 }
@@ -844,7 +1123,10 @@ fn hexpire_no_expire_early() {
     advance(1000);
     // The fields must not be pruned early; the remaining TTL proves it.
     assert_eq!(fieldttl(&mut t, "key", "k0"), 9);
-    assert_eq!(sorted(&t.run(&["HGETALL", "key"])), vec!["k0", "k1", "v0", "v1"]);
+    assert_eq!(
+        sorted(&t.run(&["HGETALL", "key"])),
+        vec!["k0", "k1", "v0", "v1"]
+    );
 }
 
 #[test]
@@ -873,7 +1155,12 @@ fn hexpire_no_add_new() {
 fn hexpire_with_null_char() {
     let mut t = Ctx::new();
     let val = b"test\0test".to_vec();
-    t.run_b(&[b"HSET".to_vec(), b"hash".to_vec(), b"field".to_vec(), val.clone()]);
+    t.run_b(&[
+        b"HSET".to_vec(),
+        b"hash".to_vec(),
+        b"field".to_vec(),
+        val.clone(),
+    ]);
     let v = t.run_b(&[b"HGET".to_vec(), b"hash".to_vec(), b"field".to_vec()]);
     assert_eq!(v.bulk().unwrap(), val);
     t.run_b(&[
@@ -902,7 +1189,10 @@ fn httl() {
     assert_eq!(ints(&v), vec![-1, -1, -2]);
 
     // Set an expiry and verify the TTL.
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key", "10", "FIELDS", "1", "k0"])), vec![1]);
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key", "10", "FIELDS", "1", "k0"])),
+        vec![1]
+    );
     let v = t.run(&["HTTL", "key", "FIELDS", "2", "k0", "k1"]);
     let (t0, k1) = (ints(&v)[0], ints(&v)[1]);
     assert_eq!(t0, 10, "httl(k0) = {t0}");
@@ -937,7 +1227,10 @@ fn hpexpire_time() {
     assert_eq!(ints(&v), vec![-1, -1, -2]);
 
     // Set an expiry and verify the absolute Unix-ms timestamp.
-    assert_eq!(ints(&t.run(&["HEXPIRE", "key", "100", "FIELDS", "1", "k0"])), vec![1]);
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "key", "100", "FIELDS", "1", "k0"])),
+        vec![1]
+    );
     let now_s = clock_ms() / 1000;
     let expected_ms = ((now_s + 100) as i64) * 1000;
     let v = t.run(&["HPEXPIRETIME", "key", "FIELDS", "2", "k0", "k1"]);
@@ -953,7 +1246,10 @@ fn hpexpire_time() {
     t.assert_err(&["HPEXPIRETIME", "strkey", "FIELDS", "1", "f"], "WRONGTYPE");
 
     // Syntax errors.
-    t.assert_err(&["HPEXPIRETIME", "key", "notfields", "1", "k0"], "Mandatory argument FIELDS");
+    t.assert_err(
+        &["HPEXPIRETIME", "key", "notfields", "1", "k0"],
+        "Mandatory argument FIELDS",
+    );
     t.assert_err(&["HPEXPIRETIME", "key", "FIELDS", "2", "k0"], "numfields");
     t.assert_err(
         &["HPEXPIRETIME", "key", "FIELDS", "0", "k0"],
@@ -976,65 +1272,108 @@ fn hgetex() {
     let mut t = Ctx::new();
     // Missing key -> array of nils.
     let v = t.run(&["HGETEX", "nokey", "FIELDS", "2", "f1", "f2"]);
-    assert_eq!(v.arr().map(<[Value]>::to_vec), Some(vec![Value::Bulk(None), Value::Bulk(None)]));
+    assert_eq!(
+        v.arr().map(<[Value]>::to_vec),
+        Some(vec![Value::Bulk(None), Value::Bulk(None)])
+    );
 
     t.assert_int(&["HSET", "key", "f1", "v1", "f2", "v2", "f3", "v3"], 3);
 
     // No option: returns values and leaves the TTLs untouched.
     let v = t.run(&["HGETEX", "key", "FIELDS", "3", "f1", "f2", "nosuch"]);
-    assert_eq!(v.arr().map(<[Value]>::to_vec), Some(vec![
-        Value::Bulk(Some(b"v1".to_vec())),
-        Value::Bulk(Some(b"v2".to_vec())),
-        Value::Bulk(None),
-    ]));
+    assert_eq!(
+        v.arr().map(<[Value]>::to_vec),
+        Some(vec![
+            Value::Bulk(Some(b"v1".to_vec())),
+            Value::Bulk(Some(b"v2".to_vec())),
+            Value::Bulk(None),
+        ])
+    );
     let v = t.run(&["HTTL", "key", "FIELDS", "2", "f1", "f2"]);
     assert_eq!(ints(&v), vec![-1, -1]);
 
     // EX sets a relative TTL and still returns the value.
-    assert_eq!(strs(&t.run(&["HGETEX", "key", "EX", "100", "FIELDS", "1", "f1"])), vec!["v1"]);
+    assert_eq!(
+        strs(&t.run(&["HGETEX", "key", "EX", "100", "FIELDS", "1", "f1"])),
+        vec!["v1"]
+    );
     assert_eq!(fieldttl(&mut t, "key", "f1"), 100);
 
     // PX rounds up to whole seconds.
-    assert_eq!(strs(&t.run(&["HGETEX", "key", "PX", "100000", "FIELDS", "1", "f2"])), vec!["v2"]);
+    assert_eq!(
+        strs(&t.run(&["HGETEX", "key", "PX", "100000", "FIELDS", "1", "f2"])),
+        vec!["v2"]
+    );
     assert_eq!(fieldttl(&mut t, "key", "f2"), 100);
 
     // EXAT / PXAT set a TTL relative to the pinned clock.
     let now_s = clock_ms() / 1000;
     assert_eq!(
-        strs(&t.run(&["HGETEX", "key", "EXAT", &(now_s + 200).to_string(), "FIELDS", "1", "f1"])),
+        strs(&t.run(&[
+            "HGETEX",
+            "key",
+            "EXAT",
+            &(now_s + 200).to_string(),
+            "FIELDS",
+            "1",
+            "f1"
+        ])),
         vec!["v1"]
     );
     assert_eq!(fieldttl(&mut t, "key", "f1"), 200);
     assert_eq!(
-        strs(&t.run(&["HGETEX", "key", "PXAT", &((now_s + 300) * 1000).to_string(), "FIELDS", "1", "f2"])),
+        strs(&t.run(&[
+            "HGETEX",
+            "key",
+            "PXAT",
+            &((now_s + 300) * 1000).to_string(),
+            "FIELDS",
+            "1",
+            "f2"
+        ])),
         vec!["v2"]
     );
     assert_eq!(fieldttl(&mut t, "key", "f2"), 300);
 
     // PERSIST removes the TTL and returns the value.
-    assert_eq!(strs(&t.run(&["HGETEX", "key", "PERSIST", "FIELDS", "1", "f1"])), vec!["v1"]);
+    assert_eq!(
+        strs(&t.run(&["HGETEX", "key", "PERSIST", "FIELDS", "1", "f1"])),
+        vec!["v1"]
+    );
     assert_eq!(fieldttl(&mut t, "key", "f1"), -1);
     // PERSIST on a field without a TTL is a no-op.
-    assert_eq!(strs(&t.run(&["HGETEX", "key", "PERSIST", "FIELDS", "1", "f3"])), vec!["v3"]);
+    assert_eq!(
+        strs(&t.run(&["HGETEX", "key", "PERSIST", "FIELDS", "1", "f3"])),
+        vec!["v3"]
+    );
     assert_eq!(fieldttl(&mut t, "key", "f3"), -1);
 
     // A past PXAT (or EX 0) returns the current value, then deletes the field.
-    assert_eq!(strs(&t.run(&["HGETEX", "key", "PXAT", "1", "FIELDS", "1", "f2"])), vec!["v2"]);
+    assert_eq!(
+        strs(&t.run(&["HGETEX", "key", "PXAT", "1", "FIELDS", "1", "f2"])),
+        vec!["v2"]
+    );
     t.assert_int(&["HEXISTS", "key", "f2"], 0);
-    assert_eq!(strs(&t.run(&["HGETEX", "key", "EX", "0", "FIELDS", "1", "f3"])), vec!["v3"]);
+    assert_eq!(
+        strs(&t.run(&["HGETEX", "key", "EX", "0", "FIELDS", "1", "f3"])),
+        vec!["v3"]
+    );
     t.assert_int(&["HEXISTS", "key", "f3"], 0);
 
     // Deleting the last field removes the key entirely.
-    assert_eq!(strs(&t.run(&["HGETEX", "key", "EX", "0", "FIELDS", "1", "f1"])), vec!["v1"]);
+    assert_eq!(
+        strs(&t.run(&["HGETEX", "key", "EX", "0", "FIELDS", "1", "f1"])),
+        vec!["v1"]
+    );
     t.assert_int(&["EXISTS", "key"], 0);
 
     // PERSIST on a hash without TTLs just returns the values.
     t.assert_int(&["HSET", "lp", "a", "1", "b", "2"], 2);
     let v = t.run(&["HGETEX", "lp", "PERSIST", "FIELDS", "2", "a", "missing"]);
-    assert_eq!(v.arr().map(<[Value]>::to_vec), Some(vec![
-        Value::Bulk(Some(b"1".to_vec())),
-        Value::Bulk(None),
-    ]));
+    assert_eq!(
+        v.arr().map(<[Value]>::to_vec),
+        Some(vec![Value::Bulk(Some(b"1".to_vec())), Value::Bulk(None),])
+    );
 }
 
 #[test]
@@ -1043,39 +1382,97 @@ fn hgetex_errors() {
     t.assert_int(&["HSET", "key", "f1", "v1"], 1);
 
     // At most one expiry option is allowed.
-    t.assert_err(&["HGETEX", "key", "EX", "10", "PX", "10000", "FIELDS", "1", "f1"], "syntax error");
-    t.assert_err(&["HGETEX", "key", "PERSIST", "EX", "10", "FIELDS", "1", "f1"], "syntax error");
-    t.assert_err(&["HGETEX", "key", "EX", "10", "EX", "20", "FIELDS", "1", "f1"], "syntax error");
+    t.assert_err(
+        &[
+            "HGETEX", "key", "EX", "10", "PX", "10000", "FIELDS", "1", "f1",
+        ],
+        "syntax error",
+    );
+    t.assert_err(
+        &["HGETEX", "key", "PERSIST", "EX", "10", "FIELDS", "1", "f1"],
+        "syntax error",
+    );
+    t.assert_err(
+        &["HGETEX", "key", "EX", "10", "EX", "20", "FIELDS", "1", "f1"],
+        "syntax error",
+    );
     // An unknown token where an option/FIELDS is expected still yields the
     // FIELDS error.
-    t.assert_err(&["HGETEX", "key", "KEEPTTL", "FIELDS", "1", "f1"], "Mandatory argument FIELDS");
+    t.assert_err(
+        &["HGETEX", "key", "KEEPTTL", "FIELDS", "1", "f1"],
+        "Mandatory argument FIELDS",
+    );
 
     // Negative relative expiry and non-integer values are rejected.
-    t.assert_err(&["HGETEX", "key", "EX", "-1", "FIELDS", "1", "f1"], "invalid expire time");
-    t.assert_err(&["HGETEX", "key", "EX", "abc", "FIELDS", "1", "f1"], "not an integer");
+    t.assert_err(
+        &["HGETEX", "key", "EX", "-1", "FIELDS", "1", "f1"],
+        "invalid expire time",
+    );
+    t.assert_err(
+        &["HGETEX", "key", "EX", "abc", "FIELDS", "1", "f1"],
+        "not an integer",
+    );
 
     // Out-of-range / overflow-inducing expiries are rejected for every unit.
     t.assert_err(
-        &["HGETEX", "key", "PX", "9223372036854775807", "FIELDS", "1", "f1"],
+        &[
+            "HGETEX",
+            "key",
+            "PX",
+            "9223372036854775807",
+            "FIELDS",
+            "1",
+            "f1",
+        ],
         "invalid expire time",
     );
     t.assert_err(
-        &["HGETEX", "key", "PXAT", "9223372036854775807", "FIELDS", "1", "f1"],
+        &[
+            "HGETEX",
+            "key",
+            "PXAT",
+            "9223372036854775807",
+            "FIELDS",
+            "1",
+            "f1",
+        ],
         "invalid expire time",
     );
     t.assert_err(
-        &["HGETEX", "key", "EX", "9223372036854775807", "FIELDS", "1", "f1"],
+        &[
+            "HGETEX",
+            "key",
+            "EX",
+            "9223372036854775807",
+            "FIELDS",
+            "1",
+            "f1",
+        ],
         "invalid expire time",
     );
     t.assert_err(
-        &["HGETEX", "key", "EXAT", "9223372036854775807", "FIELDS", "1", "f1"],
+        &[
+            "HGETEX",
+            "key",
+            "EXAT",
+            "9223372036854775807",
+            "FIELDS",
+            "1",
+            "f1",
+        ],
         "invalid expire time",
     );
     // A far-future absolute timestamp beyond the TTL cap is rejected too.
-    t.assert_err(&["HGETEX", "key", "EXAT", "9999999999", "FIELDS", "1", "f1"], "invalid expire time");
+    t.assert_err(
+        &["HGETEX", "key", "EXAT", "9999999999", "FIELDS", "1", "f1"],
+        "invalid expire time",
+    );
 
     // Missing FIELDS keyword / numfields mismatch / numfields must be positive.
-    t.assert_err(&["HGETEX", "key", "notfields", "1", "f1"], "Mandatory argument FIELDS");
+    t.assert_err(
+        &["HGETEX", "key", "notfields", "1", "f1"],
+        "Mandatory argument FIELDS",
+    );
     t.assert_err(&["HGETEX", "key", "FIELDS", "2", "f1"], "numfields");
     t.assert_err(
         &["HGETEX", "key", "FIELDS", "0", "f1"],
@@ -1090,7 +1487,10 @@ fn hgetex_errors() {
         "Number of fields must be a positive integer",
     );
     // An option placed after FIELDS is treated as a field name.
-    t.assert_err(&["HGETEX", "key", "FIELDS", "1", "f1", "EX", "10"], "numfields");
+    t.assert_err(
+        &["HGETEX", "key", "FIELDS", "1", "f1", "EX", "10"],
+        "numfields",
+    );
     t.assert_err(&["HGETEX", "key", "FIELDS", "1"], "numfields");
 
     // Wrong type.
@@ -1160,7 +1560,10 @@ fn empty_hash_bug() {
 fn scan_after_expire_set() {
     let mut t = Ctx::new();
     t.assert_int(&["HSET", "aset", "afield", "avalue"], 1);
-    assert_eq!(ints(&t.run(&["HEXPIRE", "aset", "5", "FIELDS", "1", "afield"])), vec![1]);
+    assert_eq!(
+        ints(&t.run(&["HEXPIRE", "aset", "5", "FIELDS", "1", "afield"])),
+        vec![1]
+    );
 
     let v = t.run(&["HSCAN", "aset", "0", "count", "100"]);
     assert_eq!(v.arr().map(<[Value]>::to_vec).map(|x| x.len()), Some(2));
@@ -1173,7 +1576,10 @@ fn key_removed_when_empty() {
     let mut t = Ctx::new();
     let test_cmd = |t: &mut Ctx, f: &dyn Fn(&mut Ctx), tag: &str| {
         t.assert_int(&["HSET", "a", "afield", "avalue"], 1);
-        assert_eq!(ints(&t.run(&["HEXPIRE", "a", "1", "FIELDS", "1", "afield"])), vec![1]);
+        assert_eq!(
+            ints(&t.run(&["HEXPIRE", "a", "1", "FIELDS", "1", "afield"])),
+            vec![1]
+        );
         advance(1000);
 
         // The expired field is still in the key until a hash command prunes it.
@@ -1184,18 +1590,45 @@ fn key_removed_when_empty() {
     };
 
     test_cmd(&mut t, &|t| t.assert_null(&["HGET", "a", "afield"]), "HGET");
-    test_cmd(&mut t, &|t| assert_eq!(t.run(&["HGETALL", "a"]), Value::Array(Some(vec![]))), "HGETALL");
-    test_cmd(&mut t, &|t| t.assert_int(&["HDEL", "a", "afield"], 0), "HDEL");
-    test_cmd(&mut t, &|t| {
-        let v = t.run(&["HSCAN", "a", "0"]);
-        assert_eq!(v.arr().unwrap()[0].text().unwrap(), "0");
-    }, "HSCAN");
-    test_cmd(&mut t, &|t| {
-        let v = t.run(&["HMGET", "a", "afield"]);
-        assert_eq!(v.arr().map(<[Value]>::to_vec), Some(vec![Value::Bulk(None)]));
-    }, "HMGET");
-    test_cmd(&mut t, &|t| t.assert_int(&["HEXISTS", "a", "afield"], 0), "HEXISTS");
-    test_cmd(&mut t, &|t| t.assert_int(&["HSTRLEN", "a", "afield"], 0), "HSTRLEN");
+    test_cmd(
+        &mut t,
+        &|t| assert_eq!(t.run(&["HGETALL", "a"]), Value::Array(Some(vec![]))),
+        "HGETALL",
+    );
+    test_cmd(
+        &mut t,
+        &|t| t.assert_int(&["HDEL", "a", "afield"], 0),
+        "HDEL",
+    );
+    test_cmd(
+        &mut t,
+        &|t| {
+            let v = t.run(&["HSCAN", "a", "0"]);
+            assert_eq!(v.arr().unwrap()[0].text().unwrap(), "0");
+        },
+        "HSCAN",
+    );
+    test_cmd(
+        &mut t,
+        &|t| {
+            let v = t.run(&["HMGET", "a", "afield"]);
+            assert_eq!(
+                v.arr().map(<[Value]>::to_vec),
+                Some(vec![Value::Bulk(None)])
+            );
+        },
+        "HMGET",
+    );
+    test_cmd(
+        &mut t,
+        &|t| t.assert_int(&["HEXISTS", "a", "afield"], 0),
+        "HEXISTS",
+    );
+    test_cmd(
+        &mut t,
+        &|t| t.assert_int(&["HSTRLEN", "a", "afield"], 0),
+        "HSTRLEN",
+    );
 }
 
 // RESP3 nests [field, value] pairs; the harness only speaks RESP2, so only the
@@ -1271,19 +1704,35 @@ fn shrink_memory_accounting_hash() {
     let _clock = clock_guard();
     let mut t = Ctx::new();
     for i in 0..60 {
-        t.assert_int(&["HSETEX", "h1", "1000", &format!("temp{i}"), &format!("v{i}")], 1);
+        t.assert_int(
+            &[
+                "HSETEX",
+                "h1",
+                "1000",
+                &format!("temp{i}"),
+                &format!("v{i}"),
+            ],
+            1,
+        );
     }
     for i in 0..50 {
         t.assert_int(&["HDEL", "h1", &format!("temp{i}")], 1);
     }
     for i in 0..10 {
-        t.assert_int(&["HSETEX", "h1", "1", &format!("exp{i}"), &format!("v{i}")], 1);
+        t.assert_int(
+            &["HSETEX", "h1", "1", &format!("exp{i}"), &format!("v{i}")],
+            1,
+        );
     }
 
     advance(1000);
 
     let v = t.run(&["SHRINK", "h1"]);
-    assert_eq!(v.int(), Some(0), "SHRINK replies 0 for the port's single-encoding hash");
+    assert_eq!(
+        v.int(),
+        Some(0),
+        "SHRINK replies 0 for the port's single-encoding hash"
+    );
     t.assert_int(&["HDEL", "h1", "temp50"], 1);
     t.assert_int(&["HLEN", "h1"], 9);
 }

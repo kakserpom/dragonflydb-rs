@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 use crate::commands::exec::server::now_ms;
 use crate::commands::{OpContext, ShardPart};
@@ -297,10 +297,7 @@ impl Shard {
                         let mut keys: Vec<Vec<u8>> =
                             db.iter().map(|(k, _)| k.as_bytes().to_vec()).collect();
                         keys.sort_unstable();
-                        let num_expires = keys
-                            .iter()
-                            .filter(|k| db.expire_at(k).is_some())
-                            .count();
+                        let num_expires = keys.iter().filter(|k| db.expire_at(k).is_some()).count();
                         DbBaseline {
                             dbid,
                             keys,
@@ -542,6 +539,7 @@ impl Shard {
             conn_id: op.conn_id,
             seq: op.seq,
             bytes: encode_result(result),
+            slowlog_args: None,
         };
         op.reply.send(reply);
     }
@@ -673,7 +671,8 @@ impl Shard {
             return CmdResult::err("ERR unknown command");
         };
         let owned = crate::server::extract_keys(cmd, args);
-        self.exec_core(args, &owned, cmd.key_range.first, db_idx, 0).0
+        self.exec_core(args, &owned, cmd.key_range.first, db_idx, 0)
+            .0
     }
 
     /// Record a write command into the replication journal, if one is enabled.
@@ -719,7 +718,14 @@ impl Shard {
             let jargs = journal::shard_args(cmd, args, owned);
             jargs[1..].to_vec()
         };
-        let data = journal::serialize_record(txid, OP_COMMAND, db_idx as u64, 0, cmd.name.as_bytes(), &tail);
+        let data = journal::serialize_record(
+            txid,
+            OP_COMMAND,
+            db_idx as u64,
+            0,
+            cmd.name.as_bytes(),
+            &tail,
+        );
         journal.record(data);
     }
 
@@ -769,14 +775,8 @@ impl Shard {
             }
         }
         for args in records {
-            let data = journal::serialize_record(
-                txid,
-                OP_COMMAND,
-                db_idx as u64,
-                0,
-                &args[0],
-                &args[1..],
-            );
+            let data =
+                journal::serialize_record(txid, OP_COMMAND, db_idx as u64, 0, &args[0], &args[1..]);
             journal.record(data);
         }
     }

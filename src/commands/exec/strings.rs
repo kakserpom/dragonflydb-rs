@@ -61,7 +61,11 @@ fn parse_set_args(args: &[Vec<u8>]) -> Result<SetOpts, RespError> {
                 } else {
                     n
                 };
-                opts.expire = Some(if abs { SetExpire::Abs(ms) } else { SetExpire::Rel(ms) });
+                opts.expire = Some(if abs {
+                    SetExpire::Abs(ms)
+                } else {
+                    SetExpire::Rel(ms)
+                });
                 i += 1;
             }
             _ => return Err(RespError::syntax()),

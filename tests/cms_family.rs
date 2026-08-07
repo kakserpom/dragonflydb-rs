@@ -89,9 +89,16 @@ fn incr_by() {
     t.ok(&["cms.initbydim", "cms", "100", "5"]);
 
     arr_ints(&mut t, &["cms.incrby", "cms", "foo", "3"], &[3]);
-    arr_ints(&mut t, &["cms.incrby", "cms", "foo", "4", "bar", "1"], &[7, 1]);
+    arr_ints(
+        &mut t,
+        &["cms.incrby", "cms", "foo", "4", "bar", "1"],
+        &[7, 1],
+    );
 
-    t.assert_err(&["cms.incrby", "noexist", "foo", "1"], "CMS: key does not exist");
+    t.assert_err(
+        &["cms.incrby", "noexist", "foo", "1"],
+        "CMS: key does not exist",
+    );
     t.assert_err(
         &["cms.incrby", "cms", "foo", "notanumber"],
         "CMS: Cannot parse number",
@@ -144,12 +151,23 @@ fn merge() {
     t.run(&["cms.incrby", "B", "foo", "2", "foobar", "3", "baz", "1"]);
 
     arr_ints(&mut t, &["cms.query", "A", "foo", "bar", "baz"], &[5, 3, 9]);
-    arr_ints(&mut t, &["cms.query", "B", "foo", "foobar", "baz"], &[2, 3, 1]);
+    arr_ints(
+        &mut t,
+        &["cms.query", "B", "foo", "foobar", "baz"],
+        &[2, 3, 1],
+    );
 
     t.ok(&["cms.merge", "C", "2", "A", "B"]);
-    arr_ints(&mut t, &["cms.query", "C", "foo", "bar", "baz", "foobar"], &[7, 3, 10, 3]);
+    arr_ints(
+        &mut t,
+        &["cms.query", "C", "foo", "bar", "baz", "foobar"],
+        &[7, 3, 10, 3],
+    );
 
-    t.assert_err(&["cms.merge", "noexist", "1", "A"], "CMS: key does not exist");
+    t.assert_err(
+        &["cms.merge", "noexist", "1", "A"],
+        "CMS: key does not exist",
+    );
     t.assert_err(&["cms.merge", "C", "0", "A"], "CMS: wrong number of keys");
     t.assert_err(
         &["cms.merge", "A", "1", "B", "WEIGHTS", "4", "3"],
@@ -178,7 +196,11 @@ fn merge_with_weights() {
 
     // foo: 5*2 + 2*3 = 16; bar: 3*2 + 3*3 = 15; baz: 9*2 + 1*3 = 21.
     t.ok(&["cms.merge", "C", "2", "A", "B", "WEIGHTS", "2", "3"]);
-    arr_ints(&mut t, &["cms.query", "C", "foo", "bar", "baz"], &[16, 15, 21]);
+    arr_ints(
+        &mut t,
+        &["cms.query", "C", "foo", "bar", "baz"],
+        &[16, 15, 21],
+    );
 }
 
 #[test]
@@ -216,13 +238,25 @@ fn info_after_merges() {
     arr_ints(&mut t, &["cms.query", "B", "foo", "bar", "baz"], &[2, 3, 1]);
 
     t.ok(&["cms.merge", "C", "2", "A", "B"]);
-    arr_ints(&mut t, &["cms.query", "C", "foo", "bar", "baz"], &[7, 6, 10]);
+    arr_ints(
+        &mut t,
+        &["cms.query", "C", "foo", "bar", "baz"],
+        &[7, 6, 10],
+    );
 
     t.ok(&["cms.merge", "C", "2", "A", "B", "WEIGHTS", "1", "2"]);
-    arr_ints(&mut t, &["cms.query", "C", "foo", "bar", "baz"], &[9, 9, 11]);
+    arr_ints(
+        &mut t,
+        &["cms.query", "C", "foo", "bar", "baz"],
+        &[9, 9, 11],
+    );
 
     t.ok(&["cms.merge", "C", "2", "A", "B", "WEIGHTS", "2", "3"]);
-    arr_ints(&mut t, &["cms.query", "C", "foo", "bar", "baz"], &[16, 15, 21]);
+    arr_ints(
+        &mut t,
+        &["cms.query", "C", "foo", "bar", "baz"],
+        &[16, 15, 21],
+    );
 
     let v = t.arr(&["cms.info", "A"]);
     assert_eq!(v.len(), 6, "reply {v:?}");

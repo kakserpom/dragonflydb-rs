@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use dragonflydb::commands::lua::ScriptMgr;
 use dragonflydb::server::event_loop::IoLoop;
 use dragonflydb::server::replication::ReplChunk;
-use dragonflydb::server::{coordinator, shard, Reply, ReplyBus, ServerEnv};
+use dragonflydb::server::{Reply, ReplyBus, ServerEnv, coordinator, shard};
 
 /// A running in-process server. Dropping it shuts the server down.
 pub struct TestServer {
@@ -267,28 +267,43 @@ impl Client {
 
     fn read_value(&mut self) -> Result<Value, String> {
         let mut line = String::new();
-        self.reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        self.reader
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
         let bytes = line.as_bytes();
         match bytes[0] {
             b'+' => Ok(Value::Simple(line[1..].trim_end().to_string())),
             b'-' => Ok(Value::Error(line[1..].trim_end().to_string())),
             b':' => {
-                let n = line[1..].trim().parse().map_err(|_| "bad int".to_string())?;
+                let n = line[1..]
+                    .trim()
+                    .parse()
+                    .map_err(|_| "bad int".to_string())?;
                 Ok(Value::Integer(n))
             }
             b'$' => {
-                let n: i64 = line[1..].trim().parse().map_err(|_| "bad len".to_string())?;
+                let n: i64 = line[1..]
+                    .trim()
+                    .parse()
+                    .map_err(|_| "bad len".to_string())?;
                 if n < 0 {
                     return Ok(Value::Bulk(None));
                 }
                 let mut buf = vec![0u8; n as usize];
-                self.reader.read_exact(&mut buf).map_err(|e| e.to_string())?;
+                self.reader
+                    .read_exact(&mut buf)
+                    .map_err(|e| e.to_string())?;
                 let mut crlf = [0u8; 2];
-                self.reader.read_exact(&mut crlf).map_err(|e| e.to_string())?;
+                self.reader
+                    .read_exact(&mut crlf)
+                    .map_err(|e| e.to_string())?;
                 Ok(Value::Bulk(Some(buf)))
             }
             b'*' => {
-                let n: i64 = line[1..].trim().parse().map_err(|_| "bad count".to_string())?;
+                let n: i64 = line[1..]
+                    .trim()
+                    .parse()
+                    .map_err(|_| "bad count".to_string())?;
                 if n < 0 {
                     return Ok(Value::Array(None));
                 }
@@ -406,12 +421,14 @@ impl Ctx {
 
     pub fn int(&mut self, args: &[&str]) -> i64 {
         let v = self.run(args);
-        v.int().unwrap_or_else(|| panic!("expected integer, got {v:?}"))
+        v.int()
+            .unwrap_or_else(|| panic!("expected integer, got {v:?}"))
     }
 
     pub fn text(&mut self, args: &[&str]) -> String {
         let v = self.run(args);
-        v.text().unwrap_or_else(|| panic!("expected bulk, got {v:?}"))
+        v.text()
+            .unwrap_or_else(|| panic!("expected bulk, got {v:?}"))
     }
 
     pub fn bulk(&mut self, args: &[&str]) -> Vec<u8> {
@@ -440,9 +457,9 @@ impl Ctx {
 
     pub fn arr(&mut self, args: &[&str]) -> Vec<Value> {
         let v = self.run(args);
-        v.arr().map(<[Value]>::to_vec).unwrap_or_else(|| {
-            panic!("expected array, got {v:?}")
-        })
+        v.arr()
+            .map(<[Value]>::to_vec)
+            .unwrap_or_else(|| panic!("expected array, got {v:?}"))
     }
 
     /// Assert the reply is `+OK`.
@@ -518,7 +535,11 @@ pub fn expect_err_exact(v: &Value, substr: &str) {
 
 /// Assert that a reply is a bulk string with the given text.
 pub fn expect_text(v: &Value, s: &str) {
-    assert_eq!(v.text().as_deref(), Some(s), "expected bulk {s:?}, got {v:?}");
+    assert_eq!(
+        v.text().as_deref(),
+        Some(s),
+        "expected bulk {s:?}, got {v:?}"
+    );
 }
 
 /// Assert that a reply is a null bulk / null array.

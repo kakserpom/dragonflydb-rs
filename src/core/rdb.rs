@@ -31,7 +31,7 @@ use crate::core::lzf;
 use crate::core::quicklist::{ListItem, QuickList};
 use crate::core::set::Set;
 use crate::core::stream::{
-    Consumer, ConsumerGroup, PendingEntry, Stream, StreamEntry, StreamId, SCG_INVALID_ENTRIES_READ,
+    Consumer, ConsumerGroup, PendingEntry, SCG_INVALID_ENTRIES_READ, Stream, StreamEntry, StreamId,
 };
 use crate::core::topk::Topk;
 use crate::core::value::PrimeValue;
@@ -600,7 +600,12 @@ pub fn write_full_sync_header() -> Vec<u8> {
 /// One DB's baseline header: `SELECTDB <id>` plus `RESIZEDB <keys> <expires>`.
 /// The counts come from the key list frozen at snapshot start, so the header is
 /// deterministic even though later chunks are serialized under load.
-pub fn write_full_sync_db_header(out: &mut Vec<u8>, dbid: usize, num_keys: usize, num_expires: usize) {
+pub fn write_full_sync_db_header(
+    out: &mut Vec<u8>,
+    dbid: usize,
+    num_keys: usize,
+    num_expires: usize,
+) {
     out.push(RDB_OPCODE_SELECTDB);
     write_len(out, dbid as u64);
     out.push(RDB_OPCODE_RESIZEDB);
@@ -614,7 +619,12 @@ pub fn write_full_sync_db_header(out: &mut Vec<u8>, dbid: usize, num_keys: usize
 /// keys deleted or expired mid-snapshot are skipped. Returns whether the key
 /// was still present.
 #[must_use]
-pub fn write_full_sync_entry(out: &mut Vec<u8>, slice: &mut DbSlice, key: &[u8], now_ms: u64) -> bool {
+pub fn write_full_sync_entry(
+    out: &mut Vec<u8>,
+    slice: &mut DbSlice,
+    key: &[u8],
+    now_ms: u64,
+) -> bool {
     let at = slice.expire_at(key);
     let Some(value) = slice.find(key, now_ms) else {
         return false;
@@ -912,7 +922,11 @@ fn load_lp_set(r: &mut impl Rd) -> Result<Set, RestoreError> {
     Ok(s)
 }
 
-fn load_hash(r: &mut impl Rd, with_expiry: bool, now_ms: u64) -> Result<Option<Hash>, RestoreError> {
+fn load_hash(
+    r: &mut impl Rd,
+    with_expiry: bool,
+    now_ms: u64,
+) -> Result<Option<Hash>, RestoreError> {
     let len = r.read_len()?.0;
     let mut h = Hash::new();
     let mut values_expired = false;

@@ -415,7 +415,10 @@ fn incr_by_exceeds_max_increment() {
 fn incr_by_non_numeric_increment() {
     let mut t = Ctx::new();
     reserve_default(&mut t, "tk", "5");
-    t.assert_err(&["topk.incrby", "tk", "foo", "notanumber"], "not an integer");
+    t.assert_err(
+        &["topk.incrby", "tk", "foo", "notanumber"],
+        "not an integer",
+    );
 }
 
 #[test]
@@ -591,8 +594,17 @@ fn list_with_count() {
     assert_eq!(v.len(), 6, "reply {v:?}");
     // Pairs of (string, integer).
     for i in (0..v.len()).step_by(2) {
-        assert!(matches!(&v[i], Value::Bulk(Some(_))), "element {i}: {:?}", v[i]);
-        assert!(v[i + 1].int().unwrap_or(0) >= 1, "element {}: {:?}", i + 1, v[i + 1]);
+        assert!(
+            matches!(&v[i], Value::Bulk(Some(_))),
+            "element {i}: {:?}",
+            v[i]
+        );
+        assert!(
+            v[i + 1].int().unwrap_or(0) >= 1,
+            "element {}: {:?}",
+            i + 1,
+            v[i + 1]
+        );
     }
 }
 

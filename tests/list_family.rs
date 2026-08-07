@@ -84,26 +84,35 @@ fn blmpop_nonblocking() {
     t.assert_int(&["lpush", "x", "1", "2", "3", "4"], 4);
 
     let v = t.run(&["blmpop", "0.01", "2", "b", "x", "LEFT"]);
-    assert_eq!(v.arr().map(<[Value]>::to_vec), Some(vec![
-        Value::Bulk(Some(b"x".to_vec())),
-        Value::Array(Some(vec![Value::Bulk(Some(b"4".to_vec()))])),
-    ]));
+    assert_eq!(
+        v.arr().map(<[Value]>::to_vec),
+        Some(vec![
+            Value::Bulk(Some(b"x".to_vec())),
+            Value::Array(Some(vec![Value::Bulk(Some(b"4".to_vec()))])),
+        ])
+    );
 
     let v = t.run(&["blmpop", "0.01", "2", "b", "x", "RIGHT", "COUNT", "2"]);
-    assert_eq!(v.arr().map(<[Value]>::to_vec), Some(vec![
-        Value::Bulk(Some(b"x".to_vec())),
-        Value::Array(Some(vec![
-            Value::Bulk(Some(b"1".to_vec())),
-            Value::Bulk(Some(b"2".to_vec())),
-        ])),
-    ]));
+    assert_eq!(
+        v.arr().map(<[Value]>::to_vec),
+        Some(vec![
+            Value::Bulk(Some(b"x".to_vec())),
+            Value::Array(Some(vec![
+                Value::Bulk(Some(b"1".to_vec())),
+                Value::Bulk(Some(b"2".to_vec())),
+            ])),
+        ])
+    );
 
     // Count exceeds the size: return all of the key's values.
     let v = t.run(&["blmpop", "0.01", "1", "x", "RIGHT", "COUNT", "10"]);
-    assert_eq!(v.arr().map(<[Value]>::to_vec), Some(vec![
-        Value::Bulk(Some(b"x".to_vec())),
-        Value::Array(Some(vec![Value::Bulk(Some(b"3".to_vec()))])),
-    ]));
+    assert_eq!(
+        v.arr().map(<[Value]>::to_vec),
+        Some(vec![
+            Value::Bulk(Some(b"x".to_vec())),
+            Value::Array(Some(vec![Value::Bulk(Some(b"3".to_vec()))])),
+        ])
+    );
 }
 
 #[test]
@@ -118,19 +127,28 @@ fn blmpop_invalid_syntax() {
         &["blmpop", "-0.01", "1", "x", "LEFT", "COUNT", "1"],
         "timeout is negative",
     );
-    t.assert_err(&["blmpop", "0.01", "0", "LEFT", "COUNT", "1"], "at least 1 input key is needed");
+    t.assert_err(
+        &["blmpop", "0.01", "0", "LEFT", "COUNT", "1"],
+        "at least 1 input key is needed",
+    );
     t.assert_err(
         &["blmpop", "0.01", "aa", "x", "LEFT"],
         "value is not an integer or out of range",
     );
     t.assert_err(&["blmpop", "0.01", "1", "x", "COUNT", "1"], "syntax error");
     t.assert_err(&["blmpop", "0.01", "1", "x", "b", "LEFT"], "syntax error");
-    t.assert_err(&["blmpop", "0.01", "1", "x", "LEFT", "COUNT"], "syntax error");
+    t.assert_err(
+        &["blmpop", "0.01", "1", "x", "LEFT", "COUNT"],
+        "syntax error",
+    );
     t.assert_err(
         &["blmpop", "0.01", "1", "x", "LEFT", "COUNT", "boo"],
         "value is not an integer or out of range",
     );
-    t.assert_err(&["blmpop", "0.01", "1", "c", "LEFT", "COUNT", "2", "foo"], "syntax error");
+    t.assert_err(
+        &["blmpop", "0.01", "1", "c", "LEFT", "COUNT", "2", "foo"],
+        "syntax error",
+    );
 }
 
 #[test]
@@ -140,7 +158,10 @@ fn blmpop_blocking() {
     // Pop from an empty key blocks and returns nil on timeout.
     let fb = t.spawn(&["blmpop", "0.1", "1", "x", "LEFT"]);
     let resp = fb.join().unwrap();
-    assert!(matches!(resp, Value::Bulk(None) | Value::Array(None)), "got {resp:?}");
+    assert!(
+        matches!(resp, Value::Bulk(None) | Value::Array(None)),
+        "got {resp:?}"
+    );
 
     // BLMPOP should not block if there is a non-empty key available.
     t.assert_int(&["lpush", "x", "0"], 1);
@@ -166,7 +187,10 @@ fn blpop_unblocking() {
     t.assert_int(&["lpush", "b", "2"], 1);
 
     // Missing "0" delimiter.
-    t.assert_err(&["blpop", "x", "b"], "timeout is not a float or out of range");
+    t.assert_err(
+        &["blpop", "x", "b"],
+        "timeout is not a float or out of range",
+    );
 
     let v = t.run(&["blpop", "x", "b", "0"]);
     assert_eq!(strs(&v), ["x", "1"]);
@@ -207,7 +231,10 @@ fn blpop_multiple() {
 
     // Timeout with no data.
     let resp = t.run(&["blpop", "x", "b", "0.01"]);
-    assert!(matches!(resp, Value::Bulk(None) | Value::Array(None)), "got {resp:?}");
+    assert!(
+        matches!(resp, Value::Bulk(None) | Value::Array(None)),
+        "got {resp:?}"
+    );
 
     // Block forever, then wake on a push to the first key.
     let fb = t.spawn(&["blpop", "x", "b", "0"]);
@@ -221,7 +248,10 @@ fn blpop_multiple() {
 fn blpop_timeout() {
     let mut t = Ctx::new();
     let resp = t.run(&["blpop", "x", "b", "c", "0.01"]);
-    assert!(matches!(resp, Value::Bulk(None) | Value::Array(None)), "got {resp:?}");
+    assert!(
+        matches!(resp, Value::Bulk(None) | Value::Array(None)),
+        "got {resp:?}"
+    );
 
     // Under MULTI a blocking command replies nil immediately.
     t.ok(&["multi"]);
@@ -229,14 +259,21 @@ fn blpop_timeout() {
     let v = t.run(&["exec"]);
     let a = v.arr().expect("array");
     assert_eq!(a.len(), 1);
-    assert!(matches!(a[0], Value::Bulk(None) | Value::Array(None)), "got {:?}", a[0]);
+    assert!(
+        matches!(a[0], Value::Bulk(None) | Value::Array(None)),
+        "got {:?}",
+        a[0]
+    );
 }
 
 #[test]
 fn blpop_timeout2() {
     let mut t = Ctx::new();
     let resp = t.run(&["blpop", "blist1", "blist2", "0.1"]);
-    assert!(matches!(resp, Value::Bulk(None) | Value::Array(None)), "got {resp:?}");
+    assert!(
+        matches!(resp, Value::Bulk(None) | Value::Array(None)),
+        "got {resp:?}"
+    );
 
     t.assert_int(&["rpush", "blist2", "d"], 1);
     t.assert_int(&["rpush", "blist2", "hello"], 2);
@@ -386,7 +423,12 @@ fn ltrim() {
 #[test]
 fn lrange() {
     let mut t = Ctx::new();
-    assert_eq!(t.run(&["lrange", "x", "0", "5"]).arr().map(<[Value]>::to_vec), Some(vec![]));
+    assert_eq!(
+        t.run(&["lrange", "x", "0", "5"])
+            .arr()
+            .map(<[Value]>::to_vec),
+        Some(vec![])
+    );
     t.assert_int(&["rpush", "x", "0", "1", "2"], 3);
     assert_eq!(strs(&t.run(&["lrange", "x", "-2", "-1"])), ["1", "2"]);
 }
@@ -422,13 +464,28 @@ fn lpos() {
     let v = t.run(&["lpos", "x", "f"]);
     assert!(matches!(v, Value::Bulk(None)), "got {v:?}");
 
-    t.assert_err(&["lpos", "x", "1", "COUNT", "-1"], "COUNT can't be negative");
-    t.assert_err(&["lpos", "x", "1", "MAXLEN", "-1"], "MAXLEN can't be negative");
+    t.assert_err(
+        &["lpos", "x", "1", "COUNT", "-1"],
+        "COUNT can't be negative",
+    );
+    t.assert_err(
+        &["lpos", "x", "1", "MAXLEN", "-1"],
+        "MAXLEN can't be negative",
+    );
     t.assert_err(&["lpos", "x", "1", "RANK", "0"], "RANK can't be zero");
 
-    assert_eq!(ints(&t.run(&["lpos", "x", "a", "RANK", "-1", "COUNT", "2"])), [5, 1]);
-    assert_eq!(ints(&t.run(&["lpos", "x", "1", "COUNT", "0"])), [0, 3, 4, 6]);
-    assert_eq!(ints(&t.run(&["lpos", "x", "1", "COUNT", "0", "MAXLEN", "5"])), [0, 3, 4]);
+    assert_eq!(
+        ints(&t.run(&["lpos", "x", "a", "RANK", "-1", "COUNT", "2"])),
+        [5, 1]
+    );
+    assert_eq!(
+        ints(&t.run(&["lpos", "x", "1", "COUNT", "0"])),
+        [0, 3, 4, 6]
+    );
+    assert_eq!(
+        ints(&t.run(&["lpos", "x", "1", "COUNT", "0", "MAXLEN", "5"])),
+        [0, 3, 4]
+    );
 }
 
 #[test]
@@ -440,27 +497,44 @@ fn rpoplpush() {
         assert_eq!(t.text(&["rpoplpush", "x", "b"]), expected);
     }
     assert_eq!(strs(&t.run(&["lrange", "x", "0", "-1"])), ["1", "a", "b"]);
-    assert_eq!(strs(&t.run(&["lrange", "b", "0", "-1"])), ["1", "2", "3", "4"]);
+    assert_eq!(
+        strs(&t.run(&["lrange", "b", "0", "-1"])),
+        ["1", "2", "3", "4"]
+    );
 
     for expected in ["b", "a", "1"] {
         assert_eq!(t.text(&["rpoplpush", "x", "b"]), expected);
     }
-    assert_eq!(t.run(&["lrange", "x", "0", "-1"]).arr().map(<[Value]>::to_vec), Some(vec![]));
+    assert_eq!(
+        t.run(&["lrange", "x", "0", "-1"])
+            .arr()
+            .map(<[Value]>::to_vec),
+        Some(vec![])
+    );
     t.assert_int(&["exists", "x"], 0);
     let v = t.run(&["rpoplpush", "x", "b"]);
     assert!(matches!(v, Value::Bulk(None)), "got {v:?}");
-    assert_eq!(strs(&t.run(&["lrange", "b", "0", "-1"])), ["1", "a", "b", "1", "2", "3", "4"]);
+    assert_eq!(
+        strs(&t.run(&["lrange", "b", "0", "-1"])),
+        ["1", "a", "b", "1", "2", "3", "4"]
+    );
 
     // src and dest are the same key.
     t.assert_int(&["rpush", "x", "1", "a", "b", "1", "2", "3", "4"], 7);
     for expected in ["4", "3", "2", "1"] {
         assert_eq!(t.text(&["rpoplpush", "x", "x"]), expected);
     }
-    assert_eq!(strs(&t.run(&["lrange", "x", "0", "-1"])), ["1", "2", "3", "4", "1", "a", "b"]);
+    assert_eq!(
+        strs(&t.run(&["lrange", "x", "0", "-1"])),
+        ["1", "2", "3", "4", "1", "a", "b"]
+    );
     for expected in ["b", "a", "1"] {
         assert_eq!(t.text(&["rpoplpush", "x", "x"]), expected);
     }
-    assert_eq!(strs(&t.run(&["lrange", "x", "0", "-1"])), ["1", "a", "b", "1", "2", "3", "4"]);
+    assert_eq!(
+        strs(&t.run(&["lrange", "x", "0", "-1"])),
+        ["1", "a", "b", "1", "2", "3", "4"]
+    );
 }
 
 #[test]
@@ -476,16 +550,27 @@ fn lmove() {
     assert_eq!(strs(&t.run(&["lrange", "b", "0", "-1"])), ["5", "2", "1"]);
     assert_eq!(t.text(&["lmove", "x", "b", "RIGHT", "RIGHT"]), "4");
     assert_eq!(strs(&t.run(&["lrange", "x", "0", "-1"])), ["3"]);
-    assert_eq!(strs(&t.run(&["lrange", "b", "0", "-1"])), ["5", "2", "1", "4"]);
+    assert_eq!(
+        strs(&t.run(&["lrange", "b", "0", "-1"])),
+        ["5", "2", "1", "4"]
+    );
     assert_eq!(t.text(&["lmove", "x", "b", "RIGHT", "RIGHT"]), "3");
 
-    assert_eq!(t.run(&["lrange", "x", "0", "-1"]).arr().map(<[Value]>::to_vec), Some(vec![]));
+    assert_eq!(
+        t.run(&["lrange", "x", "0", "-1"])
+            .arr()
+            .map(<[Value]>::to_vec),
+        Some(vec![])
+    );
     t.assert_int(&["exists", "x"], 0);
     let v = t.run(&["lmove", "x", "b", "LEFT", "RIGHT"]);
     assert!(matches!(v, Value::Bulk(None)), "got {v:?}");
     let v = t.run(&["lmove", "x", "b", "RIGHT", "RIGHT"]);
     assert!(matches!(v, Value::Bulk(None)), "got {v:?}");
-    assert_eq!(strs(&t.run(&["lrange", "b", "0", "-1"])), ["5", "2", "1", "4", "3"]);
+    assert_eq!(
+        strs(&t.run(&["lrange", "b", "0", "-1"])),
+        ["5", "2", "1", "4", "3"]
+    );
 
     // src and dest are the same key.
     t.assert_int(&["rpush", "x", "1", "2", "3", "4", "5"], 5);
@@ -494,12 +579,18 @@ fn lmove() {
     assert_eq!(t.text(&["lmove", "x", "x", "RIGHT", "LEFT"]), "1");
     assert_eq!(t.text(&["lmove", "x", "x", "RIGHT", "RIGHT"]), "5");
     assert_eq!(t.text(&["lmove", "x", "x", "LEFT", "RIGHT"]), "1");
-    assert_eq!(strs(&t.run(&["lrange", "x", "0", "-1"])), ["2", "3", "4", "5", "1"]);
+    assert_eq!(
+        strs(&t.run(&["lrange", "x", "0", "-1"])),
+        ["2", "3", "4", "5", "1"]
+    );
     assert_eq!(t.text(&["lmove", "x", "x", "LEFT", "RIGHT"]), "2");
     assert_eq!(t.text(&["lmove", "x", "x", "LEFT", "RIGHT"]), "3");
     assert_eq!(t.text(&["lmove", "x", "x", "RIGHT", "RIGHT"]), "3");
     assert_eq!(t.text(&["lmove", "x", "x", "LEFT", "RIGHT"]), "4");
-    assert_eq!(strs(&t.run(&["lrange", "x", "0", "-1"])), ["5", "1", "2", "3", "4"]);
+    assert_eq!(
+        strs(&t.run(&["lrange", "x", "0", "-1"])),
+        ["5", "1", "2", "3", "4"]
+    );
 
     t.assert_err(&["lmove", "x", "x", "LEFT", "R"], "syntax error");
 }
@@ -524,7 +615,11 @@ fn brpoplpush_single_shard() {
     let v = t.run(&["exec"]);
     let a = v.arr().expect("array");
     assert_eq!(a.len(), 1);
-    assert!(matches!(a[0], Value::Bulk(None) | Value::Array(None)), "got {:?}", a[0]);
+    assert!(
+        matches!(a[0], Value::Bulk(None) | Value::Array(None)),
+        "got {:?}",
+        a[0]
+    );
 }
 
 #[test]
@@ -544,7 +639,10 @@ fn brpoplpush_single_shard_bug2857() {
     let v = t.run(&["brpoplpush", "src", "dest", "1"]);
     assert!(matches!(v, Value::Bulk(None)), "got {v:?}");
     let resp = fb.join().unwrap();
-    assert!(matches!(resp, Value::Bulk(None) | Value::Array(None)), "got {resp:?}");
+    assert!(
+        matches!(resp, Value::Bulk(None) | Value::Array(None)),
+        "got {resp:?}"
+    );
 }
 
 #[test]
@@ -599,7 +697,10 @@ fn blmove() {
 
     t.assert_int(&["lpush", "x", "val1"], 1);
     t.assert_int(&["lpush", "y", "val2"], 1);
-    assert_eq!(t.text(&["blmove", "x", "y", "right", "left", "0.01"]), "val1");
+    assert_eq!(
+        t.text(&["blmove", "x", "y", "right", "left", "0.01"]),
+        "val1"
+    );
     assert_eq!(strs(&t.run(&["lrange", "y", "0", "-1"])), ["val1", "val2"]);
 }
 
@@ -616,7 +717,13 @@ fn blocking_timeout_validation() {
         vec!["blpop", "k"],
         vec!["brpop", "k"],
     ] {
-        for (timeout, err) in [("abc", not_float), ("nan", not_float), ("inf", out_of_range), ("-inf", negative), ("-1", negative)] {
+        for (timeout, err) in [
+            ("abc", not_float),
+            ("nan", not_float),
+            ("inf", out_of_range),
+            ("-inf", negative),
+            ("-1", negative),
+        ] {
             let mut args = c.clone();
             args.push(timeout);
             t.assert_err(&args, err);
@@ -633,7 +740,14 @@ fn blocking_timeout_validation() {
     ] {
         t.assert_err(&["blmpop", timeout, "1", "k", "LEFT"], err);
     }
-    for (timeout, err) in [("abc", not_float), ("nan", not_float), ("inf", out_of_range), ("-inf", negative), ("-1", negative), ("1e10", out_of_range)] {
+    for (timeout, err) in [
+        ("abc", not_float),
+        ("nan", not_float),
+        ("inf", out_of_range),
+        ("-inf", negative),
+        ("-1", negative),
+        ("1e10", out_of_range),
+    ] {
         t.assert_err(&["blpop", "k", timeout], err);
     }
 
@@ -725,16 +839,25 @@ fn linsert() {
 
     // Key is not a list.
     t.ok(&["set", "notalist", "x"]);
-    t.assert_err(&["linsert", "notalist", "before", "foo", "bar"], "wrong kind of value");
+    t.assert_err(
+        &["linsert", "notalist", "before", "foo", "bar"],
+        "wrong kind of value",
+    );
 
     // Insert before.
     t.assert_int(&["rpush", "mylist", "foo"], 1);
     t.assert_int(&["linsert", "mylist", "before", "foo", "bar"], 2);
-    assert_eq!(strs(&t.run(&["lrange", "mylist", "0", "1"])), ["bar", "foo"]);
+    assert_eq!(
+        strs(&t.run(&["lrange", "mylist", "0", "1"])),
+        ["bar", "foo"]
+    );
 
     // Insert after.
     t.assert_int(&["linsert", "mylist", "after", "foo", "car"], 3);
-    assert_eq!(strs(&t.run(&["lrange", "mylist", "0", "2"])), ["bar", "foo", "car"]);
+    assert_eq!(
+        strs(&t.run(&["lrange", "mylist", "0", "2"])),
+        ["bar", "foo", "car"]
+    );
 
     // Pivot not found.
     t.assert_int(&["linsert", "mylist", "before", "notfound", "x"], -1);
@@ -762,7 +885,10 @@ fn blpop_unwakes_in_script() {
 
     // A quick timed-out blpop while the script is running.
     let resp = t.run(&["blpop", "g", "0.01"]);
-    assert!(matches!(resp, Value::Bulk(None) | Value::Array(None)), "got {resp:?}");
+    assert!(
+        matches!(resp, Value::Bulk(None) | Value::Array(None)),
+        "got {resp:?}"
+    );
 
     f2.join().unwrap();
     let resp = f1.join().unwrap();
@@ -796,13 +922,25 @@ fn other_multi_wakes_blpop() {
 fn lmpop_invalid_syntax() {
     let mut t = Ctx::new();
     t.assert_err(&["lmpop", "1", "a"], "wrong number of arguments");
-    t.assert_err(&["lmpop", "0", "LEFT", "COUNT", "1"], "at least 1 input key is needed");
-    t.assert_err(&["lmpop", "aa", "a", "LEFT"], "value is not an integer or out of range");
+    t.assert_err(
+        &["lmpop", "0", "LEFT", "COUNT", "1"],
+        "at least 1 input key is needed",
+    );
+    t.assert_err(
+        &["lmpop", "aa", "a", "LEFT"],
+        "value is not an integer or out of range",
+    );
     t.assert_err(&["lmpop", "1", "a", "COUNT", "1"], "syntax error");
     t.assert_err(&["lmpop", "1", "a", "b", "LEFT"], "syntax error");
     t.assert_err(&["lmpop", "1", "a", "LEFT", "COUNT"], "syntax error");
-    t.assert_err(&["lmpop", "1", "a", "LEFT", "COUNT", "boo"], "value is not an integer or out of range");
-    t.assert_err(&["lmpop", "1", "c", "LEFT", "COUNT", "2", "foo"], "syntax error");
+    t.assert_err(
+        &["lmpop", "1", "a", "LEFT", "COUNT", "boo"],
+        "value is not an integer or out of range",
+    );
+    t.assert_err(
+        &["lmpop", "1", "c", "LEFT", "COUNT", "2", "foo"],
+        "syntax error",
+    );
 }
 
 #[test]
@@ -811,7 +949,10 @@ fn lmpop() {
 
     // All lists empty.
     let v = t.run(&["lmpop", "1", "e", "LEFT"]);
-    assert!(matches!(v, Value::Bulk(None) | Value::Array(None)), "got {v:?}");
+    assert!(
+        matches!(v, Value::Bulk(None) | Value::Array(None)),
+        "got {v:?}"
+    );
 
     // LEFT operation.
     t.assert_int(&["lpush", "a", "a1", "a2"], 2);
@@ -858,7 +999,10 @@ fn lmpop_multiple_elements() {
     t.assert_int(&["rpush", "list2", "v", "w", "x", "y", "z"], 5);
     let v = t.run(&["lmpop", "1", "list2", "RIGHT", "COUNT", "2"]);
     assert_eq!(strs(&v.arr().unwrap()[1]), ["z", "y"]);
-    assert_eq!(strs(&t.run(&["lrange", "list2", "0", "-1"])), ["v", "w", "x"]);
+    assert_eq!(
+        strs(&t.run(&["lrange", "list2", "0", "-1"])),
+        ["v", "w", "x"]
+    );
 }
 
 #[test]
@@ -874,7 +1018,9 @@ fn lmpop_multiple_lists() {
 
     // Pop from the second list after the first becomes empty.
     t.run(&["lmpop", "1", "list1", "LEFT"]);
-    let v = t.run(&["lmpop", "3", "list1", "list2", "list3", "RIGHT", "COUNT", "2"]);
+    let v = t.run(&[
+        "lmpop", "3", "list1", "list2", "list3", "RIGHT", "COUNT", "2",
+    ]);
     assert_eq!(key(&v), "list2");
     assert_eq!(strs(&v.arr().unwrap()[1]), ["d", "c"]);
     assert_eq!(strs(&t.run(&["lrange", "list3", "0", "-1"])), ["e", "f"]);
@@ -888,11 +1034,17 @@ fn lmpop_edge_cases() {
     t.assert_int(&["rpush", "empty_list", "a"], 1);
     t.run(&["lpop", "empty_list"]);
     let v = t.run(&["lmpop", "1", "empty_list", "LEFT"]);
-    assert!(matches!(v, Value::Bulk(None) | Value::Array(None)), "got {v:?}");
+    assert!(
+        matches!(v, Value::Bulk(None) | Value::Array(None)),
+        "got {v:?}"
+    );
 
     // Nonexistent list.
     let v = t.run(&["lmpop", "1", "nonexistent", "LEFT"]);
-    assert!(matches!(v, Value::Bulk(None) | Value::Array(None)), "got {v:?}");
+    assert!(
+        matches!(v, Value::Bulk(None) | Value::Array(None)),
+        "got {v:?}"
+    );
 
     // Wrong type key.
     t.ok(&["set", "string_key", "value"]);
@@ -907,10 +1059,16 @@ fn lmpop_edge_cases() {
     // COUNT 0 returns an empty element array.
     let v = t.run(&["lmpop", "1", "list", "LEFT", "COUNT", "0"]);
     assert_eq!(key(&v), "list");
-    assert_eq!(v.arr().unwrap()[1].arr().map(<[Value]>::to_vec), Some(vec![]));
+    assert_eq!(
+        v.arr().unwrap()[1].arr().map(<[Value]>::to_vec),
+        Some(vec![])
+    );
 
     // Negative COUNT.
-    t.assert_err(&["lmpop", "1", "list", "LEFT", "COUNT", "-1"], "value is not an integer or out of range");
+    t.assert_err(
+        &["lmpop", "1", "list", "LEFT", "COUNT", "-1"],
+        "value is not an integer or out of range",
+    );
 }
 
 #[test]
@@ -918,24 +1076,39 @@ fn lmpop_doc_example() {
     let mut t = Ctx::new();
 
     let v = t.run(&["lmpop", "2", "non1", "non2", "LEFT", "COUNT", "10"]);
-    assert!(matches!(v, Value::Bulk(None) | Value::Array(None)), "got {v:?}");
+    assert!(
+        matches!(v, Value::Bulk(None) | Value::Array(None)),
+        "got {v:?}"
+    );
 
-    t.assert_int(&["lpush", "mylist", "one", "two", "three", "four", "five"], 5);
+    t.assert_int(
+        &["lpush", "mylist", "one", "two", "three", "four", "five"],
+        5,
+    );
     let v = t.run(&["lmpop", "1", "mylist", "LEFT"]);
     assert_eq!(key(&v), "mylist");
     assert_eq!(strs(&v.arr().unwrap()[1]), ["five"]);
-    assert_eq!(strs(&t.run(&["lrange", "mylist", "0", "-1"])), ["four", "three", "two", "one"]);
+    assert_eq!(
+        strs(&t.run(&["lrange", "mylist", "0", "-1"])),
+        ["four", "three", "two", "one"]
+    );
 
     let v = t.run(&["lmpop", "1", "mylist", "RIGHT", "COUNT", "10"]);
     assert_eq!(strs(&v.arr().unwrap()[1]), ["one", "two", "three", "four"]);
 
-    t.assert_int(&["lpush", "mylist", "one", "two", "three", "four", "five"], 5);
+    t.assert_int(
+        &["lpush", "mylist", "one", "two", "three", "four", "five"],
+        5,
+    );
     t.assert_int(&["lpush", "mylist2", "a", "b", "c", "d", "e"], 5);
 
     let v = t.run(&["lmpop", "2", "mylist", "mylist2", "RIGHT", "COUNT", "3"]);
     assert_eq!(key(&v), "mylist");
     assert_eq!(strs(&v.arr().unwrap()[1]), ["one", "two", "three"]);
-    assert_eq!(strs(&t.run(&["lrange", "mylist", "0", "-1"])), ["five", "four"]);
+    assert_eq!(
+        strs(&t.run(&["lrange", "mylist", "0", "-1"])),
+        ["five", "four"]
+    );
 
     let v = t.run(&["lmpop", "2", "mylist", "mylist2", "RIGHT", "COUNT", "5"]);
     assert_eq!(key(&v), "mylist");
@@ -976,7 +1149,15 @@ fn awake_db1() {
     });
     sleep(Duration::from_millis(100));
     t.ok(&["select", "1"]);
-    t.assert_int(&["eval", "redis.call('LPUSH', KEYS[1], 'val'); return 1;", "1", "x"], 1);
+    t.assert_int(
+        &[
+            "eval",
+            "redis.call('LPUSH', KEYS[1], 'val'); return 1;",
+            "1",
+            "x",
+        ],
+        1,
+    );
     let resp = f1.join().unwrap();
     assert_eq!(resp.text().as_deref(), Some("val"));
 }

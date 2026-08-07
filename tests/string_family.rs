@@ -143,8 +143,14 @@ fn set_options_syntax_error() {
     t.assert_err(&["set", "key", "val", "NX", "XX"], "ERR syntax error");
     t.assert_err(&["set", "key", "val", "XX", "NX"], "ERR syntax error");
 
-    t.assert_err(&["set", "key", "val", "PX", "9223372036854775800"], "invalid expire time");
-    t.assert_err(&["SET", "foo", "bar", "EX", "18446744073709561"], "invalid expire time");
+    t.assert_err(
+        &["set", "key", "val", "PX", "9223372036854775800"],
+        "invalid expire time",
+    );
+    t.assert_err(
+        &["SET", "foo", "bar", "EX", "18446744073709561"],
+        "invalid expire time",
+    );
 }
 
 #[test]
@@ -154,7 +160,10 @@ fn set() {
     t.ok(&["set", "foo", "bar", "NX"]);
     t.assert_null(&["set", "foo", "bar", "NX"]);
     t.ok(&["set", "foo", "bar", "xx"]);
-    t.assert_err(&["set", "foo", "bar", "ex", "abc"], "value is not an integer or out of range");
+    t.assert_err(
+        &["set", "foo", "bar", "ex", "abc"],
+        "value is not an integer or out of range",
+    );
     t.assert_err(&["set", "foo", "bar", "ex", "-1"], "invalid expire time");
     t.ok(&["set", "foo", "bar", "ex", "1"]);
 
@@ -234,8 +243,20 @@ fn mset_get() {
     let get_h = std::thread::spawn(move || {
         let mut c = Client::connect(port).unwrap();
         for _ in 0..1000 {
-            let x = c.cmd(&["get", "x"]).unwrap().text().unwrap().parse::<i64>().unwrap();
-            let z = c.cmd(&["get", "b"]).unwrap().text().unwrap().parse::<i64>().unwrap();
+            let x = c
+                .cmd(&["get", "x"])
+                .unwrap()
+                .text()
+                .unwrap()
+                .parse::<i64>()
+                .unwrap();
+            let z = c
+                .cmd(&["get", "b"])
+                .unwrap()
+                .text()
+                .unwrap()
+                .parse::<i64>()
+                .unwrap();
             assert!(x <= z, "Inconsistency: x={x} b={z}");
         }
     });
@@ -307,7 +328,9 @@ fn mset_incr() {
         let mut c = Client::connect(port).unwrap();
         for i in 1..1000 {
             let base = (i * 900).to_string();
-            let v = c.cmd(&["mset", "b", &base, "a", &base, "c", &base]).unwrap();
+            let v = c
+                .cmd(&["mset", "b", &base, "a", &base, "c", &base])
+                .unwrap();
             assert_eq!(v.text().as_deref(), Some("OK"), "iteration {i}");
         }
     });
@@ -336,7 +359,10 @@ fn set_ex() {
     t.ok(&["setex", "key", "157680000", "val"]); // 5 * 365 * 24 * 3600
     t.ok(&["setex", "key", "1073741824", "val"]); // 1 << 30
     assert_eq!(t.int(&["ttl", "key"]), 268_435_455); // kMaxExpireDeadlineSec
-    t.assert_err(&["SETEX", "foo", "18446744073709561", "bar"], "invalid expire time");
+    t.assert_err(
+        &["SETEX", "foo", "18446744073709561", "bar"],
+        "invalid expire time",
+    );
 }
 
 #[test]
@@ -383,7 +409,10 @@ fn incr_by_float() {
     t.assert_err(&["INCRBYFLOAT", "nonum", "1.0"], "not a valid float");
 
     t.ok(&["SET", "inf", "+inf"]);
-    t.assert_err(&["INCRBYFLOAT", "inf", "1.0"], "increment would produce NaN or Infinity");
+    t.assert_err(
+        &["INCRBYFLOAT", "inf", "1.0"],
+        "increment would produce NaN or Infinity",
+    );
 
     t.ok(&["SET", "nonum", "11 "]);
     t.assert_err(&["INCRBYFLOAT", "nonum", "1.0"], "not a valid float");
@@ -398,7 +427,12 @@ fn restore_high_ttl() {
     t.ok(&["SET", "X", "1"]);
     let buffer = t.bulk(&["DUMP", "X"]);
     t.int(&["DEL", "X"]);
-    t.ok_b(&[b"RESTORE".to_vec(), b"X".to_vec(), b"5430186761345".to_vec(), buffer]);
+    t.ok_b(&[
+        b"RESTORE".to_vec(),
+        b"X".to_vec(),
+        b"5430186761345".to_vec(),
+        buffer,
+    ]);
 }
 
 #[test]
@@ -472,7 +506,13 @@ fn get_ex() {
     t.assert_err(&["getex", "foo", "PERSIST", "EX", "1"], "syntax error");
     t.assert_err(&["getex", "foo", "EX", "1", "PERSIST"], "syntax error");
     t.assert_err(
-        &["getex", "foo", "PXAT", &(now_ms + 1000).to_string(), "PERSIST"],
+        &[
+            "getex",
+            "foo",
+            "PXAT",
+            &(now_ms + 1000).to_string(),
+            "PERSIST",
+        ],
         "syntax error",
     );
     t.assert_err(&["getex", "foo", "PERSIST", "PERSIST"], "syntax error");
@@ -558,8 +598,14 @@ fn gat_via_redis_protocol() {
 #[test]
 fn mset_nx_odd_args() {
     let mut t = Ctx::new();
-    t.assert_err(&["msetnx", "key", "value", "key2"], "wrong number of arguments");
-    t.assert_err(&["mset", "key", "value", "key2"], "wrong number of arguments");
+    t.assert_err(
+        &["msetnx", "key", "value", "key2"],
+        "wrong number of arguments",
+    );
+    t.assert_err(
+        &["mset", "key", "value", "key2"],
+        "wrong number of arguments",
+    );
 }
 
 #[test]
@@ -582,7 +628,12 @@ fn multi_set_with_hashtags() {
     t.assert_text(&["set", "{key}1", "val1"], "QUEUED");
     t.assert_text(&["set", "{key}2", "val2"], "QUEUED");
     t.assert_text(
-        &["eval", "return redis.call('set', KEYS[1], 'val3')", "1", "{key}3"],
+        &[
+            "eval",
+            "return redis.call('set', KEYS[1], 'val3')",
+            "1",
+            "{key}3",
+        ],
         "QUEUED",
     );
     let a = t.arr(&["exec"]);
@@ -649,9 +700,7 @@ fn get_large_raw_squashed() {
 #[test]
 fn get_large_ascii_chunked() {
     let mut t = Ctx::new();
-    let mut build = |sz: usize| -> Vec<u8> {
-        (0..sz).map(|i| 0x20 + (i % 0x5F) as u8).collect()
-    };
+    let mut build = |sz: usize| -> Vec<u8> { (0..sz).map(|i| 0x20 + (i % 0x5F) as u8).collect() };
     for sz in [16384usize, 16391, 32768, 65535] {
         let value = build(sz);
         t.ok_b(&[b"set".to_vec(), b"k".to_vec(), value.clone()]);

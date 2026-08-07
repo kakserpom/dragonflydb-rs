@@ -14,13 +14,13 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::core::rdb::{self, Rd, RestoreError};
 use crate::error::RespValue;
-use crate::server::journal::{self, OP_COMMAND, OP_EXPIRED, OP_LSN, OP_PING, OP_SELECT};
 use crate::server::ShardMsg;
+use crate::server::journal::{self, OP_COMMAND, OP_EXPIRED, OP_LSN, OP_PING, OP_SELECT};
 
 /// Read-poll granularity: blocking reads wake up this often to re-check the
 /// stop/abort flags, and ACK threads poll at this rate.
@@ -95,10 +95,9 @@ pub struct ReplicaConfig {
 /// `["slave", host, port, state, offset]` like Redis.
 pub fn role_reply(status: &ReplicaStatus) -> RespValue {
     match status.phase {
-        ReplicaPhase::Master => RespValue::Array(vec![
-            RespValue::bulk("master"),
-            RespValue::Array(vec![]),
-        ]),
+        ReplicaPhase::Master => {
+            RespValue::Array(vec![RespValue::bulk("master"), RespValue::Array(vec![])])
+        }
         _ => RespValue::Array(vec![
             RespValue::bulk("slave"),
             RespValue::bulk(status.master_host.as_str()),
@@ -237,10 +236,7 @@ impl StreamReader {
     /// Consume bytes up to and including the next CRLF, as a string.
     fn read_line(&mut self) -> Result<String, ReplicaError> {
         loop {
-            if let Some(rel) = self.buf[self.pos..]
-                .windows(2)
-                .position(|w| w == b"\r\n")
-            {
+            if let Some(rel) = self.buf[self.pos..].windows(2).position(|w| w == b"\r\n") {
                 let line =
                     String::from_utf8_lossy(&self.buf[self.pos..self.pos + rel]).into_owned();
                 self.pos += rel + 2;
@@ -257,9 +253,7 @@ impl StreamReader {
             b'-' => Ok(RespValue::Error(self.read_line()?)),
             b':' => {
                 let line = self.read_line()?;
-                let n = line
-                    .parse::<i64>()
-                    .map_err(|_| proto("bad RESP integer"))?;
+                let n = line.parse::<i64>().map_err(|_| proto("bad RESP integer"))?;
                 Ok(RespValue::Integer(n))
             }
             b'$' => {
@@ -311,8 +305,7 @@ struct Tcp {
 
 impl Tcp {
     fn connect(cfg: &ReplicaConfig, halt: Arc<AtomicBool>) -> Result<Self, ReplicaError> {
-        let stream = TcpStream::connect((cfg.host.as_str(), cfg.port))
-            .map_err(ReplicaError::Io)?;
+        let stream = TcpStream::connect((cfg.host.as_str(), cfg.port)).map_err(ReplicaError::Io)?;
         configure_socket(&stream)?;
         let w = stream.try_clone().map_err(ReplicaError::Io)?;
         Ok(Tcp {
@@ -810,8 +803,8 @@ fn ack_thread(
 /// FULL, then apply journal records forever (or until the session stops).
 fn flow_thread(sess: &Arc<Session>, flow_id: usize) -> Result<(), ReplicaError> {
     let lsn = sess.cfg.lsn_cells[flow_id].load(Ordering::SeqCst);
-    let stream = TcpStream::connect((sess.cfg.host.as_str(), sess.cfg.port))
-        .map_err(ReplicaError::Io)?;
+    let stream =
+        TcpStream::connect((sess.cfg.host.as_str(), sess.cfg.port)).map_err(ReplicaError::Io)?;
     configure_socket(&stream)?;
     let read = stream.try_clone().map_err(ReplicaError::Io)?;
     let mut write = stream.try_clone().map_err(ReplicaError::Io)?;
@@ -876,7 +869,10 @@ fn flow_thread(sess: &Arc<Session>, flow_id: usize) -> Result<(), ReplicaError> 
         std::thread::spawn(move || ack_thread(w, cell, fa, as_, abort, stop));
     }
 
-    let mut reader = JournalReader { stream: &mut sr, dbid: 0 };
+    let mut reader = JournalReader {
+        stream: &mut sr,
+        dbid: 0,
+    };
     let result = (|| -> Result<(), ReplicaError> {
         loop {
             let entry = reader.read_entry()?;
@@ -993,18 +989,20 @@ fn connect_and_replicate(cfg: &ReplicaConfig) -> Result<(), ReplicaError> {
     for flow_id in 0..cfg.num_shards {
         let s = session.clone();
         let err_tx = session.err_tx.clone();
-        handles.push(std::thread::Builder::new()
-            .name(format!("replica-flow-{flow_id}"))
-            .spawn(move || {
-                if let Err(e) = flow_thread(&s, flow_id) {
-                    // Surface the failure to the stable-sync waiter unless the
-                    // session is already shutting down.
-                    if !s.abort.load(Ordering::Relaxed) {
-                        let _ = err_tx.send(e.into_string());
+        handles.push(
+            std::thread::Builder::new()
+                .name(format!("replica-flow-{flow_id}"))
+                .spawn(move || {
+                    if let Err(e) = flow_thread(&s, flow_id) {
+                        // Surface the failure to the stable-sync waiter unless the
+                        // session is already shutting down.
+                        if !s.abort.load(Ordering::Relaxed) {
+                            let _ = err_tx.send(e.into_string());
+                        }
                     }
-                }
-            })
-            .expect("failed to spawn replica flow thread"));
+                })
+                .expect("failed to spawn replica flow thread"),
+        );
     }
     // The flows exit on their own once `abort`/`stop` is set; the handles only
     // keep the threads referenced. Late shard messages from a dying flow are

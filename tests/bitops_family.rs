@@ -87,10 +87,22 @@ fn set_bit_missing_key() {
 fn set_bit_incorrect_values() {
     let mut t = Ctx::new();
     assert_eq!(t.int(&["setbit", "foo", "0", "1"]), 0);
-    t.assert_err(&["setbit", "foo", "1", "-1"], "ERR value is not an integer or out of range");
-    t.assert_err(&["setbit", "foo", "2", "11"], "ERR value is not an integer or out of range");
-    t.assert_err(&["setbit", "foo", "3", "a"], "ERR value is not an integer or out of range");
-    t.assert_err(&["setbit", "foo", "4", "O"], "ERR value is not an integer or out of range");
+    t.assert_err(
+        &["setbit", "foo", "1", "-1"],
+        "ERR value is not an integer or out of range",
+    );
+    t.assert_err(
+        &["setbit", "foo", "2", "11"],
+        "ERR value is not an integer or out of range",
+    );
+    t.assert_err(
+        &["setbit", "foo", "3", "a"],
+        "ERR value is not an integer or out of range",
+    );
+    t.assert_err(
+        &["setbit", "foo", "4", "O"],
+        "ERR value is not an integer or out of range",
+    );
     assert_eq!(t.int(&["getbit", "foo", "0"]), 1);
     assert_eq!(t.int(&["getbit", "foo", "1"]), 0);
     assert_eq!(t.int(&["getbit", "foo", "2"]), 0);
@@ -168,7 +180,10 @@ fn bit_count_byte_sub_range() {
 fn bit_count_byte_bit_sub_range() {
     let mut t = Ctx::new();
     t.ok(&["set", "foo", "abcdef"]);
-    t.assert_err(&["bitcount", "foo", "bar", "BIT"], "value is not an integer or out of range");
+    t.assert_err(
+        &["bitcount", "foo", "bar", "BIT"],
+        "value is not an integer or out of range",
+    );
 
     assert_eq!(t.int(&["bitcount", "foo", "1", "1", "BIT"]), 1);
     assert_eq!(t.int(&["bitcount", "foo", "1", "2", "BIT"]), 2);
@@ -220,7 +235,10 @@ fn key_values_bit_op() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         ("first_key", b8(0xFFAA_CC01u64)),
         ("key_second", vec![0xBB, 0x01]),
-        ("_this_is_the_third_key", vec![0xCC, 0xAA, 0x20, 0x15, 0x05, 0x01]),
+        (
+            "_this_is_the_third_key",
+            vec![0xCC, 0xAA, 0x20, 0x15, 0x05, 0x01],
+        ),
         ("the_last_key_we_have", b8(0xAACCu64)),
     ]
 }
@@ -244,7 +262,10 @@ fn bit_ops_and() {
     assert_eq!(t.int(&["bitop", "and", "dest_key", "1", "2", "3"]), 0);
 
     // single key
-    assert_eq!(t.int(&["bitop", "and", "foo_out", kv[0].0]), kv[0].1.len() as i64);
+    assert_eq!(
+        t.int(&["bitop", "and", "foo_out", kv[0].0]),
+        kv[0].1.len() as i64
+    );
     assert_eq!(t.bulk(&["get", "foo_out"]), kv[0].1);
 
     // two keys
@@ -265,7 +286,9 @@ fn bit_ops_and() {
 
     // four keys
     assert_eq!(
-        t.int(&["bitop", "and", "foo-out", kv[0].0, kv[1].0, kv[2].0, kv[3].0]),
+        t.int(&[
+            "bitop", "and", "foo-out", kv[0].0, kv[1].0, kv[2].0, kv[3].0
+        ]),
         8
     );
     let expected = b8(0xffaa_cc01u64 & 0x1bbu64 & 0x0105_1520_aaccu64 & 0xaa_ccu64);
@@ -281,7 +304,10 @@ fn bit_ops_or() {
     assert_eq!(t.int(&["bitop", "or", "dest_key", "1", "2", "3"]), 0);
 
     // single key
-    assert_eq!(t.int(&["bitop", "or", "foo_out", kv[0].0]), kv[0].1.len() as i64);
+    assert_eq!(
+        t.int(&["bitop", "or", "foo_out", kv[0].0]),
+        kv[0].1.len() as i64
+    );
     assert_eq!(t.bulk(&["get", "foo_out"]), kv[0].1);
 
     // two keys
@@ -315,7 +341,10 @@ fn bit_ops_xor() {
     assert_eq!(t.int(&["bitop", "or", "dest_key", "1", "2", "3"]), 0);
 
     // single key
-    assert_eq!(t.int(&["bitop", "xor", "foo_out", kv[0].0]), kv[0].1.len() as i64);
+    assert_eq!(
+        t.int(&["bitop", "xor", "foo_out", kv[0].0]),
+        kv[0].1.len() as i64
+    );
     assert_eq!(t.bulk(&["get", "foo_out"]), kv[0].1);
 
     // two keys
@@ -333,7 +362,9 @@ fn bit_ops_xor() {
 
     // four keys
     assert_eq!(
-        t.int(&["bitop", "xor", "foo-out", kv[0].0, kv[1].0, kv[2].0, kv[3].0]),
+        t.int(&[
+            "bitop", "xor", "foo-out", kv[0].0, kv[1].0, kv[2].0, kv[3].0
+        ]),
         8
     );
     let expected = b8(0xffaa_cc01u64 ^ 0x1bbu64 ^ 0x0105_1520_aaccu64 ^ 0xaaccu64);
@@ -350,7 +381,12 @@ fn bit_ops_not() {
 
     // works with none-existing keys
     assert_eq!(
-        t.int(&["bitop", "NOT", "bit-op-not-none-existing-key-results", "this-key-do-not-exists"]),
+        t.int(&[
+            "bitop",
+            "NOT",
+            "bit-op-not-none-existing-key-results",
+            "this-key-do-not-exists"
+        ]),
         0
     );
     t.assert_null(&["get", "bit-op-not-none-existing-key-results"]);
@@ -365,7 +401,10 @@ fn bit_ops_not() {
     t.assert_null(&["get", "foo"]);
 
     set_b(&mut t, kv[0].0, &kv[0].1);
-    assert_eq!(t.int(&["bitop", "not", "foo_out", kv[0].0]), kv[0].1.len() as i64);
+    assert_eq!(
+        t.int(&["bitop", "not", "foo_out", kv[0].0]),
+        kv[0].1.len() as i64
+    );
     let expected = b8(!0xffaa_cc01u64);
     assert_eq!(t.bulk(&["get", "foo_out"]), expected);
 }
@@ -485,8 +524,14 @@ fn bit_pos() {
 
     // bit argument must be 1 or 0
     t.assert_err(&["bitpos", "d", "2"], "ERR The bit argument must be 1 or 0");
-    t.assert_err(&["bitpos", "d", "42"], "ERR The bit argument must be 1 or 0");
-    t.assert_err(&["bitpos", "d", "-1"], "ERR The bit argument must be 1 or 0");
+    t.assert_err(
+        &["bitpos", "d", "42"],
+        "ERR The bit argument must be 1 or 0",
+    );
+    t.assert_err(
+        &["bitpos", "d", "-1"],
+        "ERR The bit argument must be 1 or 0",
+    );
 }
 
 #[test]
@@ -497,7 +542,10 @@ fn bit_field_parsing() {
     t.assert_err(&["bitfield", "foo", "set", "u1"], syntax);
     t.assert_err(&["bitfield", "foo", "set", "u1", "0"], syntax);
     t.assert_err(&["bitfield", "foo", "set", "u1", "0", "0", "55"], syntax);
-    t.assert_err(&["bitfield", "foo", "set", "u1", "0", "0", "get", "u1"], syntax);
+    t.assert_err(
+        &["bitfield", "foo", "set", "u1", "0", "0", "get", "u1"],
+        syntax,
+    );
     t.assert_err(&["bitfield", "foo", "incrby", "u1"], syntax);
     t.assert_err(&["bitfield", "foo", "incrby", "u1", "0"], syntax);
     t.assert_err(&["bitfield", "foo", "get", "u1", "0", "15"], syntax);
@@ -513,8 +561,14 @@ fn bit_field_parsing() {
     t.assert_err(&["bitfield", "foo", "set", "u65", "0", "0"], bad_type);
     t.assert_err(&["bitfield", "foo", "set", "i65", "0", "0"], bad_type);
 
-    t.assert_err(&["bitfield_ro", "foo", "set", "u1", "0", "0"], "BITFIELD_RO only supports the GET subcommand");
-    t.assert_err(&["bitfield_ro", "foo", "incrby", "i64", "0", "15"], "BITFIELD_RO only supports the GET subcommand");
+    t.assert_err(
+        &["bitfield_ro", "foo", "set", "u1", "0", "0"],
+        "BITFIELD_RO only supports the GET subcommand",
+    );
+    t.assert_err(
+        &["bitfield_ro", "foo", "incrby", "i64", "0", "15"],
+        "BITFIELD_RO only supports the GET subcommand",
+    );
 }
 
 #[test]
@@ -541,59 +595,204 @@ fn bit_field_overflow_underflow() {
     let max = i64::MAX;
     let min = i64::MIN;
     t.run(&["bitfield", "foo", "set", "i64", "0", &max.to_string()]);
-    arr_ints(&mut t, &["bitfield", "foo", "incrby", "i64", "0", "1"], &[min]);
+    arr_ints(
+        &mut t,
+        &["bitfield", "foo", "incrby", "i64", "0", "1"],
+        &[min],
+    );
 
     // signed 1 bit
     t.run(&["bitfield", "foo", "set", "i1", "0", "-2"]);
     arr_ints(&mut t, &["bitfield", "foo", "get", "i1", "0"], &[0]);
-    arr_ints(&mut t, &["bitfield", "foo", "incrby", "i1", "0", "-1"], &[-1]);
-    arr_ints(&mut t, &["bitfield", "foo", "incrby", "i1", "0", "-1"], &[0]);
-    arr_ints(&mut t, &["bitfield", "foo", "incrby", "i1", "0", "-3"], &[-1]);
+    arr_ints(
+        &mut t,
+        &["bitfield", "foo", "incrby", "i1", "0", "-1"],
+        &[-1],
+    );
+    arr_ints(
+        &mut t,
+        &["bitfield", "foo", "incrby", "i1", "0", "-1"],
+        &[0],
+    );
+    arr_ints(
+        &mut t,
+        &["bitfield", "foo", "incrby", "i1", "0", "-3"],
+        &[-1],
+    );
 
     t.run(&["bitfield", "foo", "set", "i8", "0", &min.to_string()]);
     arr_ints(&mut t, &["bitfield", "foo", "get", "i8", "0"], &[0]);
 
     // signed 64 bit
     t.run(&["bitfield", "foo", "set", "i64", "0", &min.to_string()]);
-    arr_ints(&mut t, &["bitfield", "foo", "incrby", "i64", "0", "-1"], &[max]);
+    arr_ints(
+        &mut t,
+        &["bitfield", "foo", "incrby", "i64", "0", "-1"],
+        &[max],
+    );
 
     // overflow sat
     t.run(&["bitfield", "foo", "set", "u1", "0", "0"]);
-    arr_ints(&mut t, &["bitfield", "foo", "overflow", "sat", "incrby", "u8", "0", "300"], &[255]);
-    arr_ints(&mut t, &["bitfield", "foo", "overflow", "sat", "incrby", "u8", "0", "10"], &[255]);
+    arr_ints(
+        &mut t,
+        &[
+            "bitfield", "foo", "overflow", "sat", "incrby", "u8", "0", "300",
+        ],
+        &[255],
+    );
+    arr_ints(
+        &mut t,
+        &[
+            "bitfield", "foo", "overflow", "sat", "incrby", "u8", "0", "10",
+        ],
+        &[255],
+    );
     arr_ints(&mut t, &["bitfield", "foo", "get", "u8", "0"], &[255]);
 
     // unsigned 63 bit
     t.run(&["bitfield", "foo", "set", "u63", "0", "0"]);
-    arr_ints(&mut t, &["bitfield", "foo", "overflow", "sat", "set", "u63", "0", &max.to_string()], &[0]);
-    arr_ints(&mut t, &["bitfield", "foo", "overflow", "sat", "incrby", "u63", "0", "10"], &[max]);
+    arr_ints(
+        &mut t,
+        &[
+            "bitfield",
+            "foo",
+            "overflow",
+            "sat",
+            "set",
+            "u63",
+            "0",
+            &max.to_string(),
+        ],
+        &[0],
+    );
+    arr_ints(
+        &mut t,
+        &[
+            "bitfield", "foo", "overflow", "sat", "incrby", "u63", "0", "10",
+        ],
+        &[max],
+    );
 
     // signed 8 bit
     t.run(&["bitfield", "foo", "set", "u8", "0", "0"]);
-    arr_ints(&mut t, &["bitfield", "foo", "overflow", "sat", "set", "i8", "0", "300"], &[0]);
-    arr_ints(&mut t, &["bitfield", "foo", "overflow", "sat", "incrby", "i8", "0", "-127"], &[0]);
-    arr_ints(&mut t, &["bitfield", "foo", "overflow", "sat", "incrby", "i8", "0", "-255"], &[-128]);
+    arr_ints(
+        &mut t,
+        &[
+            "bitfield", "foo", "overflow", "sat", "set", "i8", "0", "300",
+        ],
+        &[0],
+    );
+    arr_ints(
+        &mut t,
+        &[
+            "bitfield", "foo", "overflow", "sat", "incrby", "i8", "0", "-127",
+        ],
+        &[0],
+    );
+    arr_ints(
+        &mut t,
+        &[
+            "bitfield", "foo", "overflow", "sat", "incrby", "i8", "0", "-255",
+        ],
+        &[-128],
+    );
 
     // signed 64 bit
     t.run(&["bitfield", "foo", "set", "i64", "0", "0"]);
-    arr_ints(&mut t, &["bitfield", "foo", "overflow", "sat", "set", "i64", "0", &max.to_string()], &[0]);
-    arr_ints(&mut t, &["bitfield", "foo", "overflow", "sat", "incrby", "i64", "0", "100"], &[max]);
+    arr_ints(
+        &mut t,
+        &[
+            "bitfield",
+            "foo",
+            "overflow",
+            "sat",
+            "set",
+            "i64",
+            "0",
+            &max.to_string(),
+        ],
+        &[0],
+    );
+    arr_ints(
+        &mut t,
+        &[
+            "bitfield", "foo", "overflow", "sat", "incrby", "i64", "0", "100",
+        ],
+        &[max],
+    );
     arr_ints(&mut t, &["bitfield", "foo", "get", "i64", "0"], &[max]);
-    arr_ints(&mut t, &["bitfield", "foo", "overflow", "sat", "set", "i64", "0", &min.to_string()], &[max]);
-    arr_ints(&mut t, &["bitfield", "foo", "overflow", "sat", "incrby", "i64", "0", "-100"], &[min]);
+    arr_ints(
+        &mut t,
+        &[
+            "bitfield",
+            "foo",
+            "overflow",
+            "sat",
+            "set",
+            "i64",
+            "0",
+            &min.to_string(),
+        ],
+        &[max],
+    );
+    arr_ints(
+        &mut t,
+        &[
+            "bitfield", "foo", "overflow", "sat", "incrby", "i64", "0", "-100",
+        ],
+        &[min],
+    );
 
     // overflow fail
-    arr_mixed(&mut t, &["bitfield", "foo", "overflow", "fail", "set", "u8", "0", "300"], &[None]);
-    arr_mixed(&mut t, &["bitfield", "foo", "overflow", "fail", "incrby", "u1", "0", "10"], &[None]);
-    arr_mixed(&mut t, &["bitfield", "foo", "overflow", "fail", "incrby", "u1", "0", "-10"], &[None]);
-    arr_mixed(&mut t, &["bitfield", "foo", "overflow", "fail", "incrby", "i8", "0", "300"], &[None]);
-    arr_mixed(&mut t, &["bitfield", "foo", "overflow", "fail", "incrby", "i1", "0", "10"], &[None]);
-    arr_mixed(&mut t, &["bitfield", "foo", "overflow", "fail", "incrby", "i1", "0", "-10"], &[None]);
+    arr_mixed(
+        &mut t,
+        &[
+            "bitfield", "foo", "overflow", "fail", "set", "u8", "0", "300",
+        ],
+        &[None],
+    );
+    arr_mixed(
+        &mut t,
+        &[
+            "bitfield", "foo", "overflow", "fail", "incrby", "u1", "0", "10",
+        ],
+        &[None],
+    );
+    arr_mixed(
+        &mut t,
+        &[
+            "bitfield", "foo", "overflow", "fail", "incrby", "u1", "0", "-10",
+        ],
+        &[None],
+    );
+    arr_mixed(
+        &mut t,
+        &[
+            "bitfield", "foo", "overflow", "fail", "incrby", "i8", "0", "300",
+        ],
+        &[None],
+    );
+    arr_mixed(
+        &mut t,
+        &[
+            "bitfield", "foo", "overflow", "fail", "incrby", "i1", "0", "10",
+        ],
+        &[None],
+    );
+    arr_mixed(
+        &mut t,
+        &[
+            "bitfield", "foo", "overflow", "fail", "incrby", "i1", "0", "-10",
+        ],
+        &[None],
+    );
 
     // stickiness of overflow among operations in a chain
     arr_mixed(
         &mut t,
-        &["bitfield", "foo", "overflow", "fail", "set", "u8", "0", "300", "set", "u1", "0", "400"],
+        &[
+            "bitfield", "foo", "overflow", "fail", "set", "u8", "0", "300", "set", "u1", "0", "400",
+        ],
         &[None, None],
     );
 }
@@ -611,10 +810,22 @@ fn bit_field_operations() {
     arr_ints(&mut t, &["bitfield", "foo", "get", "u8", "16"], &[1]);
     arr_ints(&mut t, &["bitfield", "foo", "set", "u8", "24", "10"], &[0]);
     arr_ints(&mut t, &["bitfield", "foo", "get", "u8", "24"], &[10]);
-    arr_ints(&mut t, &["bitfield", "foo", "get", "u32", "0"], &[2_013_331_722]);
-    arr_ints(&mut t, &["bitfield", "foo", "incrby", "u8", "0", "120"], &[240]);
+    arr_ints(
+        &mut t,
+        &["bitfield", "foo", "get", "u32", "0"],
+        &[2_013_331_722],
+    );
+    arr_ints(
+        &mut t,
+        &["bitfield", "foo", "incrby", "u8", "0", "120"],
+        &[240],
+    );
     arr_ints(&mut t, &["bitfield", "foo", "get", "u8", "0"], &[240]);
-    arr_ints(&mut t, &["bitfield", "foo", "incrby", "u16", "0", "120"], &[61_561]);
+    arr_ints(
+        &mut t,
+        &["bitfield", "foo", "incrby", "u16", "0", "120"],
+        &[61_561],
+    );
     arr_ints(&mut t, &["bitfield", "foo", "get", "u16", "0"], &[61_561]);
 
     // aligned offset reads/writes signed
@@ -627,8 +838,16 @@ fn bit_field_operations() {
     arr_ints(&mut t, &["bitfield", "foo", "get", "i8", "16"], &[-1]);
     arr_ints(&mut t, &["bitfield", "foo", "set", "i8", "24", "-10"], &[0]);
     arr_ints(&mut t, &["bitfield", "foo", "get", "i8", "24"], &[-10]);
-    arr_ints(&mut t, &["bitfield", "foo", "get", "i32", "0"], &[-1_996_488_714]);
-    arr_ints(&mut t, &["bitfield", "foo", "incrby", "i8", "0", "-8"], &[-128]);
+    arr_ints(
+        &mut t,
+        &["bitfield", "foo", "get", "i32", "0"],
+        &[-1_996_488_714],
+    );
+    arr_ints(
+        &mut t,
+        &["bitfield", "foo", "incrby", "i8", "0", "-8"],
+        &[-128],
+    );
 
     // nonaligned offset reads/writes unsigned
     t.run(&["bitfield", "foo", "set", "i64", "0", "0"]);
@@ -645,7 +864,11 @@ fn bit_field_operations() {
     arr_ints(&mut t, &["bitfield", "foo", "get", "u1", "16"], &[1]);
     arr_ints(&mut t, &["bitfield", "foo", "get", "u1", "24"], &[1]);
     arr_ints(&mut t, &["bitfield", "foo", "get", "u1", "32"], &[1]);
-    arr_ints(&mut t, &["bitfield", "foo", "get", "u33", "0"], &[16_843_009]);
+    arr_ints(
+        &mut t,
+        &["bitfield", "foo", "get", "u33", "0"],
+        &[16_843_009],
+    );
 
     // nonaligned offset reads/writes signed
     t.run(&["bitfield", "foo", "set", "i64", "0", "0"]);
@@ -662,18 +885,22 @@ fn bit_field_operations() {
     // chaining
     t.run(&[
         "bitfield", "foo", "set", "u1", "0", "1", "set", "u1", "1", "1", "set", "u1", "2", "1",
-        "set", "u1", "3", "1", "set", "u1", "4", "1", "set", "u1", "5", "1", "set", "u1", "6",
-        "1", "set", "u1", "7", "1",
+        "set", "u1", "3", "1", "set", "u1", "4", "1", "set", "u1", "5", "1", "set", "u1", "6", "1",
+        "set", "u1", "7", "1",
     ]);
     arr_ints(&mut t, &["bitfield", "foo", "get", "u8", "0"], &[255]);
     arr_ints(
         &mut t,
-        &["bitfield", "foo", "set", "u1", "0", "0", "incrby", "u1", "0", "1", "get", "u1", "0"],
+        &[
+            "bitfield", "foo", "set", "u1", "0", "0", "incrby", "u1", "0", "1", "get", "u1", "0",
+        ],
         &[1, 1, 1],
     );
 
     // positional offsets
-    t.run(&["bitfield", "foo", "set", "u8", "#0", "1", "set", "u8", "#1", "1", "set", "u8", "#2", "1"]);
+    t.run(&[
+        "bitfield", "foo", "set", "u8", "#0", "1", "set", "u8", "#1", "1", "set", "u8", "#2", "1",
+    ]);
     arr_ints(&mut t, &["bitfield", "foo", "get", "u1", "7"], &[1]);
     arr_ints(&mut t, &["bitfield", "foo", "get", "u1", "15"], &[1]);
 }
@@ -685,14 +912,30 @@ fn bit_field_large_offset() {
 
     arr_mixed(
         &mut t,
-        &["bitfield", "foo", "get", "u32", "0", "overflow", "fail", "incrby", "u32", "0", "4294967295"],
+        &[
+            "bitfield",
+            "foo",
+            "get",
+            "u32",
+            "0",
+            "overflow",
+            "fail",
+            "incrby",
+            "u32",
+            "0",
+            "4294967295",
+        ],
         &[Some(1_650_553_344), None],
     );
     assert_eq!(t.int(&["strlen", "foo"]), 4);
     assert_eq!(t.bulk(&["get", "foo"]), b"bar\0".to_vec());
 
     // a read past the value end returns 0
-    arr_ints(&mut t, &["bitfield", "foo", "get", "u32", "4294967295"], &[0]);
+    arr_ints(
+        &mut t,
+        &["bitfield", "foo", "get", "u32", "4294967295"],
+        &[0],
+    );
 }
 
 #[test]
@@ -701,7 +944,20 @@ fn bit_field_issue5237_set_overflow_sat() {
     set_b(&mut t, "key:bitfield_set", &[0xff, 0xf0, 0x00]);
     arr_ints(
         &mut t,
-        &["bitfield", "key:bitfield_set", "overflow", "sat", "set", "i4", "0", "8", "set", "i4", "4", "7"],
+        &[
+            "bitfield",
+            "key:bitfield_set",
+            "overflow",
+            "sat",
+            "set",
+            "i4",
+            "0",
+            "8",
+            "set",
+            "i4",
+            "4",
+            "7",
+        ],
         &[-1, -1],
     );
 }
@@ -712,7 +968,18 @@ fn bit_field_issue5237_incrby_correctness() {
     set_b(&mut t, "key:bitfield_incr", &[0xff, 0xf0, 0x00]);
     arr_ints(
         &mut t,
-        &["bitfield", "key:bitfield_incr", "incrby", "u8", "0", "85", "incrby", "u8", "16", "170"],
+        &[
+            "bitfield",
+            "key:bitfield_incr",
+            "incrby",
+            "u8",
+            "0",
+            "85",
+            "incrby",
+            "u8",
+            "16",
+            "170",
+        ],
         &[84, 170],
     );
 }
@@ -721,14 +988,27 @@ fn bit_field_issue5237_incrby_correctness() {
 fn bit_field_issue5237_invalid_type_uppercase_set() {
     let mut t = Ctx::new();
     let bad_type = "ERR invalid bitfield type. use something like i16 u8. note that u64 is not supported but i64 is.";
-    t.assert_err(&["bitfield", "key:bitfield_set:wrong:args", "set", "I8", "0", "0"], bad_type);
+    t.assert_err(
+        &[
+            "bitfield",
+            "key:bitfield_set:wrong:args",
+            "set",
+            "I8",
+            "0",
+            "0",
+        ],
+        bad_type,
+    );
 }
 
 #[test]
 fn bit_field_issue5237_invalid_type_uppercase_get() {
     let mut t = Ctx::new();
     let bad_type = "ERR invalid bitfield type. use something like i16 u8. note that u64 is not supported but i64 is.";
-    t.assert_err(&["bitfield", "key:bitfield_get:wrong:args", "get", "I8", "0"], bad_type);
+    t.assert_err(
+        &["bitfield", "key:bitfield_get:wrong:args", "get", "I8", "0"],
+        bad_type,
+    );
 }
 
 #[test]
@@ -777,10 +1057,19 @@ fn set_bit_offset_out_of_range() {
 fn bit_field_offset_out_of_range() {
     let mut t = Ctx::new();
     // writes are bounded by the max string size
-    t.assert_err(&["bitfield", "bk", "set", "u8", "2200000000", "1"], "out of range");
-    t.assert_err(&["bitfield", "bk", "incrby", "u8", "2200000000", "1"], "out of range");
+    t.assert_err(
+        &["bitfield", "bk", "set", "u8", "2200000000", "1"],
+        "out of range",
+    );
+    t.assert_err(
+        &["bitfield", "bk", "incrby", "u8", "2200000000", "1"],
+        "out of range",
+    );
 
     // reads return 0 past the value end; only offsets beyond uint32 are rejected
     arr_ints(&mut t, &["bitfield", "bk", "get", "u8", "2200000000"], &[0]);
-    t.assert_err(&["bitfield", "bk", "get", "u8", "5000000000"], "out of range");
+    t.assert_err(
+        &["bitfield", "bk", "get", "u8", "5000000000"],
+        "out of range",
+    );
 }

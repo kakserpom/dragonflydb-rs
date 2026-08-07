@@ -68,12 +68,16 @@ impl Writer {
         }
     }
 
-    fn write_entry(&mut self, txid: u64, op: u8, dbid: u64, lsn: u64, cmd: &[u8], args: &[Vec<u8>]) {
-        if op != OP_SELECT
-            && op != OP_LSN
-            && op != OP_PING
-            && self.cur_dbid != Some(dbid)
-        {
+    fn write_entry(
+        &mut self,
+        txid: u64,
+        op: u8,
+        dbid: u64,
+        lsn: u64,
+        cmd: &[u8],
+        args: &[Vec<u8>],
+    ) {
+        if op != OP_SELECT && op != OP_LSN && op != OP_PING && self.cur_dbid != Some(dbid) {
             self.out.push(OP_SELECT);
             self.write_packed(dbid);
             self.cur_dbid = Some(dbid);
@@ -219,10 +223,7 @@ impl<'a> Reader<'a> {
     }
 
     fn read_exact(&mut self, n: usize) -> Result<&'a [u8], JournalError> {
-        let end = self
-            .pos
-            .checked_add(n)
-            .ok_or(JournalError::Corrupt)?;
+        let end = self.pos.checked_add(n).ok_or(JournalError::Corrupt)?;
         let s = self
             .data
             .get(self.pos..end)
@@ -290,7 +291,9 @@ impl JournalSlice {
             return None;
         }
         let start = self.ring.front().unwrap().lsn;
-        self.ring.get((lsn - start) as usize).map(|it| it.data.as_slice())
+        self.ring
+            .get((lsn - start) as usize)
+            .map(|it| it.data.as_slice())
     }
 
     /// `JournalSlice::ClearBuffer`: drop the ring and advance the LSN past
@@ -347,7 +350,11 @@ impl Default for JournalSlice {
 /// owns, that key and the `step - 1` trailing arguments (only MSET/MSETNX use
 /// step 2). Adjacent owned keys merge into contiguous slices.
 #[must_use]
-pub fn shard_args(cmd: &crate::commands::Command, args: &[Vec<u8>], owned: &[usize]) -> Vec<Vec<u8>> {
+pub fn shard_args(
+    cmd: &crate::commands::Command,
+    args: &[Vec<u8>],
+    owned: &[usize],
+) -> Vec<Vec<u8>> {
     let step = if cmd.key_range.step >= 1 {
         cmd.key_range.step
     } else {
@@ -381,14 +388,7 @@ mod tests {
 
     #[test]
     fn roundtrip_command_entry() {
-        let data = serialize_record(
-            7,
-            OP_COMMAND,
-            2,
-            0,
-            b"SET",
-            &[b"k".to_vec(), b"v".to_vec()],
-        );
+        let data = serialize_record(7, OP_COMMAND, 2, 0, b"SET", &[b"k".to_vec(), b"v".to_vec()]);
         let mut r = Reader::new(&data);
         let e = r.read_entry().unwrap();
         assert_eq!(e.opcode, OP_COMMAND);
@@ -402,14 +402,7 @@ mod tests {
 
     #[test]
     fn select_prefix_emitted_only_on_dbid_change() {
-        let data = serialize_record(
-            0,
-            OP_COMMAND,
-            2,
-            0,
-            b"SET",
-            &[b"k".to_vec(), b"v".to_vec()],
-        );
+        let data = serialize_record(0, OP_COMMAND, 2, 0, b"SET", &[b"k".to_vec(), b"v".to_vec()]);
         assert_eq!(data[0], OP_SELECT, "fresh writer must emit SELECT");
         let mut r = Reader::new(&data);
         let e = r.read_entry().unwrap();
@@ -456,14 +449,7 @@ mod tests {
 
     #[test]
     fn truncated_and_corrupt_data_error() {
-        let data = serialize_record(
-            0,
-            OP_COMMAND,
-            1,
-            0,
-            b"SET",
-            &[b"k".to_vec(), b"v".to_vec()],
-        );
+        let data = serialize_record(0, OP_COMMAND, 1, 0, b"SET", &[b"k".to_vec(), b"v".to_vec()]);
         let mut r = Reader::new(&data[..data.len() - 1]);
         assert_eq!(r.read_entry(), Err(JournalError::Truncated));
 
@@ -511,7 +497,10 @@ mod tests {
         let mut j = JournalSlice::with_capacity(4);
         j.record(b"only".to_vec());
         assert!(j.is_lsn_in_buffer(1));
-        assert!(!j.is_lsn_in_buffer(2), "single element: lsn must match exactly");
+        assert!(
+            !j.is_lsn_in_buffer(2),
+            "single element: lsn must match exactly"
+        );
     }
 
     #[test]

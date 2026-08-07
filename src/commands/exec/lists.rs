@@ -1,7 +1,7 @@
 use crate::commands::{
     Command, FLAG_BLOCKING, FLAG_DENYOOM, FLAG_FAST, FLAG_MOVABLEKEYS, FLAG_MULTI_KEY,
-    FLAG_NO_AUTOJOURNAL, FLAG_NOSCRIPT, FLAG_NO_REDUCED, FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext, ShardPart,
-    integer, ok,
+    FLAG_NO_AUTOJOURNAL, FLAG_NO_REDUCED, FLAG_NOSCRIPT, FLAG_READONLY, FLAG_WRITE, KeyRange,
+    OpContext, ShardPart, integer, ok,
 };
 use crate::core::PrimeValue;
 use crate::core::quicklist::{ListItem, QuickList};
@@ -1277,7 +1277,12 @@ pub static CMD_BLMOVE: Command = Command {
 pub static CMD_BRPOPLPUSH: Command = Command {
     name: "BRPOPLPUSH",
     arity: 4,
-    flags: FLAG_WRITE | FLAG_DENYOOM | FLAG_BLOCKING | FLAG_MULTI_KEY | FLAG_NOSCRIPT | FLAG_NO_AUTOJOURNAL,
+    flags: FLAG_WRITE
+        | FLAG_DENYOOM
+        | FLAG_BLOCKING
+        | FLAG_MULTI_KEY
+        | FLAG_NOSCRIPT
+        | FLAG_NO_AUTOJOURNAL,
     key_range: KeyRange::TWO,
     exec: exec_blmove,
     merge: Some(merge_move_blocking),

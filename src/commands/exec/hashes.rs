@@ -314,9 +314,7 @@ fn exec_hincrby(ctx: &mut OpContext) -> CmdResult {
         None => 0,
     };
     let Some(new_val) = cur.checked_add(delta) else {
-        return CmdResult::Err(RespError::new(
-            "ERR increment or decrement would overflow",
-        ));
+        return CmdResult::Err(RespError::new("ERR increment or decrement would overflow"));
     };
     h.set(
         field,
