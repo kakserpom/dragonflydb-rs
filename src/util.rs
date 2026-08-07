@@ -36,6 +36,21 @@ pub fn itoa(v: i64) -> Vec<u8> {
     buf[pos..].to_vec()
 }
 
+/// `absl::AlphaNum(double)`: `%.6g` formatting (SixDigitsToBuffer). The
+/// reference uses `AlphaNum` for `absl::StrAppend` of floating-point fields
+/// (`string_stats.cc` `AverageLength`, `dragonfly.ihash` reply strings).
+#[must_use]
+pub fn g6_format(d: f64) -> String {
+    let mut buf = [0u8; 64];
+    let len = unsafe { libc::snprintf(buf.as_mut_ptr().cast(), buf.len(), c"%.6g".as_ptr(), d) };
+    let len = if len < 0 {
+        0
+    } else {
+        (len as usize).min(buf.len())
+    };
+    String::from_utf8_lossy(&buf[..len]).into_owned()
+}
+
 #[must_use]
 pub fn parse_i64(s: &[u8]) -> Option<i64> {
     if s.is_empty() {

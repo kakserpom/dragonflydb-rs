@@ -15,6 +15,7 @@ use crate::commands::{
 };
 use crate::core::PrimeValue;
 use crate::core::compact::CompactString;
+use crate::core::string_stats::{PerShardStats, UniqueStrings};
 use crate::core::value::ObjType;
 use crate::error::{CmdResult, RespError, RespValue};
 
@@ -45,6 +46,23 @@ fn merge_dbsize(parts: &[ShardPart], _args: &[Vec<u8>], _keys: &[usize], _now: u
         }
     }
     CmdResult::Ok(RespValue::Integer(total))
+}
+
+/// `DEBUG UNIQ-STRS` (`CountUniqueStrings`, debugcmd.cc:1830): fold each
+/// shard's per-type counters and render the report once.
+fn merge_uniq_strs(
+    parts: &[ShardPart],
+    _args: &[Vec<u8>],
+    _keys: &[usize],
+    _now: u64,
+) -> CmdResult {
+    let mut summary = PerShardStats::default();
+    for p in parts {
+        if let CmdResult::UniqueStrings(per) = &p.result {
+            summary.merge(per);
+        }
+    }
+    CmdResult::Ok(RespValue::Bulk(summary.render().into_bytes()))
 }
 
 fn exec_flush(ctx: &mut OpContext) -> CmdResult {
@@ -687,6 +705,39 @@ fn exec_debug(ctx: &mut OpContext) -> CmdResult {
         ])),
         b"OBJECT" if ctx.args.len() >= 3 => debug_object(ctx),
         b"POPULATE" if ctx.args.len() >= 3 => debug_populate(ctx),
+        b"UNIQ-STRS" => {
+            let mut stats = PerShardStats::default();
+            for (_, value) in ctx.db.iter() {
+                match value {
+                    PrimeValue::List(list) => {
+                        stats
+                            .list
+                            .get_or_insert_with(UniqueStrings::new)
+                            .add_list(list);
+                    }
+                    PrimeValue::Set(set) => {
+                        stats
+                            .set
+                            .get_or_insert_with(UniqueStrings::new)
+                            .add_set(set);
+                    }
+                    PrimeValue::ZSet(zset) => {
+                        stats
+                            .zset
+                            .get_or_insert_with(UniqueStrings::new)
+                            .add_zset(zset);
+                    }
+                    PrimeValue::Hash(hash) => {
+                        stats
+                            .hash
+                            .get_or_insert_with(UniqueStrings::new)
+                            .add_hash(hash);
+                    }
+                    _ => {}
+                }
+            }
+            CmdResult::UniqueStrings(stats)
+        }
         other => CmdResult::err(unknown_subcmd(other, "DEBUG")),
     }
 }
@@ -1251,7 +1302,7 @@ pub static CMD_DEBUG: Command = Command {
         step: 1,
     },
     exec: exec_debug,
-    merge: None,
+    merge: Some(merge_uniq_strs),
 };
 pub static CMD_SAVE: Command = Command {
     name: "SAVE",

@@ -341,8 +341,25 @@ integration tests (`tests/*.rs`) that run against the in-process server
   plus a portable `socket_info_invalid_fd`. The port has no TLS, so (like the
   reference's only consumers, TLS accept error logs) nothing calls it from
   the server itself.
-- [ ] Remaining `server_family_test.cc` cases: cluster-only paths
-  (`#ifdef DFLY_USE_CLUSTER` / `CLUSTER SLOTS` gates) remain.
+- [x] Remaining `server_family_test.cc` audit: all 42 `ServerFamilyTest` cases
+  are ported. The reference has no `DFLY_USE_CLUSTER`/cluster-only gates (the
+  earlier "cluster-only paths remain" note was stale; there is no cluster mode
+  in the reference test file).
+- [x] `DEBUG UNIQ-STRS` + `string_stats_test.cc` → `tests/string_stats.rs`
+  (6 tests, 1:1: HashWithDuplicateFields, SetWithUniqueMembers,
+  SetWithDuplicateMembers, MultipleTypes, EmptyDatabase, NumberKeys).
+  `UniqueStrings`/`PerShardStats` live in `src/core/string_stats.rs`: per-entry
+  `total_count`/`total_bytes` plus a dense HLL (`create_dense_hll`), merging
+  per-object-type across shards with `pfmerge` (the register-wise max must
+  include both operands, exactly the reference's `{other.counter_, counter_}`
+  input pair). Hash/Set/ZSet count member bytes; list ints are counted by
+  their decimal rendering (reference `AddString` FastIntToBuffer), so `007`
+  dedups across keys. Average length renders via `%.6g` (`absl::AlphaNum`),
+  now a shared `util::g6_format`. Dispatch: `DEBUG UNIQ-STRS` is not
+  `FLAG_GLOBAL`, so `dispatch_keyed` special-cases it to all shards;
+  `CmdResult::UniqueStrings(PerShardStats)` carries the per-shard counters to
+  `merge_uniq_strs` (rendering `___begin unique string stats___`, per-type
+  `OBJECT:<type>` + 64-dash blocks, `___end unique string stats___`).
 - [x] `json_family_test.cc` → `tests/json_family.rs` (86 tests, 1:1 with the
   reference: `SetGetBasic`..`SetFullJsonInvalidOnNewKey`; the RESP3-parameterized
   `*NestedArrayBug` cases are ported as RESP2-only `*_flat` variants and

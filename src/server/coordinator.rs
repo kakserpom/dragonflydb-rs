@@ -835,7 +835,9 @@ impl Coordinator {
 
     fn finish_tx(msg: &CoordMsg, parts: &[ShardPart]) -> CmdResult {
         let any_err = parts.iter().any(|p| p.result.is_err());
-        let any_ok = parts.iter().any(|p| matches!(&p.result, CmdResult::Ok(_)));
+        let any_ok = parts
+            .iter()
+            .any(|p| matches!(&p.result, CmdResult::Ok(_) | CmdResult::UniqueStrings(_)));
         if parts.is_empty() {
             return CmdResult::err("ERR internal: no shards participated");
         }

@@ -17,6 +17,7 @@ pub mod quicklist;
 pub mod rdb;
 pub mod set;
 pub mod stream;
+pub mod string_stats;
 pub mod topk;
 pub mod value;
 pub mod zset;

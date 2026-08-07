@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::core::PrimeValue;
+use crate::core::string_stats::PerShardStats;
 
 /// A single deferred store: key, optional value (`None` deletes), absolute
 /// expiry in ms (if any), and whether the STICK flag should be applied.
@@ -35,6 +36,10 @@ pub enum CmdResult {
         stores: Vec<DeferredStoreItem>,
         reply: RespValue,
     },
+    /// `DEBUG UNIQ-STRS`: the per-object-type dedup counters one shard
+    /// computed. The coordinator's merge folds the per-shard HyperLogLogs and
+    /// renders the report (`DebugCmd::CountUniqueStrings`).
+    UniqueStrings(PerShardStats),
 }
 
 impl CmdResult {
@@ -76,6 +81,7 @@ impl CmdResult {
             CmdResult::DeferredStore { reply, .. } | CmdResult::DeferredStores { reply, .. } => {
                 reply
             }
+            CmdResult::UniqueStrings(_) => RespValue::Nil,
         }
     }
 }

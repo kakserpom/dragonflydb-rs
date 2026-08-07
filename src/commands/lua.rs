@@ -18,8 +18,7 @@ use mlua::{Function, HookTriggers, Lua, MultiValue, StdLib, Table, Value, VmStat
 use crate::commands::lua_libs;
 use crate::core::histogram::Histogram;
 use crate::error::RespValue;
-use crate::util::{format_lua_float, itoa, lua_tolstring};
-
+use crate::util::{format_lua_float, g6_format, itoa, lua_tolstring};
 use xxhash_rust::xxh64::xxh64;
 
 /// Error returned when a script/EVALSHA SHA is unknown.
@@ -1777,19 +1776,6 @@ fn prepare_args(args: &MultiValue) -> mlua::Result<Vec<Vec<u8>>> {
         }
     }
     Ok(out)
-}
-
-/// `absl::AlphaNum(double)`: `%.6g` formatting (SixDigitsToBuffer), used by
-/// `StringCollectorTranslator::OnDouble` for `dragonfly.ihash` reply strings.
-fn g6_format(d: f64) -> String {
-    let mut buf = [0u8; 64];
-    let len = unsafe { libc::snprintf(buf.as_mut_ptr().cast(), buf.len(), c"%.6g".as_ptr(), d) };
-    let len = if len < 0 {
-        0
-    } else {
-        (len as usize).min(buf.len())
-    };
-    String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 
 /// Flatten a subcommand reply into the strings `StringCollectorTranslator`

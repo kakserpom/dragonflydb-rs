@@ -21,9 +21,6 @@
 //!   `Arena statistics for thread N` sections plus a machine-wide section);
 //!   the port tracks no allocator arenas, so each section contains only the
 //!   header and totals rows.
-//! - `ClientPause` is not ported yet: the port has no `CLIENT PAUSE`.
-//! - `ReadTcpInfo` / `GetTcpSocketInfoIPv6` are not ported: they exercise the
-//!   Linux-only `/proc/net/{tcp,tcp6}` socket-info reporting.
 //! - The `ClientTracking*` tests use the real push-message API: `CLIENT
 //!   TRACKING` invalidations arrive as RESP3 push frames, drained by `cmd` into
 //!   the client's push queue (`push_count`/`read_push`). Writes on a second

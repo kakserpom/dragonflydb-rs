@@ -756,6 +756,17 @@ impl IoLoop {
             self.send_coord(conn_id, seq, args.to_vec(), vec![], vec![], 0);
             return;
         }
+        // `DEBUG UNIQ-STRS` derives no key, yet counts the whole keyspace, so
+        // it must run on every shard (the reference marks it `Global`).
+        if cmd.name == "DEBUG"
+            && args
+                .get(1)
+                .is_some_and(|a| a.eq_ignore_ascii_case(b"UNIQ-STRS"))
+        {
+            let shards: Vec<usize> = (0..self.env.num_shards).collect();
+            self.send_coord(conn_id, seq, args.to_vec(), vec![], shards, 0);
+            return;
+        }
         if cmd.has_flag(FLAG_GLOBAL) {
             let shards: Vec<usize> = (0..self.env.num_shards).collect();
             self.send_coord(
