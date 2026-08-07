@@ -17,6 +17,10 @@
 //!   their defaults (100 / unset).
 //! - `PubSubCommandErr` always runs the standalone-mode branch (the port has no
 //!   cluster mode).
+//! - `MemoryArenaSummary` asserts the upstream report *shape* (per-shard
+//!   `Arena statistics for thread N` sections plus a machine-wide section);
+//!   the port tracks no allocator arenas, so each section contains only the
+//!   header and totals rows.
 //! - `ClientPause` is not ported yet: the port has no `CLIENT PAUSE`.
 
 mod common;
@@ -405,6 +409,42 @@ fn memory_parser_error_handling() {
         &["MEMORY", "DEFRAGMENT", "not-a-float"],
         "not a valid float",
     );
+}
+
+/// `MemoryArenaSummary` (server_family_test.cc:760): SUMMARY reports a section
+/// per shard plus a machine-wide section; bare MEMORY ARENA reports the
+/// `Count`-style block list; trailing arguments are syntax errors.
+#[test]
+fn memory_arena_summary() {
+    let mut c = Ctx::new();
+
+    let response = c.text(&["MEMORY", "ARENA", "SUMMARY"]);
+    assert!(response.contains("BlockSize"), "{response}");
+    // Ctx::new spawns 2 shards.
+    for shard_id in 0..2 {
+        assert!(
+            response.contains(&format!("Arena statistics for thread {shard_id}")),
+            "{response}"
+        );
+    }
+    assert!(
+        response.contains("Arena statistics for machine"),
+        "{response}"
+    );
+
+    c.assert_err(&["MEMORY", "ARENA", "SUMMARY", "0"], "syntax error");
+    c.assert_err(&["MEMORY", "ARENA", "SUMMARY", "X"], "syntax error");
+
+    let backing = c.text(&["MEMORY", "ARENA", "SUMMARY", "BACKING"]);
+    assert!(backing.contains("BlockSize"), "{backing}");
+
+    c.assert_err(
+        &["MEMORY", "ARENA", "SUMMARY", "BACKING", "0"],
+        "syntax error",
+    );
+
+    let arena = c.text(&["MEMORY", "ARENA"]);
+    assert!(arena.contains("Count"), "{arena}");
 }
 
 /// `InfoReplicationMemoryNoReplicas` (server_family_test.cc:792): the memory

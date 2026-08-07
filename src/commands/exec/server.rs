@@ -453,7 +453,7 @@ fn unknown_subcmd(sub: &[u8], cmd: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// MEMORY (shard command; the key lives at argument index 2)
+// MEMORY (global command; USAGE's key lives at argument index 2)
 // ---------------------------------------------------------------------------
 
 fn exec_memory(ctx: &mut OpContext) -> CmdResult {
@@ -463,6 +463,8 @@ fn exec_memory(ctx: &mut OpContext) -> CmdResult {
             RespValue::Simple("MEMORY <subcommand> [<arg> ...]. Subcommands are:".into()),
             RespValue::Simple("STATS".into()),
             RespValue::Simple("    Shows breakdown of memory.".into()),
+            RespValue::Simple("ARENA [SUMMARY] [BACKING] [thread-id]".into()),
+            RespValue::Simple("    Show mimalloc arena stats for a heap.".into()),
             RespValue::Simple("USAGE <key> [WITHOUTKEY]".into()),
             RespValue::Simple("    Show memory usage of a key.".into()),
             RespValue::Simple(
@@ -472,6 +474,7 @@ fn exec_memory(ctx: &mut OpContext) -> CmdResult {
             RespValue::Simple("    Prints this help.".into()),
         ])),
         b"USAGE" => memory_usage(ctx),
+        b"ARENA" => memory_arena(ctx),
         b"STATS" => CmdResult::Ok(RespValue::Map(vec![
             (
                 RespValue::bulk("connections.direct_bytes"),
@@ -488,6 +491,154 @@ fn exec_memory(ctx: &mut OpContext) -> CmdResult {
         ])),
         b"DEFRAGMENT" => memory_defragment(ctx),
         other => CmdResult::err(unknown_subcmd(other, "MEMORY")),
+    }
+}
+
+/// The `FormatSummary` header row: each column right-justified to its width.
+fn arena_header() -> String {
+    format!(
+        "{:>10} {:>10} {:>10} {:>10} {:>10} {:>8}",
+        "BlockSize", "Reserved", "Committed", "Used", "Wasted", "Waste%"
+    )
+}
+
+/// The `FormatSummary` totals row for an empty block map (the port tracks no
+/// allocator arenas): `"     Total:" ... "    0.00%"`.
+fn arena_total() -> String {
+    format!(
+        "{:>10} {:>10} {:>10} {:>10} {:>10} {:>8.2}%",
+        "Total:", 0, 0, 0, 0, 0.0
+    )
+}
+
+/// One thread's SUMMARY section (`FormatSummaries`). The port reports empty
+/// per-shard block maps, so only the header and totals rows render.
+fn arena_thread_summary(shard_id: usize) -> String {
+    format!(
+        "\nArena statistics for thread {shard_id}:\n{}\n{}\n",
+        arena_header(),
+        arena_total()
+    )
+}
+
+/// The machine-wide SUMMARY section (aggregates the (empty) thread maps).
+fn arena_machine_summary() -> String {
+    format!(
+        "\nArena statistics for machine:\n{}\n{}\n",
+        arena_header(),
+        arena_total()
+    )
+}
+
+/// The single-thread report (`MallocStatsCb`): a `Count`-style block list
+/// followed by totals. The port tracks no arenas, so the list is empty.
+fn arena_single_report(tid: u64) -> String {
+    format!(
+        "\nArena statistics from thread:{tid}\nCount BlockSize Reserved Committed Used\n\
+         total reserved: 0, committed: 0, used: 0 fragmentation waste: 0%\n\
+         --- End mimalloc statistics, took 0us ---\n"
+    )
+}
+
+/// `MEMORY ARENA [SUMMARY] [BACKING] [thread-id]` (memory_cmd.cc `ArenaStats`).
+/// The command is FLAG_GLOBAL, so it runs on every shard: the SUMMARY form
+/// lets each shard render its own section (the merge concatenates them plus a
+/// machine-wide section), while the single-thread form renders only on the
+/// shard matching `tid` (default 0) and the merge keeps that one.
+fn memory_arena(ctx: &mut OpContext) -> CmdResult {
+    let mut summarize = false;
+    let mut i = 2;
+    if ctx
+        .args
+        .get(i)
+        .is_some_and(|a| a.eq_ignore_ascii_case(b"SUMMARY"))
+    {
+        summarize = true;
+        i += 1;
+    }
+    // BACKING only advances the parse; the port has no backing-heap data, so
+    // the flag is otherwise ignored (`ArenaStats`).
+    if ctx
+        .args
+        .get(i)
+        .is_some_and(|a| a.eq_ignore_ascii_case(b"BACKING"))
+    {
+        i += 1;
+    }
+    if summarize {
+        if ctx.args.len() > i {
+            return CmdResult::Err(RespError::syntax());
+        }
+        return CmdResult::Ok(RespValue::Bulk(
+            arena_thread_summary(ctx.db.shard_id()).into_bytes(),
+        ));
+    }
+    let tid = match ctx.args.get(i) {
+        Some(raw) => match crate::util::parse_u64(raw) {
+            Some(n) => {
+                if ctx.args.len() > i + 1 {
+                    return CmdResult::Err(RespError::syntax());
+                }
+                n
+            }
+            None => return CmdResult::Err(RespError::syntax()),
+        },
+        None => 0,
+    };
+    if u64::try_from(ctx.db.shard_id()).unwrap_or_default() == tid {
+        CmdResult::Ok(RespValue::Bulk(arena_single_report(tid).into_bytes()))
+    } else {
+        CmdResult::Ok(RespValue::Bulk(Vec::new()))
+    }
+}
+
+/// Combine per-shard MEMORY results (`finish_tx`).
+fn merge_memory(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], _now: u64) -> CmdResult {
+    // A parse error raised by every shard wins.
+    for p in parts {
+        if p.result.is_err() {
+            return p.result.clone();
+        }
+    }
+    match args.get(1).map(|a| a.to_ascii_uppercase()).as_deref() {
+        Some(b"USAGE") => {
+            // Only the shard owning the key returns a non-nil answer.
+            for p in parts {
+                if let CmdResult::Ok(v) = &p.result
+                    && !matches!(v, RespValue::Nil)
+                {
+                    return p.result.clone();
+                }
+            }
+            CmdResult::Ok(RespValue::Nil)
+        }
+        Some(b"ARENA") => {
+            if args
+                .get(2)
+                .is_some_and(|a| a.eq_ignore_ascii_case(b"SUMMARY"))
+            {
+                let mut lines = String::new();
+                for p in parts {
+                    if let CmdResult::Ok(RespValue::Bulk(b)) = &p.result {
+                        lines.push_str(&String::from_utf8_lossy(b));
+                    }
+                }
+                lines.push_str(&arena_machine_summary());
+                lines.push_str("\n--- End mimalloc statistics, took 0us ---\n");
+                CmdResult::Ok(RespValue::Bulk(lines.into_bytes()))
+            } else {
+                // The single-thread report lives only on the matching shard.
+                for p in parts {
+                    if let CmdResult::Ok(RespValue::Bulk(b)) = &p.result
+                        && !b.is_empty()
+                    {
+                        return CmdResult::Ok(RespValue::Bulk(b.clone()));
+                    }
+                }
+                CmdResult::Ok(RespValue::Bulk(Vec::new()))
+            }
+        }
+        _ => parts[0].result.clone(),
     }
 }
 
@@ -1085,14 +1236,10 @@ pub static CMD_SLOWLOG: Command = Command {
 pub static CMD_MEMORY: Command = Command {
     name: "MEMORY",
     arity: -2,
-    flags: FLAG_READONLY | FLAG_FAST,
-    key_range: KeyRange {
-        first: 2,
-        last: 2,
-        step: 1,
-    },
+    flags: FLAG_READONLY | FLAG_FAST | FLAG_GLOBAL,
+    key_range: KeyRange::NONE,
     exec: exec_memory,
-    merge: None,
+    merge: Some(merge_memory),
 };
 pub static CMD_DEBUG: Command = Command {
     name: "DEBUG",
