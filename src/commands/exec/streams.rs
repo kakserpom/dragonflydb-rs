@@ -4829,4 +4829,53 @@ mod tests {
         assert_eq!(*idx(&streams[1], 0), blk(b"bar"));
         assert_eq!(idx(&streams[1], 1).as_array().map(|a| a.len()), Some(1));
     }
+
+    /// Port of `StreamFamilyTest.Range`: forward and reverse iteration order,
+    /// with auto-completed sequences from `1-*`.
+    #[test]
+    fn range() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"XADD", b"key", b"1-*", b"f1", b"v1"]);
+        cmd(&mut db, &[b"XADD", b"key", b"1-*", b"f2", b"v2"]);
+        let resp = val(cmd(&mut db, &[b"XRANGE", b"key", b"-", b"+"]));
+        let es = resp.as_array().unwrap();
+        assert_eq!(es.len(), 2);
+        assert_eq!(es[0].as_array().unwrap()[0], blk(b"1-0"));
+        assert_eq!(es[1].as_array().unwrap()[0], blk(b"1-1"));
+        let resp = val(cmd(&mut db, &[b"XREVRANGE", b"key", b"+", b"-"]));
+        let es = resp.as_array().unwrap();
+        assert_eq!(es[0].as_array().unwrap()[0], blk(b"1-1"));
+        assert_eq!(es[1].as_array().unwrap()[0], blk(b"1-0"));
+    }
+
+    /// Port of `StreamFamilyTest.XrangeRangeAutocomplete`: ms-only range bounds
+    /// autocomplete start to seq 0 and end to seq UINT64_MAX, so
+    /// `1609459200001` covers every seq of that ms.
+    #[test]
+    fn xrange_range_autocomplete() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"XADD", b"mystream", b"1609459200000-0", b"0", b"0"]);
+        cmd(&mut db, &[b"XADD", b"mystream", b"1609459200001-0", b"1", b"1"]);
+        cmd(&mut db, &[b"XADD", b"mystream", b"1609459200001-1", b"2", b"2"]);
+        cmd(&mut db, &[b"XADD", b"mystream", b"1609459200002-0", b"3", b"3"]);
+
+        let ids = |db: &mut DbSlice, end: &[u8]| {
+            let resp = val(cmd(db, &[b"XRANGE", b"mystream", b"1609459200000", end]));
+            resp.as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e.as_array().unwrap()[0].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&mut db, b"1609459200001"),
+            vec![blk(b"1609459200000-0"), blk(b"1609459200001-0"), blk(b"1609459200001-1")]
+        );
+        // Exclusive end excludes (1609459200001, UINT64_MAX) and everything
+        // above it, keeping every seq of ms 1609459200001.
+        assert_eq!(
+            ids(&mut db, b"(1609459200001"),
+            vec![blk(b"1609459200000-0"), blk(b"1609459200001-0"), blk(b"1609459200001-1")]
+        );
+    }
 }

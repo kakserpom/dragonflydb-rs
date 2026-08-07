@@ -273,6 +273,21 @@ integration tests (`tests/*.rs`) that run against the in-process server
   trim); XGROUP HELP bypasses the -3 arity and is NOSCRIPT from scripts;
   `extract_movable_keys` scans past a stray STREAMS marker (a consumer
   literally named STREAMS).
+- [x] The remaining `stream_family_test.cc` cases land in two places: the
+  `streams.rs` unit module (46 tests) and the blocking cluster in
+  `tests/stream_family.rs` (13 tests: XReadBlock, XReadGroupBlock,
+  XReadGroupBlockDelconsumer, XReadBlockOnEmptiedStream,
+  XReadBlockIgnoresEntriesBelowRequestedId, XReadBlockOnMaxMsId,
+  XReadGroupBlockWakeOnDeletedStream, XReadBlockStaysBlockedOnDeletedStream,
+  XReadGroupBlockWakeOnRetypedStream, XReadGroupBlockWakeOnFlushDb,
+  XReadGroupBlockHonorsCount, Issue854, probe). Blocked readers are re-run on
+  the coordinator's 20ms poll, so wakes assert delivered data instead of
+  `IsConnBlocked`. Source fixes: a retyped key wakes a blocked XREADGROUP with
+  WRONGTYPE (list blocking keeps WrongTypeDoesNotWake); `XGROUP HELP` from a
+  script is rejected before the arity check (the rewritten `_XGROUP_HELP` has
+  arity 2). `XReadGroupBlockIgnoresWakeFromRemovedEntry` is skipped: EXEC
+  dispatches queued commands as separate transactions with a pending-retry
+  between them, so MULTI is not atomic with respect to the woken reader.
 - [ ] Remaining families (server, scripting, json) still to be ported from
   `*_test.cc`.
 

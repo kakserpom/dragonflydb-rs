@@ -1226,22 +1226,19 @@ impl ScriptDispatchCtx<'_> {
                 String::from_utf8_lossy(&args[0]).to_ascii_uppercase()
             )
         })?;
-        // The reference's `DispatchCommand` arity check runs for script
-        // subcommands too; without it a keyless subcommand with too few args
-        // would reach the executor and panic (`GET` -> `owned_keys[0]`).
-        if let Some(e) = cmd.check_arity(args.len()) {
-            return Err(e);
-        }
         // `DispatchCommand` (main_service.cc): GLOBAL_TRANS / NO_KEY_TRANSACTIONAL
         // commands may run only when the script schedules globally or re-schedules
         // per operation (GLOBAL / NON_ATOMIC); NOSCRIPT commands never run.
         // `XGROUP HELP` resolves to the hidden `_XGROUP_HELP` command which is
-        // NOSCRIPT (command_registry.cc:347-352, issue #854), so scripts must
-        // be rejected even though the top-level XGROUP is not flagged — and
-        // before the arity check, since the rewritten command's arity is 2.
+        // NOSCRIPT (command_registry.cc:347-352, issue #854), so scripts must be
+        // rejected even though the top-level XGROUP is not flagged — and before
+        // the arity check, since the rewritten command's arity is 2.
         if args.len() == 2 && cmd.name == "XGROUP" && args[1].eq_ignore_ascii_case(b"HELP") {
             return Err("This Redis command is not allowed from script".to_string());
         }
+        // The reference's `DispatchCommand` arity check runs for script
+        // subcommands too; without it a keyless subcommand with too few args
+        // would reach the executor and panic (`GET` -> `owned_keys[0]`).
         if let Some(e) = cmd.check_arity(args.len()) {
             return Err(e);
         }

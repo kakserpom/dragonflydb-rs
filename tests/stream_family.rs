@@ -373,6 +373,18 @@ fn xread_group_block_wake_on_flushdb() {
     expect_err(&resp, "consumer group this client was blocked on no longer exists");
 }
 
+/// Port of `StreamFamilyTest.Issue854` (stream_family_test.cc:693): `XGROUP
+/// HELP` works, but the hidden `_XGROUP_HELP` subcommand is NOSCRIPT so calling
+/// it from a script is rejected (the plain HELP reply is unit-tested in
+/// `streams.rs`).
+#[test]
+fn issue854() {
+    let mut t = Ctx::new();
+    assert!(matches!(t.run(&["xgroup", "help"]), Value::Array(Some(_))));
+    let resp = t.run(&["eval", "redis.call('xgroup', 'help')", "0"]);
+    expect_err(&resp, "is not allowed");
+}
+
 /// Port of `StreamFamilyTest.XReadGroupBlockHonorsCount`
 /// (stream_family_test.cc:596). A woken read must honor COUNT like the
 /// non-blocking path, delivering the transaction's burst to other consumers
