@@ -330,6 +330,65 @@ fn client_pause() {
     assert!(start.elapsed() > Duration::from_millis(50));
 }
 
+/// `GetSocketInfo(-1)` (server_family_test.cc:46): an invalid descriptor is
+/// reported before any platform check, so this assertion holds everywhere.
+#[test]
+fn socket_info_invalid_fd() {
+    assert_eq!(
+        dragonflydb::server::socket_utils::get_socket_info(-1),
+        "invalid socket"
+    );
+}
+
+/// `ReadTcpInfo` (server_family_test.cc:31): a listening socket's inode is
+/// found in `/proc/net/tcp`, and the socket reports the LISTEN state with its
+/// local address. The reference wraps this test in `#ifdef __linux__`.
+#[cfg(target_os = "linux")]
+#[test]
+fn read_tcp_info() {
+    use std::os::fd::AsRawFd;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let fd = listener.as_raw_fd();
+    let socket_info = dragonflydb::server::socket_utils::get_socket_info(fd);
+    assert!(!socket_info.is_empty(), "socket info should not be empty");
+    assert!(
+        socket_info.contains("State: LISTEN"),
+        "socket info doesn't contain expected LISTEN state: {socket_info}"
+    );
+    assert!(
+        socket_info.contains("Local: 127.0.0.1:"),
+        "socket info doesn't contain the local address: {socket_info}"
+    );
+}
+
+/// `GetTcpSocketInfoIPv6` (server_family_test.cc:68): an IPv6 listening socket
+/// is found in `/proc/net/tcp6` and uses the bracketed IPv6 address format.
+#[cfg(target_os = "linux")]
+#[test]
+fn get_tcp_socket_info_ipv6() {
+    use std::os::fd::AsRawFd;
+
+    let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+        eprintln!("skipping: IPv6 unavailable");
+        return;
+    };
+    let fd = listener.as_raw_fd();
+    let socket_info = dragonflydb::server::socket_utils::get_socket_info(fd);
+    assert!(
+        !socket_info.is_empty(),
+        "IPv6 socket info should not be empty"
+    );
+    assert!(
+        socket_info.contains("State: LISTEN"),
+        "IPv6 socket info doesn't contain expected LISTEN state: {socket_info}"
+    );
+    assert!(
+        socket_info.contains("Local: ["),
+        "IPv6 socket info doesn't use IPv6 address format: {socket_info}"
+    );
+}
+
 /// `ConfigNormalization` (server_family_test.cc:672): dashes and underscores
 /// are interchangeable in CONFIG parameter names.
 #[test]

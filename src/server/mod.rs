@@ -6,6 +6,7 @@ pub mod replica;
 pub mod replication;
 pub mod shard;
 pub mod slowlog;
+pub mod socket_utils;
 
 /// Number of logical databases (matches upstream `FLAGS_dbnum` default).
 pub const MAX_DB: usize = 16;

@@ -325,10 +325,24 @@ integration tests (`tests/*.rs`) that run against the in-process server
   blocks everything, WRITE only writes; `timeout` ms minimum validated
   (`ERR Invalid timeout`). `client_pause` test (server_family_test.cc:271)
   ports with real `Instant` timings.
-- [~] Remaining `server_family_test.cc` cases: `ReadTcpInfo`/
-  `GetTcpSocketInfoIPv6` are deferred (they exercise Linux-only
-  `/proc/net/tcp{,6}` `GetSocketInfo`, which the port's macOS/kqueue IO has no
-  consumer for — only connection error logs); cluster-only paths remain.
+- [x] `ReadTcpInfo`/`GetTcpSocketInfoIPv6` (server_family_test.cc:31, 68):
+  `GetSocketInfo` ported in `src/server/socket_utils.rs` (mirrors
+  `facade/socket_utils.cc` + the TCP half of helio's `io/proc_reader`). On
+  Linux it `fstat`s the fd for the inode, resolves the family via
+  `getsockname`, scans `/proc/net/tcp` (`AF_INET`) or `/proc/net/tcp6`
+  (`AF_INET6`) and renders `State: ..., Local: ..., Remote: ..., Inode: ...`
+  (`TcpStateToString` states, IPv4 from the little-endian hex dump, IPv6 via
+  RFC 5952 `Ipv6Addr`, exactly the reference's `inet_ntop` output); non-Linux
+  platforms return the reference's fixed
+  `"socket info not available on this platform"`. The proc parser is a pure
+  fixture-tested function (9 unit tests run everywhere), and the reference's
+  Linux-only socket tests are ported as `#[cfg(target_os = "linux")]` cases
+  in `tests/server_family.rs` (`read_tcp_info`, `get_tcp_socket_info_ipv6`)
+  plus a portable `socket_info_invalid_fd`. The port has no TLS, so (like the
+  reference's only consumers, TLS accept error logs) nothing calls it from
+  the server itself.
+- [ ] Remaining `server_family_test.cc` cases: cluster-only paths
+  (`#ifdef DFLY_USE_CLUSTER` / `CLUSTER SLOTS` gates) remain.
 - [x] `json_family_test.cc` → `tests/json_family.rs` (86 tests, 1:1 with the
   reference: `SetGetBasic`..`SetFullJsonInvalidOnNewKey`; the RESP3-parameterized
   `*NestedArrayBug` cases are ported as RESP2-only `*_flat` variants and
