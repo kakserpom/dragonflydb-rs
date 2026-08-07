@@ -580,11 +580,29 @@ pub enum ShardMsg {
     EnableJournal {
         enabled: bool,
     },
-    /// Build this shard's full-sync RDB stream (`StartFullSyncInThread`). The
-    /// snapshot is cut at the current journal LSN; records issued after it are
-    /// replayed from the ring when stable sync starts (`StartStableSync`).
+    /// Start this shard's chunked full-sync snapshot (`StartFullSyncInThread`).
+    /// The snapshot preempts itself between chunks so pending writes on the
+    /// shard keep being processed: every write executed mid-snapshot is
+    /// journaled and replayed to the replica as an in-stream journal blob
+    /// (`RDB_OPCODE_JOURNAL_BLOB`). The final chunk carries the cut LSN; the
+    /// event loop then replays the ring from it at `StartStableSync`.
     FullSyncSnapshot {
-        result_tx: mpsc::Sender<crate::server::replication::FullSyncData>,
+        sync_id: u32,
+        flow_id: usize,
+        bus: crate::server::replication::FullSyncBus,
+    },
+    /// Serialize the next baseline chunk of an in-flight full-sync snapshot
+    /// (sent by the event loop after each interim chunk it drains).
+    SnapshotStep {
+        sync_id: u32,
+        flow_id: usize,
+    },
+    /// Abort an in-flight full-sync snapshot (its session was cancelled or the
+    /// flow disconnected): drop the serialization state and unregister its
+    /// journal consumer.
+    CancelFullSync {
+        sync_id: u32,
+        flow_id: usize,
     },
     /// Catch a flow up from the journal ring and register its stable-sync
     /// consumer (`JournalStreamer::Start`). `from_lsn` is the full-sync cut LSN
@@ -680,6 +698,9 @@ pub struct ServerEnv {
     /// Stable-sync journal records routed from shard threads to their flow
     /// connections; drained by the IO thread alongside the reply bus.
     pub repl_tx: mpsc::Sender<crate::server::replication::ReplChunk>,
+    /// Full-sync chunks plus the kqueue wakeup pipe, so the IO thread wakes as
+    /// soon as a chunk is ready (mirrors `ReplyBus`).
+    pub full_sync_bus: crate::server::replication::FullSyncBus,
     /// Shared script cache: SCRIPT subcommands (IO thread) and EVAL
     /// (coordinator) both read/write it.
     pub script_mgr: std::sync::Arc<std::sync::Mutex<crate::commands::lua::ScriptMgr>>,

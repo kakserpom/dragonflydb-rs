@@ -42,9 +42,6 @@ pub struct Flow {
     pub start_partial_sync_at: Option<u64>,
     /// Last `REPLCONF ACK`ed LSN, for lag accounting.
     pub last_acked_lsn: u64,
-    /// The serialized full-sync stream, produced by the shard on `DFLY SYNC`
-    /// and appended to the flow socket.
-    pub full_sync_stream: Option<Vec<u8>>,
 }
 
 /// A replica session (`ReplicaInfo`), created by `REPLCONF CAPA dragonfly`.
@@ -101,7 +98,6 @@ impl ReplicationManager {
                 start_lsn: 0,
                 start_partial_sync_at: None,
                 last_acked_lsn: 0,
-                full_sync_stream: None,
             })
             .collect();
         self.replicas.insert(
@@ -130,19 +126,52 @@ impl Default for ReplicationManager {
     }
 }
 
-/// A journal record routed from a shard thread to the flow connection that owns
-/// it, during stable sync.
+/// What a [`ReplChunk`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkKind {
+    /// A stable-sync journal record (post-`DFLY STARTSTABLE`).
+    StableSync,
+    /// A full-sync snapshot chunk. `journal_lsn` is `Some` only on the final
+    /// chunk, carrying the snapshot cut LSN (the `JOURNAL_OFFSET` written into
+    /// the stream tail); interim chunks are `None`.
+    FullSync { journal_lsn: Option<u64> },
+}
+
+/// A journal record or full-sync chunk routed from a shard thread to the flow
+/// connection that owns it, through the shared `repl_tx` bus drained by the IO
+/// thread (`drain_repl`).
 pub struct ReplChunk {
     pub sync_id: u32,
     pub flow_id: usize,
     pub bytes: Vec<u8>,
+    pub kind: ChunkKind,
 }
 
-/// `FullSyncData`: the shard-built RDB stream plus the journal LSN at the cut.
-#[derive(Debug)]
-pub struct FullSyncData {
-    pub stream: Vec<u8>,
-    pub journal_lsn: u64,
+/// A full-sync chunk bus: the shared `repl_tx` plus a kqueue wakeup pipe, so
+/// the IO thread wakes as soon as a chunk is ready without polling. Mirrors
+/// `ReplyBus`; stable-sync records keep flowing through the raw `repl_tx` the
+/// way they did before.
+#[derive(Debug, Clone)]
+pub struct FullSyncBus {
+    tx: mpsc::Sender<ReplChunk>,
+    wake_w: libc::c_int,
+}
+
+impl FullSyncBus {
+    #[must_use]
+    pub fn new(tx: mpsc::Sender<ReplChunk>, wake_w: libc::c_int) -> Self {
+        FullSyncBus { tx, wake_w }
+    }
+
+    pub fn send(&self, chunk: ReplChunk) {
+        if self.tx.send(chunk).is_err() {
+            return;
+        }
+        let one = [1u8];
+        unsafe {
+            libc::write(self.wake_w, one.as_ptr().cast::<libc::c_void>(), 1);
+        }
+    }
 }
 
 /// Route a stable-sync journal item to the flow connection of `(sync_id,
@@ -158,6 +187,7 @@ pub fn flow_consumer(
             sync_id,
             flow_id,
             bytes: item.data.clone(),
+            kind: ChunkKind::StableSync,
         };
         let _ = repl_tx.send(chunk);
     })

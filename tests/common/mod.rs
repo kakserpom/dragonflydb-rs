@@ -118,6 +118,8 @@ impl TestServer {
 
         // Stable-sync journal records from shards to their flow connections.
         let (repl_tx, repl_rx) = mpsc::channel::<ReplChunk>();
+        let full_sync_bus =
+            dragonflydb::server::replication::FullSyncBus::new(repl_tx.clone(), pipefds[1]);
 
         // Shard threads.
         let mut shard_txs = Vec::with_capacity(num_shards);
@@ -164,6 +166,7 @@ impl TestServer {
             gc_tx,
             reply_bus_tx: reply_bus,
             repl_tx,
+            full_sync_bus,
             script_mgr,
             listen_port: port,
         };

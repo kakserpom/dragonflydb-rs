@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 
 use crate::commands::exec::server::now_ms;
 use crate::commands::{OpContext, ShardPart};
@@ -7,6 +7,7 @@ use crate::core::DbSlice;
 use crate::core::compact::CompactString;
 use crate::error::CmdResult;
 use crate::server::journal::{self, JournalItem, JournalSlice, OP_COMMAND};
+use crate::server::replication::{ChunkKind, FullSyncBus, ReplChunk};
 use crate::server::{MAX_DB, Reply, ShardMsg, SingleOp, WatchState, command_for, encode_result};
 
 /// Context for an active transaction on this shard, stored between `TxLock` and
@@ -45,6 +46,40 @@ struct Shard {
     /// Stable-sync consumers registered for replica flows: `(sync_id, flow_id,
     /// consumer_id)`. The consumer id unregisters a flow's subscription.
     repl_consumers: Vec<(u32, usize, usize)>,
+    /// In-flight chunked full-sync snapshots, keyed by `(sync_id, flow_id)`.
+    /// A snapshot serializes its baseline one chunk at a time, returning to the
+    /// message loop (and draining pending writes) between chunks so a full sync
+    /// never stalls the shard.
+    full_syncs: HashMap<(u32, usize), FullSyncState>,
+}
+
+/// One DB's frozen baseline: the sorted key list captured at snapshot start
+/// plus the `RESIZEDB` counts derived from it. Values are read live at
+/// serialization time, so mutations that happen mid-snapshot surface here and
+/// are replayed again as journal blobs (idempotent on the replica).
+struct DbBaseline {
+    dbid: usize,
+    keys: Vec<Vec<u8>>,
+    num_expires: usize,
+}
+
+/// The serialization state of one full-sync snapshot on this shard.
+struct FullSyncState {
+    /// Chunk delivery to the flow connection (pokes the IO thread's wake pipe).
+    bus: FullSyncBus,
+    dbs: Vec<DbBaseline>,
+    db_idx: usize,
+    key_idx: usize,
+    /// Whether the current DB's `SELECTDB`/`RESIZEDB` header was written.
+    db_header_written: bool,
+    /// Whether the stream header (magic + AUX) was written (first chunk only).
+    header_written: bool,
+    /// Raw journal records captured since the snapshot started, replayed to the
+    /// replica as `RDB_OPCODE_JOURNAL_BLOB` records on the final chunk. Shared
+    /// with the journal consumer so records keep landing here while the shard
+    /// serves writes between steps.
+    records: Arc<Mutex<Vec<Vec<u8>>>>,
+    consumer_id: usize,
 }
 
 #[must_use]
@@ -61,6 +96,7 @@ pub fn spawn(shard_id: usize, rx: mpsc::Receiver<ShardMsg>) -> std::thread::Join
                 pending_watches: VecDeque::new(),
                 journal: None,
                 repl_consumers: Vec::new(),
+                full_syncs: HashMap::new(),
             };
             shard.run(&rx);
         })
@@ -70,11 +106,11 @@ pub fn spawn(shard_id: usize, rx: mpsc::Receiver<ShardMsg>) -> std::thread::Join
 impl Shard {
     fn run(&mut self, rx: &mpsc::Receiver<ShardMsg>) {
         while let Ok(msg) = rx.recv() {
-            self.handle(msg);
+            self.handle(rx, msg);
         }
     }
 
-    fn handle(&mut self, msg: ShardMsg) {
+    fn handle(&mut self, rx: &mpsc::Receiver<ShardMsg>, msg: ShardMsg) {
         match msg {
             ShardMsg::Single(op) => {
                 if self.active_tx.is_some() {
@@ -236,15 +272,64 @@ impl Shard {
                     self.repl_consumers.clear();
                 }
             }
-            ShardMsg::FullSyncSnapshot { result_tx } => {
-                // Cut the snapshot at the current journal LSN; records issued
-                // after it are replayed from the ring at stable-sync start.
-                let journal_lsn = self.journal.as_ref().map_or(0, JournalSlice::lsn);
-                let stream = crate::core::rdb::save_shard_full_sync(&self.dbs, journal_lsn);
-                let _ = result_tx.send(crate::server::replication::FullSyncData {
-                    stream,
-                    journal_lsn,
-                });
+            ShardMsg::FullSyncSnapshot {
+                sync_id,
+                flow_id,
+                bus,
+            } => {
+                // Freeze the baseline key lists and start capturing journal
+                // records; every write executed mid-snapshot is replayed to the
+                // replica as a blob on the final chunk, so the snapshot can
+                // preempt itself between chunks (no shard-wide write stall).
+                let Some(journal) = &mut self.journal else {
+                    return;
+                };
+                let records: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+                let records_cb = Arc::clone(&records);
+                let consumer_id = journal.register_consumer(Box::new(move |item: &JournalItem| {
+                    records_cb.lock().unwrap().push(item.data.clone());
+                }));
+                let dbs = self
+                    .dbs
+                    .iter()
+                    .enumerate()
+                    .map(|(dbid, db)| {
+                        let mut keys: Vec<Vec<u8>> =
+                            db.iter().map(|(k, _)| k.as_bytes().to_vec()).collect();
+                        keys.sort_unstable();
+                        let num_expires = keys
+                            .iter()
+                            .filter(|k| db.expire_at(k).is_some())
+                            .count();
+                        DbBaseline {
+                            dbid,
+                            keys,
+                            num_expires,
+                        }
+                    })
+                    .collect();
+                let state = FullSyncState {
+                    bus,
+                    dbs,
+                    db_idx: 0,
+                    key_idx: 0,
+                    db_header_written: false,
+                    header_written: false,
+                    records,
+                    consumer_id,
+                };
+                self.full_syncs.insert((sync_id, flow_id), state);
+                self.snapshot_step(rx, sync_id, flow_id);
+            }
+            ShardMsg::SnapshotStep { sync_id, flow_id } => {
+                self.snapshot_step(rx, sync_id, flow_id);
+            }
+            ShardMsg::CancelFullSync { sync_id, flow_id } => {
+                if let Some(state) = self.full_syncs.remove(&(sync_id, flow_id))
+                    && let Some(journal) = &mut self.journal
+                {
+                    journal.unregister_consumer(state.consumer_id);
+                }
             }
             ShardMsg::StartStableSync {
                 sync_id,
@@ -287,6 +372,107 @@ impl Shard {
                 let _ = self.run_flushall();
                 let _ = ack.send(());
             }
+        }
+    }
+
+    /// Serialize one chunk of a full-sync snapshot: stream header (once),
+    /// then baseline entries until `FULL_SYNC_CHUNK_BYTES` is reached. Between
+    /// chunks the shard drains every pending message, so writes are stalled at
+    /// most one chunk's serialization. The final chunk appends the cut
+    /// marker, the `JOURNAL_OFFSET` and the RDB EOF, then unregisters the
+    /// consumer.
+    ///
+    /// Ordering: journal records captured since the last chunk are folded into
+    /// the chunk as blobs right after the baseline entries but before sending,
+    /// so for any key the replica sees its baseline value strictly before a
+    /// mutation blob that follows it, and a mutation blob strictly before any
+    /// later baseline entry (which then carries the mutation's result, read
+    /// live). Either interleaving converges on the master's final value; the
+    /// alternative of trailing every blob after the whole baseline would
+    /// double-apply non-idempotent commands.
+    fn snapshot_step(&mut self, rx: &mpsc::Receiver<ShardMsg>, sync_id: u32, flow_id: usize) {
+        // Phase 1: serialize one chunk (stream header once, then baseline
+        // entries until `FULL_SYNC_CHUNK_BYTES`). The state borrow ends here.
+        let (bus, mut chunk, done) = {
+            let Some(state) = self.full_syncs.get_mut(&(sync_id, flow_id)) else {
+                return;
+            };
+            let bus = state.bus.clone();
+            let mut chunk = Vec::new();
+            if !state.header_written {
+                chunk.extend_from_slice(&crate::core::rdb::write_full_sync_header());
+                state.header_written = true;
+            }
+            while chunk.len() < crate::core::rdb::FULL_SYNC_CHUNK_BYTES
+                && state.db_idx < state.dbs.len()
+            {
+                let baseline = &state.dbs[state.db_idx];
+                if !state.db_header_written {
+                    crate::core::rdb::write_full_sync_db_header(
+                        &mut chunk,
+                        baseline.dbid,
+                        baseline.keys.len(),
+                        baseline.num_expires,
+                    );
+                    state.db_header_written = true;
+                }
+                if state.key_idx >= baseline.keys.len() {
+                    state.db_idx += 1;
+                    state.key_idx = 0;
+                    state.db_header_written = false;
+                    continue;
+                }
+                let key = baseline.keys[state.key_idx].clone();
+                state.key_idx += 1;
+                let _ = crate::core::rdb::write_full_sync_entry(
+                    &mut chunk,
+                    &mut self.dbs[baseline.dbid],
+                    &key,
+                    now_ms(),
+                );
+            }
+            (bus, chunk, state.db_idx >= state.dbs.len())
+        };
+
+        // Phase 2: drain everything pending so no write outlives one chunk's
+        // serialization, then fold the journal records captured by the drain
+        // into the chunk as blobs (see the ordering note above).
+        while let Ok(msg) = rx.try_recv() {
+            self.handle(rx, msg);
+        }
+        if let Some(state) = self.full_syncs.get_mut(&(sync_id, flow_id)) {
+            let records = std::mem::take(&mut *state.records.lock().unwrap());
+            for record in &records {
+                crate::core::rdb::write_journal_blob(&mut chunk, record);
+            }
+        }
+
+        // Phase 3: finalize (tail + cut LSN) or ship the interim chunk.
+        if done {
+            if !self.full_syncs.contains_key(&(sync_id, flow_id)) {
+                return;
+            }
+            let cut = self.journal.as_ref().map_or(0, JournalSlice::lsn);
+            crate::core::rdb::write_full_sync_tail(&mut chunk, cut);
+            let state = self.full_syncs.remove(&(sync_id, flow_id)).unwrap();
+            if let Some(journal) = &mut self.journal {
+                journal.unregister_consumer(state.consumer_id);
+            }
+            bus.send(ReplChunk {
+                sync_id,
+                flow_id,
+                bytes: chunk,
+                kind: ChunkKind::FullSync {
+                    journal_lsn: Some(cut),
+                },
+            });
+        } else {
+            bus.send(ReplChunk {
+                sync_id,
+                flow_id,
+                bytes: chunk,
+                kind: ChunkKind::FullSync { journal_lsn: None },
+            });
         }
     }
 

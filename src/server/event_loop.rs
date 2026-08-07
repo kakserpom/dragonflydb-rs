@@ -16,7 +16,7 @@ use crate::error::RespValue;
 use crate::protocol::resp::RespParser;
 use crate::server::pubsub::{self, ChannelStore, SubscribeInfo};
 use crate::server::replica::{self, ReplicaPhase, ReplicaStatus};
-use crate::server::replication::{self, ReplicationManager, ReplChunk, SyncState};
+use crate::server::replication::{self, ChunkKind, ReplicationManager, ReplChunk, SyncState};
 use crate::server::{
     CoordMsg, GcRequest, Reply, ServerEnv, ShardMsg, SingleOp, WatchState, command_for,
     encode_value, extract_keys, is_eval_cmd, is_function_cmd, keys_per_shard, local_function,
@@ -1400,9 +1400,12 @@ impl IoLoop {
         self.deliver(conn_id, seq, encode_value(&reply));
     }
 
-    /// `DFLY SYNC <sync_id>`: build and stream every shard's full-sync RDB
-    /// snapshot, then move the session to FULL_SYNC. Partial-sync sessions
-    /// reject SYNC (the replica must not send it after a PARTIAL reply).
+    /// `DFLY SYNC <sync_id>`: kick off the chunked full-sync snapshot on every
+    /// shard and move the session to FULL_SYNC. Each shard serializes its RDB
+    /// baseline one chunk at a time (draining writes between chunks) and pushes
+    /// the chunks through `repl_tx`; `drain_repl` writes them to the flow
+    /// sockets and drives the next step. Partial-sync sessions reject SYNC (the
+    /// replica must not send it after a PARTIAL reply).
     fn dfly_sync(&mut self, conn_id: u64, seq: u64, args: &[Vec<u8>]) {
         let Some(sync_id) = args
             .get(2)
@@ -1424,40 +1427,14 @@ impl IoLoop {
             return;
         }
 
-        let mut streams = Vec::with_capacity(self.env.num_shards);
         for shard in 0..self.env.num_shards {
-            let (tx, rx) = mpsc::channel();
-            let _ = self.env.shard_txs[shard].send(ShardMsg::FullSyncSnapshot { result_tx: tx });
-            match rx.recv_timeout(Duration::from_secs(120)) {
-                Ok(data) => streams.push(data),
-                Err(_) => {
-                    self.deliver(
-                        conn_id,
-                        seq,
-                        encode_value(&RespValue::Error("invalid state".into())),
-                    );
-                    return;
-                }
-            }
+            let _ = self.env.shard_txs[shard].send(ShardMsg::FullSyncSnapshot {
+                sync_id,
+                flow_id: shard,
+                bus: self.env.full_sync_bus.clone(),
+            });
         }
-
         let replica = self.repl.get_mut(sync_id).unwrap();
-        for (flow, data) in replica.flows.iter_mut().zip(streams.into_iter()) {
-            flow.full_sync_stream = Some(data.stream);
-            flow.start_lsn = data.journal_lsn;
-        }
-        // The RDB stream is written to each flow socket right away, mirroring
-        // the reference streaming it asynchronously during FULL_SYNC.
-        let flow_conns: Vec<(u64, Vec<u8>)> = replica
-            .flows
-            .iter()
-            .map(|f| (f.conn_id, f.full_sync_stream.clone().unwrap_or_default()))
-            .collect();
-        for (fid, bytes) in flow_conns {
-            if let Some(conn) = self.conns.get_mut(&fid) {
-                conn.out.extend_from_slice(&bytes);
-            }
-        }
         replica.state = SyncState::FullSync;
         self.deliver(conn_id, seq, encode_value(&RespValue::Simple("OK".into())));
     }
@@ -1526,8 +1503,9 @@ impl IoLoop {
         self.deliver(conn_id, seq, encode_value(&RespValue::Simple("OK".into())));
     }
 
-    /// `DflyCmd::StopReplication`: unregister every flow's journal consumer and
-    /// drop the session. Triggered when a flow or control connection closes.
+    /// `DflyCmd::StopReplication`: unregister every flow's journal consumer,
+    /// abort any in-flight full-sync snapshot, and drop the session. Triggered
+    /// when a flow or control connection closes.
     fn stop_replication(&mut self, sync_id: u32) {
         let Some(replica) = self.repl.get(sync_id) else {
             return;
@@ -1538,6 +1516,10 @@ impl IoLoop {
                 .env
                 .shard_txs[flow_id]
                 .send(ShardMsg::StopReplication { sync_id, flow_id });
+            let _ = self
+                .env
+                .shard_txs[flow_id]
+                .send(ShardMsg::CancelFullSync { sync_id, flow_id });
         }
         if let Some(replica) = self.repl.get_mut(sync_id) {
             replica.state = SyncState::Cancelled;
@@ -1547,6 +1529,31 @@ impl IoLoop {
 
     fn drain_repl(&mut self) {
         while let Ok(chunk) = self.repl_rx.try_recv() {
+            // A full-sync chunk for a vanished session: tell the shard to abort
+            // its snapshot so no serialization state or consumer leaks.
+            if self.repl.get(chunk.sync_id).is_none() {
+                let _ = self.env.shard_txs[chunk.flow_id].send(ShardMsg::CancelFullSync {
+                    sync_id: chunk.sync_id,
+                    flow_id: chunk.flow_id,
+                });
+                continue;
+            }
+            if let ChunkKind::FullSync { journal_lsn } = chunk.kind {
+                if let Some(cut) = journal_lsn {
+                    // Final chunk: the snapshot cut LSN, matching the
+                    // `JOURNAL_OFFSET` written into the stream tail.
+                    let flow = &mut self.repl.get_mut(chunk.sync_id).unwrap().flows[chunk.flow_id];
+                    flow.start_lsn = cut;
+                } else {
+                    // Interim chunk: serialize the next baseline chunk. The
+                    // replica can only send STARTSTABLE after reading the
+                    // final chunk, so `start_lsn` is always set by then.
+                    let _ = self.env.shard_txs[chunk.flow_id].send(ShardMsg::SnapshotStep {
+                        sync_id: chunk.sync_id,
+                        flow_id: chunk.flow_id,
+                    });
+                }
+            }
             let conn_id = self
                 .repl
                 .get(chunk.sync_id)

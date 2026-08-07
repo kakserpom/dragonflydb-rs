@@ -291,3 +291,93 @@ fn master_to_replica_replication() {
     master.wait().ok();
     replica.wait().ok();
 }
+
+/// A replica must converge to the master even while the master keeps accepting
+/// writes during the full-sync snapshot. The baseline is large enough to span
+/// several 8KiB chunks, and a separate thread hammers the master from the
+/// moment the replica attaches, so writes land before, during (journal blobs)
+/// and after (stable sync) the snapshot — and the replica must agree with the
+/// master on all of them.
+#[test]
+fn writes_during_full_sync_converge() {
+    let master_port = free_port();
+    let replica_port = free_port();
+    let mut master = spawn(master_port, 2);
+    let mut replica = spawn(replica_port, 2);
+    wait_ready(master_port);
+    wait_ready(replica_port);
+
+    let mut m = Client::connect(master_port).unwrap();
+    let mut r = Client::connect(replica_port).unwrap();
+
+    const BASE_KEYS: i64 = 2000;
+    const DURING_KEYS: i64 = 600;
+    for i in 0..BASE_KEYS {
+        ok(
+            &mut m,
+            &["SET", &format!("base:{i}"), &format!("v-{i:04}-{}", "x".repeat(24))],
+        );
+    }
+
+    // Attach, then hammer the master with writes while the snapshot streams.
+    ok(&mut m, &["SET", "counter", "1000"]);
+    ok(&mut r, &["REPLICAOF", "localhost", &master_port.to_string()]);
+    let writer_port = master_port;
+    let writer = std::thread::spawn(move || {
+        let mut w = Client::connect(writer_port).unwrap();
+        for i in 0..DURING_KEYS {
+            if w.cmd(&["SET", &format!("during:{i}"), &format!("w-{i}")]).is_err() {
+                break;
+            }
+            if i % 50 == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        // A non-idempotent command on a key that predates the snapshot: every
+        // INCR must apply exactly once, whether it lands as a journal blob or
+        // a stable-sync record. A double-apply (baseline carrying the new value
+        // plus a trailing blob) would overshoot the master's value.
+        for _ in 0..100 {
+            if w.cmd(&["INCR", "counter"]).is_err() {
+                break;
+            }
+        }
+    });
+
+    wait_replica_state(replica_port, "connected");
+    writer.join().unwrap();
+
+    // The whole baseline is reproduced (sample every 100th key).
+    for i in (0..BASE_KEYS).step_by(100) {
+        assert_eq!(
+            bulk(&mut r, &["GET", &format!("base:{i}")]),
+            format!("v-{i:04}-{}", "x".repeat(24)),
+            "baseline key base:{i} diverged"
+        );
+    }
+    // Every write that raced the snapshot is present with its final value.
+    for i in 0..DURING_KEYS {
+        assert_eq!(
+            bulk(&mut r, &["GET", &format!("during:{i}")]),
+            format!("w-{i}"),
+            "concurrent key during:{i} diverged"
+        );
+    }
+    // The counter must agree with the master exactly: no increments lost and,
+    // critically, none applied twice.
+    let master_counter: i64 = bulk(&mut m, &["GET", "counter"]).parse().unwrap();
+    let replica_counter: i64 = bulk(&mut r, &["GET", "counter"]).parse().unwrap();
+    assert_eq!(master_counter, 1100, "master counter sanity");
+    assert_eq!(replica_counter, master_counter, "counter diverged");
+    // A baseline key overwritten mid-snapshot must show the new value.
+    ok(&mut m, &["SET", "base:7", "overwritten"]);
+    wait_for(Duration::from_secs(10), || bulk(&mut r, &["GET", "base:7"]) == "overwritten");
+    assert_eq!(bulk(&mut r, &["GET", "base:7"]), "overwritten");
+
+    drop(r);
+    drop(m);
+    master.kill().ok();
+    replica.kill().ok();
+    master.wait().ok();
+    replica.wait().ok();
+}

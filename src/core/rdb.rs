@@ -571,14 +571,17 @@ fn serialize_db(out: &mut Vec<u8>, slice: &DbSlice) {
     }
 }
 
-/// Build one shard's full-sync stream, mirroring the reference layout
-/// (`StartFullSyncInThread` → `SaveHeader` + `SaveBody` + `FinalizeJournalStream`
-/// + `SaveEpilog`): `REDIS0009` magic, AUX fields, every DB, the full-sync cut
-/// marker, the journal offset, then EOF with a zero checksum (replication
-/// streams disable checksums). The replica stores `journal_lsn` as the first
-/// LSN it still needs from stable sync.
+/// The target size of one full-sync baseline chunk. Mirrors the reference's
+/// `kMinBlobSize` (`snapshot.cc`): between chunks the shard returns to its
+/// message loop and drains pending writes, so no write is stalled longer than
+/// one chunk's serialization.
+pub const FULL_SYNC_CHUNK_BYTES: usize = 8 * 1024;
+
+/// Full-sync stream header, mirroring `SaveHeader`: `REDIS0009` magic plus the
+/// AUX fields. Replication streams disable checksums (`SendEofAndChecksum` with
+/// a zero checksum) and the AUX `ctime` is generated per snapshot.
 #[must_use]
-pub fn save_shard_full_sync(dbs: &[DbSlice], journal_lsn: u64) -> Vec<u8> {
+pub fn write_full_sync_header() -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(format!("REDIS{:04}", RDB_SER_VERSION).as_bytes());
     save_aux(&mut out, "redis-ver", "6.2.11");
@@ -591,27 +594,62 @@ pub fn save_shard_full_sync(dbs: &[DbSlice], journal_lsn: u64) -> Vec<u8> {
     save_aux(&mut out, "ctime", &ctime);
     save_aux(&mut out, "used-mem", "0");
     save_aux(&mut out, "aof-preamble", "0");
+    out
+}
 
-    for (dbid, db) in dbs.iter().enumerate() {
-        out.push(RDB_OPCODE_SELECTDB);
-        write_len(&mut out, dbid as u64);
-        serialize_db(&mut out, db);
+/// One DB's baseline header: `SELECTDB <id>` plus `RESIZEDB <keys> <expires>`.
+/// The counts come from the key list frozen at snapshot start, so the header is
+/// deterministic even though later chunks are serialized under load.
+pub fn write_full_sync_db_header(out: &mut Vec<u8>, dbid: usize, num_keys: usize, num_expires: usize) {
+    out.push(RDB_OPCODE_SELECTDB);
+    write_len(out, dbid as u64);
+    out.push(RDB_OPCODE_RESIZEDB);
+    write_len(out, num_keys as u64);
+    write_len(out, num_expires as u64);
+}
+
+/// One baseline entry: optional `EXPIRETIME_MS` prefix, the RDB type byte, the
+/// key and the value. The value is read at serialization time (the snapshot's
+/// frozen key list is re-checked against the live table), firing lazy expiry so
+/// keys deleted or expired mid-snapshot are skipped. Returns whether the key
+/// was still present.
+#[must_use]
+pub fn write_full_sync_entry(out: &mut Vec<u8>, slice: &mut DbSlice, key: &[u8], now_ms: u64) -> bool {
+    let at = slice.expire_at(key);
+    let Some(value) = slice.find(key, now_ms) else {
+        return false;
+    };
+    if let Some(at) = at {
+        out.push(RDB_OPCODE_EXPIRETIME_MS);
+        out.extend_from_slice(&at.to_le_bytes());
     }
+    out.push(rdb_object_type(value));
+    save_string(out, key);
+    save_value(out, value);
+    true
+}
 
-    // `SendFullSyncCut`: marks the boundary between the baseline snapshot and
-    // the journal records that follow in stable sync.
+/// A journal record wrapped inside the RDB stream, mirroring
+/// `RdbSerializer::WriteJournalEntry` (`rdb_save.cc`): opcode + `SaveLen(1)` +
+/// `SaveString(serialized_entry)`. `record` is one raw, self-delimiting journal
+/// record (`journal::serialize_record`), which carries its own SELECT prefix.
+pub fn write_journal_blob(out: &mut Vec<u8>, record: &[u8]) {
+    out.push(RDB_OPCODE_JOURNAL_BLOB);
+    write_len(out, 1);
+    save_string(out, record);
+}
+
+/// Full-sync stream tail: the cut marker, the journal offset and the RDB EOF
+/// (`SendFullSyncCut` + `FinalizeJournalStream` + `SendEofAndChecksum` with
+/// checksums disabled). `cut_lsn` is the first LSN the replica still needs from
+/// stable sync, so ring replay resumes exactly where the blobs end.
+pub fn write_full_sync_tail(out: &mut Vec<u8>, cut_lsn: u64) {
     out.push(RDB_OPCODE_FULLSYNC_END);
     out.extend_from_slice(&[0u8; 8]);
-
-    // `FinalizeJournalStream`: the LSN of the next journal record the replica
-    // needs. Written after the cut, before the RDB EOF.
     out.push(RDB_OPCODE_JOURNAL_OFFSET);
-    out.extend_from_slice(&journal_lsn.to_le_bytes());
-
-    // `SendEofAndChecksum` with checksums disabled for replication streams.
+    out.extend_from_slice(&cut_lsn.to_le_bytes());
     out.push(RDB_OPCODE_EOF);
     out.extend_from_slice(&[0u8; 8]);
-    out
 }
 
 /// `RDB_OPCODE_AUX` + `SaveString(key)` + `SaveString(val)`.

@@ -105,6 +105,11 @@ fn main() {
 
     // Stable-sync journal records from shards to their flow connections.
     let (repl_tx, repl_rx) = mpsc::channel::<dragonflydb::server::replication::ReplChunk>();
+    // Full-sync chunks ride the same bus, poking the wake pipe per chunk.
+    let full_sync_bus = dragonflydb::server::replication::FullSyncBus::new(
+        repl_tx.clone(),
+        pipefds[1],
+    );
 
     // Shard threads.
     let mut shard_txs = Vec::with_capacity(num_shards);
@@ -155,6 +160,7 @@ fn main() {
         gc_tx,
         reply_bus_tx: reply_bus,
         repl_tx,
+        full_sync_bus,
         script_mgr,
         listen_port: port,
     };

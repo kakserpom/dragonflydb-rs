@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::core::rdb::{self, Rd, RestoreError};
 use crate::error::RespValue;
-use crate::server::journal::{OP_COMMAND, OP_EXPIRED, OP_LSN, OP_PING, OP_SELECT};
+use crate::server::journal::{self, OP_COMMAND, OP_EXPIRED, OP_LSN, OP_PING, OP_SELECT};
 use crate::server::ShardMsg;
 
 /// Read-poll granularity: blocking reads wake up this often to re-check the
@@ -551,9 +551,11 @@ fn now_ms() -> u64 {
 }
 
 /// Load the full-sync RDB stream for one shard, forwarding each key to the
-/// shard thread (`RdbLoader::LoadRdbStream`). Returns the `JOURNAL_OFFSET`:
-/// the LSN of the first journal record the stable-sync stream will carry.
-fn load_rdb(r: &mut StreamReader, cfg: &ReplicaConfig, flow_id: usize) -> Result<u64, ReplicaError> {
+/// shard thread (`RdbLoader::LoadRdbStream`). Journal blobs embedded in the
+/// stream (writes the master executed mid-snapshot) are applied inline, mirror
+/// `HandleJournalBlob` + `FlushAllShards`. Returns the `JOURNAL_OFFSET`: the
+/// LSN of the first journal record the stable-sync stream will carry.
+fn load_rdb(r: &mut StreamReader, sess: &Session, flow_id: usize) -> Result<u64, ReplicaError> {
     let magic = r.take(9)?;
     if &magic != b"REDIS0009" {
         return Err(proto("bad full-sync magic"));
@@ -595,6 +597,32 @@ fn load_rdb(r: &mut StreamReader, cfg: &ReplicaConfig, flow_id: usize) -> Result
                 let a: [u8; 8] = s.try_into().map_err(|_| proto("corrupt journal offset"))?;
                 journal_lsn = u64::from_le_bytes(a);
             }
+            // JOURNAL_BLOB <num_entries> <record>: journal records the master
+            // executed mid-snapshot, applied here in stream order.
+            0xd2 => {
+                let (num, _) = r.read_len()?;
+                let record = r.read_string()?;
+                let mut reader = journal::Reader::new(&record);
+                for _ in 0..num {
+                    let entry = reader
+                        .read_entry()
+                        .map_err(|_| proto("corrupt journal blob"))?;
+                    if is_global_cmd(&entry.cmd) {
+                        global_apply(
+                            &sess.global,
+                            entry.txid,
+                            &entry.cmd,
+                            entry.dbid as usize,
+                            &sess.cfg,
+                            flow_id,
+                            &sess.abort,
+                        )?;
+                    } else {
+                        apply_ops(&sess.cfg, flow_id, &entry.cmd, entry.dbid as usize)?;
+                    }
+                    sess.cfg.status.lock().unwrap().journal_rec_executed += 1;
+                }
+            }
             // EOF + 8 zero bytes: end of the snapshot.
             0xff => {
                 r.skip(8)?;
@@ -611,7 +639,7 @@ fn load_rdb(r: &mut StreamReader, cfg: &ReplicaConfig, flow_id: usize) -> Result
                             value,
                             expire_at: pending_expiry,
                         };
-                        let _ = cfg.shard_txs[flow_id].send(msg);
+                        let _ = sess.cfg.shard_txs[flow_id].send(msg);
                     }
                     rdb::RestoreOutcome::Expired => {}
                 }
@@ -823,7 +851,7 @@ fn flow_thread(sess: &Arc<Session>, flow_id: usize) -> Result<(), ReplicaError> 
 
     let mut next_lsn = lsn;
     if is_full {
-        next_lsn = load_rdb(&mut sr, &sess.cfg, flow_id)?;
+        next_lsn = load_rdb(&mut sr, sess, flow_id)?;
         sess.cfg.lsn_cells[flow_id].store(next_lsn, Ordering::SeqCst);
     }
     let _ = sess.full_tx.send((flow_id, Ok(())));
