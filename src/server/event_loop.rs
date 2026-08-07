@@ -4,19 +4,20 @@ use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use std::fmt::Write as _;
 
+use crate::commands::exec::keys::glob_match;
 use crate::commands::exec::server;
-use crate::commands::{
-    Command, FLAG_ADMIN, FLAG_BLOCKING, FLAG_GLOBAL, FLAG_LOCAL, FLAG_WRITE,
-};
+use crate::commands::{Command, FLAG_ADMIN, FLAG_BLOCKING, FLAG_GLOBAL, FLAG_LOCAL, FLAG_WRITE};
 use crate::error::RespValue;
 use crate::protocol::resp::RespParser;
+use crate::server::coordinator::format_exec_slowlog;
 use crate::server::pubsub::{self, ChannelStore, SubscribeInfo};
 use crate::server::replica::{self, ReplicaPhase, ReplicaStatus};
-use crate::server::replication::{self, ChunkKind, ReplicationManager, ReplChunk, SyncState};
+use crate::server::replication::{self, ChunkKind, ReplChunk, ReplicationManager, SyncState};
+use crate::server::slowlog::{SlowLog, SlowLogEntry};
 use crate::server::{
     CoordMsg, GcRequest, Reply, ServerEnv, ShardMsg, SingleOp, WatchState, command_for,
     encode_value, extract_keys, is_eval_cmd, is_function_cmd, keys_per_shard, local_function,
@@ -34,6 +35,137 @@ fn monitor_timestamp() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}.{:06}", now.as_secs(), now.subsec_micros())
+}
+
+/// Epoch microseconds (wall clock): SLOWLOG entries' `unix_ts_usec`.
+fn now_usec() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
+}
+
+/// `ERR Unknown subcommand or wrong number of arguments for '<sub>'. Try
+/// SLOWLOG HELP.` (`facade::UnknownSubCmd`).
+fn slowlog_unknown_subcmd(sub: &[u8]) -> String {
+    format!(
+        "ERR Unknown subcommand or wrong number of arguments for '{}'. Try SLOWLOG HELP.",
+        String::from_utf8_lossy(sub)
+    )
+}
+
+/// `ParseClientListFilter`'s result: an optional `TYPE` class plus an
+/// allow-list of connection ids (`CLIENT LIST ID ...`).
+#[derive(Default)]
+struct ClientListFilter {
+    kind: Option<ClientListType>,
+    ids: Vec<u32>,
+}
+
+/// Connection classes from `ServerFamily::ClassifyConnection` used by the
+/// `CLIENT LIST TYPE <normal|master|replica|pubsub>` filter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClientListType {
+    Normal,
+    Master,
+    Replica,
+    Pubsub,
+}
+
+/// `facade::kSyntaxErr`.
+fn syntax_err() -> RespValue {
+    RespValue::Error("ERR syntax error".into())
+}
+
+/// One `CLIENT LIST` / `CLIENT INFO` info line (`facade::Connection::
+/// GetClientInfo`). Field values reflect the connection's live state; the
+/// reference emits the same fields for a real connection.
+fn client_info_line(conn: &Conn) -> String {
+    let flags = if conn.monitor {
+        'O'
+    } else if !conn.sub.is_empty() {
+        'P'
+    } else {
+        'N'
+    };
+    let multi = match conn.multi.phase {
+        MultiPhase::Collect => conn.multi.queue.len() as i64,
+        _ => -1,
+    };
+    format!(
+        "id={} addr={} fd={} name= age=0 idle=0 flags={} db={} sub={} psub=0 multi={} \
+         watch={} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 \
+         omem=0 tot-mem=0 events=r cmd=client user=default redir=-1 resp=2",
+        conn.id,
+        conn.remote,
+        conn.fd,
+        flags,
+        conn.db_idx,
+        conn.sub.channels.len() + conn.sub.sharded.len(),
+        multi,
+        conn.watched.len(),
+    )
+}
+
+/// `ParseClientListFilter` (server_family.cc:408): `TYPE <type>` or
+/// `ID <id>...`, rejecting trailing/unknown tokens.
+fn parse_client_list_filter(args: &[Vec<u8>]) -> Result<ClientListFilter, RespValue> {
+    let rest = &args[2..];
+    let mut filter = ClientListFilter {
+        kind: None,
+        ids: Vec::new(),
+    };
+    if rest.is_empty() {
+        return Ok(filter);
+    }
+    match rest[0].to_ascii_uppercase().as_slice() {
+        b"TYPE" => {
+            if rest.len() < 2 {
+                return Err(syntax_err());
+            }
+            let raw = String::from_utf8_lossy(&rest[1]);
+            let kind = match raw.to_ascii_uppercase().as_str() {
+                "NORMAL" => ClientListType::Normal,
+                "MASTER" => ClientListType::Master,
+                "REPLICA" | "SLAVE" => ClientListType::Replica,
+                "PUBSUB" => ClientListType::Pubsub,
+                _ => {
+                    return Err(RespValue::Error(format!("ERR Unknown client type '{raw}'")));
+                }
+            };
+            if rest.len() > 2 {
+                return Err(syntax_err());
+            }
+            filter.kind = Some(kind);
+        }
+        b"ID" => {
+            if rest.len() < 2 {
+                return Err(syntax_err());
+            }
+            for id in &rest[1..] {
+                match crate::util::parse_u64(id).and_then(|n| u32::try_from(n).ok()) {
+                    Some(n) => filter.ids.push(n),
+                    None => {
+                        return Err(RespValue::Error("ERR Invalid client ID".into()));
+                    }
+                }
+            }
+        }
+        _ => return Err(syntax_err()),
+    }
+    Ok(filter)
+}
+
+/// `ClassifyConnection` (server_family.cc:448): replica takes priority over
+/// pubsub; everything else is normal.
+fn classify_conn(conn: &Conn) -> ClientListType {
+    if conn.repl.is_some() {
+        return ClientListType::Replica;
+    }
+    if !conn.sub.is_empty() {
+        return ClientListType::Pubsub;
+    }
+    ClientListType::Normal
 }
 
 /// Escape a command argument for MONITOR output the way upstream's
@@ -124,6 +256,21 @@ struct Conn {
     repl: Option<ConnRepl>,
     /// Set by QUIT: close the socket once pending output has flushed.
     closing: bool,
+    /// In-flight requests awaiting their reply (seq -> start info), used to
+    /// measure SLOWLOG latency from dispatch to reply delivery.
+    pending_slowlog: HashMap<u64, PendingSlowlog>,
+}
+
+/// A dispatched command whose reply has not arrived yet. The SLOWLOG entry is
+/// produced when the reply for `seq` is flushed.
+struct PendingSlowlog {
+    name: String,
+    args: Vec<Vec<u8>>,
+    started: Instant,
+    /// `FormatExecSlowlog`/`FormatEvalSlowlog` arguments attached by the
+    /// coordinator for EXEC/EVAL replies; other commands send `None` and the
+    /// raw tail is used.
+    slowlog_args: Option<Vec<Vec<u8>>>,
 }
 
 /// The role a connection plays inside a replica session. The control connection
@@ -166,6 +313,8 @@ pub struct IoLoop {
     replica_status: Arc<Mutex<ReplicaStatus>>,
     replica_stop: Arc<AtomicBool>,
     replica_handle: Option<std::thread::JoinHandle<()>>,
+    /// The IO thread's SLOWLOG ring (`ServerState::tlocal()->GetSlowLog()`).
+    slow_log: SlowLog,
 }
 
 impl IoLoop {
@@ -197,6 +346,7 @@ impl IoLoop {
             replica_status: Arc::new(Mutex::new(ReplicaStatus::default())),
             replica_stop: Arc::new(AtomicBool::new(false)),
             replica_handle: None,
+            slow_log: SlowLog::new(),
         })
     }
 
@@ -305,6 +455,7 @@ impl IoLoop {
                 monitor: false,
                 repl: None,
                 closing: false,
+                pending_slowlog: HashMap::new(),
             },
         );
         self.fd_to_id.insert(fd, conn_id);
@@ -389,9 +540,7 @@ impl IoLoop {
         // 2-arg HELP form bypasses XGROUP's -3 arity.
         let xgroup_help =
             cmd.name == "XGROUP" && args.len() == 2 && args[1].eq_ignore_ascii_case(b"HELP");
-        if !xgroup_help
-            && let Some(e) = cmd.check_arity(args.len())
-        {
+        if !xgroup_help && let Some(e) = cmd.check_arity(args.len()) {
             // A validation failure while collecting poisons the transaction so
             // EXEC will abort (EXECABORT). Unknown commands do not poison it.
             if let Some(conn) = self.conns.get_mut(&conn_id)
@@ -437,6 +586,23 @@ impl IoLoop {
         if self.in_multi(conn_id) && !matches!(cmd.name, "MULTI" | "EXEC" | "DISCARD" | "RESET") {
             self.queue_cmd(conn_id, seq, cmd, args);
             return;
+        }
+
+        // Register the slowlog start: the entry is produced when the reply for
+        // this seq is flushed (`deliver`). Blocking commands are excluded
+        // (`CO::BLOCKING` skips logging, conn_context.cc:341).
+        if !cmd.has_flag(FLAG_BLOCKING)
+            && let Some(conn) = self.conns.get_mut(&conn_id)
+        {
+            conn.pending_slowlog.insert(
+                seq,
+                PendingSlowlog {
+                    name: cmd.name.to_string(),
+                    args: args.clone(),
+                    started: Instant::now(),
+                    slowlog_args: None,
+                },
+            );
         }
 
         // Feed live MONITOR connections; admin commands and EXEC are excluded
@@ -536,6 +702,19 @@ impl IoLoop {
             self.deliver(conn_id, seq, bytes);
             return;
         };
+        if !cmd.has_flag(FLAG_BLOCKING)
+            && let Some(conn) = self.conns.get_mut(&conn_id)
+        {
+            conn.pending_slowlog.insert(
+                seq,
+                PendingSlowlog {
+                    name: cmd.name.to_string(),
+                    args: args.to_vec(),
+                    started: Instant::now(),
+                    slowlog_args: None,
+                },
+            );
+        }
         if cmd.name == "UNWATCH" {
             self.local_unwatch(conn_id, seq);
             return;
@@ -626,6 +805,9 @@ impl IoLoop {
                     Err(e) => e,
                 };
             }
+            "SLOWLOG" => return self.local_slowlog(args),
+            "CONFIG" => return self.local_config(args),
+            "CLIENT" => return self.local_client(args, conn_id),
             _ => {}
         }
         if cmd.name == "SELECT" {
@@ -834,9 +1016,14 @@ impl IoLoop {
             }
         }
         // The header plus each queued command's reply, delivered in seq order,
-        // concatenate into the EXEC RESP array.
+        // concatenate into the EXEC RESP array. The header reply carries the
+        // EXEC slowlog metadata (`FormatExecSlowlog`).
+        let is_write = queue
+            .iter()
+            .any(|q| command_for(q).is_some_and(|c| c.has_flag(FLAG_WRITE)));
+        let exec_slowlog_args = format_exec_slowlog(queue.len(), is_write);
         let header = format!("*{}\r\n", queue.len()).into_bytes();
-        self.deliver(conn_id, seq, header);
+        self.deliver_with_args(conn_id, seq, header, Some(exec_slowlog_args));
         if let Some(conn) = self.conns.get_mut(&conn_id) {
             conn.exec_multi = true;
         }
@@ -1145,6 +1332,211 @@ impl IoLoop {
         local_function(&mut self.env.script_mgr.lock().unwrap(), args)
     }
 
+    /// SLOWLOG subcommands against the IO thread's ring (`ServerFamily::SlowLog`).
+    fn local_slowlog(&mut self, args: &[Vec<u8>]) -> RespValue {
+        if args.len() < 2 {
+            return RespValue::Error("ERR wrong number of arguments for 'slowlog' command".into());
+        }
+        match args[1].to_ascii_uppercase().as_slice() {
+            b"HELP" => RespValue::Array(vec![
+                RespValue::Simple(
+                    "SLOWLOG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:".into(),
+                ),
+                RespValue::Simple("GET [<count>]".into()),
+                RespValue::Simple(
+                    "    Return top <count> entries from the slowlog (default: 10, -1 mean all)."
+                        .into(),
+                ),
+                RespValue::Simple("    Entries are made of:".into()),
+                RespValue::Simple(
+                    "    id, timestamp, time in microseconds, arguments array, client IP and port,"
+                        .into(),
+                ),
+                RespValue::Simple("    client name".into()),
+                RespValue::Simple("LEN".into()),
+                RespValue::Simple("    Return the length of the slowlog.".into()),
+                RespValue::Simple("RESET".into()),
+                RespValue::Simple("    Reset the slowlog.".into()),
+                RespValue::Simple("HELP".into()),
+                RespValue::Simple("    Prints this help.".into()),
+            ]),
+            b"LEN" => RespValue::Integer(self.slow_log.len() as i64),
+            b"RESET" => {
+                self.slow_log.reset();
+                RespValue::Simple("OK".into())
+            }
+            b"GET" => self.slowlog_get(args),
+            other => RespValue::Error(slowlog_unknown_subcmd(other)),
+        }
+    }
+
+    /// `SlowLogGet` (server_family.cc:1027): parse the optional count, then
+    /// snapshot the ring (newest first, limited to the count).
+    fn slowlog_get(&self, args: &[Vec<u8>]) -> RespValue {
+        // args = ["SLOWLOG", "GET"[, count]]: 4+ arguments is a parse error.
+        if args.len() > 3 {
+            return RespValue::Error(slowlog_unknown_subcmd(b"GET"));
+        }
+        let mut requested = u32::MAX as u64;
+        if args.len() == 3 {
+            match crate::util::parse_i64(&args[2]) {
+                Some(n) if n >= -1 => {
+                    if n >= 0 {
+                        requested = n as u64;
+                    }
+                }
+                _ => {
+                    return RespValue::Error(
+                        "ERR count should be greater than or equal to -1".into(),
+                    );
+                }
+            }
+        }
+        RespValue::Array(
+            self.slow_log
+                .snapshot(requested)
+                .iter()
+                .map(SlowLogEntry::into_resp)
+                .collect(),
+        )
+    }
+
+    /// CONFIG subcommands against the IO thread's runtime knobs
+    /// (`ServerFamily::ConfigSet` / `ConfigGet`). The slowlog parameters map
+    /// onto the thread-local ring.
+    fn local_config(&mut self, args: &[Vec<u8>]) -> RespValue {
+        if args.len() < 2 {
+            return RespValue::Error("ERR wrong number of arguments for 'config' command".into());
+        }
+        match args[1].to_ascii_uppercase().as_slice() {
+            b"SET" => self.config_set(args),
+            b"GET" => self.config_get(args),
+            b"RESETSTAT" => RespValue::Simple("OK".into()),
+            _ => RespValue::Error(
+                "ERR Unknown CONFIG subcommand or wrong number of arguments for 'config' command"
+                    .into(),
+            ),
+        }
+    }
+
+    fn config_set(&mut self, args: &[Vec<u8>]) -> RespValue {
+        if args.len() != 4 {
+            return RespValue::Error(
+                "ERR wrong number of arguments for 'config|set' command".into(),
+            );
+        }
+        let name = args[2].to_ascii_lowercase();
+        let name = String::from_utf8_lossy(&name);
+        match name.as_ref() {
+            // `RegisterMutable("slowlog_max_len")` with the setter below.
+            "slowlog_max_len" => match crate::util::parse_i64(&args[3]) {
+                Some(n) if n >= 0 => {
+                    self.slow_log.change_length(n as usize);
+                    RespValue::Simple("OK".into())
+                }
+                _ => RespValue::Error(format!("ERR Invalid config parameter '{name}'")),
+            },
+            "slowlog_log_slower_than" => match crate::util::parse_i64(&args[3]) {
+                Some(n) => {
+                    self.slow_log.set_threshold(n);
+                    RespValue::Simple("OK".into())
+                }
+                None => RespValue::Error(format!("ERR Invalid config parameter '{name}'")),
+            },
+            _ => RespValue::Simple("OK".into()),
+        }
+    }
+
+    fn config_get(&self, args: &[Vec<u8>]) -> RespValue {
+        if args.len() < 3 {
+            return RespValue::Error(
+                "ERR wrong number of arguments for 'config|get' command".into(),
+            );
+        }
+        // The canonical (underscore) names of the runtime-configurable params;
+        // a glob pattern currently matches only the slowlog pair.
+        let pattern = args[2].to_ascii_lowercase();
+        let mut out = Vec::new();
+        let push = |name: &str, value: String, out: &mut Vec<RespValue>| {
+            if glob_match(&pattern, name.as_bytes()) {
+                out.push(RespValue::Bulk(name.as_bytes().to_vec()));
+                out.push(RespValue::Bulk(value.into_bytes()));
+            }
+        };
+        push(
+            "slowlog_max_len",
+            self.slow_log.max_len().to_string(),
+            &mut out,
+        );
+        push(
+            "slowlog_log_slower_than",
+            self.slow_log.log_slower_than().to_string(),
+            &mut out,
+        );
+        RespValue::Array(out)
+    }
+
+    /// CLIENT subcommands against the IO thread's connection table
+    /// (`ServerFamily::Client`): `LIST` filters connections, `INFO` reports the
+    /// calling connection.
+    fn local_client(&self, args: &[Vec<u8>], conn_id: u64) -> RespValue {
+        if args.len() < 2 {
+            return RespValue::Error("ERR wrong number of arguments for 'client' command".into());
+        }
+        match args[1].to_ascii_uppercase().as_slice() {
+            b"LIST" => self.client_list(args),
+            // `ClientInfo` (server_family.cc:391): extra arguments are rejected.
+            b"INFO" if args.len() == 2 => self
+                .conns
+                .get(&conn_id)
+                .map_or(RespValue::Bulk(Vec::new()), |conn| {
+                    RespValue::Bulk(client_info_line(conn).into_bytes())
+                }),
+            b"INFO" => RespValue::Error("ERR syntax error".into()),
+            b"SETNAME" | b"SETINFO" | b"NO-EVICT" | b"NO-TOUCH" => RespValue::Simple("OK".into()),
+            b"GETNAME" => RespValue::Bulk(Vec::new()),
+            b"ID" => self
+                .conns
+                .get(&conn_id)
+                .map_or(RespValue::Integer(0), |c| RespValue::Integer(c.id as i64)),
+            _ => RespValue::Error(
+                "ERR Unknown CLIENT subcommand or wrong number of arguments for 'client' command"
+                    .into(),
+            ),
+        }
+    }
+
+    /// `ClientList` (server_family.cc:466): one info line per matching
+    /// connection, joined with newlines and sent as a (verbatim) bulk string.
+    /// The `TYPE` filter is checked first against the `normal`/`replica`/
+    /// `pubsub` classes; `master` only matches replication link entries, which
+    /// a standalone server has none of.
+    fn client_list(&self, args: &[Vec<u8>]) -> RespValue {
+        let filter = match parse_client_list_filter(args) {
+            Ok(f) => f,
+            Err(e) => return e,
+        };
+        let mut lines: Vec<String> = Vec::new();
+        if filter.kind != Some(ClientListType::Master) {
+            for conn in self.conns.values() {
+                if !filter.ids.is_empty() && !filter.ids.contains(&(conn.id as u32)) {
+                    continue;
+                }
+                if let Some(kind) = &filter.kind
+                    && classify_conn(conn) != *kind
+                {
+                    continue;
+                }
+                lines.push(client_info_line(conn));
+            }
+        }
+        let mut result = lines.join("\n");
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        RespValue::Bulk(result.into_bytes())
+    }
+
     fn run_local(&self, cmd: &Command, args: &[Vec<u8>]) -> RespValue {
         match cmd.name {
             "PING" => server::local_ping(args),
@@ -1154,11 +1546,9 @@ impl IoLoop {
             "COMMAND" => server::local_command(args),
             "HELLO" => server::local_hello(args),
             "CONFIG" => server::local_config(args),
-            "CLIENT" => server::local_client(args),
             "TIME" => server::local_time(args),
             "LASTSAVE" => server::local_lastsave(args),
             "LATENCY" => server::local_latency(args),
-            "SLOWLOG" => server::local_slowlog(args),
             "WAIT" => server::local_wait(args),
             "ADDREPLICAOF" => server::local_addreplicaof(args),
             "REPLTAKEOVER" => server::local_repltakeover(args),
@@ -1247,7 +1637,9 @@ impl IoLoop {
                         None => (remote, 0),
                     }
                 };
-                let sync_id = self.repl.create_sync_session(address, port, self.env.num_shards);
+                let sync_id = self
+                    .repl
+                    .create_sync_session(address, port, self.env.num_shards);
                 if let Some(conn) = self.conns.get_mut(&conn_id) {
                     conn.repl = Some(ConnRepl::Control { sync_id });
                 }
@@ -1308,13 +1700,20 @@ impl IoLoop {
             return;
         }
         if String::from_utf8_lossy(&args[2]) != self.repl.master_replid {
-            self.deliver(conn_id, seq, encode_value(&RespValue::Error("bad master id".into())));
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error("bad master id".into())),
+            );
             return;
         }
-        let Some(sync_id) =
-            ReplicationManager::parse_sync_id(&String::from_utf8_lossy(&args[3]))
+        let Some(sync_id) = ReplicationManager::parse_sync_id(&String::from_utf8_lossy(&args[3]))
         else {
-            self.deliver(conn_id, seq, encode_value(&RespValue::Error("bad sync id".into())));
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error("bad sync id".into())),
+            );
             return;
         };
         let Some(flow_id) = std::str::from_utf8(&args[4])
@@ -1341,11 +1740,19 @@ impl IoLoop {
             return;
         }
         let Some(replica) = self.repl.get(sync_id) else {
-            self.deliver(conn_id, seq, encode_value(&RespValue::Error("bad sync id".into())));
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error("bad sync id".into())),
+            );
             return;
         };
         if replica.state != SyncState::Preparation {
-            self.deliver(conn_id, seq, encode_value(&RespValue::Error("invalid state".into())));
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error("invalid state".into())),
+            );
             return;
         }
 
@@ -1411,19 +1818,39 @@ impl IoLoop {
             .get(2)
             .and_then(|a| ReplicationManager::parse_sync_id(&String::from_utf8_lossy(a)))
         else {
-            self.deliver(conn_id, seq, encode_value(&RespValue::Error("bad sync id".into())));
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error("bad sync id".into())),
+            );
             return;
         };
         let Some(replica) = self.repl.get(sync_id) else {
-            self.deliver(conn_id, seq, encode_value(&RespValue::Error("bad sync id".into())));
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error("bad sync id".into())),
+            );
             return;
         };
         if replica.state != SyncState::Preparation {
-            self.deliver(conn_id, seq, encode_value(&RespValue::Error("invalid state".into())));
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error("invalid state".into())),
+            );
             return;
         }
-        if replica.flows.iter().any(|f| f.start_partial_sync_at.is_some()) {
-            self.deliver(conn_id, seq, encode_value(&RespValue::Error("invalid state".into())));
+        if replica
+            .flows
+            .iter()
+            .any(|f| f.start_partial_sync_at.is_some())
+        {
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error("invalid state".into())),
+            );
             return;
         }
 
@@ -1447,21 +1874,37 @@ impl IoLoop {
             .get(2)
             .and_then(|a| ReplicationManager::parse_sync_id(&String::from_utf8_lossy(a)))
         else {
-            self.deliver(conn_id, seq, encode_value(&RespValue::Error("bad sync id".into())));
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error("bad sync id".into())),
+            );
             return;
         };
         let Some(replica) = self.repl.get(sync_id) else {
-            self.deliver(conn_id, seq, encode_value(&RespValue::Error("bad sync id".into())));
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error("bad sync id".into())),
+            );
             return;
         };
         let state = replica.state;
         if state != SyncState::FullSync && state != SyncState::Preparation {
-            self.deliver(conn_id, seq, encode_value(&RespValue::Error("invalid state".into())));
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error("invalid state".into())),
+            );
             return;
         }
         if replica.flows.iter().any(|f| f.conn_id == 0) {
             // `AllFlowsConnected`: a flow disconnected before STARTSTABLE.
-            self.deliver(conn_id, seq, encode_value(&RespValue::Error("invalid state".into())));
+            self.deliver(
+                conn_id,
+                seq,
+                encode_value(&RespValue::Error("invalid state".into())),
+            );
             return;
         }
 
@@ -1478,10 +1921,15 @@ impl IoLoop {
                 repl_tx: self.env.repl_tx.clone(),
                 result_tx: tx,
             });
-            if rx.recv_timeout(Duration::from_secs(120))
+            if rx
+                .recv_timeout(Duration::from_secs(120))
                 .map_or(true, |r| r.is_err())
             {
-                self.deliver(conn_id, seq, encode_value(&RespValue::Error("invalid state".into())));
+                self.deliver(
+                    conn_id,
+                    seq,
+                    encode_value(&RespValue::Error("invalid state".into())),
+                );
                 return;
             }
         }
@@ -1512,14 +1960,9 @@ impl IoLoop {
         };
         let flows: Vec<usize> = replica.flows.iter().map(|f| f.flow_id).collect();
         for flow_id in flows {
-            let _ = self
-                .env
-                .shard_txs[flow_id]
-                .send(ShardMsg::StopReplication { sync_id, flow_id });
-            let _ = self
-                .env
-                .shard_txs[flow_id]
-                .send(ShardMsg::CancelFullSync { sync_id, flow_id });
+            let _ =
+                self.env.shard_txs[flow_id].send(ShardMsg::StopReplication { sync_id, flow_id });
+            let _ = self.env.shard_txs[flow_id].send(ShardMsg::CancelFullSync { sync_id, flow_id });
         }
         if let Some(replica) = self.repl.get_mut(sync_id) {
             replica.state = SyncState::Cancelled;
@@ -1647,6 +2090,7 @@ impl IoLoop {
             first_key_idx,
             db_idx,
             no_block: self.no_block(conn_id),
+            slowlog_threshold_usec: self.slow_log.threshold(),
         };
         let _ = self.env.coord_tx.send(msg);
     }
@@ -1656,24 +2100,76 @@ impl IoLoop {
     // ------------------------------------------------------------------
 
     fn deliver(&mut self, conn_id: u64, seq: u64, bytes: Vec<u8>) {
-        let Some(conn) = self.conns.get_mut(&conn_id) else {
-            return;
-        };
-        if seq == conn.deliver_seq {
-            conn.out.extend_from_slice(&bytes);
-            conn.deliver_seq += 1;
-            while let Some(next) = conn.buffered.remove(&conn.deliver_seq) {
-                conn.out.extend_from_slice(&next);
+        let completed = {
+            let Some(conn) = self.conns.get_mut(&conn_id) else {
+                return;
+            };
+            if seq == conn.deliver_seq {
+                conn.out.extend_from_slice(&bytes);
                 conn.deliver_seq += 1;
+                while let Some(next) = conn.buffered.remove(&conn.deliver_seq) {
+                    conn.out.extend_from_slice(&next);
+                    conn.deliver_seq += 1;
+                }
+                conn.pending_slowlog.remove(&seq)
+            } else if seq > conn.deliver_seq {
+                conn.buffered.insert(seq, bytes);
+                None
+            } else {
+                None
             }
-        } else if seq > conn.deliver_seq {
-            conn.buffered.insert(seq, bytes);
+        };
+        if let Some(pending) = completed {
+            self.record_slowlog(conn_id, pending);
         }
+    }
+
+    /// Like `deliver`, but attaches the augmented slowlog arguments produced by
+    /// the coordinator for EXEC/EVAL replies (`FormatExecSlowlog` /
+    /// `FormatEvalSlowlog`).
+    fn deliver_with_args(
+        &mut self,
+        conn_id: u64,
+        seq: u64,
+        bytes: Vec<u8>,
+        slowlog_args: Option<Vec<Vec<u8>>>,
+    ) {
+        if let Some(conn) = self.conns.get_mut(&conn_id)
+            && let Some(pending) = conn.pending_slowlog.get_mut(&seq)
+        {
+            pending.slowlog_args = slowlog_args;
+        }
+        self.deliver(conn_id, seq, bytes);
+    }
+
+    /// Produce the SLOWLOG entry for a completed request (`RecordLatency`): the
+    /// execution time is the dispatch-to-reply latency; the tail is the raw
+    /// arguments, or the augmented stats arguments for EXEC/EVAL.
+    fn record_slowlog(&mut self, conn_id: u64, pending: PendingSlowlog) {
+        let exec_time_usec = pending.started.elapsed().as_micros() as u64;
+        if !self.slow_log.should_log(exec_time_usec) {
+            return;
+        }
+        let tail = pending
+            .slowlog_args
+            .unwrap_or_else(|| pending.args[1..].to_vec());
+        let client_ip = self
+            .conns
+            .get(&conn_id)
+            .map_or_else(String::new, |c| c.remote.clone());
+        self.slow_log.add(
+            &pending.name,
+            tail,
+            &client_ip,
+            "",
+            exec_time_usec,
+            now_usec(),
+        );
     }
 
     fn drain_bus(&mut self) {
         while let Ok(reply) = self.reply_bus_rx.try_recv() {
-            self.deliver(reply.conn_id, reply.seq, reply.bytes);
+            self.deliver_with_args(reply.conn_id, reply.seq, reply.bytes, reply.slowlog_args);
         }
     }
 

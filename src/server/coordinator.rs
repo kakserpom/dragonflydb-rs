@@ -96,6 +96,7 @@ pub fn spawn(
                 loaded_libs: HashMap::new(),
                 tx_counter: 0,
                 pending: VecDeque::new(),
+                script_slowlog_args: None,
             }
             .run();
         })
@@ -121,6 +122,9 @@ struct Coordinator {
     loaded_libs: HashMap<String, (String, Vec<String>)>,
     tx_counter: u64,
     pending: VecDeque<PendingTx>,
+    /// Augmented slowlog arguments for the last EVAL/FCALL run
+    /// (`FormatEvalSlowlog`). The IO thread attaches them to the reply.
+    script_slowlog_args: Option<Vec<Vec<u8>>>,
 }
 
 impl Coordinator {
@@ -163,7 +167,8 @@ impl Coordinator {
             let is_evalsha = matches!(cmd.name, "EVALSHA" | "EVALSHA_RO");
             let read_only = cmd.name.ends_with("_RO");
             let result = self.execute_script(&msg, is_evalsha, read_only);
-            self.reply_result(msg.conn_id, msg.seq, result);
+            let slowlog_args = self.script_slowlog_args.take();
+            self.reply_with_slowlog(msg.conn_id, msg.seq, result, slowlog_args);
             return;
         }
         // The FCALL family runs registered functions the same way.
@@ -172,7 +177,8 @@ impl Coordinator {
         {
             let read_only = cmd.name.ends_with("_RO");
             let result = self.execute_function(&msg, read_only);
-            self.reply_result(msg.conn_id, msg.seq, result);
+            let slowlog_args = self.script_slowlog_args.take();
+            self.reply_with_slowlog(msg.conn_id, msg.seq, result, slowlog_args);
             return;
         }
         match self.execute_tx(&msg) {
@@ -495,7 +501,7 @@ impl Coordinator {
         }
 
         let ctx = ScriptCtx {
-            declared: keys,
+            declared: keys.clone(),
             undeclared_keys: params.undeclared_keys,
             read_only,
             num_shards: self.num_shards,
@@ -506,29 +512,58 @@ impl Coordinator {
             pinned_shards: Vec::new(),
             async_cmds: Vec::new(),
             async_bytes: 0,
+            num_commands: 0,
+            slow_commands: 0,
+            slowlog_threshold_usec: msg.slowlog_threshold_usec,
         };
         // `CallSHA` records the script's run duration in usec for SCRIPT LATENCY.
         let started = Instant::now();
         let kill = Arc::clone(&self.kill);
         let float_as_int =
             params.float_as_int || self.script_mgr.lock().unwrap().lua_resp2_legacy_float;
-        let (result, held) = {
+        let (result, held, stats) = {
             let mut dctx = ScriptDispatchCtx { coord: self, ctx };
             let run = sandbox.run(&sha, &mut dctx, float_as_int, &kill);
             // Force-flush pending `redis.acall` commands; a flush error
             // overrides the script's own result (`FlushEvalAsyncCmds(true)`).
             let flushed = dctx.flush();
             let held = std::mem::take(&mut dctx.ctx.locked_shards);
-            (match flushed {
-                Ok(()) => run,
-                Err(e) => Err(e),
-            }, held)
+            let stats = (dctx.ctx.num_commands, dctx.ctx.slow_commands);
+            (
+                match flushed {
+                    Ok(()) => run,
+                    Err(e) => Err(e),
+                },
+                held,
+                stats,
+            )
         };
         let elapsed_usec = started.elapsed().as_micros() as u64;
         self.script_mgr
             .lock()
             .unwrap()
             .record_latency(&sha, elapsed_usec);
+        // `FormatEvalSlowlog` metadata for the SLOWLOG entry (conn_context.cc).
+        let num_commands = stats.0;
+        let slow_commands = stats.1;
+        let tx_mode = if atomic && params.undeclared_keys {
+            1 // GLOBAL
+        } else if atomic {
+            2 // LOCK_AHEAD
+        } else {
+            3 // NON_ATOMIC
+        };
+        let tx_shards = eval_tx_shards(&keys, tx_mode, self.num_shards);
+        self.script_slowlog_args = Some(format_eval_slowlog(
+            &sha,
+            num_commands,
+            slow_commands,
+            tx_mode,
+            tx_shards,
+            !read_only,
+            keys.len(),
+            args,
+        ));
         self.sandbox = Some(sandbox);
         self.unlock_script(tx_id, &held);
 
@@ -663,6 +698,9 @@ impl Coordinator {
             pinned_shards: Vec::new(),
             async_cmds: Vec::new(),
             async_bytes: 0,
+            num_commands: 0,
+            slow_commands: 0,
+            slowlog_threshold_usec: msg.slowlog_threshold_usec,
         };
         let (result, held) = {
             let kill = Arc::clone(&self.kill);
@@ -674,10 +712,13 @@ impl Coordinator {
             // overrides the function's own result (`FlushEvalAsyncCmds(true)`).
             let flushed = dctx.flush();
             let held = std::mem::take(&mut dctx.ctx.locked_shards);
-            (match flushed {
-                Ok(()) => run,
-                Err(e) => Err(e),
-            }, held)
+            (
+                match flushed {
+                    Ok(()) => run,
+                    Err(e) => Err(e),
+                },
+                held,
+            )
         };
         self.script_mgr.lock().unwrap().clear_running();
         self.sandbox = Some(sandbox);
@@ -712,7 +753,12 @@ impl Coordinator {
     /// Phase 1 of a transaction: lock every shard in `per` and wait until all
     /// have acked, returning the shards that acknowledged. Used for the
     /// upfront `LOCK_AHEAD` lock of atomic scripts (and `execute_tx`).
-    fn lock_shards(&mut self, tx_id: u64, msg: &CoordMsg, per: &[(usize, Vec<usize>)]) -> Vec<usize> {
+    fn lock_shards(
+        &mut self,
+        tx_id: u64,
+        msg: &CoordMsg,
+        per: &[(usize, Vec<usize>)],
+    ) -> Vec<usize> {
         let mut ack_rxs = Vec::new();
         let mut shards = Vec::new();
         for &(s, _) in per {
@@ -800,11 +846,27 @@ impl Coordinator {
         self.reply(conn_id, seq, encode_result(r));
     }
 
+    fn reply_with_slowlog(
+        &self,
+        conn_id: u64,
+        seq: u64,
+        result: CmdResult,
+        slowlog_args: Option<Vec<Vec<u8>>>,
+    ) {
+        self.reply_bus.send(Reply {
+            conn_id,
+            seq,
+            bytes: encode_result(result),
+            slowlog_args,
+        });
+    }
+
     fn reply(&self, conn_id: u64, seq: u64, bytes: Vec<u8>) {
         self.reply_bus.send(Reply {
             conn_id,
             seq,
             bytes,
+            slowlog_args: None,
         });
     }
 }
@@ -815,6 +877,66 @@ fn owned_for(per: &[(usize, Vec<usize>)], shard: usize) -> Vec<usize> {
         .find(|(s, _)| *s == shard)
         .map(|(_, v)| v.clone())
         .unwrap_or_default()
+}
+
+/// `FormatExecSlowlog` (conn_context.cc:39): the augmented arguments of an
+/// EXEC slowlog entry, prepended to the raw tail by `SlowLogShard::Add`.
+pub(crate) fn format_exec_slowlog(num_cmds: usize, is_write: bool) -> Vec<Vec<u8>> {
+    vec![
+        format!("num_cmds: {num_cmds}").into_bytes(),
+        format!("is_write: {}", u8::from(is_write)).into_bytes(),
+    ]
+}
+
+/// `FormatEvalSlowlog` (conn_context.cc:44): the augmented arguments of an
+/// EVAL/EVALSHA slowlog entry: the script sha, run stats, and then the
+/// command's raw tail after the script/sha slot.
+fn format_eval_slowlog(
+    sha: &str,
+    num_commands: usize,
+    slow_commands: usize,
+    tx_mode: u8,
+    tx_shards: u32,
+    is_write: bool,
+    lock_tags: usize,
+    args: &[Vec<u8>],
+) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(8 + args.len().saturating_sub(2));
+    out.push(sha.as_bytes().to_vec());
+    out.push(format!("num_cmds: {num_commands}").into_bytes());
+    out.push(format!("slow_cmds: {slow_commands}").into_bytes());
+    out.push(format!("tx_mode: {tx_mode}").into_bytes());
+    out.push(format!("tx_shards: {tx_shards}").into_bytes());
+    out.push(format!("is_write: {}", u8::from(is_write)).into_bytes());
+    out.push(format!("lock_tags: {lock_tags}").into_bytes());
+    out.extend(args[2..].iter().cloned());
+    out
+}
+
+/// `stats.tx_shards`: the number of shards the transaction covers
+/// (main_service.cc:2356-2407). Single-shard runs report 1; `LOCK_AHEAD`
+/// without keys skips scheduling (`StartMulti` returns false) so no shards are
+/// reported.
+fn eval_tx_shards(keys: &[Vec<u8>], tx_mode: u8, num_shards: usize) -> u32 {
+    let key_idxs: Vec<usize> = (0..keys.len()).collect();
+    let mut distinct: Vec<usize> = Vec::new();
+    for (s, _) in keys_per_shard(keys, &key_idxs, num_shards) {
+        if !distinct.contains(&s) {
+            distinct.push(s);
+        }
+    }
+    let one_shard = distinct.len() <= 1;
+    let can_run_single_shard = (num_shards == 1 && tx_mode == 1) || (one_shard && tx_mode == 2);
+    if can_run_single_shard {
+        1
+    } else if tx_mode == 2 && keys.is_empty() {
+        0
+    } else {
+        match tx_mode {
+            1 => num_shards as u32,
+            _ => distinct.len() as u32,
+        }
+    }
 }
 
 /// Per-run state a script's `redis.call`/`redis.pcall` subcommands need.
@@ -847,6 +969,14 @@ struct ScriptCtx {
     /// `BackedArguments` heap + struct size plus a `StoredCmd` per slot, the
     /// `--multi_eval_squash_buffer` budget.
     async_bytes: usize,
+    /// `ConnectionState::ScriptInfo::stats.num_commands`: every subcommand the
+    /// script invoked, including squashed ones (main_service.cc:2109).
+    num_commands: usize,
+    /// `stats.slow_commands`: subcommands whose latency met the slowlog
+    /// threshold (conn_context.cc:351).
+    slow_commands: usize,
+    /// The slowlog threshold (usec) for this run (`log_slower_than_usec`).
+    slowlog_threshold_usec: u64,
 }
 
 /// A single pending async subcommand.
@@ -908,6 +1038,8 @@ struct ScriptDispatchCtx<'a> {
 
 impl ScriptDispatch for ScriptDispatchCtx<'_> {
     fn dispatch(&mut self, args: Vec<Vec<u8>>) -> Result<RespValue, String> {
+        // `CallFromScript` (main_service.cc:2109) counts every invocation.
+        self.ctx.num_commands += 1;
         // `FUNCTION KILL` from the IO thread: abort at the next dispatch
         // boundary (mirrors the count hook, which cannot fire while a
         // subcommand is dispatched from Rust).
@@ -922,17 +1054,22 @@ impl ScriptDispatch for ScriptDispatchCtx<'_> {
         // shards only for the call (`CallFromScript` -> `DispatchCommand` ->
         // `ScheduleSingleHop`), releasing them again afterwards; atomic scripts
         // already hold the declared-key shards for the whole body.
+        let started = Instant::now();
         if !self.ctx.atomic {
             let shards = self.cmd_shards(cmd, &args);
             self.ensure_locked(&shards)?;
             let r = self.execute_script_cmd(cmd, &args);
             self.release_unpinned();
+            self.count_slow(started);
             return Ok(r.into_resp_value());
         }
-        Ok(self.execute_script_cmd(cmd, &args).into_resp_value())
+        let r = self.execute_script_cmd(cmd, &args);
+        self.count_slow(started);
+        Ok(r.into_resp_value())
     }
 
     fn lock(&mut self, keys: Vec<Vec<u8>>) -> Result<(), String> {
+        self.ctx.num_commands += 1;
         // `CallFromScript` LOCK: an atomic transaction is already locked ahead,
         // so the call is a no-op.
         if self.ctx.atomic {
@@ -958,6 +1095,7 @@ impl ScriptDispatch for ScriptDispatchCtx<'_> {
     }
 
     fn unlock(&mut self) -> Result<(), String> {
+        self.ctx.num_commands += 1;
         // `CallFromScript` UNLOCK: flush the pending async batch, release every
         // lock the transaction holds and continue non-atomically
         // (`UnlockMulti(true)` + `StartMultiNonAtomic`).
@@ -969,6 +1107,7 @@ impl ScriptDispatch for ScriptDispatchCtx<'_> {
     }
 
     fn dispatch_async(&mut self, args: Vec<Vec<u8>>, abort_on_error: bool) -> Result<(), String> {
+        self.ctx.num_commands += 1;
         if command_for(&args).is_none() {
             if abort_on_error {
                 // acall: an unknown command is fatal (`early_async_error` =
@@ -1102,6 +1241,8 @@ impl ScriptDispatchCtx<'_> {
         }
         let cmds = std::mem::take(&mut self.ctx.async_cmds);
         self.ctx.async_bytes = 0;
+        let num_cmds = cmds.len();
+        let flush_started = Instant::now();
 
         if !self.ctx.atomic {
             // A NON_ATOMIC batch locks every shard it touches for the duration
@@ -1207,9 +1348,25 @@ impl ScriptDispatchCtx<'_> {
         if !self.ctx.atomic {
             self.release_unpinned();
         }
+        // `RecordLatency` (conn_context.cc:351) counts a script's slow
+        // subcommands: a squashed batch met the threshold as a whole, so every
+        // command in it counts.
+        let elapsed_usec = flush_started.elapsed().as_micros() as u64;
+        if elapsed_usec >= self.ctx.slowlog_threshold_usec {
+            self.ctx.slow_commands += num_cmds;
+        }
         match fatal {
             Some(msg) => Err(msg),
             None => Ok(()),
+        }
+    }
+
+    /// `RecordLatency`: a subcommand that met the slowlog threshold counts
+    /// toward the script's `stats.slow_commands`.
+    fn count_slow(&mut self, started: Instant) {
+        let elapsed_usec = started.elapsed().as_micros() as u64;
+        if elapsed_usec >= self.ctx.slowlog_threshold_usec {
+            self.ctx.slow_commands += 1;
         }
     }
 

@@ -221,21 +221,6 @@ pub fn local_config(args: &[Vec<u8>]) -> RespValue {
 }
 
 #[must_use]
-pub fn local_client(args: &[Vec<u8>]) -> RespValue {
-    if args.len() < 2 {
-        return RespValue::Error("ERR wrong number of arguments for 'client' command".into());
-    }
-    match args[1].to_ascii_uppercase().as_slice() {
-        b"SETNAME" | b"SETINFO" | b"NO-EVICT" | b"NO-TOUCH" => RespValue::Simple("OK".into()),
-        b"GETNAME" => RespValue::Bulk(b"".to_vec()),
-        b"ID" => RespValue::Integer(0),
-        b"INFO" => RespValue::Bulk(b"id=0 addr=127.0.0.1:0 fd=0 name= age=0 idle=0 flags=N db=0 sub=0 psub=0 multi=-1 watch=0 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd=client user=default redir=-1 resp=2".to_vec()),
-        b"LIST" => RespValue::Array(vec![]),
-        _ => RespValue::Error("ERR Unknown CLIENT subcommand or wrong number of arguments for 'client' command".into()),
-    }
-}
-
-#[must_use]
 pub fn local_time(_args: &[Vec<u8>]) -> RespValue {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -325,58 +310,6 @@ pub fn local_latency(args: &[Vec<u8>]) -> RespValue {
         b"LATEST" | b"HISTOGRAM" => RespValue::Array(vec![]),
         other => RespValue::Error(unknown_subcmd(other, "LATENCY")),
     }
-}
-
-/// SLOWLOG: commands are not timed in this port, so the log is always empty,
-/// but the full subcommand surface (HELP/LEN/RESET/GET) is honored. Mirrors
-/// `ServerFamily::SlowLog`.
-#[must_use]
-pub fn local_slowlog(args: &[Vec<u8>]) -> RespValue {
-    if args.len() < 2 {
-        return RespValue::Error("ERR wrong number of arguments for 'slowlog' command".into());
-    }
-    match args[1].to_ascii_uppercase().as_slice() {
-        b"HELP" => RespValue::Array(vec![
-            RespValue::Simple(
-                "SLOWLOG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:".into(),
-            ),
-            RespValue::Simple("GET [<count>]".into()),
-            RespValue::Simple(
-                "    Return top <count> entries from the slowlog (default: 10, -1 mean all)."
-                    .into(),
-            ),
-            RespValue::Simple("    Entries are made of:".into()),
-            RespValue::Simple(
-                "    id, timestamp, time in microseconds, arguments array, client IP and port,"
-                    .into(),
-            ),
-            RespValue::Simple("    client name".into()),
-            RespValue::Simple("LEN".into()),
-            RespValue::Simple("    Return the length of the slowlog.".into()),
-            RespValue::Simple("RESET".into()),
-            RespValue::Simple("    Reset the slowlog.".into()),
-            RespValue::Simple("HELP".into()),
-            RespValue::Simple("    Prints this help.".into()),
-        ]),
-        b"LEN" => RespValue::Integer(0),
-        b"RESET" => RespValue::Simple("OK".into()),
-        b"GET" => slowlog_get(args),
-        other => RespValue::Error(unknown_subcmd(other, "SLOWLOG")),
-    }
-}
-
-fn slowlog_get(args: &[Vec<u8>]) -> RespValue {
-    // args = ["SLOWLOG", "GET"[, count]]: 4+ arguments is a parse error.
-    if args.len() > 3 {
-        return RespValue::Error(unknown_subcmd(b"GET", "SLOWLOG"));
-    }
-    if args.len() == 3 {
-        match crate::util::parse_i64(&args[2]) {
-            Some(n) if n >= -1 => {}
-            _ => return RespValue::Error("ERR count should be greater than or equal to -1".into()),
-        }
-    }
-    RespValue::Array(vec![])
 }
 
 /// `ERR Unknown subcommand or wrong number of arguments for '<sub>'. Try <cmd>
@@ -1367,36 +1300,6 @@ mod tests {
         assert_eq!(
             render(&local_latency(&b_args(&["LATENCY", "RESET"]))),
             "ERR Unknown subcommand or wrong number of arguments for 'RESET'. Try LATENCY HELP."
-        );
-    }
-
-    #[test]
-    fn slowlog_replies() {
-        assert_eq!(render(&local_slowlog(&b_args(&["SLOWLOG", "LEN"]))), "0");
-        assert_eq!(render(&local_slowlog(&b_args(&["SLOWLOG", "RESET"]))), "OK");
-        assert_eq!(render(&local_slowlog(&b_args(&["SLOWLOG", "GET"]))), "[]");
-        assert_eq!(
-            render(&local_slowlog(&b_args(&["SLOWLOG", "GET", "10"]))),
-            "[]"
-        );
-        assert_eq!(
-            render(&local_slowlog(&b_args(&["SLOWLOG", "GET", "-1"]))),
-            "[]"
-        );
-        assert_eq!(
-            render(&local_slowlog(&b_args(&["SLOWLOG", "GET", "-2"]))),
-            "ERR count should be greater than or equal to -1"
-        );
-        assert_eq!(
-            render(&local_slowlog(&b_args(&["SLOWLOG", "GET", "1", "2"]))),
-            "ERR Unknown subcommand or wrong number of arguments for 'GET'. Try SLOWLOG HELP."
-        );
-        assert_eq!(
-            render(&local_slowlog(&b_args(&["SLOWLOG", "BOGUS"]))),
-            "ERR Unknown subcommand or wrong number of arguments for 'BOGUS'. Try SLOWLOG HELP."
-        );
-        assert!(
-            render(&local_slowlog(&b_args(&["SLOWLOG", "HELP"]))).contains("SLOWLOG <subcommand>")
         );
     }
 
