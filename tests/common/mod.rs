@@ -147,6 +147,7 @@ impl TestServer {
             }
         }
         let script_mgr = Arc::new(Mutex::new(mgr));
+        let command_stats = Arc::new(Mutex::new(std::collections::HashMap::new()));
         coordinator::spawn(
             num_shards,
             coord_rx,
@@ -154,6 +155,7 @@ impl TestServer {
             shard_txs.clone(),
             reply_bus.clone(),
             script_mgr.clone(),
+            command_stats.clone(),
         );
 
         let listener = free_listener();
@@ -169,6 +171,7 @@ impl TestServer {
             full_sync_bus,
             script_mgr,
             listen_port: port,
+            command_stats,
         };
 
         let mut io_loop = IoLoop::new(env, reply_rx, repl_rx, listener, pipefds[0]).unwrap();

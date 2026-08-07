@@ -12,6 +12,7 @@ pub const MAX_DB: usize = 16;
 
 use std::os::fd::RawFd;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::mpsc;
 
 use crate::commands::exec::server::now_ms;
@@ -717,6 +718,11 @@ pub struct ServerEnv {
     /// The port this server listens on, reported to a master as
     /// `REPLCONF listening-port` when running as a replica.
     pub listen_port: u16,
+    /// Per-command execution counters for INFO COMMANDSTATS. Shared between the
+    /// IO thread (which bumps on dispatch) and the coordinator thread (which
+    /// renders the section via the INFO merge), and scoped to this server so
+    /// in-process test servers stay isolated.
+    pub command_stats: Arc<Mutex<crate::commands::exec::server::CommandStatsMap>>,
 }
 
 impl ServerEnv {

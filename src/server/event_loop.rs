@@ -190,6 +190,42 @@ fn monitor_escape(bytes: &[u8]) -> String {
     s
 }
 
+/// Normalize a CONFIG parameter name or GET pattern: lowercased with `-`
+/// replaced by `_`, so `replica-priority` and `replica_priority` are the same
+/// parameter (`ConfigNormalization`).
+fn normalize_config_name(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw)
+        .to_ascii_lowercase()
+        .replace('-', "_")
+}
+
+/// Parse a human-readable memory size: an integer with an optional binary
+/// unit suffix (`b`, `k`/`kb`, `m`/`mb`, `g`/`gb`, `t`/`tb`), so `1GB` is
+/// 2^30 bytes (`ConfigGetMemoryBytes`).
+fn parse_human_size(raw: &[u8]) -> Option<u64> {
+    let s = String::from_utf8_lossy(raw);
+    let s = s.trim();
+    let mut digits = 0;
+    for b in s.as_bytes() {
+        if b.is_ascii_digit() {
+            digits += 1;
+        } else {
+            break;
+        }
+    }
+    let (num, unit) = s.split_at(digits);
+    let value = num.parse::<u64>().ok()?;
+    let mult: u64 = match unit.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1 << 10,
+        "m" | "mb" => 1 << 20,
+        "g" | "gb" => 1 << 30,
+        "t" | "tb" => 1 << 40,
+        _ => return None,
+    };
+    value.checked_mul(mult)
+}
+
 /// Phases of a connection-scoped MULTI/EXEC block (mirrors
 /// `ConnectionState::ExecInfo::ExecState`). `Collect` accepts queued commands;
 /// `Error` marks a block that will fail at EXEC (EXECABORT); commands arriving
@@ -315,6 +351,11 @@ pub struct IoLoop {
     replica_handle: Option<std::thread::JoinHandle<()>>,
     /// The IO thread's SLOWLOG ring (`ServerState::tlocal()->GetSlowLog()`).
     slow_log: SlowLog,
+    /// `replica_priority` config (`RegisterMutable`): dash/underscore names
+    /// are interchangeable (`ConfigNormalization`).
+    replica_priority: i64,
+    /// `maxmemory` config in bytes; human-readable sizes are parsed on set.
+    maxmemory: u64,
 }
 
 impl IoLoop {
@@ -347,6 +388,8 @@ impl IoLoop {
             replica_stop: Arc::new(AtomicBool::new(false)),
             replica_handle: None,
             slow_log: SlowLog::new(),
+            replica_priority: 100,
+            maxmemory: 0,
         })
     }
 
@@ -604,6 +647,8 @@ impl IoLoop {
                 },
             );
         }
+        // Count the execution for INFO COMMANDSTATS (`UpdateCmdStatsMap`).
+        server::bump_cmd_stat(&self.env.command_stats, cmd.name);
 
         // Feed live MONITOR connections; admin commands and EXEC are excluded
         // (`command_registry.cc` CAN_MONITOR). Queued MULTI commands are logged
@@ -723,6 +768,7 @@ impl IoLoop {
         if !cmd.has_flag(FLAG_ADMIN) && cmd.name != "EXEC" {
             self.broadcast_monitor(conn_id, args);
         }
+        server::bump_cmd_stat(&self.env.command_stats, cmd.name);
         if cmd.has_flag(FLAG_LOCAL) {
             if cmd.name == "REPLCONF" {
                 match self.replconf(conn_id, args) {
@@ -1411,7 +1457,10 @@ impl IoLoop {
         match args[1].to_ascii_uppercase().as_slice() {
             b"SET" => self.config_set(args),
             b"GET" => self.config_get(args),
-            b"RESETSTAT" => RespValue::Simple("OK".into()),
+            b"RESETSTAT" => {
+                server::reset_cmd_stats(&self.env.command_stats);
+                RespValue::Simple("OK".into())
+            }
             _ => RespValue::Error(
                 "ERR Unknown CONFIG subcommand or wrong number of arguments for 'config' command"
                     .into(),
@@ -1425,9 +1474,10 @@ impl IoLoop {
                 "ERR wrong number of arguments for 'config|set' command".into(),
             );
         }
-        let name = args[2].to_ascii_lowercase();
-        let name = String::from_utf8_lossy(&name);
-        match name.as_ref() {
+        // Config names accept dashes and underscores interchangeably
+        // (`ConfigNormalization`): normalize to the canonical underscore form.
+        let name = normalize_config_name(&args[2]);
+        match name.as_str() {
             // `RegisterMutable("slowlog_max_len")` with the setter below.
             "slowlog_max_len" => match crate::util::parse_i64(&args[3]) {
                 Some(n) if n >= 0 => {
@@ -1443,6 +1493,20 @@ impl IoLoop {
                 }
                 None => RespValue::Error(format!("ERR Invalid config parameter '{name}'")),
             },
+            "replica_priority" => match crate::util::parse_i64(&args[3]) {
+                Some(n) if n >= 0 => {
+                    self.replica_priority = n;
+                    RespValue::Simple("OK".into())
+                }
+                _ => RespValue::Error(format!("ERR Invalid config parameter '{name}'")),
+            },
+            "maxmemory" => match parse_human_size(&args[3]) {
+                Some(n) => {
+                    self.maxmemory = n;
+                    RespValue::Simple("OK".into())
+                }
+                None => RespValue::Error(format!("ERR Invalid config parameter '{name}'")),
+            },
             _ => RespValue::Simple("OK".into()),
         }
     }
@@ -1453,12 +1517,11 @@ impl IoLoop {
                 "ERR wrong number of arguments for 'config|get' command".into(),
             );
         }
-        // The canonical (underscore) names of the runtime-configurable params;
-        // a glob pattern currently matches only the slowlog pair.
-        let pattern = args[2].to_ascii_lowercase();
+        // The pattern is normalized the same way as parameter names.
+        let pattern = normalize_config_name(&args[2]);
         let mut out = Vec::new();
         let push = |name: &str, value: String, out: &mut Vec<RespValue>| {
-            if glob_match(&pattern, name.as_bytes()) {
+            if glob_match(pattern.as_bytes(), name.as_bytes()) {
                 out.push(RespValue::Bulk(name.as_bytes().to_vec()));
                 out.push(RespValue::Bulk(value.into_bytes()));
             }
@@ -1473,6 +1536,12 @@ impl IoLoop {
             self.slow_log.log_slower_than().to_string(),
             &mut out,
         );
+        push(
+            "replica_priority",
+            self.replica_priority.to_string(),
+            &mut out,
+        );
+        push("maxmemory", self.maxmemory.to_string(), &mut out);
         RespValue::Array(out)
     }
 

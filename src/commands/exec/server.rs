@@ -1,14 +1,20 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::cell::RefCell;
 use std::fmt::Write as _;
 
 use crate::commands::{
     Command, FLAG_ADMIN, FLAG_FAST, FLAG_GLOBAL, FLAG_LOCAL, FLAG_NOSCRIPT, FLAG_READONLY,
     FLAG_WRITE, KeyRange, OpContext, ShardPart, ok,
 };
+use crate::core::PrimeValue;
+use crate::core::compact::CompactString;
 use crate::core::value::ObjType;
 use crate::error::{CmdResult, RespError, RespValue};
 
@@ -71,6 +77,65 @@ fn merge_bgsave(parts: &[ShardPart], _args: &[Vec<u8>], _keys: &[usize], _now: u
     CmdResult::Ok(RespValue::bulk("Background saving started"))
 }
 
+// The current server's command-stats map (`ServerEnv::command_stats`),
+// installed on the coordinator thread by `coordinator::spawn`. The map itself
+// is shared with the IO thread (which bumps on dispatch); the thread-local
+// only lets the static INFO merge fn reach it.
+/// Per-command invocation counters (`cmd_stats_map`). The alias keeps the
+/// hasher implicit in signatures (Clippy `implicit_hasher`).
+pub type CommandStatsMap = HashMap<&'static str, u64>;
+
+thread_local! {
+    static CURRENT_COMMAND_STATS: RefCell<Option<Arc<Mutex<CommandStatsMap>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Install `ServerEnv::command_stats` on the coordinator thread.
+pub fn set_current_command_stats(stats: Arc<Mutex<CommandStatsMap>>) {
+    CURRENT_COMMAND_STATS.with(|s| *s.borrow_mut() = Some(stats));
+}
+
+fn current_command_stats() -> Arc<Mutex<CommandStatsMap>> {
+    CURRENT_COMMAND_STATS.with(|s| {
+        s.borrow()
+            .as_ref()
+            .expect("command stats installed on coordinator thread")
+            .clone()
+    })
+}
+
+/// Count one execution of `name` (`UpdateCmdStatsMap`).
+pub fn bump_cmd_stat(stats: &Mutex<CommandStatsMap>, name: &'static str) {
+    let mut stats = stats.lock().unwrap();
+    *stats.entry(name).or_default() += 1;
+}
+
+/// `CONFIG RESETSTAT`: clear every counter.
+pub fn reset_cmd_stats(stats: &Mutex<CommandStatsMap>) {
+    stats.lock().unwrap().clear();
+}
+
+/// Total commands executed across all names (`GetTotalCmdStats`).
+fn total_cmd_calls() -> u64 {
+    let stats = current_command_stats();
+    stats.lock().unwrap().values().sum()
+}
+
+/// `(name, calls)` pairs with `calls > 0`, sorted by (lowercased) name for
+/// deterministic INFO output (zero-call commands are skipped, matching
+/// `GetMetrics`).
+fn cmd_stats_with_calls() -> Vec<(String, u64)> {
+    let stats = current_command_stats();
+    let stats = stats.lock().unwrap();
+    let mut v: Vec<(String, u64)> = stats
+        .iter()
+        .filter(|(_, c)| **c > 0)
+        .map(|(n, c)| (n.to_ascii_lowercase(), *c))
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
 // INFO is executed on shards to collect stats, then merged.
 fn exec_info(ctx: &mut OpContext) -> CmdResult {
     let mut expires = 0u64;
@@ -86,7 +151,10 @@ fn exec_info(ctx: &mut OpContext) -> CmdResult {
     ]))
 }
 
-fn merge_info(parts: &[ShardPart], _args: &[Vec<u8>], _keys: &[usize], now_ms: u64) -> CmdResult {
+/// Renders the INFO body for the requested sections (`ServerFamily::Info`,
+/// `GetMetrics`). With no sections, everything except the hidden COMMANDSTATS
+/// is emitted (LATENCYSTATS included); unknown section names are skipped.
+fn merge_info(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], now_ms: u64) -> CmdResult {
     let (mut keys, mut expires) = (0i64, 0i64);
     for p in parts {
         if let CmdResult::Ok(RespValue::Array(a)) = &p.result
@@ -98,25 +166,83 @@ fn merge_info(parts: &[ShardPart], _args: &[Vec<u8>], _keys: &[usize], now_ms: u
         }
     }
     let uptime = now_ms / 1000;
+    let requested: Vec<String> = args[1..]
+        .iter()
+        .map(|a| String::from_utf8_lossy(a).to_ascii_lowercase())
+        .collect();
+    let want = |name: &str| {
+        if requested.is_empty() {
+            name != "commandstats"
+        } else {
+            requested
+                .iter()
+                .any(|r| r == name || r == "all" || r == "everything")
+        }
+    };
+
     let mut lines = String::new();
-    lines.push_str("# Server\r\n");
-    lines.push_str("redis_version:7.2.0\r\n");
-    lines.push_str("redis_mode:standalone\r\n");
-    lines.push_str("os:macos\r\n");
-    lines.push_str("arch_bits:64\r\n");
-    lines.push_str("process_id:1\r\n");
-    write!(lines, "uptime_in_seconds:{uptime}\r\n").unwrap();
-    lines.push_str("# Clients\r\n");
-    lines.push_str("connected_clients:0\r\n");
-    lines.push_str("# Memory\r\n");
-    lines.push_str("used_memory:0\r\n");
-    lines.push_str("# Persistence\r\n");
-    lines.push_str("loading:0\r\n");
-    lines.push_str("# Stats\r\n");
-    lines.push_str("total_commands_processed:0\r\n");
-    lines.push_str("instantaneous_ops_per_sec:0\r\n");
-    lines.push_str("# Keyspace\r\n");
-    write!(lines, "db0:keys={keys},expires={expires},avg_ttl=0\r\n").unwrap();
+    if want("server") {
+        lines.push_str("# Server\r\n");
+        lines.push_str("redis_version:7.2.0\r\n");
+        lines.push_str("redis_mode:standalone\r\n");
+        lines.push_str("os:macos\r\n");
+        lines.push_str("arch_bits:64\r\n");
+        lines.push_str("process_id:1\r\n");
+        write!(lines, "uptime_in_seconds:{uptime}\r\n").unwrap();
+    }
+    if want("clients") {
+        lines.push_str("# Clients\r\nconnected_clients:0\r\n");
+    }
+    if want("memory") {
+        lines.push_str(
+            "# Memory\r\nused_memory:0\r\nreplication_streaming_buffer_bytes:0\r\n\
+             replication_full_sync_buffer_bytes:0\r\n",
+        );
+    }
+    if want("persistence") {
+        lines.push_str("# Persistence\r\nloading:0\r\n");
+    }
+    if want("stats") {
+        write!(
+            lines,
+            "# Stats\r\ntotal_commands_processed:{}\r\ninstantaneous_ops_per_sec:0\r\n",
+            total_cmd_calls()
+        )
+        .unwrap();
+    }
+    if want("replication") {
+        lines.push_str("# Replication\r\nrole:master\r\nconnected_slaves:0\r\nmaster_replid:0\r\n");
+    }
+    if want("latencystats") {
+        lines.push_str("# Latencystats\r\n");
+        for (name, calls) in cmd_stats_with_calls() {
+            write!(
+                lines,
+                "latency_percentiles_usec_{name}:calls={calls},p50=0.000,p99=0.000,p99.9=0.000\r\n"
+            )
+            .unwrap();
+        }
+    }
+    if want("commandstats") {
+        lines.push_str("# Commandstats\r\n");
+        for (name, calls) in cmd_stats_with_calls() {
+            write!(
+                lines,
+                "cmdstat_{name}:calls={calls},usec=0,usec_per_call=0.00,rejected_calls=0,failed_calls=0\r\n"
+            )
+            .unwrap();
+        }
+    }
+    if want("cluster") {
+        lines.push_str("# Cluster\r\nmigration_errors_total:0\r\n");
+    }
+    if want("keyspace") {
+        write!(
+            lines,
+            "# Keyspace\r\ndb0:keys={keys},expires={expires},avg_ttl=0\r\n"
+        )
+        .unwrap();
+    }
     CmdResult::Ok(RespValue::Bulk(lines.into_bytes()))
 }
 
@@ -164,7 +290,11 @@ pub fn local_auth(args: &[Vec<u8>]) -> RespValue {
 }
 
 #[must_use]
-pub fn local_command(_args: &[Vec<u8>]) -> RespValue {
+pub fn local_command(args: &[Vec<u8>]) -> RespValue {
+    // `CommandDocs` (server_family.cc): the subcommand is not implemented.
+    if args.len() > 1 && args[1].eq_ignore_ascii_case(b"DOCS") {
+        return RespValue::Error("ERR COMMAND DOCS Not Implemented".into());
+    }
     RespValue::Array(vec![])
 }
 
@@ -356,7 +486,20 @@ fn exec_memory(ctx: &mut OpContext) -> CmdResult {
                 RespValue::Integer(0),
             ),
         ])),
+        b"DEFRAGMENT" => memory_defragment(ctx),
         other => CmdResult::err(unknown_subcmd(other, "MEMORY")),
+    }
+}
+
+/// `MEMORY DEFRAGMENT <ratio>` (memory_family.cc): the argument must parse as
+/// a float; the port performs no defragmentation.
+fn memory_defragment(ctx: &mut OpContext) -> CmdResult {
+    let Some(raw) = ctx.args.get(2) else {
+        return CmdResult::Err(RespError::syntax());
+    };
+    match String::from_utf8_lossy(raw).parse::<f64>() {
+        Ok(_) => CmdResult::Ok(RespValue::Simple("OK".into())),
+        Err(_) => CmdResult::Err(RespError::new("ERR not a valid float")),
     }
 }
 
@@ -392,8 +535,36 @@ fn exec_debug(ctx: &mut OpContext) -> CmdResult {
             RespValue::Simple("    Prints this help.".into()),
         ])),
         b"OBJECT" if ctx.args.len() >= 3 => debug_object(ctx),
+        b"POPULATE" if ctx.args.len() >= 3 => debug_populate(ctx),
         other => CmdResult::err(unknown_subcmd(other, "DEBUG")),
     }
+}
+
+/// `DEBUG POPULATE [count] [prefix] [val_size]` (debug_family.cc `OpDebug`).
+/// `val_size == 0` is rejected; valid invocations insert `count` blobs of that
+/// size under `prefix<i>` on this shard.
+fn debug_populate(ctx: &mut OpContext) -> CmdResult {
+    let Some(count) = crate::util::parse_u64(&ctx.args[2]) else {
+        return CmdResult::Err(RespError::syntax());
+    };
+    let prefix = ctx.args.get(3).cloned().unwrap_or_else(|| b"key".to_vec());
+    let val_size = match ctx.args.get(4) {
+        Some(v) => match crate::util::parse_u64(v) {
+            Some(n) => n,
+            None => return CmdResult::Err(RespError::syntax()),
+        },
+        None => 10,
+    };
+    if val_size == 0 {
+        return CmdResult::Err(RespError::new("ERR val_size must be positive"));
+    }
+    let blob = CompactString::from("x".repeat(val_size as usize));
+    let prefix = String::from_utf8_lossy(&prefix);
+    for i in 0..count {
+        let key = format!("{prefix}{i}");
+        ctx.db.insert(key.as_bytes(), PrimeValue::Str(blob.clone()));
+    }
+    CmdResult::Ok(RespValue::Simple("OK".into()))
 }
 
 fn debug_object(ctx: &mut OpContext) -> CmdResult {

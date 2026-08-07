@@ -69,10 +69,14 @@ pub fn spawn(
     shard_txs: Vec<mpsc::Sender<ShardMsg>>,
     reply_bus: ReplyBus,
     script_mgr: Arc<Mutex<ScriptMgr>>,
+    command_stats: Arc<Mutex<crate::commands::exec::server::CommandStatsMap>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("coordinator".into())
         .spawn(move || {
+            // INFO COMMANDSTATS is rendered in `merge_info` on this thread; the
+            // shared map is installed here so the static merge fn can reach it.
+            crate::commands::exec::server::set_current_command_stats(command_stats);
             // The Lua state is not `Send`, so it must be created here on the
             // coordinator thread (the only thread that ever runs scripts).
             let enable_redis_log = script_mgr.lock().unwrap().lua_enable_redis_log;

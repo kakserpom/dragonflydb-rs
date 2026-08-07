@@ -134,6 +134,7 @@ fn main() {
         std::process::exit(1);
     }
     let script_mgr = Arc::new(std::sync::Mutex::new(mgr));
+    let command_stats = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     coordinator::spawn(
         num_shards,
         coord_rx,
@@ -141,6 +142,7 @@ fn main() {
         shard_txs.clone(),
         reply_bus.clone(),
         script_mgr.clone(),
+        command_stats.clone(),
     );
 
     let listener = match TcpListener::bind(("0.0.0.0", port)) {
@@ -161,6 +163,7 @@ fn main() {
         full_sync_bus,
         script_mgr,
         listen_port: port,
+        command_stats,
     };
 
     println!("dragonflydb-rs listening on 0.0.0.0:{port} with {num_shards} shards");

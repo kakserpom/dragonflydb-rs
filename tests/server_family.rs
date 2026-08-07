@@ -12,6 +12,11 @@
 //!   the port lists its real connection, so the no-filter/normal/id forms are
 //!   asserted to contain the connection's info line instead.
 //! - `ClientListRejected` and `ClientInfoSingleDbField` are byte-identical.
+//! - `ConfigNormalization`/`ConfigGetMemoryBytes` need no `FlagSaver`: each
+//!   test spawns a fresh server, so `replica_priority`/`maxmemory` start at
+//!   their defaults (100 / unset).
+//! - `PubSubCommandErr` always runs the standalone-mode branch (the port has no
+//!   cluster mode).
 //! - `ClientPause` is not ported yet: the port has no `CLIENT PAUSE`.
 
 mod common;
@@ -284,4 +289,238 @@ fn client_info_single_db_field() {
     let info = c.text(&["CLIENT", "INFO"]);
     assert_eq!(info.matches(" db=").count(), 1, "{info}");
     assert!(!info.ends_with("\r\n"), "{info}");
+}
+
+/// `ConfigNormalization` (server_family_test.cc:672): dashes and underscores
+/// are interchangeable in CONFIG parameter names.
+#[test]
+fn config_normalization() {
+    let mut c = Ctx::new();
+
+    let get = |c: &mut Ctx, pattern: &str| c.arr(&["config", "get", pattern]);
+
+    for pattern in ["replica-priority", "replica_priority"] {
+        let got = get(&mut c, pattern);
+        assert_eq!(
+            got[0].text().as_deref(),
+            Some("replica_priority"),
+            "{pattern}"
+        );
+        assert_eq!(got[1].text().as_deref(), Some("100"), "{pattern}");
+    }
+
+    c.ok(&["config", "set", "replica-priority", "7"]);
+    for pattern in ["replica-priority", "replica_priority"] {
+        let got = get(&mut c, pattern);
+        assert_eq!(got[1].text().as_deref(), Some("7"), "{pattern}");
+    }
+
+    c.ok(&["config", "set", "replica_priority", "13"]);
+    for pattern in ["replica-priority", "replica_priority"] {
+        let got = get(&mut c, pattern);
+        assert_eq!(got[1].text().as_deref(), Some("13"), "{pattern}");
+    }
+}
+
+/// `ConfigGetMemoryBytes` (server_family_test.cc:702): human-readable memory
+/// sizes are stored and reported as numeric bytes.
+#[test]
+fn config_get_memory_bytes() {
+    let mut c = Ctx::new();
+
+    c.ok(&["config", "set", "maxmemory", "1GB"]);
+    let got = c.arr(&["config", "get", "maxmemory"]);
+    assert_eq!(got[0].text().as_deref(), Some("maxmemory"));
+    assert_eq!(got[1].text().as_deref(), Some("1073741824"));
+
+    c.ok(&["config", "set", "maxmemory", "512MB"]);
+    let got = c.arr(&["config", "get", "maxmemory"]);
+    assert_eq!(got[1].text().as_deref(), Some("536870912"));
+}
+
+/// `CommandDocsOk` (server_family_test.cc:718).
+#[test]
+fn command_docs_ok() {
+    let mut c = Ctx::new();
+    c.assert_err(&["command", "docs"], "COMMAND DOCS Not Implemented");
+}
+
+/// `PubSubCommandErr` (server_family_test.cc:722): SHARD* subcommands are
+/// rejected in standalone mode; unknown subcommands get the generic error.
+#[test]
+fn pubsub_command_err() {
+    let mut c = Ctx::new();
+    c.assert_err(
+        &["PUBSUB", "SHARDCHANNELS"],
+        "PUBSUB SHARDCHANNELS is not supported in non cluster mode",
+    );
+    c.assert_err(
+        &["PUBSUB", "SHARDNUMSUB"],
+        "PUBSUB SHARDNUMSUB is not supported in non cluster mode",
+    );
+    c.assert_err(
+        &["PUBSUB", "INVALIDSUBCOMMAND"],
+        "Unknown subcommand or wrong number of arguments for 'INVALIDSUBCOMMAND'. Try PUBSUB HELP.",
+    );
+}
+
+/// `InfoMultipleSections` (server_family_test.cc:735): querying several valid
+/// sections renders each of them.
+#[test]
+fn info_multiple_sections() {
+    let mut c = Ctx::new();
+    c.ok(&["set", "foo", "bar"]);
+    let info = c.text(&["info", "replication", "persistence"]);
+    assert!(info.contains("# Replication"), "{info}");
+    assert!(info.contains("# Persistence"), "{info}");
+}
+
+/// `InfoMultipleSectionsInvalid` (server_family_test.cc:744): an unknown
+/// section name is skipped.
+#[test]
+fn info_multiple_sections_invalid() {
+    let mut c = Ctx::new();
+    c.ok(&["set", "foo", "bar"]);
+    let info = c.text(&["info", "replication", "invalidsection"]);
+    assert!(info.contains("# Replication"), "{info}");
+    assert!(!info.contains("# invalidsection"), "{info}");
+}
+
+/// `DebugPopulateZeroValSize` (server_family_test.cc:754): `val_size == 0`
+/// must be rejected, not crash the server.
+#[test]
+fn debug_populate_zero_val_size() {
+    let mut c = Ctx::new();
+    c.assert_err(
+        &["DEBUG", "POPULATE", "1", "key", "0"],
+        "val_size must be positive",
+    );
+}
+
+/// `MemoryParserErrorHandling` (server_family_test.cc:788).
+#[test]
+fn memory_parser_error_handling() {
+    let mut c = Ctx::new();
+    c.assert_err(
+        &["MEMORY", "DEFRAGMENT", "not-a-float"],
+        "not a valid float",
+    );
+}
+
+/// `InfoReplicationMemoryNoReplicas` (server_family_test.cc:792): the memory
+/// section reports zero buffer bytes without replicas.
+#[test]
+fn info_replication_memory_no_replicas() {
+    let mut c = Ctx::new();
+    let info = c.text(&["INFO", "MEMORY"]);
+    assert!(
+        info.contains("replication_streaming_buffer_bytes:0"),
+        "{info}"
+    );
+    assert!(
+        info.contains("replication_full_sync_buffer_bytes:0"),
+        "{info}"
+    );
+}
+
+/// `InfoReplicationMemoryOnlyInMemorySection` (server_family_test.cc:799): the
+/// replication buffer fields appear only in the memory section (and the
+/// default/ALL output), never in the replication section itself.
+#[test]
+fn info_replication_memory_only_in_memory_section() {
+    let mut c = Ctx::new();
+    assert!(
+        !c.text(&["INFO", "REPLICATION"])
+            .contains("replication_streaming_buffer_bytes")
+    );
+    assert!(
+        c.text(&["INFO", "MEMORY"])
+            .contains("replication_streaming_buffer_bytes")
+    );
+    assert!(
+        c.text(&["INFO"])
+            .contains("replication_streaming_buffer_bytes")
+    );
+    assert!(
+        c.text(&["INFO", "ALL"])
+            .contains("replication_streaming_buffer_bytes")
+    );
+}
+
+/// `InfoCommandAndLatencyStatsGating` (server_family_test.cc:811): COMMANDSTATS
+/// is a hidden section (rendered only when named or via ALL), while
+/// LATENCYSTATS appears in the default INFO output.
+#[test]
+fn info_command_and_latency_stats_gating() {
+    let mut c = Ctx::new();
+    for i in 0..5 {
+        c.ok(&["set", &format!("k{i}"), "v"]);
+        c.run(&["get", &format!("k{i}")]);
+    }
+    c.run(&["ping"]);
+
+    let def = c.text(&["INFO"]);
+    assert!(!def.contains("# Commandstats"), "{def}");
+    assert!(!def.contains("cmdstat_"), "{def}");
+    assert!(def.contains("# Latencystats"), "{def}");
+
+    let stats = c.text(&["INFO", "STATS"]);
+    assert!(!stats.contains("cmdstat_"), "{stats}");
+    assert!(!stats.contains("# Latencystats"), "{stats}");
+    assert!(!stats.contains("latency_percentiles_usec_"), "{stats}");
+
+    assert!(c.text(&["INFO", "COMMANDSTATS"]).contains("# Commandstats"));
+    assert!(c.text(&["INFO", "LATENCYSTATS"]).contains("# Latencystats"));
+    let all = c.text(&["INFO", "ALL"]);
+    assert!(all.contains("# Commandstats"), "{all}");
+    assert!(all.contains("# Latencystats"), "{all}");
+}
+
+/// Extract the `calls=` counter for a `cmdstat_*` line
+/// (`InfoCommandStatsAggregation`'s `extract_calls` helper).
+fn extract_calls(info: &str, stat: &str) -> i64 {
+    const NEEDLE: &str = "calls=";
+    let Some(pos) = info.find(stat) else {
+        return -1;
+    };
+    let rest = &info[pos..];
+    let Some(cpos) = rest.find(NEEDLE) else {
+        return -1;
+    };
+    let rest = &rest[cpos + NEEDLE.len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().unwrap_or(0)
+}
+
+/// `InfoCommandStatsAggregation` (server_family_test.cc:842): per-command
+/// counters aggregate across connections and survive `CONFIG RESETSTAT`.
+#[test]
+fn info_command_stats_aggregation() {
+    const K_GETS: i64 = 17;
+    let mut c = Ctx::new();
+    c.ok(&["config", "resetstat"]);
+
+    for _ in 0..K_GETS {
+        c.run(&["get", "nonexistent"]);
+    }
+
+    let cmdstats = c.text(&["INFO", "COMMANDSTATS"]);
+    assert_eq!(extract_calls(&cmdstats, "cmdstat_get:"), K_GETS);
+
+    // A command never invoked must not appear at all (zero-call commands are
+    // skipped).
+    assert!(!cmdstats.contains("cmdstat_getex:"), "{cmdstats}");
+
+    let all = c.text(&["INFO", "ALL"]);
+    assert!(extract_calls(&all, "cmdstat_get:") >= K_GETS);
+}
+
+/// `InfoClusterMigrationErrors` (server_family_test.cc:881).
+#[test]
+fn info_cluster_migration_errors() {
+    let mut c = Ctx::new();
+    assert!(
+        c.text(&["INFO", "CLUSTER"])
+            .contains("migration_errors_total:0")
+    );
 }
