@@ -33,6 +33,8 @@
 
 mod common;
 
+use std::time::{Duration, Instant};
+
 use common::*;
 
 /// The rendered arguments array (`entry[3]`) of one SLOWLOG entry.
@@ -301,6 +303,31 @@ fn client_info_single_db_field() {
     let info = c.text(&["CLIENT", "INFO"]);
     assert_eq!(info.matches(" db=").count(), 1, "{info}");
     assert!(!info.ends_with("\r\n"), "{info}");
+}
+
+/// `ClientPause` (server_family_test.cc:271): `CLIENT PAUSE <ms>` gates every
+/// command until the timeout expires; the `WRITE` mode gates only writes, so
+/// reads slip through while writes block. The reference blocks each connection's
+/// fiber; the port blocks the single IO-thread dispatcher on the shared gate.
+#[test]
+fn client_pause() {
+    let mut c = Ctx::new();
+
+    let start = Instant::now();
+    expect_ok(&c.run(&["CLIENT", "PAUSE", "50"]));
+    expect_null(&c.run(&["GET", "key"]));
+    assert!(start.elapsed() > Duration::from_millis(50));
+
+    let start = Instant::now();
+    expect_ok(&c.run(&["CLIENT", "PAUSE", "50", "WRITE"]));
+    let get_start = Instant::now();
+    expect_null(&c.run(&["GET", "key"]));
+    assert!(
+        get_start.elapsed() < Duration::from_millis(50),
+        "a read must not be gated by a WRITE pause"
+    );
+    expect_ok(&c.run(&["SET", "key", "value2"]));
+    assert!(start.elapsed() > Duration::from_millis(50));
 }
 
 /// `ConfigNormalization` (server_family_test.cc:672): dashes and underscores

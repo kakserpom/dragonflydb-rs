@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use dragonflydb::commands::lua::ScriptMgr;
 use dragonflydb::server::event_loop::IoLoop;
 use dragonflydb::server::replication::ReplChunk;
-use dragonflydb::server::{Reply, ReplyBus, ServerEnv, Tracking, coordinator, shard};
+use dragonflydb::server::{ClientPause, Reply, ReplyBus, ServerEnv, Tracking, coordinator, shard};
 
 /// A running in-process server. Dropping it shuts the server down.
 pub struct TestServer {
@@ -129,6 +129,7 @@ impl TestServer {
 
         // Shard threads.
         let tracking = Arc::new(Mutex::new(Tracking::default()));
+        let pause = Arc::new(ClientPause::default());
         let mut shard_txs = Vec::with_capacity(num_shards);
         for s in 0..num_shards {
             let (tx, rx) = mpsc::channel();
@@ -180,6 +181,7 @@ impl TestServer {
             listen_port: port,
             command_stats,
             tracking,
+            pause,
         };
 
         let mut io_loop = IoLoop::new(env, reply_rx, repl_rx, listener, pipefds[0]).unwrap();

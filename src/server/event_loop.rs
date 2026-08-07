@@ -10,7 +10,9 @@ use std::fmt::Write as _;
 
 use crate::commands::exec::keys::glob_match;
 use crate::commands::exec::server;
-use crate::commands::{Command, FLAG_ADMIN, FLAG_BLOCKING, FLAG_GLOBAL, FLAG_LOCAL, FLAG_WRITE};
+use crate::commands::{
+    Command, FLAG_ADMIN, FLAG_BLOCKING, FLAG_GLOBAL, FLAG_LOCAL, FLAG_READONLY, FLAG_WRITE,
+};
 use crate::error::RespValue;
 use crate::protocol::resp::RespParser;
 use crate::server::coordinator::format_exec_slowlog;
@@ -19,7 +21,7 @@ use crate::server::replica::{self, ReplicaPhase, ReplicaStatus};
 use crate::server::replication::{self, ChunkKind, ReplChunk, ReplicationManager, SyncState};
 use crate::server::slowlog::{SlowLog, SlowLogEntry};
 use crate::server::{
-    CoordMsg, GcRequest, Reply, ServerEnv, ShardMsg, SingleOp, TrackingMode, WatchState,
+    CoordMsg, GcRequest, PauseMode, Reply, ServerEnv, ShardMsg, SingleOp, TrackingMode, WatchState,
     command_for, encode_value, extract_keys, is_eval_cmd, is_function_cmd, keys_per_shard,
     local_function, local_script,
 };
@@ -586,6 +588,12 @@ impl IoLoop {
             self.deliver(conn_id, seq, encode_value(&RespValue::Error(msg)));
             return;
         };
+        // `CheckPauseState` (main_service.cc:839): a top-level command covered
+        // by an active `CLIENT PAUSE` blocks the IO thread until the pause
+        // timer clears it. Queued MULTI commands return before this and run
+        // unpaused inside EXEC, matching the reference (`transaction ==
+        // nullptr` gate).
+        self.pause_check(conn_id, cmd);
         // `XGROUP HELP` resolves to the hidden `_XGROUP_HELP` command (arity 2,
         // NOSCRIPT) before the arity check (command_registry.cc:347-352), so the
         // 2-arg HELP form bypasses XGROUP's -3 arity.
@@ -718,6 +726,26 @@ impl IoLoop {
     /// return before it (`cid->IsMulti()`).
     fn tracking_seq_advance(&self, conn_id: u64) {
         self.env.tracking.lock().unwrap().inc_seq(conn_id);
+    }
+
+    /// `CheckPauseState` (main_service.cc:839): while a `CLIENT PAUSE` is
+    /// active, block this dispatch until the pause clears. `is_write` mirrors
+    /// the reference — journaled (FLAG_WRITE), PUBLISH, a writable
+    /// eval/function command — and EXEC inherits its body's write-ness
+    /// (`exec_info.is_write`).
+    fn pause_check(&self, conn_id: u64, cmd: &'static Command) {
+        let is_write = cmd.has_flag(FLAG_WRITE)
+            || cmd.name == "PUBLISH"
+            || ((is_eval_cmd(cmd.name) || is_function_cmd(cmd.name))
+                && !cmd.has_flag(FLAG_READONLY))
+            || (cmd.name == "EXEC"
+                && self.conns.get(&conn_id).is_some_and(|c| {
+                    c.multi
+                        .queue
+                        .iter()
+                        .any(|q| command_for(q).is_some_and(|qc| qc.has_flag(FLAG_WRITE)))
+                }));
+        self.env.pause.wait_until_clear(is_write);
     }
 
     /// Split a command by its keys and send it to a shard or the coordinator.
@@ -1610,6 +1638,7 @@ impl IoLoop {
             b"GETNAME" => RespValue::Bulk(Vec::new()),
             b"TRACKING" => self.local_tracking(args, conn_id),
             b"CACHING" => self.local_caching(args, conn_id),
+            b"PAUSE" => self.local_pause(args),
             b"ID" => self
                 .conns
                 .get(&conn_id)
@@ -1714,6 +1743,44 @@ impl IoLoop {
         // the flag after the `multi` state was reset (`tx->IsMulti()`).
         let is_multi = self.conns.get(&conn_id).is_some_and(|c| c.exec_multi);
         tracking.set_caching(conn_id, is_multi);
+        RespValue::Simple("OK".into())
+    }
+
+    /// `ClientPauseCmd` (server_family.cc:3953): `CLIENT PAUSE <ms> [WRITE|ALL]`
+    /// opens the shared pause gate and spawns a detached timer thread that
+    /// closes it after the timeout (the reference's `Pause` fiber). The timeout
+    /// is in milliseconds. The gate itself is enforced in `pause_check`, ahead
+    /// of every top-level dispatch, so this command only arms the gate and
+    /// returns OK.
+    fn local_pause(&self, args: &[Vec<u8>]) -> RespValue {
+        if args.len() < 3 {
+            return RespValue::Error(
+                "ERR wrong number of arguments for 'client|pause' command".into(),
+            );
+        }
+        let Some(timeout) = args
+            .get(2)
+            .and_then(|a| crate::util::parse_i64(a))
+            .filter(|&n| n >= 0)
+        else {
+            return RespValue::Error("ERR Invalid timeout".into());
+        };
+        let mut mode = PauseMode::All;
+        if let Some(m) = args.get(3) {
+            if m.eq_ignore_ascii_case(b"WRITE") {
+                mode = PauseMode::Write;
+            } else if m.eq_ignore_ascii_case(b"ALL") {
+                mode = PauseMode::All;
+            } else {
+                return RespValue::Error("ERR syntax error".into());
+            }
+        }
+        self.env.pause.begin(mode);
+        let pause = self.env.pause.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(timeout as u64));
+            pause.end(mode);
+        });
         RespValue::Simple("OK".into())
     }
 

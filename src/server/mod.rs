@@ -13,6 +13,7 @@ pub const MAX_DB: usize = 16;
 use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::mpsc;
 
@@ -899,6 +900,61 @@ pub struct GcRequest {
     pub ack: mpsc::Sender<()>,
 }
 
+/// Which commands a `CLIENT PAUSE` gate blocks (`ClientPauseCmd`,
+/// server_family.cc:3953): `WRITE` gates journaled commands only, `ALL` gates
+/// every command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseMode {
+    All,
+    Write,
+}
+
+/// Shared CLIENT PAUSE gate. `begin` opens a pause; the detached timer thread
+/// spawned by the command closes it via `end` after the timeout. Dispatches
+/// block in `wait_until_clear` until no active pause covers them — the port's
+/// analog of `ServerState::client_pauses_` + `AwaitPauseState`
+/// (server_state.cc:222), resolved on the single IO thread instead of
+/// per-connection fibers.
+#[derive(Default)]
+pub struct ClientPause {
+    inner: Mutex<ClientPauseState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct ClientPauseState {
+    all: usize,
+    write: usize,
+}
+
+impl ClientPause {
+    pub fn begin(&self, mode: PauseMode) {
+        let mut g = self.inner.lock().unwrap();
+        match mode {
+            PauseMode::All => g.all += 1,
+            PauseMode::Write => g.write += 1,
+        }
+    }
+
+    pub fn end(&self, mode: PauseMode) {
+        let mut g = self.inner.lock().unwrap();
+        match mode {
+            PauseMode::All => g.all = g.all.saturating_sub(1),
+            PauseMode::Write => g.write = g.write.saturating_sub(1),
+        }
+        drop(g);
+        self.cv.notify_all();
+    }
+
+    /// Block until no active pause covers `is_write` (`AwaitPauseState`).
+    pub fn wait_until_clear(&self, is_write: bool) {
+        let mut g = self.inner.lock().unwrap();
+        while g.all > 0 || (is_write && g.write > 0) {
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+}
+
 /// Shared handles owned by the IO thread.
 pub struct ServerEnv {
     pub num_shards: usize,
@@ -926,6 +982,9 @@ pub struct ServerEnv {
     /// The shared CLIENT TRACKING table: connections' tracking state plus the
     /// tracked-key index, written by the IO thread and read by the shard threads.
     pub tracking: Arc<Mutex<Tracking>>,
+    /// The shared CLIENT PAUSE gate: dispatches block on it while a pause is
+    /// active, and the pause timer thread clears it.
+    pub pause: Arc<ClientPause>,
 }
 
 impl ServerEnv {

@@ -69,6 +69,11 @@ Legend:
   PUNSUBSCRIBE, QUIT, REPLCONF, REPLICAOF, REPLTAKEOVER, RESET, ROLE, SAVE,
   SHRINK, SHUTDOWN, SLAVEOF, SLOWLOG, SPUBLISH, SSUBSCRIBE, SUBSCRIBE,
   SUNSUBSCRIBE, UNSUBSCRIBE, UNWATCH, WAIT, WATCH
+- [x] CLIENT TRACKING/CACHING (RESP3-gated client-side caching: per-connection
+  `seq_num` with OPTIN/OPTOUT/NOLOOP, keyed invalidation pushes delivered FIFO
+  before the triggering write's reply, a null-keyed broadcast push on
+  FLUSHDB/FLUSHALL, and CACHING stickiness through MULTI/EXEC/DISCARD; full
+  `ClientTracking*` test suite ported)
 - [x] FUNCTION (LOAD [REPLACE], DELETE, FLUSH, LIST [LIBRARYNAME] [WITHCODE],
   STATS, DUMP, RESTORE [FLUSH|APPEND|REPLACE], KILL, HELP backed by a shared
   library registry with per-library `#!lua name=...` headers, `redis.register_function`
@@ -288,8 +293,47 @@ integration tests (`tests/*.rs`) that run against the in-process server
   arity 2). `XReadGroupBlockIgnoresWakeFromRemovedEntry` is skipped: EXEC
   dispatches queued commands as separate transactions with a pending-retry
   between them, so MULTI is not atomic with respect to the woken reader.
-- [ ] Remaining families (server, scripting, json) still to be ported from
-  `*_test.cc`.
+- [x] `server_family_test.cc` (in progress) → `tests/server_family.rs`. The
+  `ClientTracking*` suite is ported (16 tests: ClientTrackingOnAndOff,
+  ToggleTrackingOnAndOff, ClientTrackingReadKey, ClientTrackingOptIn,
+  ClientTrackingMulti, ClientTrackingCompatibilityMulti, ClientTrackingMultiOptIn,
+  ClientTrackingOptOut, ClientTrackingMultiOptOut, ClientTrackingUpdateKey,
+  ClientTrackingDeleteKey, ClientTrackingRenameKey, ClientTrackingExpireKey,
+  ClientTrackingSelectDb, ClientTrackingNonTransactionalBug,
+  ClientTrackingLuaBug), alongside the slowlog/config/client-list/debug/
+  info/memory tests from earlier sessions. Feature work behind the tracking
+  suite: the RESP3 push-message path (`drain_bus` appends `is_push` frames
+  straight to the connection, FIFO before the triggering write's reply);
+  per-connection tracking state (`seq_num`, `should_track` computed at dispatch,
+  OPTIN/OPTOUT/NOLOOP, CACHING stickiness through MULTI/EXEC/DISCARD); the
+  shard-global tracking map keyed by value (a write invalidates every tracking
+  connection; FLUSHDB/FLUSHALL broadcast one null-keyed push from shard 0);
+  `TrackIfNeeded` recorded after the command runs — like the reference's
+  post-run tracking callback — so a lazy-expiry delete a read triggers
+  invalidates pre-read trackers but not the read's own freshly tracked key.
+  Adaptations: `ClientTrackingNonTransactionalBug` only asserts the port errors
+  (no `CLUSTER SLOTS`), `ClientTrackingExpireKey` drives the fake clock with
+  `advance`, and the suite gates on `HELLO 3`.
+- [x] CLIENT PAUSE ported (reference `ClientPauseCmd`, server_family.cc:3953):
+  `PauseMode::{All,Write}` + a `ClientPause` struct (`begin`/`end`/
+  `wait_until_clear`, `Mutex`+`Condvar`) on `ServerEnv`. The single IO thread
+  mirrors the reference's per-connection `Pause()` fiber gates with a
+  `pause_check` at dispatch (before XGROUP-HELP/arity): `is_write` from
+  `FLAG_WRITE`/PUBLISH/eval/function-minus-`FLAG_READONLY`/EXEC-write like
+  `main_service.cc:843`. `CLIENT PAUSE <ms> [WRITE|ALL]` spawns a detached
+  timer thread (non-blocking `+OK` like the reference's pause fiber); ALL
+  blocks everything, WRITE only writes; `timeout` ms minimum validated
+  (`ERR Invalid timeout`). `client_pause` test (server_family_test.cc:271)
+  ports with real `Instant` timings.
+- [~] Remaining `server_family_test.cc` cases: `ReadTcpInfo`/
+  `GetTcpSocketInfoIPv6` are deferred (they exercise Linux-only
+  `/proc/net/tcp{,6}` `GetSocketInfo`, which the port's macOS/kqueue IO has no
+  consumer for — only connection error logs); cluster-only paths remain.
+- [x] `json_family_test.cc` → `tests/json_family.rs` (86 tests, 1:1 with the
+  reference: `SetGetBasic`..`SetFullJsonInvalidOnNewKey`; the RESP3-parameterized
+  `*NestedArrayBug` cases are ported as RESP2-only `*_flat` variants and
+  `Type`/`NumericOperationsResp2Resp3` as the RESP2-only `type_v2`/
+  `numeric_operations_resp2`).
 - [x] Scripting end-to-end coverage in `tests/functions.rs` (11 tests). There is
   no upstream `function_family_test.cc` (and no FUNCTION tests in dragonfly's
   tree at all), so these are authored from the port's own documented semantics
