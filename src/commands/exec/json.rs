@@ -12,8 +12,8 @@
 //! traversal engine.
 
 use crate::commands::{
-    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_READONLY, FLAG_WRITE, KeyRange, OpContext, bulk,
-    integer, ok,
+    Command, FLAG_DENYOOM, FLAG_FAST, FLAG_MULTI_KEY, FLAG_READONLY, FLAG_WRITE, KeyRange,
+    LAST_BUT_ONE, OpContext, ShardPart, bulk, integer, ok,
 };
 use crate::core::PrimeValue;
 use crate::core::json::Json;
@@ -659,12 +659,17 @@ fn exec_get(ctx: &mut OpContext) -> CmdResult {
             let out = eval_wrapped(&params.paths[0].1, &json).expect("V2 always produces");
             CmdResult::Ok(bulk(out.dump_with_options(indent, newline, space)))
         } else {
+            // Mixed legacy/V2 paths: every value is reported V2-style, wrapping
+            // legacy matches in a single-element array and absent legacy matches
+            // in an empty array (reference `JSON.GET` mixed-path behavior).
             let mut out = Json::Object(Vec::new());
             for (raw, w) in &params.paths {
-                out.object_insert(
-                    raw.clone(),
-                    eval_wrapped(w, &json).expect("V2 always produces"),
-                );
+                let v = match eval_wrapped(w, &json) {
+                    Some(v) if w.is_legacy() => Json::Array(vec![v]),
+                    Some(v) => v,
+                    None => Json::Array(Vec::new()),
+                };
+                out.object_insert(raw.clone(), v);
             }
             CmdResult::Ok(bulk(out.dump_with_options(indent, newline, space)))
         }
@@ -677,8 +682,9 @@ fn exec_mget(ctx: &mut OpContext) -> CmdResult {
         return CmdResult::Err(e(ERR_SYNTAX));
     };
 
-    let mut out = Vec::new();
-    for key in &ctx.args[ctx.first_key_idx..ctx.args.len() - 1] {
+    let mut out = Vec::with_capacity(ctx.owned_keys.len());
+    for &ki in ctx.owned_keys {
+        let key = &ctx.args[ki];
         let Ok(json) = get_str_for_key(ctx.db, key, ctx.now_ms) else {
             out.push(RespValue::Nil);
             continue;
@@ -691,14 +697,49 @@ fn exec_mget(ctx: &mut OpContext) -> CmdResult {
     CmdResult::Ok(RespValue::Array(out))
 }
 
+/// Reassemble per-shard `JSON.MGET` replies in the caller's key order,
+/// mirroring the reference `OpMGet` coordinator merge.
+fn merge_json_mget(parts: &[ShardPart], _args: &[Vec<u8>], keys: &[usize], _now: u64) -> CmdResult {
+    let mut result: Vec<Option<RespValue>> = vec![None; keys.len()];
+    for p in parts {
+        match &p.result {
+            CmdResult::Ok(RespValue::Array(arr)) => {
+                if arr.len() != p.owned_key_idxs.len() {
+                    return CmdResult::Err(RespError::new(
+                        "ERR internal: JSON.MGET array length mismatch",
+                    ));
+                }
+                for (j, &ki) in p.owned_key_idxs.iter().enumerate() {
+                    if let Some(pos) = keys.iter().position(|&k| k == ki) {
+                        result[pos] = Some(arr[j].clone());
+                    }
+                }
+            }
+            CmdResult::Err(e) => return CmdResult::Err(e.clone()),
+            _ => return CmdResult::Err(RespError::new("ERR internal: bad JSON.MGET shard result")),
+        }
+    }
+    CmdResult::Ok(RespValue::Array(
+        result
+            .into_iter()
+            .map(|v| v.unwrap_or(RespValue::Nil))
+            .collect(),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Generic read-only operations (simple values)
 // ---------------------------------------------------------------------------
 
 fn exec_type(ctx: &mut OpContext) -> CmdResult {
     let key = &ctx.args[ctx.first_key_idx];
-    let path = &ctx.args[ctx.first_key_idx + 1];
-    let w = parse_json_path(std::str::from_utf8(path).unwrap_or("")).unwrap();
+    let path = ctx
+        .args
+        .get(ctx.first_key_idx + 1)
+        .map_or("", |p| std::str::from_utf8(p).unwrap_or(""));
+    let Some(w) = parse_json_path(path) else {
+        return CmdResult::Err(e(ERR_SYNTAX));
+    };
     // TYPE always returns nil on a missing key.
     let Some(pv) = ctx.db.find(key, ctx.now_ms) else {
         return CmdResult::Ok(RespValue::Nil);
@@ -866,16 +907,11 @@ fn exec_objkeys(ctx: &mut OpContext) -> CmdResult {
 fn exec_strappend(ctx: &mut OpContext) -> CmdResult {
     let key = &ctx.args[ctx.first_key_idx];
     let rest = &ctx.args[ctx.first_key_idx + 1..];
-    let (path_str, value_bytes) = if rest.len() >= 2 {
-        (std::str::from_utf8(&rest[0]).unwrap_or(""), rest[1].clone())
-    } else if rest.len() == 1 {
-        ("", rest[0].clone())
-    } else {
-        return CmdResult::Err(e(ERR_SYNTAX));
+    let (path_str, value_bytes) = match rest {
+        [path, value] => (std::str::from_utf8(path).unwrap_or(""), value.clone()),
+        [value] => ("", value.clone()),
+        _ => return CmdResult::Err(e(ERR_SYNTAX)),
     };
-    if ctx.args.len() > ctx.first_key_idx + 1 + rest.len() {
-        return CmdResult::Err(e(ERR_SYNTAX));
-    }
     let Ok(Json::String(parsed)) = Json::parse(&value_bytes) else {
         return CmdResult::Err(e("expected string value"));
     };
@@ -1372,9 +1408,10 @@ fn exec_resp(ctx: &mut OpContext) -> CmdResult {
 }
 
 fn exec_debug(ctx: &mut OpContext) -> CmdResult {
+    // The subcommand sits at index 1; the key (when present) at `first_key_idx`.
     let cmd = ctx
         .args
-        .get(ctx.first_key_idx)
+        .get(1)
         .map(|s| std::str::from_utf8(s).unwrap_or("").to_ascii_lowercase())
         .unwrap_or_default();
 
@@ -1387,12 +1424,12 @@ fn exec_debug(ctx: &mut OpContext) -> CmdResult {
     }
 
     if cmd == "fields" || cmd == "memory" {
-        let Some(key_bytes) = ctx.args.get(ctx.first_key_idx + 1) else {
+        let Some(key_bytes) = ctx.args.get(ctx.first_key_idx) else {
             return CmdResult::Err(e(ERR_SYNTAX));
         };
         let path = ctx
             .args
-            .get(ctx.first_key_idx + 2)
+            .get(ctx.first_key_idx + 1)
             .map_or("", |p| std::str::from_utf8(p).unwrap_or(""));
         let Some(w) = parse_json_path(path) else {
             return CmdResult::Err(e(ERR_SYNTAX));
@@ -1467,14 +1504,14 @@ pub static CMD_JSON_GET: Command = Command {
 pub static CMD_JSON_MGET: Command = Command {
     name: "JSON.MGET",
     arity: -3,
-    flags: FLAG_READONLY | FLAG_FAST,
+    flags: FLAG_READONLY | FLAG_FAST | FLAG_MULTI_KEY,
     key_range: KeyRange {
         first: 1,
-        last: 0,
+        last: LAST_BUT_ONE,
         step: 1,
     },
     exec: exec_mget,
-    merge: None,
+    merge: Some(merge_json_mget),
 };
 
 pub static CMD_JSON_TYPE: Command = Command {
@@ -1634,7 +1671,14 @@ pub static CMD_JSON_DEBUG: Command = Command {
     name: "JSON.DEBUG",
     arity: -2,
     flags: FLAG_READONLY | FLAG_FAST,
-    key_range: KeyRange::NONE,
+    // The key lives at argument index 2 (after the subcommand); `JSON.DEBUG
+    // HELP`/`JSON.DEBUG FIELDS` are keyless and route to shard 0, where the
+    // executor reports the syntax error.
+    key_range: KeyRange {
+        first: 2,
+        last: 2,
+        step: 1,
+    },
     exec: exec_debug,
     merge: None,
 };
@@ -1711,7 +1755,7 @@ mod tests {
             db,
             args: argv,
             owned_keys: &owned,
-            first_key_idx: 1,
+            first_key_idx: cmd.key_range.first,
             conn_id: 0,
             now_ms: now,
         };
