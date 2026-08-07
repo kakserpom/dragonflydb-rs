@@ -29,6 +29,10 @@ pub struct DbSlice {
     /// Bumped on whole-DB flush. Every WATCH in this DB is dirty after a
     /// FLUSHDB, even for watched keys that did not exist.
     db_epoch: u64,
+    /// Keys modified since the last invalidation drain (`PostUpdate`).
+    /// Client-tracking consumers read it on the next write; the shard drains it
+    /// at the end of every executed command.
+    modified: Vec<CompactString>,
     pub stats: DbStats,
 }
 
@@ -51,6 +55,7 @@ impl DbSlice {
             stream_block_watermarks: HashMap::new(),
             versions: HashMap::new(),
             db_epoch: 0,
+            modified: Vec::new(),
             stats: DbStats::default(),
         }
     }
@@ -270,6 +275,15 @@ impl DbSlice {
             .entry(CompactString::from_bytes(key))
             .or_insert(0);
         *e += 1;
+        // A version bump is the canonical write hook (`PostUpdate`): record the
+        // key for the client-tracking invalidation drain.
+        self.modified.push(CompactString::from_bytes(key));
+    }
+
+    /// Take the keys modified since the last call, for invalidation
+    /// (`SendQueuedInvalidationMessagesCb` drains per executed command).
+    pub fn drain_modified(&mut self) -> Vec<CompactString> {
+        std::mem::take(&mut self.modified)
     }
 
     /// Iterate over all (key, value) pairs. The iterator borrows self mutably

@@ -1811,6 +1811,9 @@ fn collect_reply_bytes(values: &mut Vec<Vec<u8>>, r: &RespValue) {
             collect_reply_bytes(values, k);
             collect_reply_bytes(values, v);
         }),
+        // Pushes never reach the Lua interpreter (invalidation pushes are
+        // appended straight to the connection output).
+        RespValue::Push(_) => {}
     }
 }
 
@@ -2039,6 +2042,9 @@ fn resp_to_lua(lua: &Lua, r: RespValue) -> mlua::Result<Value> {
             }
             Value::Table(t)
         }
+        // Pushes never reach the Lua interpreter (invalidation pushes are
+        // appended straight to the connection output).
+        RespValue::Push(_) => Value::Boolean(false),
     })
 }
 

@@ -5,10 +5,13 @@ use crate::commands::exec::server::now_ms;
 use crate::commands::{OpContext, ShardPart};
 use crate::core::DbSlice;
 use crate::core::compact::CompactString;
-use crate::error::CmdResult;
+use crate::error::{CmdResult, RespValue};
 use crate::server::journal::{self, JournalItem, JournalSlice, OP_COMMAND};
 use crate::server::replication::{ChunkKind, FullSyncBus, ReplChunk};
-use crate::server::{MAX_DB, Reply, ShardMsg, SingleOp, WatchState, command_for, encode_result};
+use crate::server::{
+    MAX_DB, Reply, ReplyBus, ShardMsg, SingleOp, Tracking, WatchState, command_for, encode_result,
+    encode_value,
+};
 
 /// Context for an active transaction on this shard, stored between `TxLock` and
 /// `TxExec`.
@@ -19,6 +22,8 @@ struct TxCtx {
     first_key_idx: usize,
     db_idx: usize,
     owns_all_keys: bool,
+    /// Whether the issuing connection tracks keys (CLIENT TRACKING).
+    track_keys: bool,
 }
 
 /// A watch snapshot query queued while a transaction holds the shard:
@@ -51,6 +56,10 @@ struct Shard {
     /// message loop (and draining pending writes) between chunks so a full sync
     /// never stalls the shard.
     full_syncs: HashMap<(u32, usize), FullSyncState>,
+    /// Shared CLIENT TRACKING table (connections' tracking state + key index).
+    tracking: Arc<Mutex<Tracking>>,
+    /// The reply bus for invalidation pushes, drained by the IO thread.
+    tracking_bus: ReplyBus,
 }
 
 /// One DB's frozen baseline: the sorted key list captured at snapshot start
@@ -83,7 +92,12 @@ struct FullSyncState {
 }
 
 #[must_use]
-pub fn spawn(shard_id: usize, rx: mpsc::Receiver<ShardMsg>) -> std::thread::JoinHandle<()> {
+pub fn spawn(
+    shard_id: usize,
+    rx: mpsc::Receiver<ShardMsg>,
+    tracking: Arc<Mutex<Tracking>>,
+    tracking_bus: ReplyBus,
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("shard-{shard_id}"))
         .spawn(move || {
@@ -97,6 +111,8 @@ pub fn spawn(shard_id: usize, rx: mpsc::Receiver<ShardMsg>) -> std::thread::Join
                 journal: None,
                 repl_consumers: Vec::new(),
                 full_syncs: HashMap::new(),
+                tracking,
+                tracking_bus,
             };
             shard.run(&rx);
         })
@@ -127,6 +143,7 @@ impl Shard {
                 first_key_idx,
                 db_idx,
                 owns_all_keys,
+                track_keys,
                 ack,
                 ..
             } => {
@@ -140,6 +157,7 @@ impl Shard {
                         first_key_idx,
                         db_idx,
                         owns_all_keys,
+                        track_keys,
                     },
                 );
                 let _ = ack.send(());
@@ -155,6 +173,7 @@ impl Shard {
                             ctx.owns_all_keys,
                             ctx.conn_id,
                             tx_id,
+                            ctx.track_keys,
                         );
                         ShardPart {
                             shard: self.id,
@@ -223,6 +242,7 @@ impl Shard {
                         self.ensure_db(db_idx).remove(&key);
                     }
                 }
+                self.flush_invalidations();
                 let _ = ack.send(());
             }
             ShardMsg::ScriptOp {
@@ -231,6 +251,8 @@ impl Shard {
                 first_key_idx,
                 db_idx,
                 owns_all_keys,
+                conn_id,
+                track_keys,
                 result_tx,
             } => {
                 let result = self.run_exec(
@@ -239,8 +261,9 @@ impl Shard {
                     first_key_idx,
                     db_idx,
                     owns_all_keys,
+                    conn_id,
                     0,
-                    0,
+                    track_keys,
                 );
                 let _ = result_tx.send(result);
             }
@@ -257,8 +280,9 @@ impl Shard {
                             c.first_key_idx,
                             c.db_idx,
                             c.owns_all_keys,
+                            c.conn_id,
                             0,
-                            0,
+                            c.track_keys,
                         )
                     })
                     .collect();
@@ -350,6 +374,7 @@ impl Shard {
             }
             ShardMsg::ReplicaOp { args, db_idx, ack } => {
                 let _ = self.apply_replica(&args, db_idx);
+                self.flush_invalidations();
                 let _ = ack.send(());
             }
             ShardMsg::ReplicaLoadValue {
@@ -364,9 +389,11 @@ impl Shard {
                     Some(at) => db.set_expiry(&key, at, now_ms()),
                     None => db.clear_expiry(&key),
                 }
+                self.flush_invalidations();
             }
             ShardMsg::ReplicaFlushAll { ack } => {
                 let _ = self.run_flushall();
+                self.flush_invalidations();
                 let _ = ack.send(());
             }
         }
@@ -534,12 +561,14 @@ impl Shard {
             true,
             op.conn_id,
             0,
+            op.track_keys,
         );
         let reply = Reply {
             conn_id: op.conn_id,
             seq: op.seq,
             bytes: encode_result(result),
             slowlog_args: None,
+            is_push: false,
         };
         op.reply.send(reply);
     }
@@ -578,6 +607,7 @@ impl Shard {
         owns_all_keys: bool,
         conn_id: u64,
         txid: u64,
+        track_keys: bool,
     ) -> CmdResult {
         let Some(cmd) = command_for(args) else {
             return CmdResult::err("ERR unknown command");
@@ -604,7 +634,92 @@ impl Shard {
             }
         }
         self.maybe_journal(cmd, args, owned, owns_all_keys, db_idx, txid, &result);
+        // Send invalidation pushes for every key the command modified; the
+        // pushes land on the connection before the command's own reply, so a
+        // tracked client observing a write sees the invalidate first. A flush
+        // instead clears the whole map and broadcasts one null-keyed push.
+        if matches!(cmd.name, "FLUSHDB" | "FLUSHALL") {
+            self.flush_db_invalidations();
+        } else {
+            self.flush_invalidations();
+        }
+        // `TrackIfNeeded` (main_service.cc:816): only readonly commands record
+        // their keys into the tracking map. Like the reference's transaction
+        // tracking callback (invoked after the command ran, transaction.cc:721)
+        // and its invalidations (computed at delete/update time, before the
+        // callback), the keys are recorded after the flush so a lazy-expiry
+        // delete the read triggers cannot invalidate its own freshly tracked
+        // key - the reading connection gets re-added only after.
+        if track_keys && cmd.has_flag(crate::commands::FLAG_READONLY) {
+            let keys: Vec<Vec<u8>> = owned.iter().filter_map(|&i| args.get(i)).cloned().collect();
+            if !keys.is_empty() {
+                self.tracking.lock().unwrap().record_reads(conn_id, &keys);
+            }
+        }
         result
+    }
+
+    /// `SendQueuedInvalidationMessagesCb` (db_slice.cc): every key modified
+    /// since the last drain is removed from the tracking map, and each of its
+    /// tracked readers gets a `["invalidate", [key]]` push. Pushes are routed
+    /// through the reply bus as unsequenced (`is_push`) messages.
+    fn flush_invalidations(&mut self) {
+        let keys: Vec<CompactString> = self
+            .dbs
+            .iter_mut()
+            .flat_map(DbSlice::drain_modified)
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        let mut frames: Vec<(u64, Vec<u8>)> = Vec::new();
+        {
+            let mut tracking = self.tracking.lock().unwrap();
+            for key in &keys {
+                for conn_id in tracking.invalidate_key(key.as_bytes()) {
+                    if tracking.conn(conn_id).is_some_and(|c| c.enabled) {
+                        frames.push((conn_id, invalidation_push_frame(key.as_bytes())));
+                    }
+                }
+            }
+        }
+        for (conn_id, bytes) in frames {
+            self.tracking_bus.send(Reply {
+                conn_id,
+                seq: 0,
+                bytes,
+                slowlog_args: None,
+                is_push: true,
+            });
+        }
+    }
+
+    /// `FlushDb` + `SendInvalidationMessages` (db_slice.cc:1100,
+    /// server_family.cc:1985): a FLUSHDB/FLUSHALL drops every tracked key
+    /// without per-key messages, then broadcasts a null-keyed
+    /// `["invalidate", nil]` push to every connection with tracking on. Only
+    /// shard 0 sends the push: FLUSHDB/FLUSHALL run on every shard but the
+    /// broadcast must hit each connection exactly once.
+    fn flush_db_invalidations(&mut self) {
+        let conn_ids = self.tracking.lock().unwrap().invalidate_all();
+        // The flushed keys were recorded as modified by `exec_core`; drop them
+        // so a later write cannot resurrect a stale per-key invalidation.
+        for db in &mut self.dbs {
+            db.drain_modified();
+        }
+        if self.id != 0 {
+            return;
+        }
+        let bytes = flush_invalidation_frame();
+        for conn_id in conn_ids {
+            self.tracking_bus.send(Reply {
+                conn_id,
+                seq: 0,
+                bytes: bytes.clone(),
+                slowlog_args: None,
+                is_push: true,
+            });
+        }
     }
 
     /// Execute `args` against `db_idx` and return `(result, optional SPOP
@@ -831,4 +946,22 @@ fn spop_members(result: &CmdResult) -> Vec<Vec<u8>> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Encode a client-tracking invalidation push: `["invalidate", [key]]` as an
+/// RESP3 push frame (`StartCollection(2, PUSH)`, dragonfly_connection.cc:792).
+fn invalidation_push_frame(key: &[u8]) -> Vec<u8> {
+    encode_value(&RespValue::Push(vec![
+        RespValue::bulk("invalidate"),
+        RespValue::Array(vec![RespValue::bulk(key)]),
+    ]))
+}
+
+/// Encode the flush invalidation push `["invalidate", nil]`
+/// (`invalidate_due_to_flush`, dragonfly_connection.cc:829).
+fn flush_invalidation_frame() -> Vec<u8> {
+    encode_value(&RespValue::Push(vec![
+        RespValue::bulk("invalidate"),
+        RespValue::Nil,
+    ]))
 }

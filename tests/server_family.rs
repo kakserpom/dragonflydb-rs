@@ -1,7 +1,7 @@
 //! Port of `dragonfly/src/server/server_family_test.cc`.
 //!
 //! Adaptations from the C++ original:
-//! - The whole suite runs RESP2 (the port has no RESP3/HELLO 3 handshake yet).
+//! - The tracking suite runs RESP3 (`HELLO 3`); the remaining tests run RESP2.
 //! - The slowlog tests are byte-identical: they set `slowlog_max_len` and
 //!   `slowlog_log_slower_than`, then inspect `SLOWLOG GET` entries.
 //! - The `SlowLogExecEval` EVAL sha is the reference's hardcoded value
@@ -24,8 +24,12 @@
 //! - `ClientPause` is not ported yet: the port has no `CLIENT PAUSE`.
 //! - `ReadTcpInfo` / `GetTcpSocketInfoIPv6` are not ported: they exercise the
 //!   Linux-only `/proc/net/{tcp,tcp6}` socket-info reporting.
-//! - The `ClientTracking*` tests (tracking push messages) are not ported: they
-//!   require RESP3 and the push-message reply API.
+//! - The `ClientTracking*` tests use the real push-message API: `CLIENT
+//!   TRACKING` invalidations arrive as RESP3 push frames, drained by `cmd` into
+//!   the client's push queue (`push_count`/`read_push`). Writes on a second
+//!   connection are followed by `read_push` on the tracking client, replacing
+//!   the reference's `AwaitFiberOnAll`; exact single-client sequences rely on
+//!   the invalidation being appended before the triggering write's reply.
 
 mod common;
 
@@ -567,4 +571,395 @@ fn info_cluster_migration_errors() {
         c.text(&["INFO", "CLUSTER"])
             .contains("migration_errors_total:0")
     );
+}
+
+// ---------------------------------------------------------------------------
+// CLIENT TRACKING (RESP3 invalidation pushes)
+// ---------------------------------------------------------------------------
+
+/// The key of an invalidation push: `["invalidate", [key]]` or, for the flush
+/// broadcast, `["invalidate", nil]` (no key).
+fn invalidation_key(push: &[Value]) -> Option<String> {
+    assert_eq!(
+        push.first().and_then(Value::text).as_deref(),
+        Some("invalidate"),
+        "expected an invalidate push, got {push:?}"
+    );
+    push.get(1)
+        .and_then(Value::arr)
+        .and_then(|a| a.first())
+        .and_then(Value::text)
+}
+
+/// `ClientTrackingOnAndOff` (server_family_test.cc:330).
+#[test]
+fn client_tracking_on_and_off() {
+    let mut c = Ctx::new();
+    // RESP2 rejects tracking entirely.
+    expect_err_exact(
+        &c.run(&["CLIENT", "TRACKING", "ON"]),
+        "ERR Client tracking is currently not supported for RESP2. Please use RESP3.",
+    );
+
+    c.run(&["HELLO", "3"]);
+    expect_ok(&c.run(&["CLIENT", "TRACKING", "ON"]));
+    // In NONE mode CACHING is rejected with the mode-specific error.
+    expect_err_exact(
+        &c.run(&["CLIENT", "CACHING", "YES"]),
+        "ERR CLIENT CACHING YES is only valid when tracking is enabled in OPTIN mode",
+    );
+    expect_err_exact(
+        &c.run(&["CLIENT", "CACHING", "NO"]),
+        "ERR CLIENT CACHING NO is only valid when tracking is enabled in OPTOUT mode",
+    );
+
+    // Turn tracking off: CACHING becomes invalid entirely.
+    expect_ok(&c.run(&["CLIENT", "TRACKING", "OFF"]));
+    expect_err_exact(
+        &c.run(&["CLIENT", "CACHING", "YES"]),
+        "ERR CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or \
+         OPTOUT mode enabled",
+    );
+}
+
+/// `ToggleTrackingOnAndOff` (server_family_test.cc:360).
+#[test]
+fn toggle_tracking_on_and_off() {
+    let mut c = Ctx::new();
+    c.run(&["HELLO", "3"]);
+    // seq = 0 -> CLIENT TRACKING ON OPTIN bumps to 1.
+    expect_ok(&c.run(&["CLIENT", "TRACKING", "ON", "OPTIN"]));
+    // CACHING YES captures seq 1.
+    expect_ok(&c.run(&["CLIENT", "CACHING", "YES"]));
+    // OFF then ON again: seq = 3, caching stays 1, so OPTIN no longer matches.
+    c.run(&["CLIENT", "TRACKING", "OFF"]);
+    expect_ok(&c.run(&["CLIENT", "TRACKING", "ON", "OPTIN"]));
+    c.run(&["GET", "foo"]);
+    c.run(&["SET", "foo", "tmp"]);
+    assert_eq!(c.push_count(), 0);
+}
+
+/// `ClientTrackingReadKey` (server_family_test.cc:383).
+#[test]
+fn client_tracking_read_key() {
+    let mut c = Ctx::new();
+    c.run(&["HELLO", "3"]);
+    c.run(&["CLIENT", "TRACKING", "ON"]);
+
+    c.run(&["SET", "FOO", "10"]);
+    c.run(&["GET", "FOO"]);
+    assert_eq!(c.push_count(), 0);
+
+    c.run(&["GET", "BAR"]);
+    assert_eq!(c.push_count(), 0);
+}
+
+/// `ClientTrackingOptin` (server_family_test.cc:396).
+#[test]
+fn client_tracking_optin() {
+    let mut c = Ctx::new();
+    c.run(&["HELLO", "3"]);
+    c.run(&["CLIENT", "TRACKING", "ON", "OPTIN"]);
+
+    c.run(&["GET", "FOO"]);
+    c.run(&["SET", "FOO", "10"]);
+    assert_eq!(c.push_count(), 0);
+    c.run(&["GET", "FOO"]);
+    assert_eq!(c.push_count(), 0);
+
+    // CACHING YES: the next read is tracked.
+    c.run(&["CLIENT", "CACHING", "YES"]);
+    c.run(&["GET", "FOO"]);
+    c.run(&["SET", "FOO", "20"]);
+    c.run(&["GET", "FOO"]);
+    assert_eq!(c.push_count(), 1);
+
+    // BAR was never tracked (its reads came before CACHING YES).
+    c.run(&["GET", "BAR"]);
+    c.run(&["SET", "BAR", "20"]);
+    c.run(&["GET", "BAR"]);
+    assert_eq!(c.push_count(), 1);
+
+    c.run(&["CLIENT", "CACHING", "YES"]);
+    c.run(&["GET", "BAR"]);
+    c.run(&["SET", "BAR", "20"]);
+    c.run(&["GET", "BAR"]);
+    assert_eq!(c.push_count(), 2);
+}
+
+/// `ClientTrackingMulti` (server_family_test.cc:426).
+#[test]
+fn client_tracking_multi() {
+    let mut c = Ctx::new();
+    c.run(&["HELLO", "3"]);
+    c.run(&["CLIENT", "TRACKING", "ON"]);
+    c.run(&["MULTI"]);
+    c.run(&["GET", "FOO"]);
+    c.run(&["SET", "TMP", "10"]);
+    c.run(&["GET", "FOOBAR"]);
+    c.run(&["EXEC"]);
+
+    c.run(&["SET", "FOO", "10"]);
+    c.run(&["SET", "FOOBAR", "10"]);
+    assert_eq!(c.push_count(), 2);
+}
+
+/// `ClientTrackingCompatibilityMulti` (server_family_test.cc:440).
+#[test]
+fn client_tracking_compatibility_multi() {
+    let mut c = Ctx::new();
+    c.run(&["HELLO", "3"]);
+    c.run(&["MULTI"]);
+    expect_text(&c.run(&["CLIENT", "TRACKING", "ON"]), "QUEUED");
+    expect_text(&c.run(&["CLIENT", "KILL", "127.0.0.1:6380"]), "QUEUED");
+    expect_text(&c.run(&["CLIENT", "SETNAME", "YO"]), "QUEUED");
+    expect_text(&c.run(&["CLIENT", "GETNAME"]), "QUEUED");
+    c.run(&["EXEC"]);
+
+    c.run(&["GET", "FOO"]);
+    c.run(&["SET", "FOO", "10"]);
+    assert_eq!(c.push_count(), 1);
+
+    c.run(&["MULTI"]);
+    expect_text(&c.run(&["CLIENT", "PAUSE", "0", "WRITE"]), "QUEUED");
+    c.run(&["EXEC"]);
+}
+
+/// `ClientTrackingMultiOptin` (server_family_test.cc:465).
+#[test]
+fn client_tracking_multi_optin() {
+    let mut c = Ctx::new();
+    c.run(&["HELLO", "3"]);
+    c.run(&["CLIENT", "TRACKING", "ON", "OPTIN"]);
+    c.run(&["CLIENT", "CACHING", "YES"]);
+
+    // A discarded MULTI must not track anything.
+    c.run(&["MULTI"]);
+    c.run(&["GET", "FOO"]);
+    c.run(&["SET", "TMP", "10"]);
+    c.run(&["GET", "FOOBAR"]);
+    c.run(&["DISCARD"]);
+    c.run(&["SET", "FOO", "10"]);
+    assert_eq!(c.push_count(), 0);
+
+    // Reads inside the EXEC are tracked (stickiness).
+    c.run(&["CLIENT", "CACHING", "YES"]);
+    c.run(&["MULTI"]);
+    c.run(&["GET", "FOO"]);
+    c.run(&["SET", "TMP", "10"]);
+    c.run(&["GET", "FOOBAR"]);
+    c.run(&["EXEC"]);
+    c.run(&["SET", "FOO", "10"]);
+    c.run(&["SET", "FOOBAR", "10"]);
+    assert_eq!(c.push_count(), 2);
+
+    // CACHING YES enclosed in MULTI.
+    c.run(&["MULTI"]);
+    c.run(&["GET", "TMP"]);
+    c.run(&["GET", "TMP_TMP"]);
+    c.run(&["SET", "TMP", "10"]);
+    c.run(&["CLIENT", "CACHING", "YES"]);
+    c.run(&["GET", "FOO"]);
+    c.run(&["GET", "FOOBAR"]);
+    c.run(&["EXEC"]);
+    assert_eq!(c.push_count(), 2);
+    c.run(&["SET", "TMP", "10"]);
+    assert_eq!(c.push_count(), 2);
+    c.run(&["SET", "FOO", "10"]);
+    assert_eq!(c.push_count(), 3);
+    c.run(&["SET", "FOOBAR", "10"]);
+    assert_eq!(c.push_count(), 4);
+
+    // CACHING YES enclosed in MULTI, with an untracked GET.
+    c.run(&["MULTI"]);
+    c.run(&["GET", "TMP"]);
+    c.run(&["SET", "TMP", "10"]);
+    c.run(&["CLIENT", "CACHING", "YES"]);
+    c.run(&["GET", "FOO"]);
+    c.run(&["GET", "BAR"]);
+    c.run(&["EXEC"]);
+    assert_eq!(c.push_count(), 4);
+    c.run(&["SET", "FOO", "10"]);
+    c.run(&["GET", "FOO"]);
+    assert_eq!(c.push_count(), 5);
+    c.run(&["SET", "BAR", "10"]);
+    c.run(&["GET", "BAR"]);
+    assert_eq!(c.push_count(), 6);
+}
+
+/// `ClientTrackingOptout` (server_family_test.cc:526).
+#[test]
+fn client_tracking_optout() {
+    let mut c = Ctx::new();
+    c.run(&["HELLO", "3"]);
+    c.run(&["CLIENT", "TRACKING", "ON", "OPTOUT"]);
+    c.run(&["GET", "FOO"]);
+    c.run(&["SET", "FOO", "BAR"]);
+    c.run(&["GET", "BAR"]);
+    c.run(&["SET", "BAR", "FOO"]);
+    assert_eq!(c.push_count(), 2);
+
+    // CACHING NO excludes the next read.
+    c.run(&["CLIENT", "CACHING", "NO"]);
+    c.run(&["GET", "FOO"]);
+    c.run(&["SET", "FOO", "BAR"]);
+    assert_eq!(c.push_count(), 2);
+}
+
+/// `ClientTrackingMultiOptout` (server_family_test.cc:543).
+#[test]
+fn client_tracking_multi_optout() {
+    let mut c = Ctx::new();
+    c.run(&["HELLO", "3"]);
+    c.run(&["CLIENT", "TRACKING", "ON", "OPTOUT"]);
+
+    c.run(&["MULTI"]);
+    c.run(&["GET", "FOO"]);
+    c.run(&["SET", "TMP", "10"]);
+    c.run(&["GET", "FOOBAR"]);
+    c.run(&["EXEC"]);
+    c.run(&["SET", "FOO", "10"]);
+    c.run(&["SET", "FOOBAR", "10"]);
+    assert_eq!(c.push_count(), 2);
+
+    // CACHING NO enclosed in MULTI.
+    c.run(&["MULTI"]);
+    c.run(&["CLIENT", "CACHING", "NO"]);
+    c.run(&["GET", "TMP"]);
+    c.run(&["GET", "TMP_TMP"]);
+    c.run(&["SET", "TMP", "10"]);
+    c.run(&["SET", "TMP_TMP", "10"]);
+    c.run(&["EXEC"]);
+    assert_eq!(c.push_count(), 2);
+}
+
+/// `ClientTrackingUpdateKey` (server_family_test.cc:570). Writes come from a
+/// second connection; the tracking client reads each invalidation push.
+#[test]
+fn client_tracking_update_key() {
+    let mut c = Ctx::new();
+    let mut w = c.conn();
+    c.run(&["HELLO", "3"]);
+    c.run(&["CLIENT", "TRACKING", "ON"]);
+
+    c.run(&["GET", "FOO"]);
+    w.cmd(&["SET", "FOO", "10"]).unwrap();
+    assert_eq!(invalidation_key(&c.read_push()), Some("FOO".into()));
+
+    // Invalidation is sent once per write; a re-read alone adds nothing.
+    c.run(&["GET", "FOO"]);
+    assert_eq!(c.push_count(), 0);
+
+    // Update from the other connection invalidates the re-initialized key.
+    c.run(&["GET", "FOO"]);
+    w.cmd(&["SET", "FOO", "30"]).unwrap();
+    assert_eq!(invalidation_key(&c.read_push()), Some("FOO".into()));
+
+    // MGET tracks many keys; MSET invalidates only the written subset.
+    c.run(&[
+        "MGET", "X1", "X2", "X3", "X4", "Y1", "Y2", "Y3", "Y4", "Z1", "Z2", "Z3", "Z4",
+    ]);
+    w.cmd(&["MSET", "X1", "1", "Y3", "2", "Z2", "3", "Z4", "5"])
+        .unwrap();
+    let mut keys: Vec<String> = (0..4)
+        .map(|_| invalidation_key(&c.read_push()).expect("key push"))
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["X1", "Y3", "Z2", "Z4"]);
+
+    // FLUSHDB drops the whole tracking map and broadcasts a null-keyed push
+    // (`SendInvalidationMessages`, invalidate_due_to_flush).
+    w.cmd(&["FLUSHDB"]).unwrap();
+    assert_eq!(invalidation_key(&c.read_push()), None);
+}
+
+/// `ClientTrackingDeleteKey` (server_family_test.cc:604).
+#[test]
+fn client_tracking_delete_key() {
+    let mut c = Ctx::new();
+    let mut w = c.conn();
+    c.run(&["HELLO", "3"]);
+    c.run(&["CLIENT", "TRACKING", "ON"]);
+    c.run(&["SET", "FOO", "10"]);
+    c.run(&["GET", "FOO"]);
+    w.cmd(&["DEL", "FOO"]).unwrap();
+    assert_eq!(invalidation_key(&c.read_push()), Some("FOO".into()));
+}
+
+/// `ClientTrackingRenameKey` (server_family_test.cc:614): the source key is
+/// invalidated.
+#[test]
+fn client_tracking_rename_key() {
+    let mut c = Ctx::new();
+    let mut w = c.conn();
+    c.run(&["HELLO", "3"]);
+    c.run(&["CLIENT", "TRACKING", "ON"]);
+    c.run(&["SET", "FOO", "10"]);
+    c.run(&["GET", "FOO"]);
+    w.cmd(&["RENAME", "FOO", "BAR"]).unwrap();
+    assert_eq!(invalidation_key(&c.read_push()), Some("FOO".into()));
+}
+
+/// `ClientTrackingExpireKey` (server_family_test.cc:624): EXPIRE is a write
+/// that invalidates the tracked key; the key then reads as nil after expiry.
+#[test]
+fn client_tracking_expire_key() {
+    let _g = clock_guard();
+    let mut c = Ctx::new();
+    c.run(&["HELLO", "3"]);
+    c.run(&["CLIENT", "TRACKING", "ON"]);
+    c.run(&["SET", "C", "10"]);
+    c.run(&["GET", "C"]);
+    c.run(&["EXPIRE", "C", "1"]);
+    assert_eq!(invalidation_key(&c.read_push()), Some("C".into()));
+    advance(1000);
+    expect_null(&c.run(&["GET", "C"]));
+    assert_eq!(c.push_count(), 0);
+}
+
+/// `ClientTrackingSelectDB` (server_family_test.cc:637): the tracking map is
+/// shared across DBs, so a write in another DB invalidates the same key.
+#[test]
+fn client_tracking_select_db() {
+    let mut c = Ctx::new();
+    let mut w = c.conn();
+    c.run(&["HELLO", "3"]);
+    c.run(&["CLIENT", "TRACKING", "ON"]);
+    c.run(&["SET", "C", "10"]);
+    c.run(&["GET", "C"]);
+    w.cmd(&["SELECT", "2"]).unwrap();
+    w.cmd(&["SET", "C", "1000"]).unwrap();
+    assert_eq!(invalidation_key(&c.read_push()), Some("C".into()));
+}
+
+/// `ClientTrackingNonTransactionalBug` (server_family_test.cc:649): running a
+/// non-transactional command right after enabling tracking must not crash.
+#[test]
+fn client_tracking_non_transactional_bug() {
+    let mut c = Ctx::new();
+    c.run(&["HELLO", "3"]);
+    c.run(&["CLIENT", "TRACKING", "ON"]);
+    let v = c.run(&["CLUSTER", "SLOTS"]);
+    // The port has no CLUSTER support; the reference only checks for a crash.
+    assert!(matches!(v, Value::Error(_)));
+}
+
+/// `ClientTrackingLuaBug` (server_family_test.cc:656): reads and writes inside
+/// EVAL are tracked and invalidated, and tracking sticks across scripts.
+#[test]
+fn client_tracking_lua_bug() {
+    let mut c = Ctx::new();
+    c.run(&["HELLO", "3"]);
+    c.run(&["CLIENT", "TRACKING", "ON"]);
+
+    let eval = "redis.call('get', 'foo'); redis.call('set', 'foo', 'bar'); ";
+    c.run(&["EVAL", &format!("{eval}return 1"), "1", "foo"]);
+    c.run(&["PING"]);
+    assert_eq!(c.push_count(), 1);
+
+    let eval2 =
+        format!("{eval}redis.call('get', 'oof'); redis.call('set', 'oof', 'bar'); return 1");
+    c.run(&["EVAL", &eval2, "2", "foo", "oof"]);
+    c.run(&["PING"]);
+    assert_eq!(c.push_count(), 3);
 }

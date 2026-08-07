@@ -1548,6 +1548,7 @@ mod tests {
             RespValue::Map(m) => format!("MAP{}", m.len()),
             RespValue::Bool(b) => b.to_string(),
             RespValue::Double(f) => crate::util::format_double(*f),
+            RespValue::Push(_) => "(push)".into(),
         }
     }
 

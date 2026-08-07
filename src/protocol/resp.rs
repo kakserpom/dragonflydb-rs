@@ -261,6 +261,14 @@ pub fn encode_reply(value: &RespValue, out: &mut Vec<u8>) {
             }
             encode_reply(&RespValue::Array(items), out);
         }
+        RespValue::Push(items) => {
+            out.extend_from_slice(b">");
+            out.extend_from_slice(&crate::util::itoa(items.len() as i64));
+            out.extend_from_slice(b"\r\n");
+            for item in items {
+                encode_reply(item, out);
+            }
+        }
     }
 }
 

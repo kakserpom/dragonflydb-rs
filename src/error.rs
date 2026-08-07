@@ -154,6 +154,8 @@ pub enum RespValue {
     Double(f64),
     Bool(bool),
     Map(Vec<(RespValue, RespValue)>),
+    /// An RESP3 push message (`>N\r\n`), e.g. client invalidation broadcasts.
+    Push(Vec<RespValue>),
 }
 
 impl RespValue {

@@ -297,6 +297,7 @@ impl Coordinator {
                 first_key_idx: msg.first_key_idx,
                 db_idx: msg.db_idx,
                 owns_all_keys,
+                track_keys: msg.track_keys,
                 ack: ack_tx,
             });
             if ok.is_ok() {
@@ -510,6 +511,8 @@ impl Coordinator {
             read_only,
             num_shards: self.num_shards,
             db_idx: msg.db_idx,
+            conn_id: msg.conn_id,
+            track_keys: msg.track_keys,
             atomic,
             tx_id,
             locked_shards,
@@ -696,6 +699,8 @@ impl Coordinator {
             read_only,
             num_shards: self.num_shards,
             db_idx: msg.db_idx,
+            conn_id: msg.conn_id,
+            track_keys: msg.track_keys,
             atomic,
             tx_id,
             locked_shards,
@@ -777,6 +782,7 @@ impl Coordinator {
                     first_key_idx: 0,
                     db_idx: msg.db_idx,
                     owns_all_keys: false,
+                    track_keys: msg.track_keys,
                     ack: ack_tx,
                 })
                 .is_ok()
@@ -793,6 +799,8 @@ impl Coordinator {
 
     /// Dispatch a single `redis.call(...)` subcommand to one shard and wait for
     /// its result. The shard is normally already locked by the script's tx.
+    /// `conn_id` and `track_keys` are forwarded so the shard can run the
+    /// CLIENT TRACKING read hook (`TrackIfNeeded`) for the subcommand.
     fn script_op(
         &mut self,
         shard: usize,
@@ -801,6 +809,8 @@ impl Coordinator {
         first_key_idx: usize,
         db_idx: usize,
         owns_all_keys: bool,
+        conn_id: u64,
+        track_keys: bool,
     ) -> CmdResult {
         let (result_tx, result_rx) = mpsc::channel();
         if self.shard_txs[shard]
@@ -810,6 +820,8 @@ impl Coordinator {
                 first_key_idx,
                 db_idx,
                 owns_all_keys,
+                conn_id,
+                track_keys,
                 result_tx,
             })
             .is_err()
@@ -862,6 +874,7 @@ impl Coordinator {
             seq,
             bytes: encode_result(result),
             slowlog_args,
+            is_push: false,
         });
     }
 
@@ -871,6 +884,7 @@ impl Coordinator {
             seq,
             bytes,
             slowlog_args: None,
+            is_push: false,
         });
     }
 }
@@ -954,6 +968,12 @@ struct ScriptCtx {
     num_shards: usize,
     /// The DB all subcommands run in (the connection's selected DB).
     db_idx: usize,
+    /// The connection running the script, forwarded to shards so the CLIENT
+    /// TRACKING read hook can attribute reads (`TrackIfNeeded`).
+    conn_id: u64,
+    /// Whether reads inside the script are tracked for this connection
+    /// (`ShouldTrackKeys` evaluated at EVAL dispatch time).
+    track_keys: bool,
     /// `ScriptParams::atomic` (i.e. `DetermineMultiMode`): atomic scripts hold
     /// their declared-key shards locked for the whole body (`LOCK_AHEAD`);
     /// `disable-atomicity` scripts lock each subcommand's shards only for the
@@ -1174,13 +1194,14 @@ impl ScriptDispatchCtx<'_> {
             if self.coord.shard_txs[s]
                 .send(ShardMsg::TxLock {
                     tx_id: self.ctx.tx_id,
-                    conn_id: 0,
+                    conn_id: self.ctx.conn_id,
                     seq: 0,
                     args: Vec::new(),
                     owned_key_idxs: Vec::new(),
                     first_key_idx: 0,
                     db_idx: self.ctx.db_idx,
                     owns_all_keys: false,
+                    track_keys: self.ctx.track_keys,
                     ack: ack_tx,
                 })
                 .is_err()
@@ -1296,6 +1317,8 @@ impl ScriptDispatchCtx<'_> {
                     fatal = run_squash_hop(
                         self.coord,
                         self.ctx.db_idx,
+                        self.ctx.conn_id,
+                        self.ctx.track_keys,
                         &mut batches,
                         &mut results,
                         &abort_flags,
@@ -1314,6 +1337,8 @@ impl ScriptDispatchCtx<'_> {
                 fatal = run_squash_hop(
                     self.coord,
                     self.ctx.db_idx,
+                    self.ctx.conn_id,
+                    self.ctx.track_keys,
                     &mut batches,
                     &mut results,
                     &abort_flags,
@@ -1330,6 +1355,8 @@ impl ScriptDispatchCtx<'_> {
             fatal = run_squash_hop(
                 self.coord,
                 self.ctx.db_idx,
+                self.ctx.conn_id,
+                self.ctx.track_keys,
                 &mut batches,
                 &mut results,
                 &abort_flags,
@@ -1442,6 +1469,8 @@ impl ScriptDispatchCtx<'_> {
                 first_key_idx,
                 self.ctx.db_idx,
                 true,
+                self.ctx.conn_id,
+                self.ctx.track_keys,
             );
             parts.push(ShardPart {
                 shard: 0,
@@ -1460,6 +1489,8 @@ impl ScriptDispatchCtx<'_> {
                     first_key_idx,
                     self.ctx.db_idx,
                     owns_all_keys,
+                    self.ctx.conn_id,
+                    self.ctx.track_keys,
                 );
                 parts.push(ShardPart {
                     shard: s,
@@ -1509,6 +1540,8 @@ impl ScriptDispatchCtx<'_> {
 fn run_squash_hop(
     coord: &mut Coordinator,
     db_idx: usize,
+    conn_id: u64,
+    track_keys: bool,
     batches: &mut [Vec<BatchEntry>],
     results: &mut [Option<CmdResult>],
     abort_flags: &[bool],
@@ -1530,6 +1563,8 @@ fn run_squash_hop(
                         first_key_idx: e.first_key_idx,
                         db_idx,
                         owns_all_keys: e.owns_all_keys,
+                        conn_id,
+                        track_keys,
                     })
                     .collect(),
                 result_tx,

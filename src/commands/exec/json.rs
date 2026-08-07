@@ -1777,6 +1777,7 @@ mod tests {
                 format!("[{}]", a.iter().map(render).collect::<Vec<_>>().join(", "))
             }
             RespValue::Map(m) => format!("MAP{}", m.len()),
+            RespValue::Push(_) => "(push)".into(),
         }
     }
 

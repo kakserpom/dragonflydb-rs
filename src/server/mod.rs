@@ -10,6 +10,7 @@ pub mod slowlog;
 /// Number of logical databases (matches upstream `FLAGS_dbnum` default).
 pub const MAX_DB: usize = 16;
 
+use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -449,6 +450,11 @@ pub struct Reply {
     /// `FormatEvalSlowlog`). Other commands send `None` and their raw tail is
     /// used instead.
     pub slowlog_args: Option<Vec<Vec<u8>>>,
+    /// A client-tracking invalidation push. Unlike a reply it is appended to
+    /// the connection's output immediately (`DragonflyConnection::SendPushMsg`),
+    /// not sequenced against the connection's request sequence, so it must never
+    /// reorder relative to the push that triggered it.
+    pub is_push: bool,
 }
 
 /// The watched-state snapshot of a single key, backing WATCH/EXEC.
@@ -512,6 +518,186 @@ pub struct SingleOp {
     /// True when the shard owns every key of the command (always, for single
     /// ops). Journals the full command tail instead of reduced per-shard args.
     pub owns_all_keys: bool,
+    /// Whether the issuing connection is tracking keys (CLIENT TRACKING), so
+    /// the shard records its reads for later invalidation.
+    pub track_keys: bool,
+}
+
+/// The CLIENT TRACKING mode of a connection (reference `ClientTracking::Mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackingMode {
+    /// Not in OPTIN/OPTOUT mode: every read is tracked.
+    None,
+    /// Only reads since a `CLIENT CACHING YES` are tracked.
+    OptIn,
+    /// Reads since `CLIENT CACHING NO` are not tracked.
+    OptOut,
+}
+
+/// CLIENT TRACKING state of one connection (the reference `ClientTracking`,
+/// conn_context.h:232).
+#[derive(Debug, Clone)]
+pub struct TrackingConn {
+    pub enabled: bool,
+    pub mode: TrackingMode,
+    pub noloop: bool,
+    pub redirect: u64,
+    /// `seq_num_`: bumped per non-MULTI command while tracking is enabled.
+    pub seq_num: u64,
+    /// `caching_seq_num_`: the seq captured by the last `CLIENT CACHING YES`.
+    pub caching_seq_num: u64,
+}
+
+impl TrackingConn {
+    #[must_use]
+    pub fn new() -> Self {
+        TrackingConn {
+            enabled: false,
+            mode: TrackingMode::None,
+            noloop: false,
+            redirect: 0,
+            seq_num: 0,
+            caching_seq_num: 1,
+        }
+    }
+}
+
+impl Default for TrackingConn {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The shared client-tracking table: every connection's tracking state plus the
+/// key -> readers index (`client_tracking_map_`). Guarded by a mutex; the IO
+/// thread mutates it on CLIENT TRACKING/CACHING and command dispatch, the shard
+/// threads append reads and drain invalidations.
+#[derive(Debug, Default)]
+pub struct Tracking {
+    conns: HashMap<u64, TrackingConn>,
+    /// Tracked key -> connections that read it while tracking.
+    tracked_keys: HashMap<Vec<u8>, Vec<u64>>,
+}
+
+impl Tracking {
+    #[must_use]
+    pub fn conn(&self, conn_id: u64) -> Option<&TrackingConn> {
+        self.conns.get(&conn_id)
+    }
+
+    pub fn set_enabled(&mut self, conn_id: u64, enabled: bool) {
+        // `ClientTracking::SetClientTracking` (conn_context.h:244) only flips
+        // the flag: `seq_num` keeps its value (the increment is gated on
+        // `IsTrackingOn`) and the tracked keys stay registered until a write
+        // invalidates them.
+        if let Some(c) = self.conns.get_mut(&conn_id) {
+            c.enabled = enabled;
+        } else {
+            let mut c = TrackingConn::new();
+            c.enabled = enabled;
+            self.conns.insert(conn_id, c);
+        }
+    }
+
+    pub fn set_mode(&mut self, conn_id: u64, mode: TrackingMode) {
+        if let Some(c) = self.conns.get_mut(&conn_id) {
+            c.mode = mode;
+        }
+    }
+
+    pub fn set_noloop(&mut self, conn_id: u64, noloop: bool) {
+        if let Some(c) = self.conns.get_mut(&conn_id) {
+            c.noloop = noloop;
+        }
+    }
+
+    /// `ClientTracking::IncrementSeqNum` (main_service.cc:1707): every non-MULTI
+    /// command while tracking is enabled.
+    pub fn inc_seq(&mut self, conn_id: u64) {
+        if let Some(c) = self.conns.get_mut(&conn_id)
+            && c.enabled
+        {
+            c.seq_num += 1;
+        }
+    }
+
+    /// `ClientCaching` (server_family.cc): capture `caching_seq_num_`. Inside a
+    /// MULTI block the current seq is captured before the command bumps it.
+    pub fn set_caching(&mut self, conn_id: u64, is_multi: bool) {
+        if let Some(c) = self.conns.get_mut(&conn_id)
+            && c.enabled
+        {
+            c.caching_seq_num = if is_multi && c.seq_num != 0 {
+                c.seq_num - 1
+            } else {
+                c.seq_num
+            };
+        }
+    }
+
+    /// `ClientTracking::ShouldTrackKeys` (conn_context.cc:297). Requires
+    /// tracking on; `noloop` never tracks (no REDIRECT support).
+    #[must_use]
+    pub fn should_track(&self, conn_id: u64) -> bool {
+        let Some(c) = self.conns.get(&conn_id) else {
+            return false;
+        };
+        if !c.enabled || c.noloop {
+            return false;
+        }
+        match c.mode {
+            TrackingMode::None => true,
+            TrackingMode::OptIn => c.seq_num == 1 + c.caching_seq_num,
+            TrackingMode::OptOut => c.seq_num != 1 + c.caching_seq_num,
+        }
+    }
+
+    /// Record that `conn_id` read `keys` while tracking (`DbSlice::TrackKey`).
+    /// The reference's `client_tracking_map_` is a single per-DbSlice member
+    /// (keys invalidate across DBs), which a single keyed table mirrors. The
+    /// decision was already made at dispatch (`track_keys`); the insert does
+    /// not re-check `should_track`.
+    pub fn record_reads(&mut self, conn_id: u64, keys: &[Vec<u8>]) {
+        for key in keys {
+            let e = self.tracked_keys.entry(key.clone()).or_default();
+            if !e.contains(&conn_id) {
+                e.push(conn_id);
+            }
+        }
+    }
+
+    /// Invalidate the tracked readers of `key`, returning their connection ids
+    /// and dropping the key from the index.
+    pub fn invalidate_key(&mut self, key: &[u8]) -> Vec<u64> {
+        self.tracked_keys.remove(key).unwrap_or_default()
+    }
+
+    /// `FlushDb` (db_slice.cc:1100): drop every tracked key (no per-key
+    /// messages) and return every connection with tracking on — the recipients
+    /// of the `["invalidate", nil]` flush push (`SendInvalidationMessages`).
+    pub fn invalidate_all(&mut self) -> Vec<u64> {
+        self.tracked_keys.clear();
+        self.conns
+            .iter()
+            .filter(|(_, c)| c.enabled)
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
+    /// Remove a connection's tracking state (connection close / RESET).
+    pub fn remove_conn(&mut self, conn_id: u64) {
+        self.conns.remove(&conn_id);
+        self.clear_keys(conn_id);
+    }
+
+    fn clear_keys(&mut self, conn_id: u64) {
+        self.tracked_keys.retain(|_, readers| {
+            !readers.contains(&conn_id) || {
+                readers.retain(|&r| r != conn_id);
+                !readers.is_empty()
+            }
+        });
+    }
 }
 
 /// Messages to a shard thread.
@@ -527,6 +713,8 @@ pub enum ShardMsg {
         first_key_idx: usize,
         db_idx: usize,
         owns_all_keys: bool,
+        /// Whether the issuing connection is tracking keys (CLIENT TRACKING).
+        track_keys: bool,
         ack: mpsc::Sender<()>,
     },
     TxExec {
@@ -570,6 +758,11 @@ pub enum ShardMsg {
         first_key_idx: usize,
         db_idx: usize,
         owns_all_keys: bool,
+        /// The connection running the script (`TrackIfNeeded` needs the issuing
+        /// connection to record tracked reads).
+        conn_id: u64,
+        /// Whether the connection is tracking keys (CLIENT TRACKING).
+        track_keys: bool,
         result_tx: mpsc::Sender<crate::error::CmdResult>,
     },
     /// A squashed batch of `redis.acall`/`redis.apcall` subcommands that all
@@ -667,6 +860,10 @@ pub struct ScriptBatchEntry {
     pub first_key_idx: usize,
     pub db_idx: usize,
     pub owns_all_keys: bool,
+    /// The connection running the script, for tracked-read recording.
+    pub conn_id: u64,
+    /// Whether the connection is tracking keys (CLIENT TRACKING).
+    pub track_keys: bool,
 }
 
 /// Messages to the transaction coordinator.
@@ -685,6 +882,9 @@ pub struct CoordMsg {
     /// True when the command runs inside a MULTI block: a blocking command must
     /// not wait, so the coordinator replies nil instead of re-queueing it.
     pub no_block: bool,
+    /// Whether the issuing connection is tracking keys (CLIENT TRACKING), so
+    /// the coordinator forwards the flag to the shards (`TrackIfNeeded`).
+    pub track_keys: bool,
     /// The `slowlog_log_slower_than` threshold at dispatch time, in usec. The
     /// coordinator uses it to count a script's slow subcommands
     /// (`stats.slow_commands`).
@@ -723,6 +923,9 @@ pub struct ServerEnv {
     /// renders the section via the INFO merge), and scoped to this server so
     /// in-process test servers stay isolated.
     pub command_stats: Arc<Mutex<crate::commands::exec::server::CommandStatsMap>>,
+    /// The shared CLIENT TRACKING table: connections' tracking state plus the
+    /// tracked-key index, written by the IO thread and read by the shard threads.
+    pub tracking: Arc<Mutex<Tracking>>,
 }
 
 impl ServerEnv {

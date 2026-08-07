@@ -5,7 +5,7 @@ use std::sync::mpsc;
 
 use dragonflydb::commands::lua::ScriptMgr;
 use dragonflydb::server::event_loop::IoLoop;
-use dragonflydb::server::{Reply, ReplyBus, ServerEnv};
+use dragonflydb::server::{Reply, ReplyBus, ServerEnv, Tracking};
 use dragonflydb::server::{coordinator, shard};
 
 #[global_allocator]
@@ -110,10 +110,11 @@ fn main() {
         dragonflydb::server::replication::FullSyncBus::new(repl_tx.clone(), pipefds[1]);
 
     // Shard threads.
+    let tracking = Arc::new(std::sync::Mutex::new(Tracking::default()));
     let mut shard_txs = Vec::with_capacity(num_shards);
     for s in 0..num_shards {
         let (tx, rx) = mpsc::channel();
-        let _ = shard::spawn(s, rx);
+        let _ = shard::spawn(s, rx, tracking.clone(), reply_bus.clone());
         shard_txs.push(tx);
     }
 
@@ -164,6 +165,7 @@ fn main() {
         script_mgr,
         listen_port: port,
         command_stats,
+        tracking,
     };
 
     println!("dragonflydb-rs listening on 0.0.0.0:{port} with {num_shards} shards");

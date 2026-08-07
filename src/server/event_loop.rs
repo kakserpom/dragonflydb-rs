@@ -19,9 +19,9 @@ use crate::server::replica::{self, ReplicaPhase, ReplicaStatus};
 use crate::server::replication::{self, ChunkKind, ReplChunk, ReplicationManager, SyncState};
 use crate::server::slowlog::{SlowLog, SlowLogEntry};
 use crate::server::{
-    CoordMsg, GcRequest, Reply, ServerEnv, ShardMsg, SingleOp, WatchState, command_for,
-    encode_value, extract_keys, is_eval_cmd, is_function_cmd, keys_per_shard, local_function,
-    local_script,
+    CoordMsg, GcRequest, Reply, ServerEnv, ShardMsg, SingleOp, TrackingMode, WatchState,
+    command_for, encode_value, extract_keys, is_eval_cmd, is_function_cmd, keys_per_shard,
+    local_function, local_script,
 };
 
 const EV_READ: i16 = libc::EVFILT_READ;
@@ -269,6 +269,10 @@ struct Conn {
     buffered: BTreeMap<u64, Vec<u8>>,
     /// The connection's currently selected DB index.
     db_idx: usize,
+    /// Whether the connection negotiated RESP3 (`HELLO 3`). CLIENT TRACKING and
+    /// CACHING reject RESP2 connections, and invalidation pushes are only ever
+    /// sent to RESP3 connections.
+    resp3: bool,
     /// MULTI/EXEC transaction state.
     multi: MultiState,
     /// True while EXEC runs the queued commands: their blocking commands must
@@ -489,6 +493,7 @@ impl IoLoop {
                 deliver_seq: 0,
                 buffered: BTreeMap::new(),
                 db_idx: 0,
+                resp3: false,
                 multi: MultiState::default(),
                 exec_multi: false,
                 watched: Vec::new(),
@@ -520,6 +525,9 @@ impl IoLoop {
             self.fd_to_id.remove(&conn.fd);
             self.pubsub.remove_conn(conn_id);
             self.monitors.retain(|&c| c != conn_id);
+            // Drop the connection's tracking state (`SetClientTracking(false)`
+            // on close, main_service.cc:1955); its registered keys go too.
+            self.env.tracking.lock().unwrap().remove_conn(conn_id);
             unsafe { libc::close(conn.fd) };
         }
     }
@@ -681,17 +689,35 @@ impl IoLoop {
                     Some(v) => self.deliver(conn_id, seq, encode_value(&v)),
                     None => self.deliver(conn_id, seq, Vec::new()),
                 }
+                self.tracking_seq_advance(conn_id);
                 return;
             }
             if cmd.name == "DFLY" {
                 self.dfly(conn_id, seq, &args);
+                self.tracking_seq_advance(conn_id);
                 return;
             }
             let v = self.handle_local(conn_id, cmd, &args);
             self.deliver(conn_id, seq, encode_value(&v));
+            // The tracking sequence is bumped after the command's state changes:
+            // `CLIENT TRACKING ON` (the increment sees tracking now enabled) and
+            // `OFF` (no increment) behave exactly like the reference's
+            // post-dispatch `IncrementSequenceNumber`.
+            self.tracking_seq_advance(conn_id);
             return;
         }
         self.dispatch_keyed(conn_id, seq, cmd, &args);
+        self.tracking_seq_advance(conn_id);
+    }
+
+    /// `IncrementSequenceNumber` (main_service.cc:1707): bump the tracking
+    /// sequence of a connection that just ran a top-level (non-MULTI) command.
+    /// The increment is gated on tracking being enabled, so it runs after the
+    /// command's own `CLIENT TRACKING` state change. Queued MULTI commands run
+    /// through `run_queued` and never reach this path; MULTI/EXEC/DISCARD
+    /// return before it (`cid->IsMulti()`).
+    fn tracking_seq_advance(&self, conn_id: u64) {
+        self.env.tracking.lock().unwrap().inc_seq(conn_id);
     }
 
     /// Split a command by its keys and send it to a shard or the coordinator.
@@ -865,6 +891,16 @@ impl IoLoop {
                 )
             {
                 conn.db_idx = db as usize;
+            }
+            return v;
+        }
+        if cmd.name == "HELLO" {
+            // The negotiated protocol version is captured for RESP3 gating
+            // (client tracking). HELLO 3 returns a map response.
+            let v = server::local_hello(args);
+            let resp3 = matches!(args.get(1).and_then(|a| crate::util::parse_i64(a)), Some(3));
+            if let Some(conn) = self.conns.get_mut(&conn_id) {
+                conn.resp3 = resp3;
             }
             return v;
         }
@@ -1089,7 +1125,15 @@ impl IoLoop {
             conn.db_idx = 0;
             conn.sub = SubscribeInfo::default();
             conn.monitor = false;
+            // RESET drops client tracking and re-negotiates the protocol
+            // (`ConnectionContext::Reset`).
+            conn.resp3 = false;
         }
+        self.env
+            .tracking
+            .lock()
+            .unwrap()
+            .set_enabled(conn_id, false);
         self.pubsub.remove_conn(conn_id);
         self.monitors.retain(|&c| c != conn_id);
         self.deliver(
@@ -1564,6 +1608,8 @@ impl IoLoop {
             b"INFO" => RespValue::Error("ERR syntax error".into()),
             b"SETNAME" | b"SETINFO" | b"NO-EVICT" | b"NO-TOUCH" => RespValue::Simple("OK".into()),
             b"GETNAME" => RespValue::Bulk(Vec::new()),
+            b"TRACKING" => self.local_tracking(args, conn_id),
+            b"CACHING" => self.local_caching(args, conn_id),
             b"ID" => self
                 .conns
                 .get(&conn_id)
@@ -1573,6 +1619,102 @@ impl IoLoop {
                     .into(),
             ),
         }
+    }
+
+    /// `ClientTracking` (server_family.cc:513). RESP2 is rejected; the only
+    /// subcommand options are OPTIN/OPTOUT/NOLOOP. The tracking state lives in
+    /// the shared `Tracking` table.
+    fn local_tracking(&self, args: &[Vec<u8>], conn_id: u64) -> RespValue {
+        if !self.conns.get(&conn_id).is_some_and(|c| c.resp3) {
+            return RespValue::Error(
+                "ERR Client tracking is currently not supported for RESP2. Please use RESP3."
+                    .into(),
+            );
+        }
+        let sub = &args[2..];
+        if sub.is_empty() || sub.len() > 3 {
+            return RespValue::Error("ERR syntax error".into());
+        }
+        let is_on = if sub[0].eq_ignore_ascii_case(b"ON") {
+            true
+        } else if sub[0].eq_ignore_ascii_case(b"OFF") {
+            false
+        } else {
+            return RespValue::Error("ERR syntax error".into());
+        };
+        let mut mode = TrackingMode::None;
+        let mut noloop = false;
+        if sub.len() >= 2 {
+            if sub[1].eq_ignore_ascii_case(b"OPTIN") {
+                mode = TrackingMode::OptIn;
+            } else if sub[1].eq_ignore_ascii_case(b"OPTOUT") {
+                mode = TrackingMode::OptOut;
+            } else if sub[1].eq_ignore_ascii_case(b"NOLOOP") {
+                noloop = true;
+            } else {
+                return RespValue::Error("ERR syntax error".into());
+            }
+        }
+        if sub.len() == 3 {
+            if !noloop && sub[2].eq_ignore_ascii_case(b"NOLOOP") {
+                noloop = true;
+            } else {
+                return RespValue::Error("ERR syntax error".into());
+            }
+        }
+        let mut tracking = self.env.tracking.lock().unwrap();
+        tracking.set_enabled(conn_id, is_on);
+        tracking.set_mode(conn_id, mode);
+        tracking.set_noloop(conn_id, noloop);
+        RespValue::Simple("OK".into())
+    }
+
+    /// `ClientCaching` (server_family.cc:564). The captured `caching_seq_num`
+    /// is `seq - 1` inside a MULTI/EXEC block so the seq advance of the block's
+    /// first read makes it tracked.
+    fn local_caching(&self, args: &[Vec<u8>], conn_id: u64) -> RespValue {
+        if !self.conns.get(&conn_id).is_some_and(|c| c.resp3) {
+            return RespValue::Error(
+                "ERR Client caching is currently not supported for RESP2. Please use RESP3.".into(),
+            );
+        }
+        if args.len() != 3 {
+            return RespValue::Error("ERR syntax error".into());
+        }
+        let mut tracking = self.env.tracking.lock().unwrap();
+        let Some(c) = tracking.conn(conn_id) else {
+            return RespValue::Error(
+                "ERR CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled".into(),
+            );
+        };
+        if !c.enabled {
+            return RespValue::Error(
+                "ERR CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled".into(),
+            );
+        }
+        let yes = args[2].eq_ignore_ascii_case(b"YES");
+        if yes {
+            if c.mode != TrackingMode::OptIn {
+                return RespValue::Error(
+                    "ERR CLIENT CACHING YES is only valid when tracking is enabled in OPTIN mode"
+                        .into(),
+                );
+            }
+        } else if args[2].eq_ignore_ascii_case(b"NO") {
+            if c.mode != TrackingMode::OptOut {
+                return RespValue::Error(
+                    "ERR CLIENT CACHING NO is only valid when tracking is enabled in OPTOUT mode"
+                        .into(),
+                );
+            }
+        } else {
+            return RespValue::Error("ERR syntax error".into());
+        }
+        // Queued CACHING commands run inside EXEC, where `exec_multi` carries
+        // the flag after the `multi` state was reset (`tx->IsMulti()`).
+        let is_multi = self.conns.get(&conn_id).is_some_and(|c| c.exec_multi);
+        tracking.set_caching(conn_id, is_multi);
+        RespValue::Simple("OK".into())
     }
 
     /// `ClientList` (server_family.cc:466): one info line per matching
@@ -2128,6 +2270,10 @@ impl IoLoop {
         owned: Vec<usize>,
     ) {
         let db_idx = self.conns.get(&conn_id).map_or(0, |c| c.db_idx);
+        // `IncrementSequenceNumber` has not run for this command yet, so
+        // `should_track` sees the pre-dispatch sequence (OPTIN: first command
+        // after CACHING YES, OPTOUT: any but the first, NONE: always).
+        let track_keys = self.should_track(conn_id);
         let op = SingleOp {
             conn_id,
             seq,
@@ -2136,6 +2282,7 @@ impl IoLoop {
             db_idx,
             owns_all_keys: true,
             reply: self.env.reply_bus_tx.clone(),
+            track_keys,
         };
         let _ = self.env.shard_txs[shard].send(ShardMsg::Single(op));
     }
@@ -2150,6 +2297,7 @@ impl IoLoop {
         first_key_idx: usize,
     ) {
         let db_idx = self.conns.get(&conn_id).map_or(0, |c| c.db_idx);
+        let track_keys = self.should_track(conn_id);
         let msg = CoordMsg {
             conn_id,
             seq,
@@ -2160,8 +2308,15 @@ impl IoLoop {
             db_idx,
             no_block: self.no_block(conn_id),
             slowlog_threshold_usec: self.slow_log.threshold(),
+            track_keys,
         };
         let _ = self.env.coord_tx.send(msg);
+    }
+
+    /// `TrackingConn::ShouldTrackKeys` (conn_context.h:232): enabled, not
+    /// noloop, and the seq matches the mode's requirement.
+    fn should_track(&self, conn_id: u64) -> bool {
+        self.env.tracking.lock().unwrap().should_track(conn_id)
     }
 
     // ------------------------------------------------------------------
@@ -2238,6 +2393,15 @@ impl IoLoop {
 
     fn drain_bus(&mut self) {
         while let Ok(reply) = self.reply_bus_rx.try_recv() {
+            if reply.is_push {
+                // An unsequenced push (e.g. a CLIENT TRACKING invalidation).
+                // It is appended straight to the connection's output buffer,
+                // bypassing the reply ordering machinery and slowlog.
+                if let Some(conn) = self.conns.get_mut(&reply.conn_id) {
+                    conn.out.extend_from_slice(&reply.bytes);
+                }
+                continue;
+            }
             self.deliver_with_args(reply.conn_id, reply.seq, reply.bytes, reply.slowlog_args);
         }
     }

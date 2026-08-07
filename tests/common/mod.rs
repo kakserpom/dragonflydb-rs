@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use dragonflydb::commands::lua::ScriptMgr;
 use dragonflydb::server::event_loop::IoLoop;
 use dragonflydb::server::replication::ReplChunk;
-use dragonflydb::server::{Reply, ReplyBus, ServerEnv, coordinator, shard};
+use dragonflydb::server::{Reply, ReplyBus, ServerEnv, Tracking, coordinator, shard};
 
 /// A running in-process server. Dropping it shuts the server down.
 pub struct TestServer {
@@ -25,13 +25,17 @@ pub struct TestServer {
     io_handle: Option<JoinHandle<()>>,
 }
 
-/// A RESP2 client bound to one connection of a [`TestServer`].
+/// A RESP client bound to one connection of a [`TestServer`].
 pub struct Client {
     stream: TcpStream,
     reader: BufReader<TcpStream>,
+    /// RESP3 push frames (`>N`) received so far, in arrival order. A push is
+    /// unsolicited (e.g. a CLIENT TRACKING invalidation), so `cmd` drains any
+    /// pushes that precede a reply into this queue instead of returning them.
+    pushes: std::collections::VecDeque<Vec<Value>>,
 }
 
-/// A decoded RESP value (RESP2).
+/// A decoded RESP value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     Simple(String),
@@ -39,6 +43,8 @@ pub enum Value {
     Integer(i64),
     Bulk(Option<Vec<u8>>),
     Array(Option<Vec<Value>>),
+    /// A RESP3 map (`%N\r\n`), e.g. the HELLO 3 reply.
+    Map(Vec<(Value, Value)>),
 }
 
 impl Value {
@@ -122,10 +128,11 @@ impl TestServer {
             dragonflydb::server::replication::FullSyncBus::new(repl_tx.clone(), pipefds[1]);
 
         // Shard threads.
+        let tracking = Arc::new(Mutex::new(Tracking::default()));
         let mut shard_txs = Vec::with_capacity(num_shards);
         for s in 0..num_shards {
             let (tx, rx) = mpsc::channel();
-            let _ = shard::spawn(s, rx);
+            let _ = shard::spawn(s, rx, tracking.clone(), reply_bus.clone());
             shard_txs.push(tx);
         }
 
@@ -172,6 +179,7 @@ impl TestServer {
             script_mgr,
             listen_port: port,
             command_stats,
+            tracking,
         };
 
         let mut io_loop = IoLoop::new(env, reply_rx, repl_rx, listener, pipefds[0]).unwrap();
@@ -240,6 +248,7 @@ impl Client {
         Ok(Self {
             reader: BufReader::new(stream.try_clone()?),
             stream,
+            pushes: std::collections::VecDeque::new(),
         })
     }
 
@@ -268,7 +277,49 @@ impl Client {
         self.read_value()
     }
 
+    /// Read the reply to a command, draining any RESP3 push frames received
+    /// before it into [`Self::pushes`] (invalidation broadcasts, pub/sub
+    /// messages). Pushes are stored as their inner arrays.
     fn read_value(&mut self) -> Result<Value, String> {
+        loop {
+            let frame = self.read_frame()?;
+            match frame {
+                Frame::Push(items) => self.pushes.push_back(items),
+                Frame::Reply(v) => return Ok(v),
+            }
+        }
+    }
+
+    fn read_frame(&mut self) -> Result<Frame, String> {
+        let t = self.next_type()?;
+        if t == b'>' {
+            let mut line = String::new();
+            self.reader
+                .read_line(&mut line)
+                .map_err(|e| e.to_string())?;
+            let n: i64 = line[1..]
+                .trim()
+                .parse()
+                .map_err(|_| "bad push count".to_string())?;
+            let mut items = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                items.push(self.parse_value()?);
+            }
+            return Ok(Frame::Push(items));
+        }
+        Ok(Frame::Reply(self.parse_value()?))
+    }
+
+    /// The next byte in the stream, without consuming it.
+    fn next_type(&mut self) -> Result<u8, String> {
+        let buf = self.reader.fill_buf().map_err(|e| e.to_string())?;
+        if buf.is_empty() {
+            return Err("connection closed".into());
+        }
+        Ok(buf[0])
+    }
+
+    fn parse_value(&mut self) -> Result<Value, String> {
         let mut line = String::new();
         self.reader
             .read_line(&mut line)
@@ -312,13 +363,58 @@ impl Client {
                 }
                 let mut items = Vec::with_capacity(n as usize);
                 for _ in 0..n {
-                    items.push(self.read_value()?);
+                    items.push(self.parse_value()?);
                 }
                 Ok(Value::Array(Some(items)))
+            }
+            b'%' => {
+                let n: i64 = line[1..]
+                    .trim()
+                    .parse()
+                    .map_err(|_| "bad map count".to_string())?;
+                let mut pairs = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    let k = self.parse_value()?;
+                    let v = self.parse_value()?;
+                    pairs.push((k, v));
+                }
+                Ok(Value::Map(pairs))
+            }
+            b'#' => {
+                let v = line[1..].trim();
+                match v {
+                    "t" => Ok(Value::Integer(1)),
+                    "f" => Ok(Value::Integer(0)),
+                    _ => Err("bad bool".to_string()),
+                }
             }
             other => Err(format!("unexpected reply byte {other}")),
         }
     }
+
+    /// The number of push frames received so far.
+    #[must_use]
+    pub fn push_count(&self) -> usize {
+        self.pushes.len()
+    }
+
+    /// Block until the next push frame arrives and return its inner array.
+    /// Reads without interpreting a reply, so it can be called right after a
+    /// write on another connection produced an invalidation.
+    pub fn read_push(&mut self) -> Vec<Value> {
+        if let Some(items) = self.pushes.pop_front() {
+            return items;
+        }
+        match self.read_frame().expect("read push frame") {
+            Frame::Push(items) => items,
+            Frame::Reply(v) => panic!("expected a push, got reply {v:?}"),
+        }
+    }
+}
+
+enum Frame {
+    Reply(Value),
+    Push(Vec<Value>),
 }
 
 impl Drop for Client {
@@ -500,6 +596,18 @@ impl Ctx {
     #[must_use]
     pub fn conn(&self) -> Client {
         self.server.client()
+    }
+
+    /// The number of RESP3 push frames the primary connection has received.
+    #[must_use]
+    pub fn push_count(&self) -> usize {
+        self.c.push_count()
+    }
+
+    /// Block for the next RESP3 push frame on the primary connection.
+    #[must_use]
+    pub fn read_push(&mut self) -> Vec<Value> {
+        self.c.read_push()
     }
 }
 
