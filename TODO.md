@@ -231,8 +231,16 @@ integration tests (`tests/*.rs`) that run against the in-process server
   before running the queue, which previously made queued BLPOP with timeout 0
   block forever); a blocked command that wakes to a wrong-type key stays
   blocked instead of erroring (`WrongTypeDoesNotWake`).
-- [ ] Remaining families (set, zset, stream, hll, geo, server,
-  scripting, json) still to be ported from `*_test.cc`.
+- [x] `set_family_test.cc` → `tests/set_family.rs` (31 tests). Source fixes:
+  deterministic SRANDMEMBER and SPOP/SRANDMEMBER trailing-argument parsing.
+- [x] `zset_family_test.cc` → `tests/zset_family.rs` (47 tests). Source
+  fixes: BYLEX range parity and the blocking-timeout wire shape.
+- [x] `hll_family_test.cc` → `tests/hll_family.rs` (20 tests).
+- [x] `geo_family_test.cc` → `tests/geo_family.rs` (12 tests).
+- [x] `bloom_family_test.cc` → `tests/bloom_family.rs` (8 tests).
+- [x] `cms_family_test.cc` → `tests/cms_family.rs` (11 tests).
+- [x] `cuckoo_filter_family_test.cc` → `tests/cuckoo_family.rs` (35 tests).
+- [x] `topk_family_test.cc` → `tests/topk_family.rs` (67 tests).
 - [x] `hset_family_test.cc` → `tests/hset_family.rs` (44 tests). Adaptations:
   real wall clock (field-TTL assertions use ranges where a second boundary can
   land between commands; `hexpire_no_expire_early` widens the TTL to 10s with a
@@ -246,6 +254,27 @@ integration tests (`tests/*.rs`) that run against the in-process server
   HSCAN scans small (listpack) hashes whole, ignoring COUNT; shared
   `parse_double` now rejects f64 overflow ("1e999", "1.8E+308") like the
   reference `ParseDouble`/`TryParseNum`.
+- [x] `stream_family_test.cc` → the in-file `streams.rs` tests module (12
+  tests: Add, AddExtended, Xclaim, XAutoClaim,
+  AutoClaimPelItemsFromAnotherConsumer, AutoClaimDelCount,
+  XClaimWithNonExistentGroup, XsetIdSmallerMaxDeleted, XAutoClaimEmptyConsumer,
+  XInfoGroups, XInfoConsumers, XInfoStream) plus a RESP2 wire-format probe in
+  `tests/stream_family.rs`. Unlike the other families the stream tests run
+  directly against `exec_*` on a `DbSlice` (no socket), because the reply
+  shape and per-connection watermark logic is asserted at the unit level.
+  Source fixes: XREAD/XREADGROUP reply with one nested `[key, [entries]]`
+  pair per stream and empty reads send a null *array*, not a null bulk (new
+  `RespValue::NilArray`; MULTI no-block and woken-XREADGROUP replies use it);
+  blocked `$` watermarks are resolved per connection (conn_id threaded through
+  `OpContext`/`TxCtx`/`run_exec`), so concurrent readers keep their own
+  watermark; XADD accepts ms-only ids (`xadd key 5` -> `5-0`) with the
+  sequence auto-completed like Redis; stream trim chunks live entries only
+  (counting tombstones underflowed the node-length subtraction after a MAXLEN
+  trim); XGROUP HELP bypasses the -3 arity and is NOSCRIPT from scripts;
+  `extract_movable_keys` scans past a stray STREAMS marker (a consumer
+  literally named STREAMS).
+- [ ] Remaining families (server, scripting, json) still to be ported from
+  `*_test.cc`.
 
 ## Priority order
 1. Core data types: bitops, keys/generic, string, list, hash, set, zset, stream

@@ -54,20 +54,29 @@ fn parse_stream_id_literal(s: &[u8], missing_seq: u64) -> Result<StreamId, RespE
     }
 }
 
-fn next_star_id(last: StreamId, now_ms: u64) -> StreamId {
+/// The successor of `last` for an auto-generated id: the reference
+/// `StreamNextID` (stream_family.cc:831-839) increments in place and lets the
+/// final `id <= last` check reject the overflow wrap, so a stream whose last id
+/// is `X-UINT64_MAX` cannot accept a bare `*` (EDOM -> "equal or smaller").
+fn next_star_id(last: StreamId, now_ms: u64) -> Option<StreamId> {
     if now_ms > last.ms {
-        StreamId { ms: now_ms, seq: 0 }
+        Some(StreamId { ms: now_ms, seq: 0 })
+    } else if last.seq == u64::MAX {
+        None
     } else {
-        StreamId {
+        Some(StreamId {
             ms: last.ms,
             seq: last.seq + 1,
-        }
+        })
     }
 }
 
 fn parse_xadd_id(s: &[u8], last: StreamId, now_ms: u64) -> Result<StreamId, RespError> {
+    let leq_err = || {
+        RespError::new("ERR The ID specified in XADD is equal or smaller than the target stream top item")
+    };
     if s == b"*" {
-        return Ok(next_star_id(last, now_ms));
+        return next_star_id(last, now_ms).ok_or_else(leq_err);
     }
     let invalid = || RespError::new("ERR Invalid stream ID specified as stream command argument");
     let (ms, seq_str) = match s.iter().position(|&b| b == b'-') {
@@ -85,9 +94,10 @@ fn parse_xadd_id(s: &[u8], last: StreamId, now_ms: u64) -> Result<StreamId, Resp
     let seq_auto = seq_str.map_or(true, |s| s == b"*");
     if seq_auto {
         if ms < last.ms {
-            return Err(RespError::new(
-                "ERR The ID specified in XADD is equal or smaller than the target stream top item",
-            ));
+            return Err(leq_err());
+        }
+        if ms == last.ms && last.seq == u64::MAX {
+            return Err(leq_err());
         }
         return Ok(if ms == last.ms {
             StreamId { ms, seq: last.seq + 1 }
@@ -98,9 +108,7 @@ fn parse_xadd_id(s: &[u8], last: StreamId, now_ms: u64) -> Result<StreamId, Resp
     let seq = parse_u64(seq_str.unwrap()).ok_or_else(invalid)?;
     let id = StreamId { ms, seq };
     if id <= last {
-        return Err(RespError::new(
-            "ERR The ID specified in XADD is equal or smaller than the target stream top item",
-        ));
+        return Err(leq_err());
     }
     Ok(id)
 }
@@ -262,13 +270,54 @@ fn exec_xlen(ctx: &mut OpContext) -> CmdResult {
     }
 }
 
-fn parse_range_bound(s: &[u8], is_end: bool) -> Result<StreamId, RespError> {
-    if s == b"-" {
-        Ok(StreamId::MIN)
-    } else if s == b"+" {
-        Ok(StreamId::MAX)
+/// A parsed range bound: the id plus whether the bound is exclusive (`(`).
+type RangeBound = (StreamId, bool);
+
+/// Port of `ParseRangeId` (stream_family.cc:785-794). An exclusive bound keeps
+/// the ms part as-is (`(5` as an end means `< 5-MAX`, unlike Redis which
+/// decrements the ms), so a bare `(1609459200001` end still covers
+/// `1609459200001-*` entries.
+fn parse_range_bound(s: &[u8], is_end: bool) -> Result<RangeBound, RespError> {
+    let mut exclude = false;
+    let body = if s.starts_with(b"(") {
+        exclude = true;
+        &s[1..]
     } else {
-        parse_stream_id_literal(s, if is_end { u64::MAX } else { 0 })
+        s
+    };
+    let id = if body == b"-" {
+        StreamId::MIN
+    } else if body == b"+" {
+        StreamId::MAX
+    } else {
+        parse_stream_id_literal(body, if is_end { u64::MAX } else { 0 })?
+    };
+    Ok((id, exclude))
+}
+
+/// Successor id (`StreamIncrID`, stream_family.cc:59-73).
+fn stream_incr(id: StreamId) -> Option<StreamId> {
+    if id.seq == u64::MAX {
+        if id.ms == u64::MAX {
+            None
+        } else {
+            Some(StreamId { ms: id.ms + 1, seq: 0 })
+        }
+    } else {
+        Some(StreamId { ms: id.ms, seq: id.seq + 1 })
+    }
+}
+
+/// Predecessor id (`StreamDecrID`, stream_family.cc:77-91).
+fn stream_decr(id: StreamId) -> Option<StreamId> {
+    if id.seq == 0 {
+        if id.ms == 0 {
+            None
+        } else {
+            Some(StreamId { ms: id.ms - 1, seq: u64::MAX })
+        }
+    } else {
+        Some(StreamId { ms: id.ms, seq: id.seq - 1 })
     }
 }
 
@@ -310,13 +359,33 @@ fn exec_xrange_common(ctx: &mut OpContext, rev: bool) -> CmdResult {
         Ok(c) => c,
         Err(e) => return CmdResult::Err(e),
     };
-    let start = match parse_range_bound(start_arg, false) {
+    let (start, start_excl) = match parse_range_bound(start_arg, false) {
         Ok(s) => s,
         Err(e) => return CmdResult::Err(e),
     };
-    let end = match parse_range_bound(end_arg, true) {
+    let (end, end_excl) = match parse_range_bound(end_arg, true) {
         Ok(s) => s,
         Err(e) => return CmdResult::Err(e),
+    };
+    let start = if start_excl {
+        match stream_incr(start) {
+            Some(id) => id,
+            None => {
+                return CmdResult::Err(RespError::new("ERR invalid start ID for the interval"));
+            }
+        }
+    } else {
+        start
+    };
+    let end = if end_excl {
+        match stream_decr(end) {
+            Some(id) => id,
+            None => {
+                return CmdResult::Err(RespError::new("ERR invalid end ID for the interval"));
+            }
+        }
+    } else {
+        end
     };
     match ctx.db.find(key, ctx.now_ms) {
         Some(PrimeValue::Stream(s)) => {
@@ -692,6 +761,30 @@ fn merge_xread(parts: &[ShardPart], _args: &[Vec<u8>], keys: &[usize], _now: u64
     }
 }
 
+/// Whether every stream requested by an XREADGROUP carries the `>` id. A
+/// history read (concrete id) always replies array form, even an empty PEL.
+fn xreadgroup_all_gt(args: &[Vec<u8>]) -> bool {
+    // Mirror the option walk in `exec_xreadgroup` to find the STREAMS marker
+    // (a consumer may literally be named "STREAMS", as in
+    // XReadGroupConsumerNamedStreams).
+    let mut i = 1;
+    while i < args.len() {
+        let t = args[i].to_ascii_uppercase();
+        match t.as_slice() {
+            b"GROUP" => i += 3,
+            b"COUNT" | b"BLOCK" => i += 2,
+            b"NOACK" => i += 1,
+            b"STREAMS" => break,
+            _ => return false,
+        }
+    }
+    if i >= args.len() {
+        return false;
+    }
+    let n = (args.len() - i - 1) / 2;
+    (0..n).all(|j| args[i + 1 + n + j] == b">")
+}
+
 fn merge_xreadgroup(
     parts: &[ShardPart],
     args: &[Vec<u8>],
@@ -742,8 +835,13 @@ fn merge_xreadgroup(
     }
     if any {
         CmdResult::Ok(RespValue::Array(result))
-    } else {
+    } else if xreadgroup_all_gt(args) {
+        // A pure `>` read with nothing new replies nil (`XReadBlock` ->
+        // `SendNullArray`), even though `result` holds the empty pairs.
         CmdResult::Ok(RespValue::NilArray)
+    } else {
+        // A history read serves the requested keys with empty entry lists.
+        CmdResult::Ok(RespValue::Array(result))
     }
 }
 
@@ -831,6 +929,10 @@ fn exec_xreadgroup(ctx: &mut OpContext) -> CmdResult {
         key_idxs.push(si + 1 + j);
         id_args.push(args[si + 1 + n + j].clone());
     }
+    // Every requested id is `>`: only then can the command block or reply nil.
+    // A history read (concrete id) serves even an empty PEL (`HasEntries2`,
+    // stream_family.cc:3983-3987: serve_history -> have_entries).
+    let all_gt = id_args.iter().all(|id| id == b">");
 
     let mut out: Vec<RespValue> = Vec::new();
     let mut any = false;
@@ -886,7 +988,7 @@ fn exec_xreadgroup(ctx: &mut OpContext) -> CmdResult {
             }
         }
     }
-    if block_ms.is_some() && !any {
+    if block_ms.is_some() && !any && all_gt {
         return CmdResult::Blocked;
     }
     CmdResult::Ok(RespValue::Array(out))
@@ -929,7 +1031,7 @@ fn exec_xpending(ctx: &mut OpContext) -> CmdResult {
             if e.message.starts_with("WRONGTYPE") {
                 return CmdResult::Err(e);
             }
-            return CmdResult::Err(RespError::no_such_key_or_group(key, group.as_bytes()));
+            return CmdResult::Err(RespError::new("ERR no such key"));
         }
     };
     let Some(grp) = s.group(&group) else {
@@ -959,11 +1061,37 @@ fn exec_xpending(ctx: &mut OpContext) -> CmdResult {
     if i + 3 <= ctx.args.len() {
         // detailed form: start end count [consumer]
         let start = match parse_range_bound(&ctx.args[i], false) {
-            Ok(id) => id,
+            Ok((id, excl)) => {
+                if excl {
+                    match stream_incr(id) {
+                        Some(id) => id,
+                        None => {
+                            return CmdResult::Err(RespError::new(
+                                "ERR invalid start ID for the interval",
+                            ));
+                        }
+                    }
+                } else {
+                    id
+                }
+            }
             Err(e) => return CmdResult::Err(e),
         };
         let end = match parse_range_bound(&ctx.args[i + 1], true) {
-            Ok(id) => id,
+            Ok((id, excl)) => {
+                if excl {
+                    match stream_decr(id) {
+                        Some(id) => id,
+                        None => {
+                            return CmdResult::Err(RespError::new(
+                                "ERR invalid end ID for the interval",
+                            ));
+                        }
+                    }
+                } else {
+                    id
+                }
+            }
             Err(e) => return CmdResult::Err(e),
         };
         let count = match parse_i64(&ctx.args[i + 2]) {
@@ -2115,6 +2243,17 @@ mod tests {
     }
 
     fn dispatch_at(db: &mut DbSlice, now_ms: u64, argv: &[Vec<u8>]) -> CmdResult {
+        // Mirror the server's arity gate (event_loop.rs:393) so malformed
+        // commands fail with the same "wrong number of arguments" text the
+        // reference asserts. `XGROUP HELP` (2 args) bypasses XGROUP's -3 arity.
+        let xgroup_help =
+            argv.len() == 2 && argv[0].eq_ignore_ascii_case(b"XGROUP") && argv[1].eq_ignore_ascii_case(b"HELP");
+        if !xgroup_help
+            && let Some(cmd) = crate::commands::lookup(&argv[0])
+            && let Some(e) = cmd.check_arity(argv.len())
+        {
+            return CmdResult::Err(RespError::new(e));
+        }
         let cmd = argv[0].to_ascii_uppercase();
         let (exec, first_key_idx, owned): (crate::commands::ExecFn, usize, Vec<usize>) =
             match cmd.as_slice() {
@@ -2129,13 +2268,19 @@ mod tests {
                 b"XLEN" => (exec_xlen, 1, vec![1]),
                 b"XGROUP" => (exec_xgroup, 2, vec![2]),
                 b"XINFO" => (exec_xinfo, 2, vec![2]),
-                b"XREADGROUP" => {
-                    let si = argv
-                        .iter()
-                        .position(|a| a.eq_ignore_ascii_case(b"STREAMS"))
-                        .expect("XREADGROUP without STREAMS");
-                    (exec_xreadgroup, 0, vec![si + 1])
+                // Key extraction mirrors `extract_movable_keys`: the first
+                // STREAMS marker with an even tail (a consumer may literally be
+                // named "STREAMS", as in XReadGroupConsumerNamedStreams).
+                b"XREAD" => {
+                    let owned = crate::server::extract_movable_keys(argv);
+                    (exec_xread, 0, owned)
                 }
+                b"XREADGROUP" => {
+                    let owned = crate::server::extract_movable_keys(argv);
+                    (exec_xreadgroup, 0, owned)
+                }
+                b"XTRIM" => (exec_xtrim, 1, vec![1]),
+                b"XREVRANGE" => (exec_xrevrange, 1, vec![1]),
                 _ => panic!("unhandled command {:?}", argv[0]),
             };
         let mut ctx = OpContext {
@@ -2146,7 +2291,44 @@ mod tests {
             conn_id: 0,
             now_ms,
         };
-        exec(&mut ctx)
+        let mut result = exec(&mut ctx);
+        // Mirror the server's merge step (coordinator.rs finish_tx): XREAD and
+        // XREADGROUP replies are finalized by their merge fns even for a
+        // single shard, so empty reads collapse to nil and empty history reads
+        // keep the `[key, []]` form.
+        // A shard error is final (the merge fns only propagate errors found
+        // while iterating keys, so an empty key set would mask it).
+        if result.is_err() {
+            return result;
+        }
+        match cmd.as_slice() {
+            b"XREAD" => {
+                result = merge_xread(
+                    &[ShardPart {
+                        shard: 0,
+                        owned_key_idxs: owned.clone(),
+                        result,
+                    }],
+                    argv,
+                    &owned,
+                    now_ms,
+                );
+            }
+            b"XREADGROUP" => {
+                result = merge_xreadgroup(
+                    &[ShardPart {
+                        shard: 0,
+                        owned_key_idxs: owned.clone(),
+                        result,
+                    }],
+                    argv,
+                    &owned,
+                    now_ms,
+                );
+            }
+            _ => {}
+        }
+        result
     }
 
     fn cmd(db: &mut DbSlice, args: &[&[u8]]) -> CmdResult {
@@ -3578,5 +3760,1073 @@ mod tests {
         assert_ne!(consumer[5], RespValue::Integer(-1)); // active-time now set
         assert_eq!(consumer[7], RespValue::Integer(11)); // consumer pel-count
         assert_eq!(consumer[9].as_array().map(|a| a.len()), Some(11)); // consumer pending
+    }
+
+    /// Port of `StreamFamilyTest.GroupCreate`.
+    #[test]
+    fn group_create() {
+        let mut db = DbSlice::new(0);
+        let resp = cmd(&mut db, &[b"xadd", b"key", b"1-*", b"f1", b"v1"]);
+        assert_eq!(bulk_of(resp), b"1-0");
+        let resp = cmd(&mut db, &[b"xgroup", b"create", b"key", b"grname", b"1"]);
+        assert_eq!(val(resp), RespValue::Simple("OK".into()));
+        let resp = cmd(&mut db, &[b"xgroup", b"create", b"test", b"test", b"0"]);
+        assert!(err_of(resp).contains("requires the key to exist"));
+        let resp = cmd(&mut db, &[b"xgroup", b"create", b"test", b"test", b"0", b"MKSTREAM"]);
+        assert_eq!(val(resp), RespValue::Simple("OK".into()));
+        let resp = cmd(&mut db, &[b"xgroup", b"create", b"test", b"test", b"0", b"MKSTREAM"]);
+        assert!(err_of(resp).contains("BUSYGROUP"));
+    }
+
+    /// Port of `StreamFamilyTest.XRead` (non-RESP3, non-metrics parts).
+    #[test]
+    fn xread() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k1", b"v1"]);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k2", b"v2"]);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k3", b"v3"]);
+        cmd(&mut db, &[b"xadd", b"bar", b"1-*", b"k4", b"v4"]);
+
+        // Receive all records from a single stream.
+        let resp = val(cmd(&mut db, &[b"xread", b"streams", b"foo", b"0"]));
+        assert_eq!(idx(&resp, 0).as_array().map(|a| a.len()), Some(2));
+        assert_eq!(*idx(idx(&resp, 0), 0), blk(b"foo"));
+        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(3));
+
+        // Receive all records from both streams.
+        let resp = val(cmd(&mut db, &[b"xread", b"streams", b"foo", b"bar", b"0", b"0"]));
+        assert_eq!(resp.as_array().map(|a| a.len()), Some(2));
+        assert_eq!(*idx(idx(&resp, 0), 0), blk(b"foo"));
+        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(3));
+        assert_eq!(*idx(idx(&resp, 1), 0), blk(b"bar"));
+        assert_eq!(idx(idx(&resp, 1), 1).as_array().map(|a| a.len()), Some(1));
+
+        // Order of the requested streams is maintained.
+        let resp = val(cmd(&mut db, &[b"xread", b"streams", b"bar", b"foo", b"0", b"0"]));
+        assert_eq!(*idx(idx(&resp, 0), 0), blk(b"bar"));
+        assert_eq!(*idx(idx(&resp, 1), 0), blk(b"foo"));
+
+        // Limit count.
+        let resp = val(cmd(
+            &mut db,
+            &[b"xread", b"count", b"1", b"streams", b"foo", b"bar", b"0", b"0"],
+        ));
+        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(1));
+        assert_eq!(idx(idx(&resp, 1), 1).as_array().map(|a| a.len()), Some(1));
+
+        // Read from ID.
+        let resp = val(cmd(
+            &mut db,
+            &[b"xread", b"count", b"10", b"streams", b"foo", b"bar", b"1-1", b"2-0"],
+        ));
+        assert_eq!(resp.as_array().map(|a| a.len()), Some(1));
+        let foo = idx(&resp, 0).as_array().unwrap();
+        assert_eq!(foo[0], blk(b"foo"));
+        let entry = foo[1].as_array().unwrap()[0].as_array().cloned().unwrap();
+        assert_eq!(entry[0], blk(b"1-2"));
+        assert_eq!(entry[1].as_array().map(|a| a.len()), Some(2));
+
+        // Stream not found: omitted from the reply.
+        let resp = val(cmd(&mut db, &[b"xread", b"streams", b"foo", b"notfound", b"0", b"0"]));
+        assert_eq!(resp.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(*idx(idx(&resp, 0), 0), blk(b"foo"));
+
+        // Only a missing stream: null array.
+        let resp = val(cmd(&mut db, &[b"xread", b"streams", b"notfound", b"0"]));
+        assert_eq!(resp, RespValue::NilArray);
+    }
+
+    /// Port of `StreamFamilyTest.XReadInvalidArgs`.
+    #[test]
+    fn xread_invalid_args() {
+        let mut db = DbSlice::new(0);
+        let resp = cmd(&mut db, &[b"xread", b"count", b"invalid", b"streams", b"s1", b"s2", b"0", b"0"]);
+        assert!(err_of(resp).contains("not an integer or out of range"));
+        let resp = cmd(&mut db, &[b"xread", b"count"]);
+        assert!(err_of(resp).contains("wrong number of arguments for 'xread' command"));
+        let resp = cmd(&mut db, &[b"xread", b"block", b"invalid", b"streams", b"s1", b"s2", b"0", b"0"]);
+        assert!(err_of(resp).contains("not an integer or out of range"));
+        let resp = cmd(&mut db, &[b"xread", b"block", b"streams", b"s1", b"s2", b"0", b"0"]);
+        assert!(err_of(resp).contains("not an integer or out of range"));
+        let resp = cmd(&mut db, &[b"xread", b"count", b"5"]);
+        assert!(err_of(resp).contains("syntax error"));
+        // Wrong type.
+        db.insert(b"foo", PrimeValue::Str(CompactString::from("v")));
+        let resp = cmd(&mut db, &[b"xread", b"streams", b"foo", b"0"]);
+        assert!(err_of(resp).contains("wrong kind of value"));
+    }
+
+    /// Port of `StreamFamilyTest.XReadGroup` (the blocking tail is a nil-array
+    /// reply in the single-shard unit harness instead of a 1s wall-clock wait).
+    #[test]
+    fn xread_group() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k1", b"v1"]);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k2", b"v2"]);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k3", b"v3"]);
+        cmd(&mut db, &[b"xadd", b"bar", b"1-*", b"k4", b"v4"]);
+        cmd(&mut db, &[b"xadd", b"mystream", b"1-*", b"k1", b"v1"]);
+        cmd(&mut db, &[b"xadd", b"mystream", b"1-*", b"k2", b"v2"]);
+        cmd(&mut db, &[b"xadd", b"mystream", b"1-*", b"k3", b"v3"]);
+        cmd(&mut db, &[b"xgroup", b"create", b"foo", b"group", b"0"]);
+        cmd(&mut db, &[b"xgroup", b"create", b"bar", b"group", b"0"]);
+
+        // Consumer PEL is empty, so the reply has an empty list.
+        let resp = val(cmd(
+            &mut db,
+            &[b"xreadgroup", b"group", b"group", b"alice", b"streams", b"foo", b"0"],
+        ));
+        assert_eq!(resp.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(*idx(idx(&resp, 0), 0), blk(b"foo"));
+        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(0));
+
+        // ">" returns unread entries with key "foo".
+        let resp = val(cmd(
+            &mut db,
+            &[b"xreadgroup", b"group", b"group", b"alice", b"streams", b"foo", b">"],
+        ));
+        assert_eq!(resp.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(3));
+
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k5", b"v5"]);
+        let resp = val(cmd(
+            &mut db,
+            &[b"xreadgroup", b"group", b"group", b"alice", b"streams", b"bar", b"foo", b">", b">"],
+        ));
+        assert_eq!(resp.as_array().map(|a| a.len()), Some(2));
+        let bar_entries = idx(idx(&resp, 0), 1).as_array().unwrap();
+        assert_eq!(bar_entries.len(), 1);
+        assert_eq!(bar_entries[0].as_array().unwrap()[0], blk(b"1-0"));
+        let foo_entries = idx(idx(&resp, 1), 1).as_array().unwrap();
+        assert_eq!(foo_entries.len(), 1);
+        assert_eq!(foo_entries[0].as_array().unwrap()[0], blk(b"1-3"));
+
+        // A concrete id fetches from alice's consumer PEL.
+        let resp = val(cmd(
+            &mut db,
+            &[b"xreadgroup", b"group", b"group", b"alice", b"streams", b"foo", b"0"],
+        ));
+        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(4));
+
+        // Nothing new for ">": nil array.
+        let resp = val(cmd(
+            &mut db,
+            &[b"xreadgroup", b"group", b"group", b"alice", b"streams", b"foo", b">"],
+        ));
+        assert_eq!(resp, RespValue::NilArray);
+
+        // Count limits the fetched entries.
+        let resp = val(cmd(
+            &mut db,
+            &[b"xreadgroup", b"group", b"group", b"alice", b"count", b"2", b"streams", b"foo", b"bar", b"0", b"0"],
+        ));
+        assert_eq!(resp.as_array().map(|a| a.len()), Some(2));
+        assert_eq!(*idx(idx(&resp, 0), 0), blk(b"foo"));
+        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(2));
+        assert_eq!(*idx(idx(&resp, 1), 0), blk(b"bar"));
+        assert_eq!(idx(idx(&resp, 1), 1).as_array().map(|a| a.len()), Some(1));
+
+        // Bob will not get entries of alice.
+        let resp = val(cmd(
+            &mut db,
+            &[b"xreadgroup", b"group", b"group", b"bob", b"streams", b"foo", b"0"],
+        ));
+        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(0));
+
+        let resp = val(cmd(&mut db, &[b"xinfo", b"groups", b"foo"]));
+        let gi = idx(&resp, 0).as_array().unwrap();
+        assert_eq!(gi[3], RespValue::Integer(2)); // consumers
+        assert_eq!(gi[7], blk(b"1-3")); // last-delivered-id
+
+        // Noack: entry is delivered but not inserted in the consumer PEL.
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k6", b"v6"]);
+        let resp = val(cmd(
+            &mut db,
+            &[b"xreadgroup", b"group", b"group", b"bob", b"noack", b"streams", b"foo", b">"],
+        ));
+        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(1));
+        let resp = val(cmd(
+            &mut db,
+            &[b"xreadgroup", b"group", b"group", b"bob", b"streams", b"foo", b"0"],
+        ));
+        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(0));
+
+        // No group.
+        let resp = cmd(
+            &mut db,
+            &[b"xreadgroup", b"group", b"nogroup", b"alice", b"streams", b"foo", b"0"],
+        );
+        assert!(err_of(resp).contains(
+            "No such key 'foo' or consumer group 'nogroup' in XREADGROUP with GROUP option"
+        ));
+
+        // '>' gives the error if the group doesn't exist.
+        let resp = cmd(
+            &mut db,
+            &[b"xreadgroup", b"group", b"group", b"alice", b"streams", b"mystream", b">"],
+        );
+        assert!(err_of(resp).contains(
+            "No such key 'mystream' or consumer group 'group' in XREADGROUP with GROUP option"
+        ));
+
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k7", b"v7"]);
+        let resp = cmd(
+            &mut db,
+            &[b"xreadgroup", b"group", b"group", b"alice", b"streams", b"mystream", b"foo", b">", b">"],
+        );
+        assert!(err_of(resp).contains(
+            "No such key 'mystream' or consumer group 'group' in XREADGROUP with GROUP option"
+        ));
+
+        // A missing key is an error even with BLOCK.
+        let resp = cmd(
+            &mut db,
+            &[b"xreadgroup", b"group", b"group", b"consumer", b"count", b"10", b"block", b"5000", b"streams", b"nostream", b">"],
+        );
+        assert!(err_of(resp).contains(
+            "No such key 'nostream' or consumer group 'group' in XREADGROUP with GROUP option"
+        ));
+
+        // Block on an empty stream: nil array (reference waits 1s for the
+        // timeout; the unit harness replies immediately).
+        cmd(&mut db, &[b"xgroup", b"create", b"emptystream", b"group", b"0", b"mkstream"]);
+        let resp = val(cmd_at(
+            &mut db,
+            1000,
+            &[b"xreadgroup", b"group", b"group", b"consumer", b"count", b"10", b"block", b"1000", b"streams", b"emptystream", b">"],
+        ));
+        assert_eq!(resp, RespValue::NilArray);
+    }
+
+    /// Port of `StreamFamilyTest.XReadGroupEmpty`.
+    #[test]
+    fn xread_group_empty() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"XADD", b"stream", b"*", b"foo", b"bar"]);
+        cmd(&mut db, &[b"XGROUP", b"CREATE", b"stream", b"group", b"0"]);
+        let resp = val(cmd(
+            &mut db,
+            &[b"XREADGROUP", b"GROUP", b"group", b"consumer1", b"STREAMS", b"stream", b"0"],
+        ));
+        assert_eq!(resp.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(*idx(idx(&resp, 0), 0), blk(b"stream"));
+        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(0));
+    }
+
+    /// Port of `StreamFamilyTest.XReadGroupEmptyConsumer`.
+    #[test]
+    fn xread_group_empty_consumer() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"xadd", b"s", b"*", b"x", b"y"]);
+        cmd(&mut db, &[b"xgroup", b"create", b"s", b"g", b"0"]);
+        let resp = cmd(&mut db, &[b"xreadgroup", b"group", b"g", b"", b"streams", b"s", b">"]);
+        assert!(err_of(resp).contains("consumer name can't be empty"));
+    }
+
+    /// Port of `StreamFamilyTest.XGroupConsumer`.
+    #[test]
+    fn xgroup_consumer() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"xgroup", b"create", b"foo", b"group", b"$", b"MKSTREAM"]);
+        let resp = cmd(&mut db, &[b"xgroup", b"createconsumer", b"foo", b"group", b"bob"]);
+        assert_eq!(val(resp), RespValue::Integer(1));
+        cmd(&mut db, &[b"xgroup", b"createconsumer", b"foo", b"group", b"alice"]);
+        let resp = val(cmd(&mut db, &[b"xinfo", b"groups", b"foo"]));
+        assert_eq!(idx(idx(&resp, 0), 3), &RespValue::Integer(2));
+        cmd(&mut db, &[b"xgroup", b"delconsumer", b"foo", b"group", b"alice"]);
+        let resp = val(cmd(&mut db, &[b"xinfo", b"groups", b"foo"]));
+        assert_eq!(idx(idx(&resp, 0), 3), &RespValue::Integer(1));
+
+        let resp = cmd(&mut db, &[b"xgroup", b"createconsumer", b"foo", b"group", b"alice"]);
+        assert_eq!(val(resp), RespValue::Integer(1));
+        // Ensure createconsumer doesn't recreate an existing consumer.
+        let resp = cmd(&mut db, &[b"xgroup", b"createconsumer", b"foo", b"group", b"alice"]);
+        assert_eq!(val(resp), RespValue::Integer(0));
+
+        // Nogrouperror.
+        let resp = cmd(&mut db, &[b"xgroup", b"createconsumer", b"foo", b"not-exists", b"alice"]);
+        assert!(err_of(resp).contains("NOGROUP"));
+    }
+
+    /// Port of `StreamFamilyTest.XAck`.
+    #[test]
+    fn xack() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-0", b"k0", b"v0"]);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-1", b"k1", b"v1"]);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-2", b"k2", b"v2"]);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-3", b"k3", b"v3"]);
+        cmd(&mut db, &[b"xgroup", b"create", b"foo", b"cgroup", b"0"]);
+        cmd(
+            &mut db,
+            &[b"xreadgroup", b"group", b"cgroup", b"consumer", b"count", b"4", b"streams", b"foo", b">"],
+        );
+
+        let pel = |db: &mut DbSlice| -> Vec<RespValue> {
+            let resp = val(cmd(
+                db,
+                &[b"xreadgroup", b"group", b"cgroup", b"consumer", b"streams", b"foo", b"0"],
+            ));
+            idx(idx(&resp, 0), 1).as_array().cloned().unwrap()
+        };
+
+        // Acknowledge a message that exists.
+        let resp = cmd(&mut db, &[b"xack", b"foo", b"cgroup", b"1-0"]);
+        assert_eq!(val(resp), RespValue::Integer(1));
+        // Acknowledge a message from a non-existing stream.
+        let resp = cmd(&mut db, &[b"xack", b"nosuchstream", b"cgroup", b"1-0"]);
+        assert_eq!(val(resp), RespValue::Integer(0));
+        // Acknowledge a message for a non-existing consumer group.
+        let resp = cmd(&mut db, &[b"xack", b"foo", b"nosuchcgroup", b"1-0"]);
+        assert_eq!(val(resp), RespValue::Integer(0));
+
+        // Verifies 1-0 gets removed from the PEL.
+        let es = pel(&mut db);
+        assert_eq!(es.len(), 3);
+        assert_eq!(es[0].as_array().unwrap()[0], blk(b"1-1"));
+
+        // Acknowledge a message that doesn't exist.
+        let resp = cmd(&mut db, &[b"xack", b"foo", b"cgroup", b"1-9"]);
+        assert_eq!(val(resp), RespValue::Integer(0));
+        assert_eq!(pel(&mut db).len(), 3);
+
+        // Acknowledge one existing and one non-existing message.
+        let resp = cmd(&mut db, &[b"xack", b"foo", b"cgroup", b"1-3", b"1-9"]);
+        assert_eq!(val(resp), RespValue::Integer(1));
+        assert_eq!(pel(&mut db).len(), 2);
+
+        // Acknowledge all the remaining messages.
+        let resp = cmd(&mut db, &[b"xack", b"foo", b"cgroup", b"1-1", b"1-2"]);
+        assert_eq!(val(resp), RespValue::Integer(2));
+        assert_eq!(pel(&mut db).len(), 0);
+    }
+
+    /// Port of `StreamFamilyTest.XPending`.
+    #[test]
+    fn xpending() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-0", b"k1", b"v1"]);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-1", b"k2", b"v2"]);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-2", b"k3", b"v3"]);
+        cmd(&mut db, &[b"xgroup", b"create", b"foo", b"group", b"0"]);
+        cmd(&mut db, &[b"xreadgroup", b"group", b"group", b"alice", b"streams", b"foo", b">"]);
+        // Bob doesn't have pending entries.
+        cmd(&mut db, &[b"xgroup", b"createconsumer", b"foo", b"group", b"bob"]);
+
+        let resp = val(cmd(&mut db, &[b"xpending", b"foo", b"group"]));
+        assert_eq!(
+            resp,
+            arr(vec![
+                RespValue::Integer(3),
+                blk(b"1-0"),
+                blk(b"1-2"),
+                arr(vec![arr(vec![blk(b"alice"), RespValue::Integer(3)])])
+            ])
+        );
+
+        let resp = val(cmd(&mut db, &[b"xpending", b"foo", b"group", b"-", b"+", b"10"]));
+        let es = resp.as_array().unwrap();
+        assert_eq!(es.len(), 3);
+        assert_eq!(
+            es[0],
+            arr(vec![blk(b"1-0"), blk(b"alice"), RespValue::Integer(0), RespValue::Integer(1)])
+        );
+        assert_eq!(
+            es[1],
+            arr(vec![blk(b"1-1"), blk(b"alice"), RespValue::Integer(0), RespValue::Integer(1)])
+        );
+        assert_eq!(
+            es[2],
+            arr(vec![blk(b"1-2"), blk(b"alice"), RespValue::Integer(0), RespValue::Integer(1)])
+        );
+
+        // Only a single entry.
+        let resp = val(cmd(&mut db, &[b"xpending", b"foo", b"group", b"-", b"+", b"1"]));
+        assert_eq!(
+            idx(&resp, 0),
+            &arr(vec![blk(b"1-0"), blk(b"alice"), RespValue::Integer(0), RespValue::Integer(1)])
+        );
+
+        // Bob reads a new entry.
+        cmd(&mut db, &[b"xadd", b"foo", b"1-3", b"k4", b"v4"]);
+        cmd(&mut db, &[b"xreadgroup", b"group", b"group", b"bob", b"streams", b"foo", b">"]);
+        let resp = val(cmd(&mut db, &[b"xpending", b"foo", b"group", b"-", b"+", b"10", b"bob"]));
+        assert_eq!(
+            idx(&resp, 0),
+            &arr(vec![blk(b"1-3"), blk(b"bob"), RespValue::Integer(0), RespValue::Integer(1)])
+        );
+
+        // The last entry is delivered at t=100, xpending runs at t=3100.
+        cmd(&mut db, &[b"xadd", b"foo", b"1-4", b"k5", b"v5"]);
+        cmd_at(&mut db, 100, &[b"xreadgroup", b"group", b"group", b"bob", b"streams", b"foo", b">"]);
+        // Min-idle-time exceeds the delivery time of the last inserted entry.
+        let resp = val(cmd_at(
+            &mut db,
+            3100,
+            &[b"xpending", b"foo", b"group", b"IDLE", b"4000", b"-", b"+", b"10"],
+        ));
+        assert_eq!(resp.as_array().map(|a| a.len()), Some(0));
+    }
+
+    /// Port of `StreamFamilyTest.XPendingEmpty`.
+    #[test]
+    fn xpending_empty() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"XADD", b"stream", b"*", b"foo", b"bar"]);
+        cmd(&mut db, &[b"XADD", b"stream", b"*", b"foo", b"bar"]);
+        cmd(&mut db, &[b"XGROUP", b"CREATE", b"stream", b"group", b"0"]);
+        let resp = val(cmd(&mut db, &[b"XPENDING", b"stream", b"group"]));
+        assert_eq!(
+            resp,
+            arr(vec![
+                RespValue::Integer(0),
+                RespValue::Nil,
+                RespValue::Nil,
+                RespValue::Nil
+            ])
+        );
+    }
+
+    /// Port of `StreamFamilyTest.XPendingMissingGroup`.
+    #[test]
+    fn xpending_missing_group() {
+        let mut db = DbSlice::new(0);
+        let resp = cmd(&mut db, &[b"xpending", b"?"]);
+        assert!(err_of(resp).contains("wrong number of arguments"));
+    }
+
+    /// Port of `StreamFamilyTest.XPendingInvalidArgs`.
+    #[test]
+    fn xpending_invalid_args() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-0", b"k1", b"v1"]);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-1", b"k2", b"v2"]);
+
+        let resp = cmd(&mut db, &[b"xpending", b"unknown", b"group"]);
+        assert!(err_of(resp).contains("no such key"));
+        let resp = cmd(&mut db, &[b"xpending", b"foo", b"group"]);
+        assert!(err_of(resp).contains("NOGROUP"));
+
+        cmd(&mut db, &[b"xgroup", b"create", b"foo", b"group", b"0"]);
+        let resp = cmd(&mut db, &[b"xpending", b"foo", b"group", b"IDLE", b"0"]);
+        assert!(err_of(resp).contains("wrong number of arguments"));
+        let resp = cmd(&mut db, &[b"xpending", b"foo", b"group", b"-", b"+"]);
+        assert!(err_of(resp).contains("wrong number of arguments"));
+    }
+
+    /// Port of `StreamFamilyTest.XTrim`.
+    #[test]
+    fn xtrim() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k", b"v"]);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k", b"v"]);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k", b"v"]);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k", b"v"]);
+
+        // Trim to maxlen 2: 2 entries deleted, 2 remaining.
+        let resp = cmd(&mut db, &[b"xtrim", b"foo", b"maxlen", b"2"]);
+        assert_eq!(val(resp), RespValue::Integer(2));
+        let resp = cmd(&mut db, &[b"xlen", b"foo"]);
+        assert_eq!(val(resp), RespValue::Integer(2));
+
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k", b"v"]);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k", b"v"]);
+
+        // Trim messages whose ID is before 1-4: 2 entries deleted.
+        let resp = cmd(&mut db, &[b"xtrim", b"foo", b"minid", b"1-4"]);
+        assert_eq!(val(resp), RespValue::Integer(2));
+        let resp = cmd(&mut db, &[b"xlen", b"foo"]);
+        assert_eq!(val(resp), RespValue::Integer(2));
+
+        // Trim with no changes needed.
+        let resp = cmd(&mut db, &[b"xtrim", b"foo", b"maxlen", b"5"]);
+        assert_eq!(val(resp), RespValue::Integer(0));
+        let resp = cmd(&mut db, &[b"xlen", b"foo"]);
+        assert_eq!(val(resp), RespValue::Integer(2));
+
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k", b"v"]);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k", b"v"]);
+
+        // Trim exact.
+        let resp = cmd(&mut db, &[b"xtrim", b"foo", b"maxlen", b"=", b"2"]);
+        assert_eq!(val(resp), RespValue::Integer(2));
+        let resp = cmd(&mut db, &[b"xlen", b"foo"]);
+        assert_eq!(val(resp), RespValue::Integer(2));
+
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k", b"v"]);
+        cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k", b"v"]);
+
+        // Trim approx: nothing below the node boundary is removed.
+        let resp = cmd(&mut db, &[b"xtrim", b"foo", b"maxlen", b"~", b"2"]);
+        assert_eq!(val(resp), RespValue::Integer(0));
+        let resp = cmd(&mut db, &[b"xlen", b"foo"]);
+        assert_eq!(val(resp), RespValue::Integer(4));
+
+        // Trim a stream that doesn't exist: no entries.
+        let resp = cmd(&mut db, &[b"xtrim", b"notfound", b"maxlen", b"5"]);
+        assert_eq!(val(resp), RespValue::Integer(0));
+    }
+
+    /// Port of `StreamFamilyTest.XTrimInvalidArgs`.
+    #[test]
+    fn xtrim_invalid_args() {
+        let mut db = DbSlice::new(0);
+        let resp = cmd(&mut db, &[b"xtrim", b"foo"]);
+        assert!(err_of(resp).contains("wrong number of arguments"));
+        let resp = cmd(&mut db, &[b"xtrim", b"foo", b"maxlen"]);
+        assert!(err_of(resp).contains("wrong number of arguments"));
+        let resp = cmd(&mut db, &[b"xtrim", b"foo", b"minid"]);
+        assert!(err_of(resp).contains("wrong number of arguments"));
+
+        let resp = cmd(&mut db, &[b"xtrim", b"foo", b"maxlen", b"nan"]);
+        assert!(err_of(resp).contains("not an integer or out of range"));
+        let resp = cmd(&mut db, &[b"xtrim", b"foo", b"maxlen", b"-1"]);
+        assert!(err_of(resp).contains("not an integer or out of range"));
+        let resp = cmd(&mut db, &[b"xtrim", b"foo", b"minid", b"nan"]);
+        assert!(err_of(resp).contains("syntax error"));
+
+        // Limit with non-approx.
+        let resp = cmd(&mut db, &[b"xtrim", b"foo", b"maxlen", b"2", b"limit", b"5"]);
+        assert!(err_of(resp).contains("syntax error"));
+
+        // Both maxlen and minid.
+        let resp = cmd(&mut db, &[b"xtrim", b"foo", b"maxlen", b"2", b"minid", b"1-1"]);
+        assert!(err_of(resp).contains("MAXLEN and MINID options at the same time are not compatible"));
+        let resp = cmd(&mut db, &[b"xtrim", b"foo", b"minid", b"1-1", b"maxlen", b"2"]);
+        assert!(err_of(resp).contains("MAXLEN and MINID options at the same time are not compatible"));
+
+        // Invalid limit.
+        let resp = cmd(&mut db, &[b"xtrim", b"foo", b"maxlen", b"~", b"2", b"limit", b"nan"]);
+        assert!(err_of(resp).contains("value is not an integer or out of range"));
+    }
+
+    /// Port of `StreamFamilyTest.XTrimWrongSyntax`.
+    #[test]
+    fn xtrim_wrong_syntax() {
+        let mut db = DbSlice::new(0);
+        let resp = cmd(
+            &mut db,
+            &[
+                b"xtrim",
+                b"-992",
+                b"k1 \"v1\" k2 \"v2 with spaces\" \"k3 with spaces\" \"v3\"",
+                b"list1 element1",
+            ],
+        );
+        assert!(err_of(resp).contains("syntax error"));
+    }
+
+    /// Port of `StreamFamilyTest.XReadGroupMultipleStreams`.
+    #[test]
+    fn xread_group_multiple_streams() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"XGROUP", b"CREATE", b"mystream1", b"mygroup", b"$", b"MKSTREAM"]);
+        cmd(&mut db, &[b"XGROUP", b"CREATE", b"mystream", b"mygroup", b"$", b"MKSTREAM"]);
+        cmd(&mut db, &[b"XADD", b"mystream", b"2000-0", b"field1", b"value1"]);
+        cmd(&mut db, &[b"XADD", b"mystream", b"2000-1", b"field1", b"value1"]);
+        cmd(&mut db, &[b"XADD", b"mystream", b"2000-2", b"field1", b"value1"]);
+        cmd(&mut db, &[b"XADD", b"mystream1", b"2000-0", b"field1", b"value1"]);
+        cmd(&mut db, &[b"XADD", b"mystream1", b"2000-1", b"field1", b"value1"]);
+        cmd(&mut db, &[b"XADD", b"mystream1", b"2000-2", b"field1", b"value1"]);
+
+        let resp = val(cmd(
+            &mut db,
+            &[b"XREADGROUP", b"GROUP", b"mygroup", b"myconsumer", b"STREAMS", b"mystream", b"mystream1", b">", b"2000-0"],
+        ));
+        assert_eq!(resp.as_array().map(|a| a.len()), Some(2));
+        let s0 = idx(&resp, 0).as_array().unwrap();
+        assert_eq!(s0[0], blk(b"mystream"));
+        let es = s0[1].as_array().unwrap();
+        assert_eq!(es.len(), 3);
+        assert_eq!(es[0], arr(vec![blk(b"2000-0"), arr(vec![blk(b"field1"), blk(b"value1")])]));
+        assert_eq!(es[1], arr(vec![blk(b"2000-1"), arr(vec![blk(b"field1"), blk(b"value1")])]));
+        assert_eq!(es[2], arr(vec![blk(b"2000-2"), arr(vec![blk(b"field1"), blk(b"value1")])]));
+        let s1 = idx(&resp, 1).as_array().unwrap();
+        assert_eq!(s1[0], blk(b"mystream1"));
+        assert_eq!(s1[1].as_array().map(|a| a.len()), Some(0));
+    }
+
+    /// Port of `StreamFamilyTest.XGroupSetIdEntriesRead`.
+    #[test]
+    fn xgroup_setid_entries_read() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"XGROUP", b"CREATE", b"mystream", b"mygroup", b"$", b"MKSTREAM"]);
+        cmd(&mut db, &[b"XADD", b"mystream", b"2000-0", b"key", b"val"]);
+        cmd(
+            &mut db,
+            &[b"XGROUP", b"SETID", b"mystream", b"mygroup", b"2000-0", b"ENTRIESREAD", b"100"],
+        );
+        let resp = val(cmd(&mut db, &[b"XINFO", b"GROUPS", b"mystream"]));
+        let gi = idx(&resp, 0).as_array().unwrap();
+        assert_eq!(gi[7], blk(b"2000-0")); // last-delivered-id
+        assert_eq!(gi[9], RespValue::Integer(100)); // entries-read
+        assert_eq!(gi[11], RespValue::Integer(-99)); // lag
+
+        cmd(
+            &mut db,
+            &[b"XGROUP", b"SETID", b"mystream", b"mygroup", b"2000-0", b"ENTRIESREAD", b"-1"],
+        );
+        let resp = val(cmd(&mut db, &[b"XINFO", b"GROUPS", b"mystream"]));
+        let gi = idx(&resp, 0).as_array().unwrap();
+        assert_eq!(gi[7], blk(b"2000-0")); // last-delivered-id
+        assert_eq!(gi[9], RespValue::Nil); // entries-read
+        assert_eq!(gi[11], RespValue::Integer(0)); // lag
+    }
+
+    /// Port of `StreamFamilyTest.XInfoConsumersArityCrash`.
+    #[test]
+    fn xinfo_consumers_arity_crash() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"XGROUP", b"CREATE", b"mystream", b"mygroup", b"$", b"MKSTREAM"]);
+        let resp = cmd(&mut db, &[b"XINFO", b"CONSUMERS", b"mystream"]);
+        assert!(err_of(resp).contains("syntax error"));
+    }
+
+    /// Port of `StreamFamilyTest.XTrimCrashWithMallocUsedZero`.
+    #[test]
+    fn xtrim_crash_with_malloc_used_zero() {
+        let mut db = DbSlice::new(0);
+        let resp = cmd(&mut db, &[b"xadd", b"mystream", b"0-0", b"field1", b"value1"]);
+        assert!(err_of(resp).contains("equal or smaller"));
+        // Without the fix the server crashed with check failed MallocUsed() != 0.
+        cmd(&mut db, &[b"XTRIM", b"mystream", b"MAXLEN", b"0"]);
+    }
+
+    /// Port of `StreamFamilyTest.XRangeIdRoundTrip`.
+    #[test]
+    fn xrange_id_round_trip() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"XADD", b"key", b"1-1", b"value", b"1"]);
+        cmd(&mut db, &[b"XADD", b"key", b"2-2", b"value", b"2"]);
+        cmd(&mut db, &[b"XADD", b"key", b"3-3", b"value", b"3"]);
+        let resp = val(cmd(&mut db, &[b"XRANGE", b"key", b"2-2", b"3-3"]));
+        let es = resp.as_array().unwrap();
+        assert_eq!(es.len(), 2);
+        assert_eq!(es[0].as_array().unwrap()[0], blk(b"2-2"));
+        assert_eq!(es[1].as_array().unwrap()[0], blk(b"3-3"));
+    }
+
+    /// Port of `StreamFamilyTest.XAddMaxSeq`.
+    #[test]
+    fn xadd_max_seq() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"XADD", b"x", b"1-18446744073709551615", b"f1", b"v1"]);
+        let resp = cmd(&mut db, &[b"XADD", b"x", b"1-*", b"f2", b"v2"]);
+        assert!(err_of(resp).contains("The ID specified in XADD is equal or smaller"));
+    }
+
+    /// Port of `StreamFamilyTest.XDelNonExistentId`.
+    #[test]
+    fn xdel_nonexistent_id() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"XADD", b"key", b"0", b"set1", b"member1"]);
+        // Deleting a non-existent ID must not crash (issue #5202).
+        let resp = cmd(&mut db, &[b"XDEL", b"key", b"46-867"]);
+        assert_eq!(val(resp), RespValue::Integer(0));
+    }
+
+    /// Port of `StreamFamilyTest.SeenActiveTime` (the DUMP/RESTORE part is
+    /// serialization and is covered by the snapshot tests).
+    #[test]
+    fn seen_active_time() {
+        let mut db = DbSlice::new(0);
+        cmd_at(&mut db, 1000, &[b"XGROUP", b"CREATE", b"mystream", b"mygroup", b"$", b"MKSTREAM"]);
+        cmd_at(
+            &mut db,
+            1000,
+            &[b"XREADGROUP", b"GROUP", b"mygroup", b"Alice", b"COUNT", b"1", b"STREAMS", b"mystream", b">"],
+        );
+        let resp = val(cmd_at(&mut db, 1100, &[b"XINFO", b"CONSUMERS", b"mystream", b"mygroup"]));
+        assert_eq!(
+            resp,
+            arr(vec![arr(vec![
+                blk(b"name"),
+                blk(b"Alice"),
+                blk(b"pending"),
+                RespValue::Integer(0),
+                blk(b"idle"),
+                RespValue::Integer(100),
+                blk(b"inactive"),
+                RespValue::Integer(-1),
+            ])])
+        );
+
+        cmd_at(&mut db, 1100, &[b"XADD", b"mystream", b"*", b"f", b"v"]);
+        cmd_at(
+            &mut db,
+            1100,
+            &[b"XREADGROUP", b"GROUP", b"mygroup", b"Alice", b"COUNT", b"1", b"STREAMS", b"mystream", b">"],
+        );
+        let resp = val(cmd_at(&mut db, 1150, &[b"XINFO", b"CONSUMERS", b"mystream", b"mygroup"]));
+        assert_eq!(
+            resp,
+            arr(vec![arr(vec![
+                blk(b"name"),
+                blk(b"Alice"),
+                blk(b"pending"),
+                RespValue::Integer(1),
+                blk(b"idle"),
+                RespValue::Integer(50),
+                blk(b"inactive"),
+                RespValue::Integer(50),
+            ])])
+        );
+
+        // Nothing new to read: idle resets to 0 (seen_time refreshed) but
+        // inactive keeps clocking because nothing was actually read.
+        cmd_at(
+            &mut db,
+            1250,
+            &[b"XREADGROUP", b"GROUP", b"mygroup", b"Alice", b"COUNT", b"1", b"STREAMS", b"mystream", b">"],
+        );
+        let resp = val(cmd_at(&mut db, 1250, &[b"XINFO", b"CONSUMERS", b"mystream", b"mygroup"]));
+        assert_eq!(
+            resp,
+            arr(vec![arr(vec![
+                blk(b"name"),
+                blk(b"Alice"),
+                blk(b"pending"),
+                RespValue::Integer(1),
+                blk(b"idle"),
+                RespValue::Integer(0),
+                blk(b"inactive"),
+                RespValue::Integer(150),
+            ])])
+        );
+
+        let resp = val(cmd_at(&mut db, 1250, &[b"XINFO", b"STREAM", b"mystream", b"FULL"]));
+        let info = resp.as_array().unwrap();
+        let consumer = idx(idx(&info[17], 0), 13).as_array().unwrap()[0].as_array().unwrap();
+        assert_eq!(consumer[3], RespValue::Integer(1250)); // seen-time
+        assert_eq!(consumer[5], RespValue::Integer(1100)); // active-time
+        assert_eq!(consumer[7], RespValue::Integer(1)); // pel-count
+    }
+
+    /// Port of `StreamFamilyTest.ConsumerGroupLagWithTombstoneAfterLastId`.
+    #[test]
+    fn consumer_group_lag_with_tombstone_after_last_id() {
+        let mut db = DbSlice::new(0);
+        for i in 1..=6 {
+            let id = format!("{i}-0").into_bytes();
+            cmd(&mut db, &[b"XADD", b"x", id.as_slice(), b"data", b"a"]);
+        }
+        cmd(&mut db, &[b"XDEL", b"x", b"3-0"]);
+        cmd(&mut db, &[b"XGROUP", b"CREATE", b"x", b"g1", b"0"]);
+
+        let g1 = |db: &mut DbSlice| {
+            let resp = val(cmd(db, &[b"XINFO", b"STREAM", b"x", b"FULL"]));
+            let info = resp.as_array().unwrap();
+            let g = idx(&info[17], 0).as_array().unwrap();
+            (g[1].clone(), g[3].clone(), g[5].clone(), g[7].clone())
+        };
+        let (name, last, eread, lag) = g1(&mut db);
+        assert_eq!(name, blk(b"g1"));
+        assert_eq!(last, blk(b"0-0"));
+        assert_eq!(eread, RespValue::Nil);
+        assert_eq!(lag, RespValue::Nil);
+
+        // Read all messages (5 actual entries since 3-0 was deleted, but entries_added is 6).
+        cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"g1", b"c11", b"COUNT", b"10", b"STREAMS", b"x", b">"]);
+        let (_, last, eread, lag) = g1(&mut db);
+        assert_eq!(last, blk(b"6-0"));
+        assert_eq!(eread, RespValue::Integer(6));
+        assert_eq!(lag, RespValue::Integer(0));
+
+        // Add more messages.
+        for i in 7..=10 {
+            let id = format!("{i}-0").into_bytes();
+            cmd(&mut db, &[b"XADD", b"x", id.as_slice(), b"data", b"a"]);
+        }
+        let (_, last, eread, lag) = g1(&mut db);
+        assert_eq!(last, blk(b"6-0"));
+        assert_eq!(eread, RespValue::Integer(6));
+        assert_eq!(lag, RespValue::Integer(4));
+
+        // Read 3 more messages (COUNT 3 will read 7-0, 8-0, 9-0).
+        cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"g1", b"c11", b"COUNT", b"3", b"STREAMS", b"x", b">"]);
+        cmd(&mut db, &[b"XDEL", b"x", b"9-0"]);
+        // Now there is a tombstone in the stream after the group's last_id, so the lag can't be calculated.
+        let (_, last, eread, lag) = g1(&mut db);
+        assert_eq!(last, blk(b"9-0"));
+        assert_eq!(eread, RespValue::Integer(9));
+        assert_eq!(lag, RespValue::Nil);
+
+        // Read one more message to catch up.
+        cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"g1", b"c12", b"COUNT", b"1", b"STREAMS", b"x", b">"]);
+        let (_, last, eread, lag) = g1(&mut db);
+        assert_eq!(last, blk(b"10-0"));
+        assert_eq!(eread, RespValue::Integer(10));
+        assert_eq!(lag, RespValue::Integer(0));
+    }
+
+    /// Port of `StreamFamilyTest.ConsumerGroupLagWithXTrim`.
+    #[test]
+    fn consumer_group_lag_with_xtrim() {
+        let mut db = DbSlice::new(0);
+        for i in 1..=5 {
+            let id = format!("{i}-0").into_bytes();
+            cmd(&mut db, &[b"XADD", b"x", id.as_slice(), b"data", b"a"]);
+        }
+        cmd(&mut db, &[b"XDEL", b"x", b"3-0"]);
+        cmd(&mut db, &[b"XGROUP", b"CREATE", b"x", b"g1", b"0"]);
+        cmd(&mut db, &[b"XGROUP", b"CREATE", b"x", b"g2", b"0"]);
+
+        let group = |db: &mut DbSlice, gi: usize| {
+            let resp = val(cmd(db, &[b"XINFO", b"STREAM", b"x", b"FULL"]));
+            let info = resp.as_array().unwrap();
+            let g = idx(&info[17], gi).as_array().unwrap();
+            (g[1].clone(), g[3].clone(), g[5].clone(), g[7].clone())
+        };
+        let (name, last, eread, lag) = group(&mut db, 0);
+        assert_eq!(name, blk(b"g1"));
+        assert_eq!(last, blk(b"0-0"));
+        assert_eq!(eread, RespValue::Nil);
+        assert_eq!(lag, RespValue::Nil);
+
+        // Read messages one by one; the counter stays invalid while a tombstone
+        // fragments the stream ahead of the group.
+        for i in 1..=2 {
+            cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"g1", b"c11", b"COUNT", b"1", b"STREAMS", b"x", b">"]);
+            let (_, last, eread, lag) = group(&mut db, 0);
+            let id = format!("{i}-0").into_bytes();
+            assert_eq!(last, blk(&id));
+            assert_eq!(eread, RespValue::Nil);
+            assert_eq!(lag, RespValue::Nil);
+        }
+        cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"g1", b"c11", b"COUNT", b"1", b"STREAMS", b"x", b">"]);
+        let (_, last, eread, lag) = group(&mut db, 0);
+        assert_eq!(last, blk(b"4-0"));
+        assert_eq!(eread, RespValue::Nil);
+        assert_eq!(lag, RespValue::Nil);
+        cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"g1", b"c11", b"COUNT", b"1", b"STREAMS", b"x", b">"]);
+        let (_, last, eread, lag) = group(&mut db, 0);
+        assert_eq!(last, blk(b"5-0"));
+        assert_eq!(eread, RespValue::Integer(5));
+        assert_eq!(lag, RespValue::Integer(0));
+
+        // Add more messages.
+        cmd(&mut db, &[b"XADD", b"x", b"6-0", b"data", b"a"]);
+        cmd(&mut db, &[b"XADD", b"x", b"7-0", b"data", b"a"]);
+        let (_, last, eread, lag) = group(&mut db, 0);
+        assert_eq!(last, blk(b"5-0"));
+        assert_eq!(eread, RespValue::Integer(5));
+        assert_eq!(lag, RespValue::Integer(2));
+
+        // XTRIM.
+        cmd(&mut db, &[b"XTRIM", b"x", b"MINID", b"=", b"7-0"]);
+        let (_, last, eread, lag) = group(&mut db, 0);
+        assert_eq!(last, blk(b"5-0"));
+        assert_eq!(eread, RespValue::Integer(5));
+        assert_eq!(lag, RespValue::Integer(2));
+        let (_, last, eread, lag) = group(&mut db, 1);
+        assert_eq!(last, blk(b"0-0"));
+        assert_eq!(eread, RespValue::Nil);
+        assert_eq!(lag, RespValue::Integer(1));
+
+        // Read all remaining with g1.
+        cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"g1", b"c11", b"STREAMS", b"x", b">"]);
+        let (_, last, eread, lag) = group(&mut db, 0);
+        assert_eq!(last, blk(b"7-0"));
+        assert_eq!(eread, RespValue::Integer(7));
+        assert_eq!(lag, RespValue::Integer(0));
+    }
+
+    /// Port of `StreamFamilyTest.ConsumerGroupLagWithXAddTrimming`.
+    #[test]
+    fn consumer_group_lag_with_xadd_trimming() {
+        let mut db = DbSlice::new(0);
+        for i in 1..=5 {
+            let id = format!("{i}-0").into_bytes();
+            cmd(&mut db, &[b"XADD", b"x", id.as_slice(), b"data", b"a"]);
+        }
+        cmd(&mut db, &[b"XDEL", b"x", b"3-0"]);
+        cmd(&mut db, &[b"XGROUP", b"CREATE", b"x", b"g1", b"0"]);
+        cmd(&mut db, &[b"XGROUP", b"CREATE", b"x", b"g2", b"0"]);
+
+        let group = |db: &mut DbSlice, gi: usize| {
+            let resp = val(cmd(db, &[b"XINFO", b"STREAM", b"x", b"FULL"]));
+            let info = resp.as_array().unwrap();
+            let g = idx(&info[17], gi).as_array().unwrap();
+            (g[1].clone(), g[3].clone(), g[5].clone(), g[7].clone())
+        };
+        let (name, last, eread, lag) = group(&mut db, 0);
+        assert_eq!(name, blk(b"g1"));
+        assert_eq!(last, blk(b"0-0"));
+        assert_eq!(eread, RespValue::Nil);
+        assert_eq!(lag, RespValue::Nil);
+
+        // Read messages one by one.
+        for i in 1..=2 {
+            cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"g1", b"c11", b"COUNT", b"1", b"STREAMS", b"x", b">"]);
+            let (_, last, eread, lag) = group(&mut db, 0);
+            let id = format!("{i}-0").into_bytes();
+            assert_eq!(last, blk(&id));
+            assert_eq!(eread, RespValue::Nil);
+            assert_eq!(lag, RespValue::Nil);
+        }
+        cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"g1", b"c11", b"COUNT", b"1", b"STREAMS", b"x", b">"]);
+        let (_, last, eread, lag) = group(&mut db, 0);
+        assert_eq!(last, blk(b"4-0"));
+        assert_eq!(eread, RespValue::Nil);
+        assert_eq!(lag, RespValue::Nil);
+        cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"g1", b"c11", b"COUNT", b"1", b"STREAMS", b"x", b">"]);
+        let (_, last, eread, lag) = group(&mut db, 0);
+        assert_eq!(last, blk(b"5-0"));
+        assert_eq!(eread, RespValue::Integer(5));
+        assert_eq!(lag, RespValue::Integer(0));
+
+        // Add more messages.
+        cmd(&mut db, &[b"XADD", b"x", b"6-0", b"data", b"a"]);
+        cmd(&mut db, &[b"XADD", b"x", b"7-0", b"data", b"a"]);
+        let (_, last, eread, lag) = group(&mut db, 0);
+        assert_eq!(last, blk(b"5-0"));
+        assert_eq!(eread, RespValue::Integer(5));
+        assert_eq!(lag, RespValue::Integer(2));
+
+        // XADD with MINID trimming: after trimming, the group's counter is
+        // estimated again since its last-delivered id predates the new first entry.
+        cmd(&mut db, &[b"XADD", b"x", b"MINID", b"=", b"7-0", b"8-0", b"data", b"h"]);
+        let (_, last, eread, lag) = group(&mut db, 0);
+        assert_eq!(last, blk(b"5-0"));
+        assert_eq!(eread, RespValue::Integer(5));
+        assert_eq!(lag, RespValue::Integer(3));
+        let (_, last, eread, lag) = group(&mut db, 1);
+        assert_eq!(last, blk(b"0-0"));
+        assert_eq!(eread, RespValue::Nil);
+        assert_eq!(lag, RespValue::Integer(2));
+
+        // Read all remaining with g1.
+        cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"g1", b"c11", b"STREAMS", b"x", b">"]);
+        let (_, last, eread, lag) = group(&mut db, 0);
+        assert_eq!(last, blk(b"8-0"));
+        assert_eq!(eread, RespValue::Integer(8));
+        assert_eq!(lag, RespValue::Integer(0));
+    }
+
+    /// Port of `StreamFamilyTest.XReadGroupInvalidArgs`.
+    #[test]
+    fn xread_group_invalid_args() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"XGROUP", b"CREATE", b"foo", b"group", b"0", b"MKSTREAM"]);
+
+        // Invalid COUNT value.
+        let resp = cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"group", b"alice", b"COUNT", b"invalid", b"STREAMS", b"foo", b"0"]);
+        assert!(err_of(resp).contains("not an integer or out of range"));
+
+        // Invalid "stream" instead of GROUP.
+        let resp = cmd(&mut db, &[b"XREADGROUP", b"STREAM", b"group", b"alice", b"COUNT", b"1", b"STREAMS", b"foo", b"0"]);
+        assert!(err_of(resp).contains("Missing 'GROUP' in 'XREADGROUP' command"));
+
+        // Missing streams.
+        let resp = cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"group", b"alice", b"STREAMS"]);
+        assert!(err_of(resp).contains("wrong number of arguments for 'xreadgroup' command"));
+
+        // Missing consumer.
+        let resp = cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"group", b"STREAMS", b"foo", b"0"]);
+        assert!(err_of(resp).contains("syntax error"));
+
+        // Missing block value.
+        let resp = cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"group", b"alice", b"BLOCK", b"STREAMS", b"foo", b"0"]);
+        assert!(err_of(resp).contains("not an integer or out of range"));
+
+        // Invalid block value.
+        let resp = cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"group", b"alice", b"BLOCK", b"invalid", b"STREAMS", b"foo", b"0"]);
+        assert!(err_of(resp).contains("not an integer or out of range"));
+
+        // Unbalanced list of streams.
+        let resp = cmd(&mut db, &[b"XREADGROUP", b"GROUP", b"group", b"alice", b"STREAMS", b"s1", b"s2", b"s3", b"0", b"0"]);
+        assert!(err_of(resp).contains(
+            "Unbalanced 'xreadgroup' list of streams: for each stream key an ID or '>' must be specified"
+        ));
+
+        let resp = cmd(&mut db, &[b"XREAD", b"COUNT", b"1", b"STREAMS", b"mystream"]);
+        assert!(err_of(resp).contains(
+            "Unbalanced 'xread' list of streams: for each stream key an ID or '$' must be specified"
+        ));
+    }
+
+    /// Port of `StreamFamilyTest.XReadGroupConsumerNamedStreams` (a consumer
+    /// literally named "STREAMS" must not confuse key extraction).
+    #[test]
+    fn xread_group_consumer_named_streams() {
+        let mut db = DbSlice::new(0);
+        cmd(&mut db, &[b"XADD", b"COUNT", b"1-0", b"field", b"value"]);
+        cmd(&mut db, &[b"XGROUP", b"CREATE", b"COUNT", b"grp1", b"0"]);
+        cmd(&mut db, &[b"XADD", b"2", b"1-0", b"field", b"value"]);
+        cmd(&mut db, &[b"XGROUP", b"CREATE", b"2", b"grp1", b"0"]);
+        cmd(&mut db, &[b"XADD", b"xp1", b"1-0", b"field", b"value"]);
+        cmd(&mut db, &[b"XGROUP", b"CREATE", b"xp1", b"grp1", b"0"]);
+
+        let resp = val(cmd(
+            &mut db,
+            &[b"XREADGROUP", b"GROUP", b"grp1", b"STREAMS", b"COUNT", b"2", b"STREAMS", b"xp1", b">"],
+        ));
+        assert_eq!(resp.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(*idx(idx(&resp, 0), 0), blk(b"xp1"));
+        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(1));
+    }
+
+    /// Port of the `StreamFamilyTest.Issue854` XGROUP HELP part (the EVAL half
+    /// is out of scope for the unit harness).
+    #[test]
+    fn xgroup_help() {
+        let mut db = DbSlice::new(0);
+        let resp = val(cmd(&mut db, &[b"XGROUP", b"HELP"]));
+        assert_eq!(resp.as_array().map(|a| a.len()), Some(17));
+        assert_eq!(*idx(&resp, 0), blk(b"XGROUP <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"));
+    }
+
+    /// Port of `StreamFamilyTest.GroupCreateInvalidIdMemoryTracking`.
+    #[test]
+    fn group_create_invalid_id_memory_tracking() {
+        let mut db = DbSlice::new(0);
+        let resp = cmd(
+            &mut db,
+            &[b"XGROUP", b"CREATE", b"mystream", b"mygroup", b"notanumber", b"MKSTREAM"],
+        );
+        assert!(err_of(resp).contains("syntax error"));
+        // Verify the stream was not created (no orphan stream after the error).
+        assert!(db.find(b"mystream", 0).is_none());
+    }
+
+    /// Port of `StreamFamilyTest.XAddOnOrphanedStreamMemoryTracking`.
+    #[test]
+    fn xadd_on_orphaned_stream_memory_tracking() {
+        let mut db = DbSlice::new(0);
+        let resp = cmd(
+            &mut db,
+            &[b"XGROUP", b"CREATE", b"mystream", b"mygroup", b"invalid_id", b"MKSTREAM"],
+        );
+        assert!(err_of(resp).contains("syntax error"));
+
+        let resp = cmd(&mut db, &[b"XADD", b"mystream", b"0-0", b"field", b"value"]);
+        assert!(err_of(resp).contains("equal or smaller"));
+
+        assert!(db.find(b"mystream", 0).is_none());
+    }
+
+    /// Port of `StreamFamilyTest.XReadGroupBlockwithoutBlock`: BLOCK is a no-op
+    /// when every stream has entries to deliver.
+    #[test]
+    fn xread_group_block_without_block() {
+        let mut db = DbSlice::new(0);
+        for i in 1..=3 {
+            let id = format!("1-{i}").into_bytes();
+            cmd(&mut db, &[b"XADD", b"foo", id.as_slice(), b"k", b"v"]);
+        }
+        cmd(&mut db, &[b"XADD", b"bar", b"1-1", b"k4", b"v4"]);
+        cmd(&mut db, &[b"XGROUP", b"CREATE", b"foo", b"group", b"0"]);
+        cmd(&mut db, &[b"XGROUP", b"CREATE", b"bar", b"group", b"0"]);
+
+        let resp = val(cmd(
+            &mut db,
+            &[b"XREADGROUP", b"GROUP", b"group", b"alice", b"BLOCK", b"100", b"STREAMS", b"foo", b"bar", b">", b">"],
+        ));
+        let streams = resp.as_array().unwrap();
+        assert_eq!(streams.len(), 2);
+        assert_eq!(*idx(&streams[0], 0), blk(b"foo"));
+        assert_eq!(idx(&streams[0], 1).as_array().map(|a| a.len()), Some(3));
+        assert_eq!(*idx(&streams[1], 0), blk(b"bar"));
+        assert_eq!(idx(&streams[1], 1).as_array().map(|a| a.len()), Some(1));
     }
 }

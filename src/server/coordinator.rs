@@ -29,10 +29,15 @@ struct PendingTx {
 
 /// Whether a re-ran blocked command found its key holding the wrong type, in
 /// which case it remains blocked rather than erroring (`WrongTypeDoesNotWake`).
+/// XREADGROUP is the exception: a retyped stream wakes it with WRONGTYPE
+/// (`XReadGroupBlockWakeOnRetypedStream`).
 fn is_blocked_wrong_type(msg: &CoordMsg, err: &RespError) -> bool {
     let Some(cmd) = command_for(&msg.args) else {
         return false;
     };
+    if cmd.name == "XREADGROUP" {
+        return false;
+    }
     blocking_timeout_ms(cmd, &msg.args).is_some() && err.message.starts_with("WRONGTYPE")
 }
 
