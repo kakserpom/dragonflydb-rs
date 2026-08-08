@@ -10,17 +10,22 @@
 //! - EVAL/EVALSHA errors are wrapped by the port as `ERR Error running script
 //!   (call to <sha>): <message>`, so error checks use substring matches.
 //! - The `MultiEvalTest` fixture (default `allow-undeclared-keys` flags) is
-//!   not used; tests run with the default (empty) Lua flags.
+//!   replicated via [`Ctx::with_lua`]; the BRPOP fiber is [`Ctx::spawn`].
+//!   A GLOBAL-mode EXEC is dispatched as one coordinator batch, since the
+//!   port's shard lock is last-writer-wins (no contention): the single-threaded
+//!   coordinator runs the whole queue without letting a woken blocked command
+//!   slip between the queued commands.
 //! - Tests gated on features the port lacks are skipped:
 //!   - `UndeclaredKeyFlag`/`LegacyFloatShaFlag` need `CONFIG SET` to apply
 //!     `lua_undeclared_keys_shas`/`lua_float_as_int_shas` dynamically.
 //!   - `MemoryInScript` needs `MEMORY USAGE` to reply 0 from scripts.
 //!   - `PerDbHitMissInfoOutput` needs `INFO keyspace` hit/miss counters.
 //!   - `NoKeyTransactional`/`NoKeyTransactionalMany` exercise FT._LIST (no FT).
-//!   - `MultiAllEval`/`MultiSomeEval` rely on the `MultiEvalTest` default flags
-//!     plus BRPOP-fiber concurrency.
 
 mod common;
+
+use std::thread::sleep;
+use std::time::Duration;
 
 use common::*;
 
@@ -275,6 +280,90 @@ fn multi_eval_mode_conflict() {
     assert!(
         e.contains("Multi mode conflict when running eval in multi transaction"),
         "{e}"
+    );
+}
+
+/// `MultiAllEval` (multi_test.cc:1501): with `allow-undeclared-keys` as the
+/// default flag the transaction runs in GLOBAL mode, so two undeclared-key
+/// EVALs execute as one atomic transaction — a concurrently blocked BRPOP is
+/// not woken mid-transaction and times out.
+#[test]
+fn multi_all_eval() {
+    let mut c = Ctx::with_lua(
+        2,
+        LuaConfig {
+            default_lua_flags: "allow-undeclared-keys".into(),
+            ..Default::default()
+        },
+    );
+    let fb = c.spawn(&["BRPOP", "x", "1"]);
+    sleep(Duration::from_millis(50));
+
+    c.ok(&["MULTI"]);
+    c.run(&["EVAL", "return redis.call('lpush', 'x', 'y')", "0"]);
+    c.run(&["EVAL", "return redis.call('lpop', 'x')", "0"]);
+    let exec = c.arr(&["EXEC"]);
+    assert_eq!(exec.len(), 2);
+    assert_eq!(exec[0], Value::Integer(1));
+    assert_eq!(exec[1], Value::Bulk(Some(b"y".to_vec())));
+
+    let brpop = fb.join().unwrap();
+    assert!(
+        matches!(brpop, Value::Bulk(None) | Value::Array(None)),
+        "expected nil array, got {brpop:?}"
+    );
+}
+
+/// `MultiAndEval` (multi_test.cc:1556): a declared-key EVAL queued under the
+/// `allow-undeclared-keys` default (a "borrowing interpreters" crash
+/// regression upstream).
+#[test]
+fn multi_and_eval_default_global() {
+    let mut c = Ctx::with_lua(
+        2,
+        LuaConfig {
+            default_lua_flags: "allow-undeclared-keys".into(),
+            ..Default::default()
+        },
+    );
+    c.ok(&["MULTI"]);
+    assert_eq!(
+        c.run(&["EVAL", "return redis.call('set', 'x', 'y1')", "1", "x"])
+            .text()
+            .as_deref(),
+        Some("QUEUED")
+    );
+    let exec = c.arr(&["EXEC"]);
+    assert_eq!(exec, [Value::Simple("OK".into())]);
+    assert_eq!(c.run(&["GET", "x"]).text().as_deref(), Some("y1"));
+}
+
+/// `MultiSomeEval` (multi_test.cc:1519): like `MultiAllEval` but only the first
+/// queued command is a script; the transaction is still GLOBAL.
+#[test]
+fn multi_some_eval() {
+    let mut c = Ctx::with_lua(
+        2,
+        LuaConfig {
+            default_lua_flags: "allow-undeclared-keys".into(),
+            ..Default::default()
+        },
+    );
+    let fb = c.spawn(&["BRPOP", "x", "1"]);
+    sleep(Duration::from_millis(50));
+
+    c.ok(&["MULTI"]);
+    c.run(&["EVAL", "return redis.call('lpush', 'x', 'y')", "0"]);
+    c.run(&["LPOP", "x"]);
+    let exec = c.arr(&["EXEC"]);
+    assert_eq!(exec.len(), 2);
+    assert_eq!(exec[0], Value::Integer(1));
+    assert_eq!(exec[1], Value::Bulk(Some(b"y".to_vec())));
+
+    let brpop = fb.join().unwrap();
+    assert!(
+        matches!(brpop, Value::Bulk(None) | Value::Array(None)),
+        "expected nil array, got {brpop:?}"
     );
 }
 

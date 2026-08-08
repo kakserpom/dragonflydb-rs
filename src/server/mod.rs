@@ -868,6 +868,23 @@ pub struct ScriptBatchEntry {
     pub track_keys: bool,
 }
 
+/// The mode a MULTI transaction runs in (`transaction.h:137`). The enum order
+/// is significant: `CallSHA` rejects an EVAL whose script mode is lower than
+/// the transaction's (`tx_mode > script_mode`), e.g. a GLOBAL
+/// (`allow-undeclared-keys`) script inside a LOCK_AHEAD transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum TxMultiMode {
+    /// No transaction is scheduled (pipeline-style EXEC, or not in a MULTI).
+    #[default]
+    NotDetermined = 0,
+    /// The transaction runs on all shards (contains a global command).
+    Global = 1,
+    /// The transaction locks its keys ahead of execution.
+    LockAhead = 2,
+    /// Each command runs separately (contains an admin command).
+    NonAtomic = 3,
+}
+
 /// Messages to the transaction coordinator.
 #[derive(Debug)]
 pub struct CoordMsg {
@@ -884,6 +901,10 @@ pub struct CoordMsg {
     /// True when the command runs inside a MULTI block: a blocking command must
     /// not wait, so the coordinator replies nil instead of re-queueing it.
     pub no_block: bool,
+    /// The mode deduced for the running MULTI transaction by the IO thread at
+    /// EXEC time (`DeduceExecMode`, main_service.cc:583). `NotDetermined` for
+    /// commands outside EXEC or when the transaction needs no scheduling.
+    pub multi_mode: TxMultiMode,
     /// Whether the issuing connection is tracking keys (CLIENT TRACKING), so
     /// the coordinator forwards the flag to the shards (`TrackIfNeeded`).
     pub track_keys: bool,
@@ -891,6 +912,14 @@ pub struct CoordMsg {
     /// coordinator uses it to count a script's slow subcommands
     /// (`stats.slow_commands`).
     pub slowlog_threshold_usec: u64,
+    /// A GLOBAL-mode MULTI transaction dispatched as one batch: the `(seq,
+    /// args)` pairs of every queued command. When `Some`, the coordinator runs
+    /// the whole queue synchronously in a single `handle` so no other message
+    /// (e.g. a woken blocked command) interleaves mid-transaction. The port has
+    /// no shard-lock contention (`active_tx` is last-writer-wins), so the
+    /// single-threaded coordinator is what gives a GLOBAL transaction its
+    /// all-shards atomicity (`Coordinator::execute_multi_batch`).
+    pub multi_queue: Option<Vec<(u64, Vec<Vec<u8>>)>>,
 }
 
 /// `SCRIPT GC`: a request for the coordinator to run a full Lua GC over its

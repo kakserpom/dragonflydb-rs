@@ -21,9 +21,9 @@ use crate::server::replica::{self, ReplicaPhase, ReplicaStatus};
 use crate::server::replication::{self, ChunkKind, ReplChunk, ReplicationManager, SyncState};
 use crate::server::slowlog::{SlowLog, SlowLogEntry};
 use crate::server::{
-    CoordMsg, GcRequest, PauseMode, Reply, ServerEnv, ShardMsg, SingleOp, TrackingMode, WatchState,
-    command_for, encode_value, extract_keys, is_eval_cmd, is_function_cmd, keys_per_shard,
-    local_function, local_script,
+    CoordMsg, GcRequest, PauseMode, Reply, ServerEnv, ShardMsg, SingleOp, TrackingMode,
+    TxMultiMode, WatchState, command_for, encode_value, extract_keys, is_eval_cmd, is_function_cmd,
+    keys_per_shard, local_function, local_script,
 };
 
 const EV_READ: i16 = libc::EVFILT_READ;
@@ -281,6 +281,10 @@ struct Conn {
     /// reply nil instead of waiting (upstream `IsMulti` during exec). The
     /// `multi` state is reset before the queue runs, so this carries the flag.
     exec_multi: bool,
+    /// The mode deduced for the running EXEC (`DeduceExecMode`), carried for
+    /// the queued commands' CoordMsgs so the coordinator can reject an EVAL
+    /// whose script mode conflicts (`CallSHA`).
+    exec_multi_mode: TxMultiMode,
     /// Keys this connection is watching (WATCH/UNWATCH).
     watched: Vec<WatchedKey>,
     /// Latch mirroring upstream `ExecInfo::watched_dirty`: set when any
@@ -498,6 +502,7 @@ impl IoLoop {
                 resp3: false,
                 multi: MultiState::default(),
                 exec_multi: false,
+                exec_multi_mode: TxMultiMode::NotDetermined,
                 watched: Vec::new(),
                 watched_dirty: false,
                 sub: SubscribeInfo::default(),
@@ -1145,15 +1150,129 @@ impl IoLoop {
         let exec_slowlog_args = format_exec_slowlog(queue.len(), is_write);
         let header = format!("*{}\r\n", queue.len()).into_bytes();
         self.deliver_with_args(conn_id, seq, header, Some(exec_slowlog_args));
+        let multi_mode = self.deduce_exec_mode(&queue, watched.is_empty());
         if let Some(conn) = self.conns.get_mut(&conn_id) {
             conn.exec_multi = true;
+            conn.exec_multi_mode = multi_mode;
         }
-        for args in queue {
-            self.run_queued(conn_id, &args);
+        if multi_mode == TxMultiMode::Global && self.queue_is_batchable(&queue) {
+            self.run_global_batch(conn_id, &queue);
+        } else {
+            for args in queue {
+                self.run_queued(conn_id, &args);
+            }
         }
         if let Some(conn) = self.conns.get_mut(&conn_id) {
             conn.exec_multi = false;
+            conn.exec_multi_mode = TxMultiMode::NotDetermined;
         }
+    }
+
+    /// `DeduceExecMode` (main_service.cc:583): pick the mode a MULTI
+    /// transaction runs in from its queued body. The port has no script-issued
+    /// EXEC (`ExecScriptUse::SCRIPT_RUN`), so a queued EVAL consults
+    /// `AreGlobalByDefault` directly instead: when the default Lua flags allow
+    /// undeclared keys the EVAL schedules globally, which makes the whole
+    /// transaction GLOBAL.
+    fn deduce_exec_mode(&self, queue: &[Vec<Vec<u8>>], watched_empty: bool) -> TxMultiMode {
+        // `ScriptMgr::AreGlobalByDefault` (script_mgr.cc:412).
+        let are_global_by_default = {
+            let mgr = self.env.script_mgr.lock().unwrap();
+            mgr.default_params.undeclared_keys && mgr.default_params.atomic
+        };
+        let mut contains_global = false;
+        let mut contains_admin_cmd = false;
+        let mut transactional = false;
+        for q in queue {
+            let Some(cmd) = command_for(q) else { continue };
+            if cmd.name.starts_with("EVAL") {
+                if are_global_by_default {
+                    contains_global = true;
+                    transactional = true;
+                } else if let Some(n) = q.get(2).and_then(|a| crate::util::parse_i64(a)) {
+                    // `DetermineKeys(...).NumArgs() > 0`: only a declared-keys
+                    // EVAL is transactional.
+                    transactional |= n > 0;
+                }
+            } else {
+                transactional |= cmd.has_flag(FLAG_WRITE) || cmd.has_flag(FLAG_READONLY);
+            }
+            contains_global |= cmd.has_flag(FLAG_GLOBAL);
+            contains_admin_cmd |= cmd.has_flag(FLAG_ADMIN);
+            if contains_global {
+                break;
+            }
+        }
+        // A body of only non-transactional commands (PING, SELECT, ...) with no
+        // watched keys runs without any scheduling.
+        if !transactional && watched_empty {
+            return TxMultiMode::NotDetermined;
+        }
+        if contains_admin_cmd {
+            TxMultiMode::NonAtomic
+        } else if contains_global {
+            TxMultiMode::Global
+        } else {
+            TxMultiMode::LockAhead
+        }
+    }
+
+    /// Whether a GLOBAL EXEC can be dispatched as one coordinator batch: every
+    /// queued command must be coordinator-dispatched. Local commands (SELECT,
+    /// UNWATCH, REPLCONF, ...) need the IO thread's connection state, so they
+    /// fall back to the per-command loop.
+    fn queue_is_batchable(&self, queue: &[Vec<Vec<u8>>]) -> bool {
+        queue.iter().all(|args| {
+            command_for(args).is_some_and(|c| !c.has_flag(FLAG_LOCAL) && !c.has_flag(FLAG_ADMIN))
+        })
+    }
+
+    /// Dispatch a GLOBAL-mode EXEC as one `CoordMsg` batch: the coordinator
+    /// runs every queued command in a single `handle` call, so a woken blocked
+    /// command or any other transaction cannot slip between them. The IO thread
+    /// still performs the per-command bookkeeping `run_queued` would (slowlog,
+    /// monitor, stats).
+    fn run_global_batch(&mut self, conn_id: u64, queue: &[Vec<Vec<u8>>]) {
+        let mut batch = Vec::with_capacity(queue.len());
+        for args in queue {
+            let seq = self.next_seq(conn_id);
+            let cmd = command_for(args).expect("batchable checked");
+            if !cmd.has_flag(FLAG_BLOCKING)
+                && let Some(conn) = self.conns.get_mut(&conn_id)
+            {
+                conn.pending_slowlog.insert(
+                    seq,
+                    PendingSlowlog {
+                        name: cmd.name.to_string(),
+                        args: args.to_vec(),
+                        started: Instant::now(),
+                        slowlog_args: None,
+                    },
+                );
+            }
+            if !cmd.has_flag(FLAG_ADMIN) && cmd.name != "EXEC" {
+                self.broadcast_monitor(conn_id, args);
+            }
+            server::bump_cmd_stat(&self.env.command_stats, cmd.name);
+            batch.push((seq, args.clone()));
+        }
+        let db_idx = self.conns.get(&conn_id).map_or(0, |c| c.db_idx);
+        let track_keys = self.should_track(conn_id);
+        let msg = CoordMsg {
+            conn_id,
+            seq: 0,
+            args: Vec::new(),
+            keys: Vec::new(),
+            shards: Vec::new(),
+            first_key_idx: 0,
+            db_idx,
+            no_block: true,
+            multi_mode: TxMultiMode::Global,
+            track_keys,
+            slowlog_threshold_usec: self.slow_log.threshold(),
+            multi_queue: Some(batch),
+        };
+        let _ = self.env.coord_tx.send(msg);
     }
 
     fn local_reset(&mut self, conn_id: u64, seq: u64) {
@@ -2385,8 +2504,13 @@ impl IoLoop {
             first_key_idx,
             db_idx,
             no_block: self.no_block(conn_id),
+            multi_mode: self
+                .conns
+                .get(&conn_id)
+                .map_or(TxMultiMode::NotDetermined, |c| c.exec_multi_mode),
             slowlog_threshold_usec: self.slow_log.threshold(),
             track_keys,
+            multi_queue: None,
         };
         let _ = self.env.coord_tx.send(msg);
     }

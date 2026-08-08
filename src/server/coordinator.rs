@@ -13,9 +13,9 @@ use crate::commands::lua::{
 use crate::commands::{Command, FLAG_GLOBAL, FLAG_NOSCRIPT, FLAG_WRITE, ShardPart};
 use crate::error::{CmdResult, RespError, RespValue};
 use crate::server::{
-    CoordMsg, GcRequest, Reply, ReplyBus, ScriptBatchEntry, ShardMsg,
-    blocking_timeout_is_nil_array, blocking_timeout_ms, command_for, encode_result, extract_keys,
-    is_eval_cmd, is_function_cmd, keys_per_shard, shard_for_key,
+    CoordMsg, GcRequest, Reply, ReplyBus, ScriptBatchEntry, ShardMsg, TxMultiMode,
+    blocking_timeout_is_nil_array, blocking_timeout_ms, command_for, encode_result, encode_value,
+    extract_keys, is_eval_cmd, is_function_cmd, keys_per_shard, shard_for_key,
 };
 
 /// A blocking command (XREAD/XREADGROUP) waiting for data or a timeout. The
@@ -163,6 +163,13 @@ impl Coordinator {
     }
 
     fn handle(&mut self, msg: CoordMsg) {
+        // A GLOBAL-mode EXEC arrives as one batch; run it synchronously so no
+        // message (a woken blocked command, another connection's command)
+        // interleaves between the queued commands.
+        if msg.multi_queue.is_some() {
+            self.execute_multi_batch(&msg);
+            return;
+        }
         // The EVAL family runs scripts in the coordinator's Lua state; it never
         // goes through the shard-based `execute_tx`.
         if let Some(cmd) = command_for(&msg.args)
@@ -201,6 +208,119 @@ impl Coordinator {
                     self.reply(msg.conn_id, msg.seq, bytes);
                     return;
                 }
+                let cmd = command_for(&msg.args);
+                let deadline = cmd.and_then(|c| blocking_timeout_ms(c, &msg.args)).map_or(
+                    Some(Instant::now()),
+                    |ms| {
+                        if ms == 0 {
+                            None // wait forever
+                        } else {
+                            Some(Instant::now() + Duration::from_millis(ms))
+                        }
+                    },
+                );
+                self.pending.push_back(PendingTx { msg, deadline });
+            }
+            other => self.reply_result(msg.conn_id, msg.seq, other),
+        }
+    }
+
+    /// Execute a GLOBAL-mode MULTI transaction: run every queued command
+    /// synchronously within this `handle` call. The single-threaded coordinator
+    /// never returns to its message loop mid-batch, so a woken blocked command
+    /// or any other connection's transaction cannot run between the queued
+    /// commands — the all-shards atomicity a GLOBAL transaction provides in the
+    /// reference (`TxMultiMode::Global`, where the shards stay locked for the
+    /// whole EXEC).
+    fn execute_multi_batch(&mut self, msg: &CoordMsg) {
+        let Some(queue) = &msg.multi_queue else {
+            return;
+        };
+        for (seq, args) in queue {
+            let sub = CoordMsg {
+                conn_id: msg.conn_id,
+                seq: *seq,
+                args: args.clone(),
+                keys: Vec::new(),
+                shards: Vec::new(),
+                first_key_idx: 0,
+                db_idx: msg.db_idx,
+                no_block: msg.no_block,
+                multi_mode: msg.multi_mode,
+                track_keys: msg.track_keys,
+                slowlog_threshold_usec: msg.slowlog_threshold_usec,
+                multi_queue: None,
+            };
+            self.dispatch_batch_one(sub);
+        }
+    }
+
+    /// Run one queued command of a GLOBAL EXEC batch. EVAL/FCALL run on the
+    /// coordinator like outside EXEC; everything else dispatches through
+    /// `execute_tx`, deriving its shards the way the IO thread's
+    /// `dispatch_keyed` does for a non-queued command.
+    fn dispatch_batch_one(&mut self, mut msg: CoordMsg) {
+        let Some(cmd) = command_for(&msg.args) else {
+            self.reply(
+                msg.conn_id,
+                msg.seq,
+                encode_value(&RespValue::Error("ERR unknown command".into())),
+            );
+            return;
+        };
+        if is_eval_cmd(cmd.name) {
+            let is_evalsha = matches!(cmd.name, "EVALSHA" | "EVALSHA_RO");
+            let read_only = cmd.name.ends_with("_RO");
+            let result = self.execute_script(&msg, is_evalsha, read_only);
+            let slowlog_args = self.script_slowlog_args.take();
+            self.reply_with_slowlog(msg.conn_id, msg.seq, result, slowlog_args);
+            return;
+        }
+        if is_function_cmd(cmd.name) {
+            let read_only = cmd.name.ends_with("_RO");
+            let result = self.execute_function(&msg, read_only);
+            let slowlog_args = self.script_slowlog_args.take();
+            self.reply_with_slowlog(msg.conn_id, msg.seq, result, slowlog_args);
+            return;
+        }
+        // `dispatch_keyed`'s shard derivation (event_loop.rs): global commands
+        // and `DEBUG UNIQ-STRS` span every shard; everything else is keyed.
+        if cmd.name == "DEBUG"
+            && msg
+                .args
+                .get(1)
+                .is_some_and(|a| a.eq_ignore_ascii_case(b"UNIQ-STRS"))
+        {
+            msg.shards = (0..self.num_shards).collect();
+        } else if cmd.has_flag(FLAG_GLOBAL) {
+            msg.shards = (0..self.num_shards).collect();
+            msg.first_key_idx = cmd.key_range.first;
+        } else {
+            let keys = extract_keys(cmd, &msg.args);
+            if keys.is_empty() {
+                // Malformed/movable-key command without keys: let the executor
+                // validate and reply with an error from shard 0.
+                msg.shards = vec![0];
+            } else {
+                msg.keys = keys;
+                msg.first_key_idx = cmd.key_range.first;
+                msg.shards = keys_per_shard(&msg.args, &msg.keys, self.num_shards)
+                    .iter()
+                    .map(|(s, _)| *s)
+                    .collect();
+            }
+        }
+        match self.execute_tx(&msg) {
+            // Inside EXEC a blocking command never waits (`no_block` is set).
+            CmdResult::Blocked if msg.no_block => {
+                let bytes = if command_for(&msg.args).is_some_and(blocking_timeout_is_nil_array) {
+                    crate::protocol::resp::encode_nil_array()
+                } else {
+                    encode_result(CmdResult::Ok(RespValue::Nil))
+                };
+                self.reply(msg.conn_id, msg.seq, bytes);
+            }
+            CmdResult::Blocked => {
                 let cmd = command_for(&msg.args);
                 let deadline = cmd.and_then(|c| blocking_timeout_ms(c, &msg.args)).map_or(
                     Some(Instant::now()),
@@ -427,14 +547,25 @@ impl Coordinator {
             Ok(p) => p,
             Err(e) => return CmdResult::err(format!("ERR {e}")),
         };
-        // `CallSHA` (main_service.cc): a script that requires GLOBAL scheduling
-        // (allow-undeclared-keys) cannot run inside a LOCK_AHEAD MULTI
-        // transaction. The port's EXEC always schedules lock-ahead, so the
-        // conflict fires whenever such a script is queued in a MULTI.
-        if msg.no_block && params.undeclared_keys {
-            return CmdResult::err(
-                "Multi mode conflict when running eval in multi transaction. Multi mode is: LOCK_AHEAD, eval mode is: GLOBAL",
-            );
+        // `CallSHA` (main_service.cc:2389): a script whose mode is lower than
+        // the running transaction's is rejected — a GLOBAL script
+        // (`allow-undeclared-keys`) inside a LOCK_AHEAD MULTI, for example.
+        // The transaction mode was deduced at EXEC time by the IO thread
+        // (`DeduceExecMode`); outside EXEC it is `NotDetermined` and never
+        // conflicts. The reference renders the modes as their integer values
+        // (`absl::StrCat` over the enum).
+        let script_mode = if params.atomic && params.undeclared_keys {
+            TxMultiMode::Global
+        } else if params.atomic {
+            TxMultiMode::LockAhead
+        } else {
+            TxMultiMode::NonAtomic
+        };
+        if msg.no_block && msg.multi_mode > script_mode {
+            return CmdResult::err(format!(
+                "Multi mode conflict when running eval in multi transaction. Multi mode is: {} eval mode is: {}",
+                msg.multi_mode as u8, script_mode as u8
+            ));
         }
         // `lua_auto_async`: rewrite statement-context `redis.call`/`redis.pcall`
         // into `acall`/`apcall` for atomic bodies before the first compile
