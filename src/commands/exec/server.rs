@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -163,24 +163,44 @@ fn exec_info(ctx: &mut OpContext) -> CmdResult {
             expires += 1;
         }
     }
-    CmdResult::Ok(RespValue::Array(vec![
+    // INFO is special-cased in `Shard::exec_core` to report every DB on the
+    // shard (`run_info`); this entry for the current DB is the fallback used
+    // when the command runs through a plain `OpContext`.
+    CmdResult::Ok(RespValue::Array(vec![RespValue::Array(vec![
+        RespValue::Integer(0),
         RespValue::Integer(ctx.db.key_count() as i64),
         RespValue::Integer(expires as i64),
-    ]))
+        RespValue::Integer(ctx.db.stats.hits as i64),
+        RespValue::Integer(ctx.db.stats.misses as i64),
+    ])]))
 }
 
 /// Renders the INFO body for the requested sections (`ServerFamily::Info`,
 /// `GetMetrics`). With no sections, everything except the hidden COMMANDSTATS
 /// is emitted (LATENCYSTATS included); unknown section names are skipped.
 fn merge_info(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], now_ms: u64) -> CmdResult {
-    let (mut keys, mut expires) = (0i64, 0i64);
+    // Each shard part is a list of `[db, keys, expires, hits, misses]` entries,
+    // aggregated per DB across shards.
+    let mut per_db: BTreeMap<usize, (i64, i64, i64, i64)> = BTreeMap::new();
     for p in parts {
-        if let CmdResult::Ok(RespValue::Array(a)) = &p.result
-            && let (Some(RespValue::Integer(k)), Some(RespValue::Integer(e))) =
-                (a.first(), a.get(1))
-        {
-            keys += k;
-            expires += e;
+        if let CmdResult::Ok(RespValue::Array(entries)) = &p.result {
+            for entry in entries {
+                if let RespValue::Array(f) = entry
+                    && let [
+                        RespValue::Integer(db),
+                        RespValue::Integer(k),
+                        RespValue::Integer(e),
+                        RespValue::Integer(h),
+                        RespValue::Integer(m),
+                    ] = f.as_slice()
+                {
+                    let agg = per_db.entry(*db as usize).or_default();
+                    agg.0 += k;
+                    agg.1 += e;
+                    agg.2 += h;
+                    agg.3 += m;
+                }
+            }
         }
     }
     let uptime = now_ms / 1000;
@@ -255,11 +275,23 @@ fn merge_info(parts: &[ShardPart], args: &[Vec<u8>], _keys: &[usize], now_ms: u6
         lines.push_str("# Cluster\r\nmigration_errors_total:0\r\n");
     }
     if want("keyspace") {
-        write!(
-            lines,
-            "# Keyspace\r\ndb0:keys={keys},expires={expires},avg_ttl=0\r\n"
-        )
-        .unwrap();
+        lines.push_str("# Keyspace\r\n");
+        for (db, (keys, expires, hits, misses)) in &per_db {
+            // `InfoKeyspace` (server_family.cc:3064): db0 and any DB with keys.
+            if *db == 0 || *keys > 0 {
+                let total = hits + misses;
+                let hit_ratio = if total > 0 {
+                    *hits as f64 / total as f64 * 100.0
+                } else {
+                    0.0
+                };
+                write!(
+                    lines,
+                    "db{db}:keys={keys},expires={expires},hits={hits},misses={misses},hit_ratio={hit_ratio:.2},avg_ttl=-1\r\n"
+                )
+                .unwrap();
+            }
+        }
     }
     CmdResult::Ok(RespValue::Bulk(lines.into_bytes()))
 }

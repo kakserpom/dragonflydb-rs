@@ -41,6 +41,10 @@ pub struct DbStats {
     pub key_count: usize,
     pub expiry_count: usize,
     pub expired_checked: u64,
+    /// Read hits (key found), `INFO keyspace` `hits=`.
+    pub hits: u64,
+    /// Read misses (key absent), `INFO keyspace` `misses=`.
+    pub misses: u64,
 }
 
 impl DbSlice {
@@ -71,12 +75,17 @@ impl DbSlice {
     }
 
     /// Look up a value, transparently removing it if expired. Marks the key as
-    /// touched when found (backing SCAN `ATTR a`).
+    /// touched when found (backing SCAN `ATTR a`). A successful read counts a
+    /// hit, a missing/expired key a miss (`DbSlice::FindInternal` with
+    /// `UpdateStatsMode::kReadStats`).
     pub fn find(&mut self, key: &[u8], now_ms: u64) -> Option<&PrimeValue> {
         self.expire_if_needed(key, now_ms);
         let v = self.prime_table.get(key);
         if v.is_some() {
             self.touched.insert(CompactString::from_bytes(key));
+            self.stats.hits += 1;
+        } else {
+            self.stats.misses += 1;
         }
         v
     }

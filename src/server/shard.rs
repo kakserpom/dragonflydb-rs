@@ -747,7 +747,18 @@ impl Shard {
         if cmd.name == "FLUSHALL" {
             return (self.run_flushall(), None);
         }
+        // INFO aggregates every DB on the shard (`ServerFamily::Info` reads the
+        // whole per-thread `db_stats` array), not just the connection's current
+        // DB, so it needs the raw `dbs` vector like MOVE.
+        if cmd.name == "INFO" {
+            return (self.run_info(), None);
+        }
         let db = self.ensure_db(db_idx);
+        // `DbSlice::find` counts a hit/miss like `FindInternal` with
+        // `kReadStats`; write commands also call `find` for existence checks
+        // (the reference uses `FindMutable` there, which does not count), so
+        // roll the counters back when the command is not a read.
+        let (hits_before, misses_before) = (db.stats.hits, db.stats.misses);
         let mut ctx = OpContext {
             db,
             args,
@@ -757,6 +768,10 @@ impl Shard {
             now_ms: now_ms(),
         };
         let result = (cmd.exec)(&mut ctx);
+        if !cmd.has_flag(crate::commands::FLAG_READONLY) {
+            ctx.db.stats.hits = hits_before;
+            ctx.db.stats.misses = misses_before;
+        }
         let mut spop: Option<Vec<Vec<u8>>> = None;
         if cmd.name == "SPOP" {
             let members = spop_members(&result);
@@ -929,6 +944,27 @@ impl Shard {
             db.bump_db_epoch();
         }
         CmdResult::Ok(crate::commands::ok())
+    }
+
+    /// Per-DB stats for INFO keyspace: one `[db, keys, expires, hits, misses]`
+    /// entry per DB, which `merge_info` aggregates across shards
+    /// (`ServerFamily::Info` reads the whole per-thread `db_stats` array).
+    fn run_info(&self) -> CmdResult {
+        let entries = self
+            .dbs
+            .iter()
+            .enumerate()
+            .map(|(i, db)| {
+                RespValue::Array(vec![
+                    RespValue::Integer(i as i64),
+                    RespValue::Integer(db.key_count() as i64),
+                    RespValue::Integer(db.stats.expiry_count as i64),
+                    RespValue::Integer(db.stats.hits as i64),
+                    RespValue::Integer(db.stats.misses as i64),
+                ])
+            })
+            .collect();
+        CmdResult::Ok(RespValue::Array(entries))
     }
 }
 

@@ -16,7 +16,6 @@
 //!   coordinator runs the whole queue without letting a woken blocked command
 //!   slip between the queued commands.
 //! - Tests gated on features the port lacks are skipped:
-//!   - `PerDbHitMissInfoOutput` needs `INFO keyspace` hit/miss counters.
 //!   - `NoKeyTransactional`/`NoKeyTransactionalMany` exercise FT._LIST (no FT).
 
 mod common;
@@ -794,4 +793,20 @@ fn legacy_float_sha_flag() {
     c.ok(&["SCRIPT", "FLUSH"]);
     c.ok(&["CONFIG", "SET", "lua_float_as_int_shas", &sha]);
     assert_eq!(c.run(&["EVAL", script, "0"]).int(), Some(42));
+}
+
+/// `PerDbHitMissInfoOutput` (multi_test.cc:283): `INFO keyspace` reports
+/// per-DB read hit/miss counters and the hit ratio.
+#[test]
+fn per_db_hit_miss_info_output() {
+    let mut c = Ctx::new();
+    c.ok(&["SELECT", "0"]);
+    c.ok(&["SET", "testkey", "testval"]);
+    c.run(&["GET", "testkey"]);
+    c.run(&["GET", "missing"]);
+
+    let info = c.text(&["INFO", "keyspace"]);
+    assert!(info.contains("hits=1"), "{info}");
+    assert!(info.contains("misses=1"), "{info}");
+    assert!(info.contains("hit_ratio=50.00"), "{info}");
 }
