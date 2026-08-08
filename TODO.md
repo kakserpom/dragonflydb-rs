@@ -341,6 +341,30 @@ integration tests (`tests/*.rs`) that run against the in-process server
   plus a portable `socket_info_invalid_fd`. The port has no TLS, so (like the
   reference's only consumers, TLS accept error logs) nothing calls it from
   the server itself.
+- [x] `multi_test.cc` → `tests/multi.rs` (25 tests): MULTI/EXEC queueing
+  (`multi_and_flush`/`multi_with_error`/`multi_empty`/`multi_seq`/
+  `multi_without_tx`/`multi_global_commands`/`multi_rename`/`multi_types`),
+  EVAL/SCRIPT LOAD in transactions (`multi_and_eval`), WATCH validation
+  (`watch`), RESET semantics (`reset_returns_reset_string`,
+  `reset_clears_multi_block`, `reset_clears_watch_state`, `reset_selects_db0`),
+  the script-flag suite (`script_flags_invalid_sha`/`script_flags_embedded`,
+  `cjson_decode_integer_behavior`, `script_bad_command`), and the EVAL family
+  (`eval_ro`/`eval_sha_ro`, `eval_expiration`, `eval_select`, `general_acall`,
+  `acall_undeclared_keys`, `multi_eval_mode_conflict`). Source fixes:
+  FLAG_LOCAL subcommands (PING/ECHO/TIME/LASTSAVE/SELECT) now run inline on the
+  coordinator (`script_local` in `coordinator.rs`) instead of hitting a shard's
+  `local_stub`; `script_select` rejects LOCK_AHEAD scripts ("SELECT is not
+  allowed in regular EXEC/EVAL"), range-checks the DB ("ERR DB index is out of
+  range") and switches the script DB for GLOBAL/NON_ATOMIC scripts;
+  script-local errors are raised from `redis.call` (not returned as replies);
+  a MULTI-queued `allow-undeclared-keys` EVAL reports "Multi mode conflict when
+  running eval in multi transaction. Multi mode is: LOCK_AHEAD, eval mode is:
+  GLOBAL" (`no_block && undeclared_keys` in `execute_script`). Adaptations:
+  EVAL/EVALSHA error strings are matched by substring (wrapped as "ERR Error
+  running script (call to <sha>): ..."), "OK" replies by content (status vs
+  bulk), EXEC-abort matchers use the port's nil reply, EXPIRE-based checks run
+  under `clock_guard`, and the `MultiEvalTest`-fixture / CONFIG-gated /
+  FT-gated / INFO-keyspace cases are skipped (documented in the test header).
 - [x] Remaining `server_family_test.cc` audit: all 42 `ServerFamilyTest` cases
   are ported. The reference has no `DFLY_USE_CLUSTER`/cluster-only gates (the
   earlier "cluster-only paths remain" note was stale; there is no cluster mode
