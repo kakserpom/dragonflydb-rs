@@ -16,7 +16,7 @@ use crate::commands::{
 use crate::core::PrimeValue;
 use crate::core::compact::CompactString;
 use crate::core::string_stats::{PerShardStats, UniqueStrings};
-use crate::core::value::ObjType;
+use crate::core::value::{ObjType, str_malloc_used};
 use crate::error::{CmdResult, RespError, RespValue};
 
 /// Last completed snapshot timestamp (epoch seconds), backing LASTSAVE. Starts
@@ -680,7 +680,13 @@ fn memory_usage(ctx: &mut OpContext) -> CmdResult {
     let account_key = !(ctx.args.len() >= 4 && ctx.args[3].eq_ignore_ascii_case(b"WITHOUTKEY"));
     match ctx.db.find(key, ctx.now_ms) {
         Some(value) => {
-            let key_size = if account_key { key.len() } else { 0 };
+            // `MemoryUsage` (memory_cmd.cc): the key is a `CompactObj`, so its
+            // MallocUsed is 0 when stored inline just like the value's.
+            let key_size = if account_key {
+                str_malloc_used(key.len())
+            } else {
+                0
+            };
             CmdResult::Ok(RespValue::Integer((key_size + value.malloc_used()) as i64))
         }
         None => CmdResult::Ok(RespValue::Nil),
@@ -1676,16 +1682,17 @@ mod tests {
     #[test]
     fn memory_usage() {
         let mut d = db();
-        // A value short enough to be stored inline has MallocUsed() == 0, so
-        // USAGE reports just the key length.
+        // Inline strings (key and value both <= 16 bytes) have MallocUsed() ==
+        // 0, so USAGE reports 0 — the reference `MemoryInScript` test relies on
+        // this for a 1-byte key/value pair.
         assert_eq!(s(&mut d, &["SET", "key", "val"]), "OK");
-        assert_eq!(s(&mut d, &["MEMORY", "USAGE", "key"]), "3");
+        assert_eq!(s(&mut d, &["MEMORY", "USAGE", "key"]), "0");
         assert_eq!(s(&mut d, &["MEMORY", "USAGE", "key", "WITHOUTKEY"]), "0");
         assert_eq!(s(&mut d, &["MEMORY", "USAGE", "nosuch"]), "(nil)");
 
-        // A heap-backed value is accounted: key(3) + malloc_used(30-char = 24).
+        // A heap-backed value is accounted: key(inline = 0) + malloc_used(30-char = 24).
         assert_eq!(s(&mut d, &["SET", "big", "x".repeat(30).as_str()]), "OK");
-        assert_eq!(s(&mut d, &["MEMORY", "USAGE", "big"]), "27");
+        assert_eq!(s(&mut d, &["MEMORY", "USAGE", "big"]), "24");
         assert_eq!(s(&mut d, &["MEMORY", "USAGE", "big", "WITHOUTKEY"]), "24");
 
         assert_eq!(s(&mut d, &["MEMORY", "USAGE"]), "ERR syntax error");

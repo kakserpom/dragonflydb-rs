@@ -18,7 +18,6 @@
 //! - Tests gated on features the port lacks are skipped:
 //!   - `UndeclaredKeyFlag`/`LegacyFloatShaFlag` need `CONFIG SET` to apply
 //!     `lua_undeclared_keys_shas`/`lua_float_as_int_shas` dynamically.
-//!   - `MemoryInScript` needs `MEMORY USAGE` to reply 0 from scripts.
 //!   - `PerDbHitMissInfoOutput` needs `INFO keyspace` hit/miss counters.
 //!   - `NoKeyTransactional`/`NoKeyTransactionalMany` exercise FT._LIST (no FT).
 
@@ -461,6 +460,25 @@ fn eval_expiration() {
     c.run(&["EVAL", "redis.call('set', 'x', 0, 'ex', 5, 'nx')", "1", "x"]);
     let pttl = c.int(&["PTTL", "x"]);
     assert!(pttl <= 5000, "pttl={pttl}");
+}
+
+/// `MemoryInScript` (multi_test.cc:1471): `MEMORY USAGE` runs from a script
+/// (the reference dropped NOSCRIPT in #2382) and reports 0 for the 1-byte
+/// inline key/value pair — both `CompactObj`s are stored inline, so
+/// `MallocUsed()` is 0 for each.
+#[test]
+fn memory_in_script() {
+    let mut c = Ctx::new();
+    c.ok(&["SET", "x", "y"]);
+    assert_eq!(
+        c.run(&[
+            "EVAL",
+            "return redis.call('MEMORY', 'USAGE', KEYS[1])",
+            "1",
+            "x"
+        ]),
+        Value::Integer(0)
+    );
 }
 
 /// `Watch` (multi_test.cc:691): WATCH semantics including expiry and FLUSHDB

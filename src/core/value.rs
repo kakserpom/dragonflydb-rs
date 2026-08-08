@@ -79,26 +79,14 @@ impl PrimeValue {
     }
 
     /// Approximate allocated size of the value in bytes, mirroring Dragonfly's
-    /// `CompactObj::MallocUsed` used by SCAN `MINMSZ`. Strings report
-    /// 0 when stored inline (length <= 16), the rounded-up heap portion for
-    /// SmallString-sized values (17..=255), and the request rounded down to the
-    /// allocator's 8-byte granularity for LargeString-sized values. Calibrated
-    /// to the reference `ScanMallocSize` test: 15/500/1000-byte values report
-    /// 0/496/1000.
+    /// `CompactObj::MallocUsed` used by SCAN `MINMSZ` and `MEMORY USAGE`.
     #[must_use]
     pub fn malloc_used(&self) -> usize {
         match self {
             PrimeValue::Str(s) => {
                 // `CompactString::len()` truncates to a u8; use the real byte
                 // length for heap-backed strings.
-                let len = s.as_bytes().len();
-                if len <= 16 {
-                    0
-                } else if len <= 255 {
-                    (len - 10).div_ceil(8) * 8
-                } else {
-                    len / 8 * 8
-                }
+                str_malloc_used(s.as_bytes().len())
             }
             // Container types are not exercised by the SCAN MINMSZ tests.
             PrimeValue::Sbf(s) => s.malloc_used(),
@@ -137,5 +125,23 @@ impl ObjType {
 impl Default for PrimeValue {
     fn default() -> Self {
         PrimeValue::Str(CompactString::new())
+    }
+}
+
+/// Dragonfly's `CompactObj::MallocUsed` model for strings, applied to keys and
+/// values alike (a prime-table key is a `CompactObj` too). Strings report 0
+/// when stored inline (length <= 16), the rounded-up heap portion for
+/// SmallString-sized values (17..=255), and the request rounded down to the
+/// allocator's 8-byte granularity for LargeString-sized values. Calibrated to
+/// the reference `ScanMallocSize` test: 15/500/1000-byte values report
+/// 0/496/1000.
+#[must_use]
+pub fn str_malloc_used(len: usize) -> usize {
+    if len <= 16 {
+        0
+    } else if len <= 255 {
+        (len - 10).div_ceil(8) * 8
+    } else {
+        len / 8 * 8
     }
 }

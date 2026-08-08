@@ -1588,7 +1588,14 @@ impl ScriptDispatchCtx<'_> {
             return Err(e);
         }
         if cmd.has_flag(FLAG_NOSCRIPT)
-            || (cmd.has_flag(FLAG_GLOBAL) && self.ctx.atomic && !self.ctx.undeclared_keys)
+            || (cmd.has_flag(FLAG_GLOBAL)
+                // MEMORY is READONLY|FAST in the reference (NOSCRIPT was
+                // dropped in #2382), so it runs from any script; the port flags
+                // it GLOBAL only so top-level `MEMORY USAGE` reaches every
+                // shard (`MemoryCmd::Usage` picks the key's shard internally).
+                && cmd.name != "MEMORY"
+                && self.ctx.atomic
+                && !self.ctx.undeclared_keys)
         {
             return Err("This Redis command is not allowed from script".to_string());
         }
@@ -1657,21 +1664,32 @@ impl ScriptDispatchCtx<'_> {
         let first_key_idx = cmd.key_range.first;
         let mut parts = Vec::new();
         if keys.is_empty() {
-            let result = self.coord.script_op(
-                0,
-                args.to_owned(),
-                vec![],
-                first_key_idx,
-                self.ctx.db_idx,
-                true,
-                self.ctx.conn_id,
-                self.ctx.track_keys,
-            );
-            parts.push(ShardPart {
-                shard: 0,
-                owned_key_idxs: vec![],
-                result,
-            });
+            // A GLOBAL subcommand (MEMORY, DBSIZE, FLUSHALL, ...) runs on every
+            // shard like the top-level GLOBAL dispatch (event_loop.rs), so the
+            // merge can pick the shard that owns a `MEMORY USAGE` key; other
+            // keyless commands validate/reply from shard 0.
+            let shards: Vec<usize> = if cmd.has_flag(FLAG_GLOBAL) {
+                (0..self.ctx.num_shards).collect()
+            } else {
+                vec![0]
+            };
+            for s in shards {
+                let result = self.coord.script_op(
+                    s,
+                    args.to_owned(),
+                    vec![],
+                    first_key_idx,
+                    self.ctx.db_idx,
+                    true,
+                    self.ctx.conn_id,
+                    self.ctx.track_keys,
+                );
+                parts.push(ShardPart {
+                    shard: s,
+                    owned_key_idxs: vec![],
+                    result,
+                });
+            }
         } else {
             for (s, owned) in keys_per_shard(args, &keys, self.ctx.num_shards) {
                 // A subcommand whose keys all live on one shard journals the
