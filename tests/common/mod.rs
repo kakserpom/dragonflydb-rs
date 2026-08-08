@@ -6,6 +6,10 @@
 //! C++ suite. `TestServer::stop` sends `SHUTDOWN`, which makes the IO loop
 //! return, after which dropping the server closes every channel and the shard
 //! and coordinator threads exit.
+//!
+//! Integration tests are separate crates, so each only uses a subset of these
+//! helpers; silence per-crate dead-code warnings for the shared harness.
+#![allow(dead_code)]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -535,8 +539,7 @@ impl Ctx {
     pub fn bulk(&mut self, args: &[&str]) -> Vec<u8> {
         let v = self.run(args);
         v.bulk()
-            .map(<[u8]>::to_vec)
-            .unwrap_or_else(|| panic!("expected bulk, got {v:?}"))
+            .map_or_else(|| panic!("expected bulk, got {v:?}"), <[u8]>::to_vec)
     }
 
     /// The raw (possibly null) bulk reply.
@@ -559,8 +562,7 @@ impl Ctx {
     pub fn arr(&mut self, args: &[&str]) -> Vec<Value> {
         let v = self.run(args);
         v.arr()
-            .map(<[Value]>::to_vec)
-            .unwrap_or_else(|| panic!("expected array, got {v:?}"))
+            .map_or_else(|| panic!("expected array, got {v:?}"), <[Value]>::to_vec)
     }
 
     /// Assert the reply is `+OK`.

@@ -77,11 +77,10 @@ impl CmdResult {
         match self {
             CmdResult::Ok(v) => v,
             CmdResult::Err(e) => RespValue::Error(e.message),
-            CmdResult::Blocked => RespValue::Nil,
+            CmdResult::Blocked | CmdResult::UniqueStrings(_) => RespValue::Nil,
             CmdResult::DeferredStore { reply, .. } | CmdResult::DeferredStores { reply, .. } => {
                 reply
             }
-            CmdResult::UniqueStrings(_) => RespValue::Nil,
         }
     }
 }

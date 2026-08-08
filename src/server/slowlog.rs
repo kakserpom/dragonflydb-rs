@@ -53,6 +53,7 @@ pub struct SlowLog {
 impl SlowLog {
     /// Defaults mirror the reference flags `slowlog_log_slower_than=10000` and
     /// `slowlog_max_len=20` (server_family.cc:133-136).
+    #[must_use]
     pub fn new() -> Self {
         SlowLog {
             capacity: 20,
@@ -78,16 +79,19 @@ impl SlowLog {
     }
 
     /// The configured `slowlog_log_slower_than` value.
+    #[must_use]
     pub fn log_slower_than(&self) -> i64 {
         self.log_slower_than
     }
 
     /// The configured `slowlog_max_len` value.
+    #[must_use]
     pub fn max_len(&self) -> usize {
         self.capacity
     }
 
     /// The effective threshold in usec (`log_slower_than_usec`).
+    #[must_use]
     pub fn threshold(&self) -> u64 {
         if self.log_slower_than < 0 {
             u32::MAX as u64
@@ -97,20 +101,24 @@ impl SlowLog {
     }
 
     /// `SlowLogShard::IsEnabled` (slowlog.h:46).
+    #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.capacity > 0
     }
 
     /// `ServerState::ShouldLogSlowCmd` (server_state.cc:295).
+    #[must_use]
     pub fn should_log(&self, exec_time_usec: u64) -> bool {
         self.is_enabled() && exec_time_usec >= self.threshold()
     }
 
     /// `SlowLogShard::Length`.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -169,6 +177,7 @@ impl SlowLog {
     /// by timestamp (newest first) and limited to `requested` (pass
     /// `u32::MAX` for all). With a single IO thread the reference's
     /// per-thread merge degenerates to this ring.
+    #[must_use]
     pub fn snapshot(&self, requested: u64) -> Vec<SlowLogEntry> {
         let mut out: Vec<SlowLogEntry> = self.entries.iter().cloned().collect();
         // Newest first; equal timestamps (same-µs back-to-back commands) keep
@@ -184,6 +193,7 @@ impl SlowLogEntry {
     /// exec_time(usec), args, client_ip, client_name]` (server_family.cc:1071).
     /// Argument truncation is applied here, so the stored prefix is re-cut to
     /// leave room for the `"... (N more bytes)"` suffix.
+    #[must_use]
     pub fn into_resp(&self) -> RespValue {
         RespValue::Array(vec![
             RespValue::Integer(self.id as i64),

@@ -138,18 +138,18 @@ fn spawn(port: u16, shards: usize) -> Child {
 fn wait_for(timeout: Duration, mut f: impl FnMut() -> bool) {
     let deadline = Instant::now() + timeout;
     while !f() {
-        if Instant::now() > deadline {
-            panic!("timed out waiting for condition");
-        }
+        assert!(
+            Instant::now() <= deadline,
+            "timed out waiting for condition"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
 fn wait_ready(port: u16) {
     wait_for(Duration::from_secs(15), || {
-        let mut c = match Client::connect(port) {
-            Ok(c) => c,
-            Err(_) => return false,
+        let Ok(mut c) = Client::connect(port) else {
+            return false;
         };
         matches!(c.cmd(&["PING"]), Ok(Value::Simple(s)) if s == "PONG")
     });
@@ -158,9 +158,8 @@ fn wait_ready(port: u16) {
 /// Wait until the replica's ROLE state field equals `target`.
 fn wait_replica_state(port: u16, target: &str) {
     wait_for(Duration::from_secs(20), || {
-        let mut c = match Client::connect(port) {
-            Ok(c) => c,
-            Err(_) => return false,
+        let Ok(mut c) = Client::connect(port) else {
+            return false;
         };
         matches!(
             c.cmd(&["ROLE"]),
@@ -299,9 +298,8 @@ fn master_to_replica_replication() {
     // Detach: back to master mode, writes allowed.
     ok(&mut r, &["REPLICAOF", "NO", "ONE"]);
     wait_for(Duration::from_secs(5), || {
-        let mut c = match Client::connect(replica_port) {
-            Ok(c) => c,
-            Err(_) => return false,
+        let Ok(mut c) = Client::connect(replica_port) else {
+            return false;
         };
         matches!(
             c.cmd(&["ROLE"]),
@@ -327,6 +325,8 @@ fn master_to_replica_replication() {
 /// master on all of them.
 #[test]
 fn writes_during_full_sync_converge() {
+    const BASE_KEYS: i64 = 2000;
+    const DURING_KEYS: i64 = 600;
     let master_port = free_port();
     let replica_port = free_port();
     let mut master = spawn(master_port, 2);
@@ -337,8 +337,6 @@ fn writes_during_full_sync_converge() {
     let mut m = Client::connect(master_port).unwrap();
     let mut r = Client::connect(replica_port).unwrap();
 
-    const BASE_KEYS: i64 = 2000;
-    const DURING_KEYS: i64 = 600;
     for i in 0..BASE_KEYS {
         ok(
             &mut m,

@@ -437,8 +437,8 @@ impl Stream {
             let first_id = entries.iter().find(|(_, e)| !e.deleted).map(|(id, _)| *id);
             group.consumer_mut(consumer_name, now_ms);
             let last = group.last_delivered;
-            let mut iter = entries.range((Bound::Excluded(last), Bound::Unbounded));
-            while let Some((&eid, entry)) = iter.next() {
+            let iter = entries.range((Bound::Excluded(last), Bound::Unbounded));
+            for (&eid, entry) in iter {
                 if entry.deleted {
                     continue;
                 }

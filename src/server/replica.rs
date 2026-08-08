@@ -93,6 +93,7 @@ pub struct ReplicaConfig {
 
 /// The `ROLE` reply. A master reports `["master", []]`; a replica reports
 /// `["slave", host, port, state, offset]` like Redis.
+#[must_use]
 pub fn role_reply(status: &ReplicaStatus) -> RespValue {
     match status.phase {
         ReplicaPhase::Master => {
@@ -449,7 +450,7 @@ struct JournalReader<'a> {
     dbid: u64,
 }
 
-impl<'a> JournalReader<'a> {
+impl JournalReader<'_> {
     fn read_entry(&mut self) -> Result<JournalEntry, ReplicaError> {
         loop {
             let op = self.stream.next_u8()?;
@@ -772,11 +773,11 @@ fn global_apply(
 /// `REPLCONF ACK <next-lsn>` on the flow socket, immediately after a PING.
 fn ack_thread(
     mut w: TcpStream,
-    lsn_cell: Arc<AtomicU64>,
-    force_ack: Arc<AtomicBool>,
-    ack_stop: Arc<AtomicBool>,
-    abort: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
+    lsn_cell: &Arc<AtomicU64>,
+    force_ack: &Arc<AtomicBool>,
+    ack_stop: &Arc<AtomicBool>,
+    abort: &Arc<AtomicBool>,
+    stop: &Arc<AtomicBool>,
 ) {
     let mut last = Instant::now();
     while !ack_stop.load(Ordering::Relaxed)
@@ -818,7 +819,7 @@ fn flow_thread(sess: &Arc<Session>, flow_id: usize) -> Result<(), ReplicaError> 
             b"DFLY".to_vec(),
             b"FLOW".to_vec(),
             sess.master_replid.clone().into_bytes(),
-            sess.session_id.clone().into_bytes(),
+            sess.sync_id.clone().into_bytes(),
             flow_arg.clone().into_bytes(),
             flow_lsn.into_bytes(),
         ],
@@ -866,7 +867,7 @@ fn flow_thread(sess: &Arc<Session>, flow_id: usize) -> Result<(), ReplicaError> 
         let abort = sess.abort.clone();
         let stop = sess.stop.clone();
         let cell = lsn_cell.clone();
-        std::thread::spawn(move || ack_thread(w, cell, fa, as_, abort, stop));
+        std::thread::spawn(move || ack_thread(w, &cell, &fa, &as_, &abort, &stop));
     }
 
     let mut reader = JournalReader {
@@ -917,7 +918,7 @@ fn flow_thread(sess: &Arc<Session>, flow_id: usize) -> Result<(), ReplicaError> 
 struct Session {
     cfg: ReplicaConfig,
     master_replid: String,
-    session_id: String,
+    sync_id: String,
     global: Arc<GlobalBarrier>,
     abort: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -976,7 +977,7 @@ fn connect_and_replicate(cfg: &ReplicaConfig) -> Result<(), ReplicaError> {
     let session = Arc::new(Session {
         cfg: cfg.clone(),
         master_replid: handshake.master_replid,
-        session_id: handshake.sync_id.clone(),
+        sync_id: handshake.sync_id.clone(),
         global: Arc::new(GlobalBarrier::new()),
         abort: abort.clone(),
         stop: cfg.stop.clone(),
@@ -1038,7 +1039,7 @@ fn connect_and_replicate(cfg: &ReplicaConfig) -> Result<(), ReplicaError> {
 
     if all_full {
         flush_all_shards(cfg)?;
-        tcp.cmd_str(&["DFLY", "SYNC", &session.session_id])?;
+        tcp.cmd_str(&["DFLY", "SYNC", &session.sync_id])?;
         expect_ok(tcp.reply()?)?;
     }
 
@@ -1057,7 +1058,7 @@ fn connect_and_replicate(cfg: &ReplicaConfig) -> Result<(), ReplicaError> {
         }
     }
 
-    tcp.cmd_str(&["DFLY", "STARTSTABLE", &session.session_id])?;
+    tcp.cmd_str(&["DFLY", "STARTSTABLE", &session.sync_id])?;
     expect_ok(tcp.reply()?)?;
 
     {

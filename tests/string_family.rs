@@ -49,10 +49,10 @@ fn incr() {
     t.assert_int(&["incr", "key"], 1);
 
     t.ok(&["set", "key1", "123456789"]);
-    t.assert_int(&["incrby", "key1", "0"], 123456789);
+    t.assert_int(&["incrby", "key1", "0"], 123_456_789);
 
     t.ok(&["set", "key1", "-123456789"]);
-    t.assert_int(&["incrby", "key1", "0"], -123456789);
+    t.assert_int(&["incrby", "key1", "0"], -123_456_789);
 
     t.ok(&["set", "key1", "   -123  "]);
     t.assert_err(&["incrby", "key1", "1"], "ERR value is not an integer");
@@ -266,7 +266,7 @@ fn mset_get() {
 
 #[test]
 fn mset_del() {
-    let mut t = Ctx::new();
+    let t = Ctx::new();
     let port = t.server.port();
     let set_h = std::thread::spawn(move || {
         let mut c = Client::connect(port).unwrap();
@@ -648,7 +648,7 @@ fn get_large_raw() {
     // Large binary values round-trip intact (the reference asserts the
     // zero-copy borrow counter in INFO, which the port does not expose).
     let mut t = Ctx::new();
-    let mut rng = 0xDF1FDF1Fu32;
+    let mut rng = 0xDF1F_DF1Fu32;
     let mut rand = || {
         rng ^= rng << 13;
         rng ^= rng >> 17;
@@ -669,7 +669,7 @@ fn get_large_raw() {
 #[test]
 fn get_large_raw_squashed() {
     let mut t = Ctx::new();
-    let mut rng = 0xDF1FDF1Fu32;
+    let mut rng = 0xDF1F_DF1Fu32;
     let mut rand = || {
         rng ^= rng << 13;
         rng ^= rng >> 17;
@@ -700,7 +700,7 @@ fn get_large_raw_squashed() {
 #[test]
 fn get_large_ascii_chunked() {
     let mut t = Ctx::new();
-    let mut build = |sz: usize| -> Vec<u8> { (0..sz).map(|i| 0x20 + (i % 0x5F) as u8).collect() };
+    let build = |sz: usize| -> Vec<u8> { (0..sz).map(|i| 0x20 + (i % 0x5F) as u8).collect() };
     for sz in [16384usize, 16391, 32768, 65535] {
         let value = build(sz);
         t.ok_b(&[b"set".to_vec(), b"k".to_vec(), value.clone()]);
@@ -712,7 +712,7 @@ fn get_large_ascii_chunked() {
 #[test]
 fn get_large_ascii_chunked_squashed() {
     let mut t = Ctx::new();
-    let mut build = |sz: usize| -> Vec<u8> { (0..sz).map(|i| 0x20 + (i % 0x5F) as u8).collect() };
+    let build = |sz: usize| -> Vec<u8> { (0..sz).map(|i| 0x20 + (i % 0x5F) as u8).collect() };
     let v0 = build(16384);
     let v1 = build(32768);
     t.ok_b(&[b"set".to_vec(), b"k0".to_vec(), v0.clone()]);

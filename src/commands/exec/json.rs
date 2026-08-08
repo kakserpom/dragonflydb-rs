@@ -1769,8 +1769,7 @@ mod tests {
             RespValue::Simple(s) => s.clone(),
             RespValue::Integer(i) => i.to_string(),
             RespValue::Double(f) => format_double(*f),
-            RespValue::Nil => "(nil)".into(),
-            RespValue::NilArray => "(nil)".into(),
+            RespValue::Nil | RespValue::NilArray => "(nil)".into(),
             RespValue::Error(e) => e.clone(),
             RespValue::Bool(b) => b.to_string(),
             RespValue::Array(a) => {

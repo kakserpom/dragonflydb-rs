@@ -87,12 +87,12 @@ impl Writer {
         match op {
             OP_SELECT => self.write_packed(dbid),
             OP_LSN => self.write_packed(lsn),
-            OP_PING => {}
             OP_COMMAND | OP_EXPIRED => {
                 self.write_packed(txid);
                 self.write_packed(1); // deprecated `payload` field
                 self.write_payload(cmd, args);
             }
+            // OP_PING and any future opcode carry nothing beyond the byte.
             _ => {}
         }
     }
@@ -143,6 +143,7 @@ pub struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
+    #[must_use]
     pub fn new(data: &'a [u8]) -> Self {
         Self {
             data,

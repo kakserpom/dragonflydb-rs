@@ -37,7 +37,7 @@ fn key(v: &Value) -> String {
     v.arr()
         .unwrap_or_else(|| panic!("expected array, got {v:?}"))
         .first()
-        .and_then(|x| x.text())
+        .and_then(common::Value::text)
         .unwrap_or_else(|| panic!("expected key text in {v:?}"))
 }
 
@@ -873,12 +873,12 @@ fn linsert() {
 #[test]
 fn blpop_unwakes_in_script() {
     let mut t = Ctx::new();
-    let script = r#"
+    let script = r"
         for i = 1, 1000 do
           redis.call('MGET', 'a', 'b', 'c', 'd')
           redis.call('LPUSH', 'l', tostring(i))
         end
-    "#;
+    ";
 
     let f1 = t.spawn(&["blpop", "l", "0"]);
     let f2 = t.spawn(&["eval", script, "5", "a", "b", "c", "d", "l"]);
@@ -898,14 +898,14 @@ fn blpop_unwakes_in_script() {
 #[test]
 fn other_multi_wakes_blpop() {
     let mut t = Ctx::new();
-    let script = r#"
+    let script = r"
         redis.call('LPUSH', 'l', 'bad')
         for i = 1, 1000 do
           redis.call('MGET', 'a', 'b', 'c', 'd')
         end
         redis.call('LPUSH', 'l', 'good')
-    "#;
-    let script_short = r#"redis.call('GET', KEYS[1])"#;
+    ";
+    let script_short = r"redis.call('GET', KEYS[1])";
 
     let f1 = t.spawn(&["blpop", "l", "0"]);
     let f2 = t.spawn(&["eval", script, "5", "a", "b", "c", "d", "l"]);

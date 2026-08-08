@@ -281,7 +281,7 @@ fn type_v2() {
     t.assert_text(&["JSON.SET", "json", ".", json], "OK");
 
     let v = t.arr(&["JSON.TYPE", "json", "$[*]"]);
-    let got: Vec<String> = v.iter().filter_map(|x| x.text()).collect();
+    let got: Vec<String> = v.iter().filter_map(common::Value::text).collect();
     assert_eq!(
         got,
         vec![
@@ -1417,9 +1417,9 @@ fn clear_legacy() {
 #[test]
 fn arr_pop() {
     let mut t = Ctx::new();
-    let json = r#"
+    let json = r"
     [[6,1,6], [7,2,7], [8,3,8]]
-  "#;
+  ";
     t.assert_text(&["JSON.SET", "json", ".", json], "OK");
 
     let mut v = t.arr(&["JSON.ARRPOP", "json", "$[*]", "-2"]);
@@ -1445,9 +1445,9 @@ fn arr_pop() {
 #[test]
 fn arr_pop_legacy() {
     let mut t = Ctx::new();
-    let json = r#"
+    let json = r"
     [[6,1,6], [7,2,7], [8,3,8]]
-  "#;
+  ";
     t.assert_text(&["JSON.SET", "json", ".", json], "OK");
 
     t.assert_text(&["JSON.ARRPOP", "json", "[*]", "-2"], "3");
@@ -1480,9 +1480,9 @@ fn arr_pop_legacy() {
 #[test]
 fn arr_pop_out_of_range() {
     let mut t = Ctx::new();
-    let json = r#"
+    let json = r"
     [0,1,2,3,4,5]
-  "#;
+  ";
 
     t.assert_text(&["JSON.SET", "arr", "$", json], "OK");
     let mut v = t.arr(&["JSON.ARRPOP", "arr", "$", "-55"]);
@@ -1546,12 +1546,12 @@ fn arr_trim() {
         "{\"a\":[2,3],\"nested\":{\"a\":false}}",
     );
 
-    let json = r#"
+    let json = r"
     [1,2,3,4,5,6,7]
-  "#;
+  ";
     t.assert_text(&["JSON.SET", "json", "$", json], "OK");
 
-    let mut v = t.arr(&["JSON.ARRTRIM", "json", "$", "2", "3"]);
+    let v = t.arr(&["JSON.ARRTRIM", "json", "$", "2", "3"]);
     assert_eq!(v.len(), 1);
     assert_eq!(v[0].int(), Some(2));
     t.assert_text(&["JSON.GET", "json"], "[3,4]");
@@ -1590,9 +1590,9 @@ fn arr_trim_legacy() {
         "{\"a\":[2,3],\"nested\":{\"a\":false}}",
     );
 
-    let json = r#"
+    let json = r"
     [1,2,3,4,5,6,7]
-  "#;
+  ";
     t.assert_text(&["JSON.SET", "json", "$", json], "OK");
 
     t.assert_int(&["JSON.ARRTRIM", "json", ".", "2", "3"], 2);
@@ -1611,9 +1611,9 @@ fn arr_trim_legacy() {
 #[test]
 fn arr_trim_out_of_range() {
     let mut t = Ctx::new();
-    let arr = r#"
+    let arr = r"
     [0,1,2,3,4]
-  "#;
+  ";
 
     t.assert_text(&["JSON.SET", "arr", "$", arr], "OK");
     let mut v = t.arr(&["JSON.ARRTRIM", "arr", "$", "-1", "3"]);
@@ -1646,7 +1646,7 @@ fn arr_trim_out_of_range() {
     t.assert_text(&["JSON.GET", "arr"], "[3,4]");
 
     t.assert_text(&["JSON.SET", "arr", "$", arr], "OK");
-    let mut v = t.arr(&["JSON.ARRTRIM", "arr", "$", "-1", "-2"]);
+    let v = t.arr(&["JSON.ARRTRIM", "arr", "$", "-1", "-2"]);
     assert_eq!(v.len(), 1);
     assert_eq!(v[0].int(), Some(0));
     t.assert_text(&["JSON.GET", "arr"], "[]");
@@ -1734,9 +1734,9 @@ fn arr_insert_legacy() {
 #[test]
 fn arr_insert_out_of_range() {
     let mut t = Ctx::new();
-    let json = r#"
+    let json = r"
     [0,1,2,3,4,5]
-  "#;
+  ";
     t.assert_text(&["JSON.SET", "arr", ".", json], "OK");
 
     t.assert_err(
@@ -1765,7 +1765,7 @@ fn arr_insert_out_of_range() {
         &["JSON.ARRINSERT", "arr", "$", "1", "2"],
         "index out of range",
     );
-    let mut v = t.arr(&["JSON.ARRINSERT", "arr", "$", "0", "2"]);
+    let v = t.arr(&["JSON.ARRINSERT", "arr", "$", "0", "2"]);
     assert_eq!(v.len(), 1);
     assert_eq!(v[0].int(), Some(1));
     t.assert_text(&["JSON.GET", "arr"], "[2]");
@@ -1915,9 +1915,9 @@ fn arr_index_legacy() {
 #[test]
 fn arr_index_with_numeric_values() {
     let mut t = Ctx::new();
-    let json = r#"
+    let json = r"
     [2, 3.0, 3]
-  "#;
+  ";
     t.assert_text(&["JSON.SET", "json", "$", json], "OK");
 
     let mut v = t.arr(&["JSON.ARRINDEX", "json", "$", "3"]);
@@ -1927,9 +1927,9 @@ fn arr_index_with_numeric_values() {
     assert_eq!(v.len(), 1);
     assert_eq!(v[0].int(), Some(1));
 
-    let json = r#"
+    let json = r"
     [[1, 2, 3], [1.0, 2.0, 3.0], 2.0, [1,2,3]]
-  "#;
+  ";
     t.assert_text(&["JSON.SET", "json", "$", json], "OK");
 
     v = t.arr(&["JSON.ARRINDEX", "json", "$", "[1,2,3]"]);
@@ -1993,9 +1993,9 @@ fn arr_index_with_numeric_values() {
 #[test]
 fn arr_index_with_numeric_values_legacy() {
     let mut t = Ctx::new();
-    let json = r#"
+    let json = r"
     [2, 3.0, 3]
-  "#;
+  ";
     t.assert_text(&["JSON.SET", "json", ".", json], "OK");
 
     t.assert_int(&["JSON.ARRINDEX", "json", ".", "3"], 2);
@@ -2047,7 +2047,7 @@ fn arr_index_with_numeric_values_legacy() {
 #[test]
 fn arr_index_out_of_range() {
     let mut t = Ctx::new();
-    t.assert_text(&["JSON.SET", "arr", ".", r#"[1,1,1,1,1]"#], "OK");
+    t.assert_text(&["JSON.SET", "arr", ".", r"[1,1,1,1,1]"], "OK");
 
     let mut v = t.arr(&["JSON.ARRINDEX", "arr", "$", "1", "-55", "-55"]);
     assert_eq!(v.len(), 1);
@@ -2259,8 +2259,8 @@ fn debug_memory() {
 
     let v = t.arr(&["JSON.DEBUG", "memory", "json1", "$[*]"]);
     assert_eq!(v.len(), 9);
-    for i in 0..5 {
-        assert_eq!(v[i].int(), Some(0), "scalar element {i} should be 0");
+    for (i, item) in v.iter().take(5).enumerate() {
+        assert_eq!(item.int(), Some(0), "scalar element {i} should be 0");
     }
     assert!(v[5].int().unwrap() >= 0);
     assert!(v[6].int().unwrap() >= 0);
@@ -2337,7 +2337,7 @@ fn debug_memory_legacy() {
     );
     assert!(t.int(&["JSON.DEBUG", "MEMORY", "obj_doc", ".longstring"]) > 0);
 
-    t.assert_text(&["JSON.SET", "arr", "$", r#"[1,2,3,4,5,6,7,8,9,10]"#], "OK");
+    t.assert_text(&["JSON.SET", "arr", "$", r"[1,2,3,4,5,6,7,8,9,10]"], "OK");
     assert!(t.int(&["JSON.DEBUG", "memory", "arr", "."]) > 0);
 
     t.assert_text(&["JSON.SET", "obj", "$", r#"{"a":1, "b":2, "c":3}"#], "OK");

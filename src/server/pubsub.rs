@@ -293,8 +293,7 @@ mod tests {
             RespValue::Bulk(b) => String::from_utf8_lossy(b).into_owned(),
             RespValue::Simple(s) => s.clone(),
             RespValue::Integer(i) => i.to_string(),
-            RespValue::Nil => "(nil)".into(),
-            RespValue::NilArray => "(nil)".into(),
+            RespValue::Nil | RespValue::NilArray => "(nil)".into(),
             RespValue::Error(e) => e.clone(),
             RespValue::Array(a) => {
                 format!("[{}]", a.iter().map(render).collect::<Vec<_>>().join(", "))

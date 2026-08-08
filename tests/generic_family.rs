@@ -24,21 +24,6 @@ mod common;
 
 use common::*;
 
-/// Parse an array of integer-formatted bulk strings (`ToIntArr`).
-fn int_arr(v: &Value) -> Vec<i64> {
-    let a = v
-        .arr()
-        .unwrap_or_else(|| panic!("expected array, got {v:?}"));
-    a.iter()
-        .map(|x| {
-            x.text()
-                .unwrap_or_else(|| panic!("expected numeric bulk, got {x:?}"))
-                .parse()
-                .unwrap_or_else(|_| panic!("expected numeric bulk, got {x:?}"))
-        })
-        .collect()
-}
-
 /// All text entries of an array reply, order-independent.
 fn sorted(v: &Value) -> Vec<String> {
     let mut s: Vec<String> = v
@@ -193,9 +178,9 @@ fn expire_corner_cases() {
     // Huge relative TTLs are silently capped to kMaxExpireDeadlineSec (~8.5 years).
     t.assert_int(&["expire", "key", "99999999999"], 1);
     let ttl = t.int(&["ttl", "key"]);
-    assert!(ttl == 268435455, "ttl {ttl}, expected 268435455");
+    assert!(ttl == 268_435_455, "ttl {ttl}, expected 268435455");
     t.assert_int(&["pexpire", "key", "2684354550000"], 1);
-    t.assert_int(&["pttl", "key"], 268435455000);
+    t.assert_int(&["pttl", "key"], 268_435_455_000);
 
     // Missing key -> 0 regardless of the TTL value.
     t.assert_int(&["del", "missing"], 0);
@@ -345,7 +330,7 @@ fn pexpire_options() {
     );
 
     t.assert_int(&["pexpire", "key", "3600000", "NX"], 1);
-    t.assert_int(&["pttl", "key"], 3600000);
+    t.assert_int(&["pttl", "key"], 3_600_000);
     t.assert_int(&["pexpire", "key", "42", "NX"], 0);
 
     t.ok(&["set", "key2", "val"]);
@@ -354,15 +339,15 @@ fn pexpire_options() {
 
     t.assert_int(&["pexpire", "key", "101000"], 1);
     t.assert_int(&["pexpire", "key", "100000", "GT"], 0);
-    t.assert_int(&["pttl", "key"], 101000);
+    t.assert_int(&["pttl", "key"], 101_000);
     t.assert_int(&["pexpire", "key", "102000", "GT"], 1);
-    t.assert_int(&["pttl", "key"], 102000);
+    t.assert_int(&["pttl", "key"], 102_000);
     t.assert_int(&["pexpire", "key", "101000", "GT"], 0);
-    t.assert_int(&["pttl", "key"], 102000);
+    t.assert_int(&["pttl", "key"], 102_000);
     t.assert_int(&["pexpire", "key", "101000", "LT"], 1);
-    t.assert_int(&["pttl", "key"], 101000);
+    t.assert_int(&["pttl", "key"], 101_000);
     t.assert_int(&["pexpire", "key", "102000", "LT"], 0);
-    t.assert_int(&["pttl", "key"], 101000);
+    t.assert_int(&["pttl", "key"], 101_000);
 }
 
 #[test]
@@ -720,10 +705,10 @@ fn keys() {
     t.ok(&["set", "bar", "1"]);
     assert_eq!(
         sorted(&t.run(&["keys", "*"])),
-        vec!["".to_string(), "bar".to_string()]
+        vec![String::new(), "bar".to_string()]
     );
     let v = t.run(&["keys", ""]);
-    assert_eq!(sorted(&v), vec!["".to_string()]);
+    assert_eq!(sorted(&v), vec![String::new()]);
 }
 
 #[test]
@@ -742,7 +727,7 @@ fn unlink() {
         for j in 0..10 {
             cmd.push(format!("f{}", i * 10 + j));
         }
-        let args: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+        let args: Vec<&str> = cmd.iter().map(std::string::String::as_str).collect();
         t.assert_int(&args, 10);
     }
     t.assert_int(&["unlink", "s1"], 1);
@@ -988,7 +973,7 @@ fn sort_bug3636() {
         "-15710".to_string(),
         "-15710".to_string(),
     ]);
-    let args: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+    let args: Vec<&str> = cmd.iter().map(std::string::String::as_str).collect();
     t.assert_int(&args, 17);
     assert_eq!(
         t.run(&["sort", "foo", "desc", "alpha"])

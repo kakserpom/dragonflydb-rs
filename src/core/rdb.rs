@@ -583,7 +583,7 @@ pub const FULL_SYNC_CHUNK_BYTES: usize = 8 * 1024;
 #[must_use]
 pub fn write_full_sync_header() -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(format!("REDIS{:04}", RDB_SER_VERSION).as_bytes());
+    out.extend_from_slice(format!("REDIS{RDB_SER_VERSION:04}").as_bytes());
     save_aux(&mut out, "redis-ver", "6.2.11");
     save_aux(&mut out, "df-ver", "1.0.0");
     save_aux(&mut out, "redis-bits", "64");
@@ -833,7 +833,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-impl<'a> Rd for Reader<'a> {
+impl Rd for Reader<'_> {
     fn read_u8(&mut self) -> Result<u8, RestoreError> {
         let b = *self.data.get(self.pos).ok_or(RestoreError::BadDataFormat)?;
         self.pos += 1;

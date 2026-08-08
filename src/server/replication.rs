@@ -213,17 +213,18 @@ pub fn capa_dragonfly_reply(
 /// A fresh random lowercase hex string (like `GetRandomHex`): `bytes` hex chars.
 #[must_use]
 pub fn random_hex(bytes: usize) -> String {
+    use std::fmt::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
-    static SEED: AtomicU64 = AtomicU64::new(0x9e3779b97f4a7c15);
-    let mut seed = SEED.fetch_add(0x100000001b3, Ordering::Relaxed) as u64;
+    static SEED: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+    let mut seed = SEED.fetch_add(0x1000_0000_01b3, Ordering::Relaxed);
     let mut out = String::with_capacity(bytes);
     for _ in 0..(bytes / 2) {
         // xorshift64star
         seed ^= seed >> 12;
         seed ^= seed << 25;
         seed ^= seed >> 27;
-        let w = (seed.wrapping_mul(0x2545f4914f6cdd1d)) & 0xff;
-        out.push_str(&format!("{w:02x}"));
+        let w = (seed.wrapping_mul(0x2545_f491_4f6c_dd1d)) & 0xff;
+        let _ = write!(out, "{w:02x}");
     }
     out
 }
@@ -271,8 +272,8 @@ mod tests {
 
     #[test]
     fn replid_is_40_hex() {
-        let mut r1 = ReplicationManager::new();
-        let mut r2 = ReplicationManager::new();
+        let r1 = ReplicationManager::new();
+        let r2 = ReplicationManager::new();
         assert_eq!(r1.master_replid.len(), 40);
         assert_eq!(r1.lineage_id.len(), 40);
         assert_ne!(r1.master_replid, r2.master_replid);

@@ -369,7 +369,7 @@ impl Shard {
                 let in_buffer = self
                     .journal
                     .as_ref()
-                    .map_or(false, |j| j.is_lsn_in_buffer(lsn));
+                    .is_some_and(|j| j.is_lsn_in_buffer(lsn));
                 let _ = result_tx.send(in_buffer);
             }
             ShardMsg::ReplicaOp { args, db_idx, ack } => {
@@ -598,6 +598,7 @@ impl Shard {
         let _ = result_tx.send(out);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_exec(
         &mut self,
         args: &[Vec<u8>],
@@ -618,20 +619,19 @@ impl Shard {
         // journal the deterministic rewrite (SREM of the popped members, or DEL
         // when the pop drained the set) instead. `exec_core` computes the
         // rewrite while the DB borrow is live; it is journaled here afterwards.
-        if let Some(record) = spop {
-            if journal_enabled {
-                if let Some(j) = &mut self.journal {
-                    let data = journal::serialize_record(
-                        txid,
-                        OP_COMMAND,
-                        db_idx as u64,
-                        0,
-                        &record[0],
-                        &record[1..],
-                    );
-                    j.record(data);
-                }
-            }
+        if let Some(record) = spop
+            && journal_enabled
+            && let Some(j) = &mut self.journal
+        {
+            let data = journal::serialize_record(
+                txid,
+                OP_COMMAND,
+                db_idx as u64,
+                0,
+                &record[0],
+                &record[1..],
+            );
+            j.record(data);
         }
         self.maybe_journal(cmd, args, owned, owns_all_keys, db_idx, txid, &result);
         // Send invalidation pushes for every key the command modified; the
@@ -806,8 +806,6 @@ impl Shard {
     }
 
     /// Record a write command into the replication journal, if one is enabled.
-
-    /// Record a write command into the replication journal, if one is enabled.
     ///
     /// The record carries the full command tail when this shard owns all the
     /// command's keys, and the reduced per-shard args (`ShardArgs`) otherwise;
@@ -817,6 +815,7 @@ impl Shard {
     /// (SPOP, blocking writes) journal an explicit rewrite or nothing at all,
     /// and `FLAG_NO_REDUCED` commands (multi-key stores) are journaled by the
     /// coordinator's `ShardMsg::StoreValue` when their keys span shards.
+    #[allow(clippy::too_many_arguments)]
     fn maybe_journal(
         &mut self,
         cmd: &'static crate::commands::Command,

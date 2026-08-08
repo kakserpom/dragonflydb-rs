@@ -93,7 +93,7 @@ fn parse_xadd_id(s: &[u8], last: StreamId, now_ms: u64) -> Result<StreamId, Resp
             (ms, Some(&s[idx + 1..]))
         }
     };
-    let seq_auto = seq_str.map_or(true, |s| s == b"*");
+    let seq_auto = seq_str.is_none_or(|s| s == b"*");
     if seq_auto {
         if ms < last.ms {
             return Err(leq_err());
@@ -165,10 +165,7 @@ fn parse_xadd(ctx: &mut OpContext) -> Result<XAddArgs, RespError> {
                         None => return Err(RespError::integer()),
                     });
                 } else {
-                    minid = Some(match parse_stream_id_literal(&ctx.args[i], 0) {
-                        Ok(v) => v,
-                        Err(e) => return Err(e),
-                    });
+                    minid = Some(parse_stream_id_literal(&ctx.args[i], 0)?);
                 }
                 i += 1;
                 if i < ctx.args.len() && ctx.args[i].eq_ignore_ascii_case(b"LIMIT") {
@@ -488,9 +485,8 @@ fn exec_xtrim(ctx: &mut OpContext) -> CmdResult {
             if i >= ctx.args.len() {
                 return CmdResult::Err(RespError::syntax());
             }
-            let maxlen = match parse_u64(&ctx.args[i]) {
-                Some(v) => v,
-                None => return CmdResult::Err(RespError::integer()),
+            let Some(maxlen) = parse_u64(&ctx.args[i]) else {
+                return CmdResult::Err(RespError::integer());
             };
             i += 1;
             (Some(maxlen), None, approx)
@@ -500,9 +496,8 @@ fn exec_xtrim(ctx: &mut OpContext) -> CmdResult {
             if i >= ctx.args.len() {
                 return CmdResult::Err(RespError::syntax());
             }
-            let minid = match parse_stream_id_literal(&ctx.args[i], 0) {
-                Ok(v) => v,
-                Err(_) => return CmdResult::Err(RespError::syntax()),
+            let Ok(minid) = parse_stream_id_literal(&ctx.args[i], 0) else {
+                return CmdResult::Err(RespError::syntax());
             };
             i += 1;
             (None, Some(minid), approx)
@@ -1223,9 +1218,7 @@ fn exec_xgroup(ctx: &mut OpContext) -> CmdResult {
     // and NOSCRIPT (so scripts get "not allowed"); the plain XGROUP path here
     // handles both by short-circuiting the keyless form.
     if ctx.args.len() == 2 && ctx.args[1].eq_ignore_ascii_case(b"HELP") {
-        return CmdResult::Ok(RespValue::Array(
-            XGROUP_HELP.iter().map(|s| bulk(s.to_vec())).collect(),
-        ));
+        return CmdResult::Ok(RespValue::Array(XGROUP_HELP.iter().map(bulk).collect()));
     }
     if ctx.owned_keys.is_empty() {
         return CmdResult::Err(RespError::syntax());
@@ -2226,7 +2219,7 @@ mod tests {
     }
 
     /// Element `i` of the array `v`.
-    fn idx<'a>(v: &'a RespValue, i: usize) -> &'a RespValue {
+    fn idx(v: &RespValue, i: usize) -> &RespValue {
         &v.as_array().unwrap()[i]
     }
 
@@ -3533,8 +3526,8 @@ mod tests {
         let resp = cmd(&mut db, &[b"XINFO", b"CONSUMERS", b"mystream", b"mygroup"]);
         let info = arr_of(resp);
         assert_eq!(info.len(), 2);
-        assert_eq!(info[0].as_array().map(|a| a.len()), Some(8));
-        assert_eq!(info[1].as_array().map(|a| a.len()), Some(8));
+        assert_eq!(info[0].as_array().map(std::vec::Vec::len), Some(8));
+        assert_eq!(info[1].as_array().map(std::vec::Vec::len), Some(8));
         assert_eq!(*idx(&info[0], 1), blk(b"first-consumer"));
         assert_eq!(*idx(&info[1], 1), blk(b"second-consumer"));
 
@@ -3683,9 +3676,12 @@ mod tests {
         let resp = cmd(&mut db, &[b"XINFO", b"STREAM", b"mystream", b"FULL"]);
         let info = arr_of(resp);
         assert_eq!(info.len(), 18);
-        assert_eq!(info[15].as_array().map(|a| a.len()), Some(10));
-        assert_eq!(info[17].as_array().map(|a| a.len()), Some(1));
-        assert_eq!(idx(&info[17], 0).as_array().map(|a| a.len()), Some(14));
+        assert_eq!(info[15].as_array().map(std::vec::Vec::len), Some(10));
+        assert_eq!(info[17].as_array().map(std::vec::Vec::len), Some(1));
+        assert_eq!(
+            idx(&info[17], 0).as_array().map(std::vec::Vec::len),
+            Some(14)
+        );
         assert_eq!(
             *idx(&info[17], 0),
             arr(vec![
@@ -3722,21 +3718,21 @@ mod tests {
             &[b"XINFO", b"STREAM", b"mystream", b"FULL", b"COUNT", b"5"],
         );
         let info = arr_of(resp);
-        assert_eq!(info[15].as_array().map(|a| a.len()), Some(5));
+        assert_eq!(info[15].as_array().map(std::vec::Vec::len), Some(5));
 
         let resp = cmd(
             &mut db,
             &[b"XINFO", b"STREAM", b"mystream", b"FULL", b"COUNT", b"12"],
         );
         let info = arr_of(resp);
-        assert_eq!(info[15].as_array().map(|a| a.len()), Some(11));
+        assert_eq!(info[15].as_array().map(std::vec::Vec::len), Some(11));
 
         let resp = cmd(
             &mut db,
             &[b"XINFO", b"STREAM", b"mystream", b"FULL", b"COUNT", b"0"],
         );
         let info = arr_of(resp);
-        assert_eq!(info[15].as_array().map(|a| a.len()), Some(11));
+        assert_eq!(info[15].as_array().map(std::vec::Vec::len), Some(11));
 
         cmd(
             &mut db,
@@ -3755,18 +3751,18 @@ mod tests {
             &[b"XINFO", b"STREAM", b"mystream", b"FULL", b"COUNT", b"0"],
         );
         let info = arr_of(resp);
-        assert_eq!(info[15].as_array().map(|a| a.len()), Some(11));
+        assert_eq!(info[15].as_array().map(std::vec::Vec::len), Some(11));
         let group = idx(&info[17], 0).as_array().cloned().unwrap();
         assert_eq!(group[5], RespValue::Integer(11)); // entries-read
         assert_eq!(group[7], RespValue::Integer(0)); // lag
         assert_eq!(group[9], RespValue::Integer(11)); // pel-count
-        assert_eq!(group[11].as_array().map(|a| a.len()), Some(11)); // pending
+        assert_eq!(group[11].as_array().map(std::vec::Vec::len), Some(11)); // pending
         let consumer = group[13].as_array().unwrap()[0]
             .as_array()
             .cloned()
             .unwrap();
         assert_eq!(consumer[7], RespValue::Integer(11)); // consumer pel-count
-        assert_eq!(consumer[9].as_array().map(|a| a.len()), Some(11)); // consumer pending
+        assert_eq!(consumer[9].as_array().map(std::vec::Vec::len), Some(11)); // consumer pending
 
         cmd(&mut db, &[b"XDEL", b"mystream", b"1-1"]);
         let resp = cmd(&mut db, &[b"XINFO", b"STREAM", b"mystream"]);
@@ -3802,14 +3798,14 @@ mod tests {
             &[b"XINFO", b"STREAM", b"mystream", b"FULL", b"COUNT", b"0"],
         );
         let info = arr_of(resp);
-        assert_eq!(info[15].as_array().map(|a| a.len()), Some(10));
+        assert_eq!(info[15].as_array().map(std::vec::Vec::len), Some(10));
         let group = idx(&info[17], 0).as_array().cloned().unwrap();
         assert_eq!(group[1], blk(b"mygroup"));
         assert_eq!(group[3], blk(b"11-1")); // last-delivered-id
         assert_eq!(group[5], RespValue::Integer(11)); // entries-read
         assert_eq!(group[7], RespValue::Integer(0)); // lag
         assert_eq!(group[9], RespValue::Integer(11)); // pel-count
-        assert_eq!(group[11].as_array().map(|a| a.len()), Some(11)); // pending
+        assert_eq!(group[11].as_array().map(std::vec::Vec::len), Some(11)); // pending
         let consumers = group[13].as_array().unwrap();
         assert_eq!(consumers.len(), 1);
         let consumer = consumers[0].as_array().cloned().unwrap();
@@ -3817,7 +3813,7 @@ mod tests {
         assert!(matches!(consumer[3], RespValue::Integer(_))); // seen-time set
         assert_ne!(consumer[5], RespValue::Integer(-1)); // active-time now set
         assert_eq!(consumer[7], RespValue::Integer(11)); // consumer pel-count
-        assert_eq!(consumer[9].as_array().map(|a| a.len()), Some(11)); // consumer pending
+        assert_eq!(consumer[9].as_array().map(std::vec::Vec::len), Some(11)); // consumer pending
     }
 
     /// Port of `StreamFamilyTest.GroupCreate`.
@@ -3853,20 +3849,29 @@ mod tests {
 
         // Receive all records from a single stream.
         let resp = val(cmd(&mut db, &[b"xread", b"streams", b"foo", b"0"]));
-        assert_eq!(idx(&resp, 0).as_array().map(|a| a.len()), Some(2));
+        assert_eq!(idx(&resp, 0).as_array().map(std::vec::Vec::len), Some(2));
         assert_eq!(*idx(idx(&resp, 0), 0), blk(b"foo"));
-        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(3));
+        assert_eq!(
+            idx(idx(&resp, 0), 1).as_array().map(std::vec::Vec::len),
+            Some(3)
+        );
 
         // Receive all records from both streams.
         let resp = val(cmd(
             &mut db,
             &[b"xread", b"streams", b"foo", b"bar", b"0", b"0"],
         ));
-        assert_eq!(resp.as_array().map(|a| a.len()), Some(2));
+        assert_eq!(resp.as_array().map(std::vec::Vec::len), Some(2));
         assert_eq!(*idx(idx(&resp, 0), 0), blk(b"foo"));
-        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(3));
+        assert_eq!(
+            idx(idx(&resp, 0), 1).as_array().map(std::vec::Vec::len),
+            Some(3)
+        );
         assert_eq!(*idx(idx(&resp, 1), 0), blk(b"bar"));
-        assert_eq!(idx(idx(&resp, 1), 1).as_array().map(|a| a.len()), Some(1));
+        assert_eq!(
+            idx(idx(&resp, 1), 1).as_array().map(std::vec::Vec::len),
+            Some(1)
+        );
 
         // Order of the requested streams is maintained.
         let resp = val(cmd(
@@ -3883,8 +3888,14 @@ mod tests {
                 b"xread", b"count", b"1", b"streams", b"foo", b"bar", b"0", b"0",
             ],
         ));
-        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(1));
-        assert_eq!(idx(idx(&resp, 1), 1).as_array().map(|a| a.len()), Some(1));
+        assert_eq!(
+            idx(idx(&resp, 0), 1).as_array().map(std::vec::Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            idx(idx(&resp, 1), 1).as_array().map(std::vec::Vec::len),
+            Some(1)
+        );
 
         // Read from ID.
         let resp = val(cmd(
@@ -3893,19 +3904,19 @@ mod tests {
                 b"xread", b"count", b"10", b"streams", b"foo", b"bar", b"1-1", b"2-0",
             ],
         ));
-        assert_eq!(resp.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(resp.as_array().map(std::vec::Vec::len), Some(1));
         let foo = idx(&resp, 0).as_array().unwrap();
         assert_eq!(foo[0], blk(b"foo"));
         let entry = foo[1].as_array().unwrap()[0].as_array().cloned().unwrap();
         assert_eq!(entry[0], blk(b"1-2"));
-        assert_eq!(entry[1].as_array().map(|a| a.len()), Some(2));
+        assert_eq!(entry[1].as_array().map(std::vec::Vec::len), Some(2));
 
         // Stream not found: omitted from the reply.
         let resp = val(cmd(
             &mut db,
             &[b"xread", b"streams", b"foo", b"notfound", b"0", b"0"],
         ));
-        assert_eq!(resp.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(resp.as_array().map(std::vec::Vec::len), Some(1));
         assert_eq!(*idx(idx(&resp, 0), 0), blk(b"foo"));
 
         // Only a missing stream: null array.
@@ -3974,9 +3985,12 @@ mod tests {
                 b"0",
             ],
         ));
-        assert_eq!(resp.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(resp.as_array().map(std::vec::Vec::len), Some(1));
         assert_eq!(*idx(idx(&resp, 0), 0), blk(b"foo"));
-        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(0));
+        assert_eq!(
+            idx(idx(&resp, 0), 1).as_array().map(std::vec::Vec::len),
+            Some(0)
+        );
 
         // ">" returns unread entries with key "foo".
         let resp = val(cmd(
@@ -3991,8 +4005,11 @@ mod tests {
                 b">",
             ],
         ));
-        assert_eq!(resp.as_array().map(|a| a.len()), Some(1));
-        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(3));
+        assert_eq!(resp.as_array().map(std::vec::Vec::len), Some(1));
+        assert_eq!(
+            idx(idx(&resp, 0), 1).as_array().map(std::vec::Vec::len),
+            Some(3)
+        );
 
         cmd(&mut db, &[b"xadd", b"foo", b"1-*", b"k5", b"v5"]);
         let resp = val(cmd(
@@ -4009,7 +4026,7 @@ mod tests {
                 b">",
             ],
         ));
-        assert_eq!(resp.as_array().map(|a| a.len()), Some(2));
+        assert_eq!(resp.as_array().map(std::vec::Vec::len), Some(2));
         let bar_entries = idx(idx(&resp, 0), 1).as_array().unwrap();
         assert_eq!(bar_entries.len(), 1);
         assert_eq!(bar_entries[0].as_array().unwrap()[0], blk(b"1-0"));
@@ -4030,7 +4047,10 @@ mod tests {
                 b"0",
             ],
         ));
-        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(4));
+        assert_eq!(
+            idx(idx(&resp, 0), 1).as_array().map(std::vec::Vec::len),
+            Some(4)
+        );
 
         // Nothing new for ">": nil array.
         let resp = val(cmd(
@@ -4064,11 +4084,17 @@ mod tests {
                 b"0",
             ],
         ));
-        assert_eq!(resp.as_array().map(|a| a.len()), Some(2));
+        assert_eq!(resp.as_array().map(std::vec::Vec::len), Some(2));
         assert_eq!(*idx(idx(&resp, 0), 0), blk(b"foo"));
-        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(2));
+        assert_eq!(
+            idx(idx(&resp, 0), 1).as_array().map(std::vec::Vec::len),
+            Some(2)
+        );
         assert_eq!(*idx(idx(&resp, 1), 0), blk(b"bar"));
-        assert_eq!(idx(idx(&resp, 1), 1).as_array().map(|a| a.len()), Some(1));
+        assert_eq!(
+            idx(idx(&resp, 1), 1).as_array().map(std::vec::Vec::len),
+            Some(1)
+        );
 
         // Bob will not get entries of alice.
         let resp = val(cmd(
@@ -4083,7 +4109,10 @@ mod tests {
                 b"0",
             ],
         ));
-        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(0));
+        assert_eq!(
+            idx(idx(&resp, 0), 1).as_array().map(std::vec::Vec::len),
+            Some(0)
+        );
 
         let resp = val(cmd(&mut db, &[b"xinfo", b"groups", b"foo"]));
         let gi = idx(&resp, 0).as_array().unwrap();
@@ -4105,7 +4134,10 @@ mod tests {
                 b">",
             ],
         ));
-        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(1));
+        assert_eq!(
+            idx(idx(&resp, 0), 1).as_array().map(std::vec::Vec::len),
+            Some(1)
+        );
         let resp = val(cmd(
             &mut db,
             &[
@@ -4118,7 +4150,10 @@ mod tests {
                 b"0",
             ],
         ));
-        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(0));
+        assert_eq!(
+            idx(idx(&resp, 0), 1).as_array().map(std::vec::Vec::len),
+            Some(0)
+        );
 
         // No group.
         let resp = cmd(
@@ -4245,9 +4280,12 @@ mod tests {
                 b"0",
             ],
         ));
-        assert_eq!(resp.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(resp.as_array().map(std::vec::Vec::len), Some(1));
         assert_eq!(*idx(idx(&resp, 0), 0), blk(b"stream"));
-        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(0));
+        assert_eq!(
+            idx(idx(&resp, 0), 1).as_array().map(std::vec::Vec::len),
+            Some(0)
+        );
     }
 
     /// Port of `StreamFamilyTest.XReadGroupEmptyConsumer`.
@@ -4530,7 +4568,7 @@ mod tests {
                 b"10",
             ],
         ));
-        assert_eq!(resp.as_array().map(|a| a.len()), Some(0));
+        assert_eq!(resp.as_array().map(std::vec::Vec::len), Some(0));
     }
 
     /// Port of `StreamFamilyTest.XPendingEmpty`.
@@ -4762,7 +4800,7 @@ mod tests {
                 b"2000-0",
             ],
         ));
-        assert_eq!(resp.as_array().map(|a| a.len()), Some(2));
+        assert_eq!(resp.as_array().map(std::vec::Vec::len), Some(2));
         let s0 = idx(&resp, 0).as_array().unwrap();
         assert_eq!(s0[0], blk(b"mystream"));
         let es = s0[1].as_array().unwrap();
@@ -4790,7 +4828,7 @@ mod tests {
         );
         let s1 = idx(&resp, 1).as_array().unwrap();
         assert_eq!(s1[0], blk(b"mystream1"));
-        assert_eq!(s1[1].as_array().map(|a| a.len()), Some(0));
+        assert_eq!(s1[1].as_array().map(std::vec::Vec::len), Some(0));
     }
 
     /// Port of `StreamFamilyTest.XGroupSetIdEntriesRead`.
@@ -5538,9 +5576,12 @@ mod tests {
                 b">",
             ],
         ));
-        assert_eq!(resp.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(resp.as_array().map(std::vec::Vec::len), Some(1));
         assert_eq!(*idx(idx(&resp, 0), 0), blk(b"xp1"));
-        assert_eq!(idx(idx(&resp, 0), 1).as_array().map(|a| a.len()), Some(1));
+        assert_eq!(
+            idx(idx(&resp, 0), 1).as_array().map(std::vec::Vec::len),
+            Some(1)
+        );
     }
 
     /// Port of the `StreamFamilyTest.Issue854` XGROUP HELP part (the EVAL half
@@ -5549,7 +5590,7 @@ mod tests {
     fn xgroup_help() {
         let mut db = DbSlice::new(0);
         let resp = val(cmd(&mut db, &[b"XGROUP", b"HELP"]));
-        assert_eq!(resp.as_array().map(|a| a.len()), Some(17));
+        assert_eq!(resp.as_array().map(std::vec::Vec::len), Some(17));
         assert_eq!(
             *idx(&resp, 0),
             blk(b"XGROUP <subcommand> [<arg> [value] [opt] ...]. Subcommands are:")
@@ -5631,9 +5672,15 @@ mod tests {
         let streams = resp.as_array().unwrap();
         assert_eq!(streams.len(), 2);
         assert_eq!(*idx(&streams[0], 0), blk(b"foo"));
-        assert_eq!(idx(&streams[0], 1).as_array().map(|a| a.len()), Some(3));
+        assert_eq!(
+            idx(&streams[0], 1).as_array().map(std::vec::Vec::len),
+            Some(3)
+        );
         assert_eq!(*idx(&streams[1], 0), blk(b"bar"));
-        assert_eq!(idx(&streams[1], 1).as_array().map(|a| a.len()), Some(1));
+        assert_eq!(
+            idx(&streams[1], 1).as_array().map(std::vec::Vec::len),
+            Some(1)
+        );
     }
 
     /// Port of `StreamFamilyTest.Range`: forward and reverse iteration order,

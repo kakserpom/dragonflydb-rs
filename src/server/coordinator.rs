@@ -941,6 +941,7 @@ impl Coordinator {
     /// its result. The shard is normally already locked by the script's tx.
     /// `conn_id` and `track_keys` are forwarded so the shard can run the
     /// CLIENT TRACKING read hook (`TrackIfNeeded`) for the subcommand.
+    #[allow(clippy::too_many_arguments)]
     fn script_op(
         &mut self,
         shard: usize,
@@ -1051,6 +1052,7 @@ pub(crate) fn format_exec_slowlog(num_cmds: usize, is_write: bool) -> Vec<Vec<u8
 /// `FormatEvalSlowlog` (conn_context.cc:44): the augmented arguments of an
 /// EVAL/EVALSHA slowlog entry: the script sha, run stats, and then the
 /// command's raw tail after the script/sha slot.
+#[allow(clippy::too_many_arguments)]
 fn format_eval_slowlog(
     sha: &str,
     num_commands: usize,
@@ -1750,6 +1752,7 @@ impl ScriptDispatchCtx<'_> {
 /// returned (`error_abort` in `ExecuteSquashed`). The whole hop runs even when
 /// it contains an error, mirroring the reference's shard-side execution.
 /// Clears the batches and the hop position list.
+#[allow(clippy::too_many_arguments)]
 fn run_squash_hop(
     coord: &mut Coordinator,
     db_idx: usize,

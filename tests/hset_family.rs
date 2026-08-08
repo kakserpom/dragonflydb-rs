@@ -60,8 +60,8 @@ impl Lcg {
     fn next(&mut self) -> u64 {
         self.0 = self
             .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         self.0
     }
 }
@@ -111,7 +111,7 @@ fn hset() {
     let mut mirror: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut rng = Lcg(0x1234_5678_9abc_def0);
     while mirror.len() < 600 {
-        let mut cmd = vec!["HSET", "hash"];
+        let cmd = ["HSET", "hash"];
         let mut new_values = 0i64;
         let mut args: Vec<String> = Vec::new();
         for _ in 0..20 {
@@ -177,7 +177,7 @@ fn mixed_types() {
         let key2 = format!("i{i}");
         t.assert_text(&["HGET", "hash", &key1], "VALUE");
         t.assert_text(&["HGET", "hash", &key2], "123456");
-        t.assert_int(&["hincrby", "hash", &key2, "1"], 123457);
+        t.assert_int(&["hincrby", "hash", &key2, "1"], 123_457);
     }
 }
 
@@ -499,7 +499,7 @@ fn hrand_field() {
     let keys: Vec<&String> = items.iter().step_by(2).collect();
     let vals: Vec<&String> = items.iter().skip(1).step_by(2).collect();
     let mut keys_sorted: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-    keys_sorted.sort();
+    keys_sorted.sort_unstable();
     assert_eq!(keys_sorted, vec!["a", "b", "c"]);
     let mut vals_sorted = vals.clone();
     vals_sorted.sort();

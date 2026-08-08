@@ -1784,22 +1784,20 @@ fn prepare_args(args: &MultiValue) -> mlua::Result<Vec<Vec<u8>>> {
 /// then value.
 fn collect_reply_bytes(values: &mut Vec<Vec<u8>>, r: &RespValue) {
     match r {
-        RespValue::Nil => values.push(Vec::new()),
-        RespValue::NilArray => values.push(Vec::new()),
+        RespValue::Nil | RespValue::NilArray => values.push(Vec::new()),
         RespValue::Bool(b) => values.push(if *b { b"1".to_vec() } else { b"0".to_vec() }),
         RespValue::Integer(i) => values.push(itoa(*i)),
         RespValue::Double(d) => values.push(g6_format(*d).into_bytes()),
         RespValue::Simple(s) => values.push(s.as_bytes().to_vec()),
-        RespValue::Error(_) => {}
+        // Errors and pushes never contribute (pushes never reach the
+        // interpreter anyway).
+        RespValue::Error(_) | RespValue::Push(_) => {}
         RespValue::Bulk(b) => values.push(b.clone()),
         RespValue::Array(items) => items.iter().for_each(|v| collect_reply_bytes(values, v)),
         RespValue::Map(pairs) => pairs.iter().for_each(|(k, v)| {
             collect_reply_bytes(values, k);
             collect_reply_bytes(values, v);
         }),
-        // Pushes never reach the Lua interpreter (invalidation pushes are
-        // appended straight to the connection output).
-        RespValue::Push(_) => {}
     }
 }
 
@@ -1986,8 +1984,7 @@ fn install_dragonfly_functions<'a, D: ScriptDispatch>(
 /// `false`, integral doubles -> integers.
 fn resp_to_lua(lua: &Lua, r: RespValue) -> mlua::Result<Value> {
     Ok(match r {
-        RespValue::Nil => Value::Boolean(false),
-        RespValue::NilArray => Value::Boolean(false),
+        RespValue::Nil | RespValue::NilArray | RespValue::Push(_) => Value::Boolean(false),
         RespValue::Bool(b) => Value::Boolean(b),
         RespValue::Integer(i) => Value::Integer(i),
         RespValue::Double(d) => {
@@ -2028,9 +2025,6 @@ fn resp_to_lua(lua: &Lua, r: RespValue) -> mlua::Result<Value> {
             }
             Value::Table(t)
         }
-        // Pushes never reach the Lua interpreter (invalidation pushes are
-        // appended straight to the connection output).
-        RespValue::Push(_) => Value::Boolean(false),
     })
 }
 

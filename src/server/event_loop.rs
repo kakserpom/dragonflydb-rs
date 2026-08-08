@@ -1,3 +1,4 @@
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, HashMap};
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
@@ -533,8 +534,7 @@ impl IoLoop {
         // (`DflyCmd::StopReplication`); the shard consumers are unregistered.
         if let Some(role) = self.conns.get(&conn_id).and_then(|c| c.repl) {
             let sync_id = match role {
-                ConnRepl::Control { sync_id } => sync_id,
-                ConnRepl::Flow { sync_id, .. } => sync_id,
+                ConnRepl::Control { sync_id } | ConnRepl::Flow { sync_id, .. } => sync_id,
             };
             self.stop_replication(sync_id);
         }
@@ -1165,7 +1165,7 @@ impl IoLoop {
             conn.exec_multi = true;
             conn.exec_multi_mode = multi_mode;
         }
-        if multi_mode == TxMultiMode::Global && self.queue_is_batchable(&queue) {
+        if multi_mode == TxMultiMode::Global && Self::queue_is_batchable(&queue) {
             self.run_global_batch(conn_id, &queue);
         } else {
             for args in queue {
@@ -1231,7 +1231,7 @@ impl IoLoop {
     /// queued command must be coordinator-dispatched. Local commands (SELECT,
     /// UNWATCH, REPLCONF, ...) need the IO thread's connection state, so they
     /// fall back to the per-command loop.
-    fn queue_is_batchable(&self, queue: &[Vec<Vec<u8>>]) -> bool {
+    fn queue_is_batchable(queue: &[Vec<Vec<u8>>]) -> bool {
         queue.iter().all(|args| {
             command_for(args).is_some_and(|c| !c.has_flag(FLAG_LOCAL) && !c.has_flag(FLAG_ADMIN))
         })
@@ -1254,7 +1254,7 @@ impl IoLoop {
                     seq,
                     PendingSlowlog {
                         name: cmd.name.to_string(),
-                        args: args.to_vec(),
+                        args: args.clone(),
                         started: Instant::now(),
                         slowlog_args: None,
                     },
@@ -2096,17 +2096,13 @@ impl IoLoop {
             if rest[0].eq_ignore_ascii_case(b"ACK") {
                 if let Some(ConnRepl::Flow { sync_id, flow_id }) =
                     self.conns.get(&conn_id).and_then(|c| c.repl)
-                {
-                    if let Some(n) = std::str::from_utf8(&rest[1])
+                    && let Some(n) = std::str::from_utf8(&rest[1])
                         .ok()
                         .and_then(|s| s.parse::<u64>().ok())
-                    {
-                        if let Some(replica) = self.repl.get_mut(sync_id)
-                            && let Some(flow) = replica.flows.get_mut(flow_id)
-                        {
-                            flow.last_acked_lsn = n;
-                        }
-                    }
+                    && let Some(replica) = self.repl.get_mut(sync_id)
+                    && let Some(flow) = replica.flows.get_mut(flow_id)
+                {
+                    flow.last_acked_lsn = n;
                 }
                 return None;
             }
@@ -2246,7 +2242,7 @@ impl IoLoop {
         }
         let reply = RespValue::Array(vec![
             RespValue::Simple(sync_type.into()),
-            RespValue::Simple(eof_token.into()),
+            RespValue::Simple(eof_token),
         ]);
         self.deliver(conn_id, seq, encode_value(&reply));
     }
@@ -2366,7 +2362,7 @@ impl IoLoop {
                 result_tx: tx,
             });
             if rx
-                .recv_timeout(Duration::from_secs(120))
+                .recv_timeout(Duration::from_mins(2))
                 .map_or(true, |r| r.is_err())
             {
                 self.deliver(
@@ -2566,19 +2562,21 @@ impl IoLoop {
             let Some(conn) = self.conns.get_mut(&conn_id) else {
                 return;
             };
-            if seq == conn.deliver_seq {
-                conn.out.extend_from_slice(&bytes);
-                conn.deliver_seq += 1;
-                while let Some(next) = conn.buffered.remove(&conn.deliver_seq) {
-                    conn.out.extend_from_slice(&next);
+            match seq.cmp(&conn.deliver_seq) {
+                CmpOrdering::Equal => {
+                    conn.out.extend_from_slice(&bytes);
                     conn.deliver_seq += 1;
+                    while let Some(next) = conn.buffered.remove(&conn.deliver_seq) {
+                        conn.out.extend_from_slice(&next);
+                        conn.deliver_seq += 1;
+                    }
+                    conn.pending_slowlog.remove(&seq)
                 }
-                conn.pending_slowlog.remove(&seq)
-            } else if seq > conn.deliver_seq {
-                conn.buffered.insert(seq, bytes);
-                None
-            } else {
-                None
+                CmpOrdering::Greater => {
+                    conn.buffered.insert(seq, bytes);
+                    None
+                }
+                CmpOrdering::Less => None,
             }
         };
         if let Some(pending) = completed {
