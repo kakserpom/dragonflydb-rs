@@ -427,6 +427,15 @@ impl Coordinator {
             Ok(p) => p,
             Err(e) => return CmdResult::err(format!("ERR {e}")),
         };
+        // `CallSHA` (main_service.cc): a script that requires GLOBAL scheduling
+        // (allow-undeclared-keys) cannot run inside a LOCK_AHEAD MULTI
+        // transaction. The port's EXEC always schedules lock-ahead, so the
+        // conflict fires whenever such a script is queued in a MULTI.
+        if msg.no_block && params.undeclared_keys {
+            return CmdResult::err(
+                "Multi mode conflict when running eval in multi transaction. Multi mode is: LOCK_AHEAD, eval mode is: GLOBAL",
+            );
+        }
         // `lua_auto_async`: rewrite statement-context `redis.call`/`redis.pcall`
         // into `acall`/`apcall` for atomic bodies before the first compile
         // (`ScriptMgr::Insert`). The SHA stays computed over the original body,
@@ -1081,6 +1090,19 @@ impl ScriptDispatch for ScriptDispatchCtx<'_> {
         // `ScheduleSingleHop`), releasing them again afterwards; atomic scripts
         // already hold the declared-key shards for the whole body.
         let started = Instant::now();
+        // FLAG_LOCAL subcommands (PING, ECHO, TIME, SELECT, ...) run on the
+        // connection thread in the reference too (`GenericFamily::Ping`,
+        // `GenericFamily::Select`), so execute them inline instead of routing
+        // them to a shard's `local_stub`.
+        if let Some(r) = self.script_local(cmd, &args) {
+            self.count_slow(started);
+            // An error reply must abort the script (`redis.call` raises on an
+            // error from `DispatchCommand`, lua_libs.cc `RedisCallCommand`).
+            return match r {
+                CmdResult::Err(e) => Err(e.message),
+                other => Ok(other.into_resp_value()),
+            };
+        }
         if !self.ctx.atomic {
             let shards = self.cmd_shards(cmd, &args);
             self.ensure_locked(&shards)?;
@@ -1349,7 +1371,9 @@ impl ScriptDispatchCtx<'_> {
                 if fatal.is_some() {
                     break;
                 }
-                let result = self.execute_script_cmd(exec, &cmd.args);
+                let result = self
+                    .script_local(exec, &cmd.args)
+                    .unwrap_or_else(|| self.execute_script_cmd(exec, &cmd.args));
                 results[pos] = Some(result);
             }
         }
@@ -1455,6 +1479,44 @@ impl ScriptDispatchCtx<'_> {
             }
         }
         Ok(cmd)
+    }
+
+    /// Run a FLAG_LOCAL subcommand on the coordinator thread. The reference
+    /// executes these on the connection thread (`GenericFamily::Ping`,
+    /// `GenericFamily::Echo`, `GenericFamily::Time`), so routing them to a
+    /// shard would hit `local_stub`'s "local command should not reach a shard"
+    /// error. Returns `None` for commands that must reach a shard.
+    fn script_local(&mut self, cmd: &'static Command, args: &[Vec<u8>]) -> Option<CmdResult> {
+        let resp = match cmd.name {
+            "PING" => crate::commands::exec::server::local_ping(args),
+            "ECHO" => crate::commands::exec::server::local_echo(args),
+            "TIME" => crate::commands::exec::server::local_time(args),
+            "LASTSAVE" => crate::commands::exec::server::local_lastsave(args),
+            "SELECT" => return Some(self.script_select(args)),
+            _ => return None,
+        };
+        Some(CmdResult::Ok(resp))
+    }
+
+    /// `GenericFamily::Select` (generic_family.cc:2439): parse and range-check
+    /// the target DB, accept a same-DB select as a noop, reject it for
+    /// LOCK_AHEAD (regular) scripts, and switch the script's DB for GLOBAL /
+    /// NON_ATOMIC scripts so subsequent subcommands target the new DB.
+    fn script_select(&mut self, args: &[Vec<u8>]) -> CmdResult {
+        let Some(index) = args.get(1).and_then(|a| crate::util::parse_i64(a)) else {
+            return CmdResult::err("ERR DB index is out of range");
+        };
+        if index < 0 || index as usize >= crate::server::MAX_DB {
+            return CmdResult::err("ERR DB index is out of range");
+        }
+        if self.ctx.db_idx == index as usize {
+            return CmdResult::ok(RespValue::Simple("OK".into()));
+        }
+        if self.ctx.atomic && !self.ctx.undeclared_keys {
+            return CmdResult::err("SELECT is not allowed in regular EXEC/EVAL");
+        }
+        self.ctx.db_idx = index as usize;
+        CmdResult::ok(RespValue::Simple("OK".into()))
     }
 
     /// Execute one (already verified) subcommand against the shards owning its
