@@ -16,8 +16,6 @@
 //!   coordinator runs the whole queue without letting a woken blocked command
 //!   slip between the queued commands.
 //! - Tests gated on features the port lacks are skipped:
-//!   - `UndeclaredKeyFlag`/`LegacyFloatShaFlag` need `CONFIG SET` to apply
-//!     `lua_undeclared_keys_shas`/`lua_float_as_int_shas` dynamically.
 //!   - `PerDbHitMissInfoOutput` needs `INFO keyspace` hit/miss counters.
 //!   - `NoKeyTransactional`/`NoKeyTransactionalMany` exercise FT._LIST (no FT).
 
@@ -727,4 +725,73 @@ fn acall_undeclared_keys() {
     let mut args = vec!["EVAL", script, "10"];
     args.extend(keys.iter().map(String::as_str));
     assert!(matches!(c.run(&args), Value::Bulk(None)));
+}
+
+/// `UndeclaredKeyFlag` (multi_test.cc:1043): `CONFIG SET
+/// lua_undeclared_keys_shas` force-flags a SHA to allow undeclared keys.
+#[test]
+fn undeclared_key_flag() {
+    let mut c = Ctx::new();
+    let script = "return redis.call('GET', 'random-key');";
+    c.ok(&["SET", "random-key", "works"]);
+
+    let sha = c.text(&["SCRIPT", "LOAD", script]);
+    let err = c.err(&["EVALSHA", &sha, "0"]);
+    assert!(err.contains("undeclared"), "{err}");
+    let err = c.err(&["EVAL", script, "0"]);
+    assert!(err.contains("undeclared"), "{err}");
+
+    c.ok(&["SCRIPT", "FLUSH"]);
+    let v = c.arr(&["SCRIPT", "EXISTS", &sha]);
+    assert_eq!(v, vec![Value::Integer(0)]);
+
+    let val = format!("{sha},NON-EXISTING-HASH");
+    c.ok(&["CONFIG", "SET", "lua_undeclared_keys_shas", &val]);
+    assert_eq!(
+        c.run(&["EVAL", script, "0"]).text().as_deref(),
+        Some("works")
+    );
+    assert_eq!(
+        c.run(&["EVALSHA", &sha, "0"]).text().as_deref(),
+        Some("works")
+    );
+}
+
+/// `LegacyFloatFlag` (multi_test.cc:1069): `--!df flags=legacy-float` and
+/// `SCRIPT FLAGS <sha> legacy-float` round floats toward zero.
+#[test]
+fn legacy_float_flag() {
+    let mut c = Ctx::new();
+    let with_flag = "--!df flags=legacy-float\nreturn 42.9\n";
+    assert_eq!(c.run(&["EVAL", with_flag, "0"]).int(), Some(42));
+
+    let negative = "--!df flags=legacy-float\nreturn -3.8\n";
+    assert_eq!(c.run(&["EVAL", negative, "0"]).int(), Some(-3));
+
+    assert_eq!(
+        c.run(&["EVAL", "return 42.9", "0"]).text().as_deref(),
+        Some("42.9")
+    );
+
+    let sha = c.text(&["SCRIPT", "LOAD", "return 42.9"]);
+    c.ok(&["SCRIPT", "FLAGS", &sha, "legacy-float"]);
+    assert_eq!(c.run(&["EVAL", "return 42.9", "0"]).int(), Some(42));
+}
+
+/// `LegacyFloatShaFlag` (multi_test.cc:1094): `CONFIG SET lua_float_as_int_shas`
+/// force-flags a SHA to return floats as integers.
+#[test]
+fn legacy_float_sha_flag() {
+    let mut c = Ctx::new();
+    let script = "return 42.9";
+    let sha = c.text(&["SCRIPT", "LOAD", script]);
+
+    assert_eq!(
+        c.run(&["EVALSHA", &sha, "0"]).text().as_deref(),
+        Some("42.9")
+    );
+
+    c.ok(&["SCRIPT", "FLUSH"]);
+    c.ok(&["CONFIG", "SET", "lua_float_as_int_shas", &sha]);
+    assert_eq!(c.run(&["EVAL", script, "0"]).int(), Some(42));
 }

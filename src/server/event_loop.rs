@@ -201,6 +201,16 @@ fn normalize_config_name(raw: &[u8]) -> String {
         .replace('-', "_")
 }
 
+/// Split a comma-separated config value into a list of non-empty elements,
+/// mirroring how absl string flags (e.g. `lua_undeclared_keys_shas`) parse a
+/// `CONFIG SET` value into a `vector<string>`.
+fn parse_sha_list(raw: &[u8]) -> Vec<String> {
+    raw.split(|&b| b == b',')
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
+}
+
 /// Parse a human-readable memory size: an integer with an optional binary
 /// unit suffix (`b`, `k`/`kb`, `m`/`mb`, `g`/`gb`, `t`/`tb`), so `1GB` is
 /// 2^30 bytes (`ConfigGetMemoryBytes`).
@@ -1709,6 +1719,19 @@ impl IoLoop {
                 }
                 None => RespValue::Error(format!("ERR Invalid config parameter '{name}'")),
             },
+            // Comma-separated SHA lists consulted at script load time
+            // (`FLAGS_lua_undeclared_keys_shas`/`FLAGS_lua_float_as_int_shas`,
+            // parsed like any absl string flag).
+            "lua_undeclared_keys_shas" | "lua_float_as_int_shas" => {
+                let shas = parse_sha_list(&args[3]);
+                let mut mgr = self.env.script_mgr.lock().unwrap();
+                if name == "lua_undeclared_keys_shas" {
+                    mgr.undeclared_keys_shas = shas;
+                } else {
+                    mgr.float_as_int_shas = shas;
+                }
+                RespValue::Simple("OK".into())
+            }
             _ => RespValue::Simple("OK".into()),
         }
     }
@@ -1744,6 +1767,19 @@ impl IoLoop {
             &mut out,
         );
         push("maxmemory", self.maxmemory.to_string(), &mut out);
+        {
+            let mgr = self.env.script_mgr.lock().unwrap();
+            push(
+                "lua_undeclared_keys_shas",
+                mgr.undeclared_keys_shas.join(","),
+                &mut out,
+            );
+            push(
+                "lua_float_as_int_shas",
+                mgr.float_as_int_shas.join(","),
+                &mut out,
+            );
+        }
         RespValue::Array(out)
     }
 
