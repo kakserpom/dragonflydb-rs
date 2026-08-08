@@ -78,17 +78,17 @@ Legend:
   STATS, DUMP, RESTORE [FLUSH|APPEND|REPLACE], KILL, HELP backed by a shared
   library registry with per-library `#!lua name=...` headers, `redis.register_function`
   collection, and duplicate library/function-name enforcement)
-- [x] FCALL, FCALL_RO (run registered functions on the coordinator: lazy library
-  load into its interpreter, `(keys, args)` tables, per-key transaction locking,
-  `no-writes`/`allow-undeclared-keys` flag enforcement)
+- [x] FCALL, FCALL_RO (run registered functions on the shard owning the first
+  key: lazy library load into its interpreter, `(keys, args)` tables, per-key
+  transaction locking, `no-writes`/`allow-undeclared-keys` flag enforcement)
 - [x] SCRIPT (EXISTS, LIST, FLUSH, LATENCY, GC, FLAGS, LOAD, HELP backed by a
   shared `ScriptMgr` cache of compiled scripts; `SCRIPT FLAGS` and `--!df`
   comment flags set per-script params)
-- [x] EVAL, EVALSHA, EVAL_RO, EVALSHA_RO (sandboxed Lua interpreter on the
-  coordinator thread: compile-before-cache, `KEYS`/`ARGV` globals, per-key
-  transaction locking, cross-shard `redis.call`/`redis.pcall` dispatch, script
-  error wrapping `ERR Error running script (call to <sha>): ...`, NOSCRIPT and
-  read-only write rejection)
+- [x] EVAL, EVALSHA, EVAL_RO, EVALSHA_RO (sandboxed Lua interpreter per shard,
+  created on the shard thread: compile-once per shard, `KEYS`/`ARGV` globals,
+  per-key transaction locking, cross-shard `redis.call`/`redis.pcall` dispatch,
+  script error wrapping `ERR Error running script (call to <sha>): ...`, NOSCRIPT
+  and read-only write rejection)
 - [x] `redis.acall`/`redis.apcall` (async command batching flushed as one
   squashed phase on sync calls / budget overflow / end of run, with the
   `--multi_eval_squash_buffer` 8096-byte budget and the reference's
@@ -114,9 +114,23 @@ Legend:
   `lua_isnumber` (numeric strings accepted)
 
 ### Scripting deviations
-- Scripts run on a single coordinator-side interpreter (taken from the sandbox
-  pool), not one per shard; EVAL is serialized by the coordinator and holds
-  the script's locks for its whole body.
+- Scripts run on the shard owning their first key (shard 0 for keyless GLOBAL
+  scripts), not on the coordinator: each shard owns one interpreter, created on
+  the shard thread (mlua is not `Send`), and compiles each script/library once —
+  the reference's per-thread `InterpreterManager` model. The run-shard locks the
+  shards its transaction needs before executing (`LOCK_AHEAD`, or every shard in
+  GLOBAL mode) and holds them for the whole body; subcommands dispatch to peer
+  shards from the interpreter (`ShardMsg::ScriptOp`/`ScriptBatch`).
+- Script runs are serialized by the coordinator as a deliberate design choice:
+  `execute_script`/`execute_function` send `ShardMsg::RunScript` to the resident
+  shard and block on the single `ScriptRunResult` — one blocking wait per run,
+  not per subcommand as in the pre-refactor coordinator. While a script runs the
+  coordinator dispatches no new work, so the run-shard's waits on peer lock acks
+  and cross-shard op acks can never deadlock against a concurrent script on
+  another shard — the port's analog of the reference's connection thread
+  awaiting the multi transaction, where shards suspend per-fiber instead. It
+  also keeps `active_tx` on the run-shard owned exclusively by the script for
+  its whole body.
 - `SCRIPT LATENCY` prints the reference's `base::Histogram::ToString()` text
   dump per SHA (a 154-bucket fixed-boundary histogram, ported in
   `src/core/histogram.rs`, sent as a bulk string — exactly
@@ -351,8 +365,8 @@ integration tests (`tests/*.rs`) that run against the in-process server
   `cjson_decode_integer_behavior`, `script_bad_command`), and the EVAL family
   (`eval_ro`/`eval_sha_ro`, `eval_expiration`, `eval_select`, `general_acall`,
   `acall_undeclared_keys`, `multi_eval_mode_conflict`). Source fixes:
-  FLAG_LOCAL subcommands (PING/ECHO/TIME/LASTSAVE/SELECT) now run inline on the
-  coordinator (`script_local` in `coordinator.rs`) instead of hitting a shard's
+  FLAG_LOCAL subcommands (PING/ECHO/TIME/LASTSAVE/SELECT) now run inline in the
+  script dispatch (`script_local` in `shard.rs`) instead of hitting a shard's
   `local_stub`; `script_select` rejects LOCK_AHEAD scripts ("SELECT is not
   allowed in regular EXEC/EVAL"), range-checks the DB ("ERR DB index is out of
   range") and switches the script DB for GLOBAL/NON_ATOMIC scripts;
@@ -392,13 +406,14 @@ integration tests (`tests/*.rs`) that run against the in-process server
 - [x] Scripting end-to-end coverage in `tests/functions.rs` (11 tests). There is
   no upstream `function_family_test.cc` (and no FUNCTION tests in dragonfly's
   tree at all), so these are authored from the port's own documented semantics
-  (`local_function` in `src/server/mod.rs` + the coordinator's
-  `execute_function` in `src/server/coordinator.rs`). They run over the socket
-  through the shared `ScriptMgr`, exercising both dispatch halves: FUNCTION
-  admin on the IO thread (`handle_local`) and FCALL/FCALL_RO on the coordinator
-  (`is_function_cmd`). Coverage: LOAD/REPLACE/DELETE/FLUSH round-trips,
-  duplicate library/function-name enforcement, the REPLACE purge path for
-  dropped names (coordinator `loaded_libs` + `purge_functions`), LIST
+  (`local_function` in `src/server/mod.rs` + `execute_function` in
+  `src/server/coordinator.rs`). They run over the socket through the shared
+  `ScriptMgr`, exercising both dispatch halves: FUNCTION admin on the IO thread
+  (`handle_local`) and FCALL/FCALL_RO dispatched from the coordinator
+  (`is_function_cmd`) to the function's resident shard. Coverage:
+  LOAD/REPLACE/DELETE/FLUSH round-trips, duplicate library/function-name
+  enforcement, the REPLACE purge path for dropped names (per-shard `loaded_libs`
+  + `purge_functions`), LIST
   LIBRARYNAME/WITHCODE (maps flatten to RESP2 arrays), STATS fields, HELP,
   NOTBUSY KILL, bad payloads (missing metadata / no functions / invalid engine /
   missing name / non-function callback / top-level redis.call), FCALL errors

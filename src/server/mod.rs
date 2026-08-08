@@ -749,11 +749,14 @@ pub enum ShardMsg {
         db_idx: usize,
         result_tx: mpsc::Sender<Vec<(Vec<u8>, WatchState)>>,
     },
-    /// A single `redis.call(...)` dispatched from a script running on the
-    /// coordinator. The target shard is already locked by the script's
-    /// transaction, so the subcommand executes immediately and its result is
-    /// sent back on `result_tx`.
+    /// A single `redis.call(...)` dispatched from a script running on another
+    /// shard (or, before the refactor, the coordinator). The target shard is
+    /// already locked by the script's transaction, so the subcommand executes
+    /// immediately and its result is sent back on `result_tx`.
     ScriptOp {
+        /// The script's transaction id, so the subcommand's journal records
+        /// join the script's transaction.
+        tx_id: u64,
         args: Vec<Vec<u8>>,
         owned_key_idxs: Vec<usize>,
         /// The subcommand's `KeyRange::first` for the `OpContext`.
@@ -772,8 +775,29 @@ pub enum ShardMsg {
     /// shard is already locked by the script's transaction, so every entry runs
     /// inline in order and the results are sent back together.
     ScriptBatch {
+        /// The script's transaction id, shared by every journal record the
+        /// batch writes.
+        tx_id: u64,
         cmds: Vec<ScriptBatchEntry>,
         result_tx: mpsc::Sender<Vec<crate::error::CmdResult>>,
+    },
+    /// Run a script (`EVAL`/`EVALSHA`/`FCALL`) on the shard owning its first
+    /// key. The shard runs the Lua body in its own interpreter, dispatching
+    /// `redis.call` subcommands to itself inline and to peers over their
+    /// channels — the port's analog of the reference's per-thread
+    /// interpreters, where a single-shard script runs inline on its shard
+    /// thread and a multi-shard script runs on the connection thread. The final
+    /// result is sent back on `result_tx`.
+    RunScript {
+        req: ScriptRunRequest,
+        result_tx: mpsc::Sender<ScriptRunResult>,
+    },
+    /// `SCRIPT GC`: run a full Lua GC over the shard's interpreter and ack
+    /// (`ScriptMgr::GCCmd`, which does the same on every interpreter across all
+    /// threads). The ack may lag behind a running script: the shard collects
+    /// once its current run returns to the message loop.
+    ScriptGc {
+        ack: mpsc::Sender<()>,
     },
     /// Create or drop the per-shard replication journal (`journal_slice.cc`).
     /// The master enables it once a replica's `DFLY FLOW` arrives; while
@@ -866,6 +890,74 @@ pub struct ScriptBatchEntry {
     pub conn_id: u64,
     /// Whether the connection is tracking keys (CLIENT TRACKING).
     pub track_keys: bool,
+}
+
+/// What a `ShardMsg::RunScript` executes on the shard's interpreter.
+#[derive(Debug, Clone)]
+pub enum ScriptRunKind {
+    /// EVAL / EVALSHA: run the cached body for `sha`. The body is included so a
+    /// script the shard has not compiled yet can be defined on demand (each
+    /// shard compiles a script once, like the reference's per-thread
+    /// `InterpreterManager`). The sha is content-addressed, so a cached
+    /// `defined_scripts` hit implies an identical body.
+    Eval { sha: String, body: Vec<u8> },
+    /// FCALL / FCALL_RO: invoke the registered function `name`, loading its
+    /// library into the shard's interpreter when `lib_sha` differs from the
+    /// shard's cached copy for `lib_name`.
+    Function {
+        name: String,
+        lib_name: String,
+        lib_sha: String,
+        code: Vec<u8>,
+    },
+}
+
+/// A request to run a script on the shard owning its first key
+/// (`ShardMsg::RunScript`).
+#[derive(Debug, Clone)]
+pub struct ScriptRunRequest {
+    pub kind: ScriptRunKind,
+    /// Declared KEYS values (the script's lock tags).
+    pub keys: Vec<Vec<u8>>,
+    /// ARGV values.
+    pub argv: Vec<Vec<u8>>,
+    pub params: crate::commands::lua::ScriptParams,
+    /// The connection running the script (`TrackIfNeeded` needs the issuing
+    /// connection to record tracked reads).
+    pub conn_id: u64,
+    /// The DB all subcommands run in (the connection's selected DB).
+    pub db_idx: usize,
+    /// Whether the connection is tracking keys (CLIENT TRACKING).
+    pub track_keys: bool,
+    /// The script's transaction id, shared by every lock the run takes and by
+    /// every journal record its subcommands write.
+    pub tx_id: u64,
+    /// `EVAL_RO`/`EVALSHA_RO`/`FCALL_RO` (or a `no-writes` function): reject
+    /// write subcommands.
+    pub read_only: bool,
+    /// The slowlog threshold (usec) for this run (`log_slower_than_usec`).
+    pub slowlog_threshold_usec: u64,
+    /// Total shard count, for `keys_per_shard` grouping.
+    pub num_shards: usize,
+    /// Channels to every shard, cloned from the coordinator, so the run-shard
+    /// can lock peers, dispatch cross-shard `ScriptOp`/`ScriptBatch` hops and
+    /// perform deferred stores — the port's analog of a multi-shard script
+    /// running on the connection thread and dispatching over the shards.
+    pub peer_txs: Vec<mpsc::Sender<ShardMsg>>,
+}
+
+/// The outcome of a `ShardMsg::RunScript`, sent back on the request's
+/// `result_tx`.
+#[derive(Debug)]
+pub struct ScriptRunResult {
+    /// The final script result, or the bare error message (the coordinator
+    /// wraps it with `Error running script (call to ...)` and runs
+    /// `ScriptMgr::OnScriptError` for the auto-correct flag flip).
+    pub result: Result<crate::error::RespValue, String>,
+    /// `ConnectionState::ScriptInfo::stats` for the slowlog entry
+    /// (`num_cmds`/`slow_cmds`, conn_context.cc:351).
+    pub num_commands: usize,
+    pub slow_commands: usize,
 }
 
 /// The mode a MULTI transaction runs in (`transaction.h:137`). The enum order

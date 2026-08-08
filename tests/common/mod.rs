@@ -131,19 +131,8 @@ impl TestServer {
         let full_sync_bus =
             dragonflydb::server::replication::FullSyncBus::new(repl_tx.clone(), pipefds[1]);
 
-        // Shard threads.
-        let tracking = Arc::new(Mutex::new(Tracking::default()));
-        let pause = Arc::new(ClientPause::default());
-        let mut shard_txs = Vec::with_capacity(num_shards);
-        for s in 0..num_shards {
-            let (tx, rx) = mpsc::channel();
-            let _ = shard::spawn(s, rx, tracking.clone(), reply_bus.clone());
-            shard_txs.push(tx);
-        }
-
-        // Transaction coordinator thread.
-        let (coord_tx, coord_rx) = mpsc::channel();
-        let (gc_tx, gc_rx) = mpsc::channel();
+        // Shard threads. The shared `ScriptMgr` must exist first so each shard
+        // can read the Lua params and spin up its own interpreter.
         let mut mgr = ScriptMgr::new();
         if let Some(lua) = lua {
             mgr.lua_auto_async = lua.lua_auto_async;
@@ -159,6 +148,33 @@ impl TestServer {
             }
         }
         let script_mgr = Arc::new(Mutex::new(mgr));
+
+        let tracking = Arc::new(Mutex::new(Tracking::default()));
+        let pause = Arc::new(ClientPause::default());
+        let mut shard_txs = Vec::with_capacity(num_shards);
+        let mut shard_rxs = Vec::with_capacity(num_shards);
+        for _ in 0..num_shards {
+            let (tx, rx) = mpsc::channel();
+            shard_txs.push(tx);
+            shard_rxs.push(rx);
+        }
+        // Every shard holds senders to all shards so a script running on its
+        // resident shard can lock peers and dispatch cross-shard subcommands.
+        let peer_txs = shard_txs.clone();
+        for (s, rx) in shard_rxs.into_iter().enumerate() {
+            let _ = shard::spawn(
+                s,
+                rx,
+                tracking.clone(),
+                reply_bus.clone(),
+                script_mgr.clone(),
+                peer_txs.clone(),
+            );
+        }
+
+        // Transaction coordinator thread.
+        let (coord_tx, coord_rx) = mpsc::channel();
+        let (gc_tx, gc_rx) = mpsc::channel();
         let command_stats = Arc::new(Mutex::new(std::collections::HashMap::new()));
         coordinator::spawn(
             num_shards,

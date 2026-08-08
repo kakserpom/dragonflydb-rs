@@ -1,16 +1,20 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::Instant;
 
 use crate::commands::exec::server::now_ms;
-use crate::commands::{OpContext, ShardPart};
+use crate::commands::lua::{FUNCTION_KILLED_ERR, SandboxedInterpreter, ScriptDispatch, ScriptMgr};
+use crate::commands::{Command, FLAG_GLOBAL, FLAG_NOSCRIPT, FLAG_WRITE, OpContext, ShardPart};
 use crate::core::DbSlice;
 use crate::core::compact::CompactString;
 use crate::error::{CmdResult, RespValue};
 use crate::server::journal::{self, JournalItem, JournalSlice, OP_COMMAND};
 use crate::server::replication::{ChunkKind, FullSyncBus, ReplChunk};
 use crate::server::{
-    MAX_DB, Reply, ReplyBus, ShardMsg, SingleOp, Tracking, WatchState, command_for, encode_result,
-    encode_value,
+    MAX_DB, Reply, ReplyBus, ScriptBatchEntry, ScriptRunKind, ScriptRunRequest, ScriptRunResult,
+    ShardMsg, SingleOp, Tracking, WatchState, command_for, encode_result, encode_value,
+    extract_keys, keys_per_shard, shard_for_key,
 };
 
 /// Context for an active transaction on this shard, stored between `TxLock` and
@@ -60,6 +64,30 @@ struct Shard {
     tracking: Arc<Mutex<Tracking>>,
     /// The reply bus for invalidation pushes, drained by the IO thread.
     tracking_bus: ReplyBus,
+    /// Shared script cache + FUNCTION registry (`ScriptMgr`), for script lookup
+    /// and the `FUNCTION KILL` flag.
+    script_mgr: Arc<Mutex<ScriptMgr>>,
+    /// The per-shard Lua interpreter, created here on the shard thread (mlua is
+    /// `!Send`). `Option` so it can be taken out while a script runs (the
+    /// dispatch context borrows the whole `Shard`).
+    sandbox: Option<SandboxedInterpreter>,
+    /// `FUNCTION KILL` flag shared with the IO thread; polled by the
+    /// `LUA_MASKCOUNT` instruction hook and the dispatch path.
+    kill: Arc<AtomicBool>,
+    /// SHAs already compiled into `sandbox`, so a repeated EVAL/EVALSHA skips
+    /// the recompile (like the reference's per-thread `InterpreterManager`,
+    /// which compiles each script once per thread).
+    defined_scripts: HashSet<String>,
+    /// Libraries already loaded into `sandbox`, keyed by library name with the
+    /// loaded sha and its function names (so `FUNCTION LOAD REPLACE` invalidates
+    /// the cached callbacks and purges names the new version dropped).
+    loaded_libs: HashMap<String, (String, Vec<String>)>,
+    /// Channels to every shard (including this one), for cross-shard script
+    /// hops and locks: a multi-shard script runs on the first-key shard and
+    /// dispatches subcommands to peers over these channels.
+    peer_txs: Vec<mpsc::Sender<ShardMsg>>,
+    /// Total shard count, for `keys_per_shard` grouping.
+    num_shards: usize,
 }
 
 /// One DB's frozen baseline: the sorted key list captured at snapshot start
@@ -97,10 +125,24 @@ pub fn spawn(
     rx: mpsc::Receiver<ShardMsg>,
     tracking: Arc<Mutex<Tracking>>,
     tracking_bus: ReplyBus,
+    script_mgr: Arc<Mutex<ScriptMgr>>,
+    peer_txs: Vec<mpsc::Sender<ShardMsg>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("shard-{shard_id}"))
         .spawn(move || {
+            let num_shards = peer_txs.len();
+            // The Lua state is not `Send`, so it must be created here on the
+            // shard thread (the only thread that ever runs scripts on it).
+            let enable_redis_log = script_mgr.lock().unwrap().lua_enable_redis_log;
+            let sandbox = match SandboxedInterpreter::with_redis_log(enable_redis_log) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("shard-{shard_id}: failed to init Lua interpreter: {e}");
+                    None
+                }
+            };
+            let kill = script_mgr.lock().unwrap().kill_flag();
             let mut shard = Shard {
                 id: shard_id,
                 dbs: vec![DbSlice::new(shard_id)],
@@ -113,6 +155,13 @@ pub fn spawn(
                 full_syncs: HashMap::new(),
                 tracking,
                 tracking_bus,
+                script_mgr,
+                sandbox,
+                kill,
+                defined_scripts: HashSet::new(),
+                loaded_libs: HashMap::new(),
+                peer_txs,
+                num_shards,
             };
             shard.run(&rx);
         })
@@ -189,23 +238,7 @@ impl Shard {
                 };
                 let _ = result_tx.send(part);
             }
-            ShardMsg::TxUnlock { tx_id } => {
-                if self.active_tx == Some(tx_id) {
-                    self.active_tx = None;
-                    while self.active_tx.is_none() {
-                        match self.pending_singles.pop_front() {
-                            Some(op) => self.execute_single(&op),
-                            None => break,
-                        }
-                    }
-                    while let Some((keys, db_idx, tx)) = self.pending_watches.pop_front() {
-                        self.run_watch_query(&keys, db_idx, &tx);
-                    }
-                }
-                // Drop any leftover tx context (e.g. a script subcommand that
-                // locked the shard without ever dispatching a `TxExec`).
-                self.tx_ctx.remove(&tx_id);
-            }
+            ShardMsg::TxUnlock { tx_id } => self.unlock_tx(tx_id),
             ShardMsg::WatchQuery {
                 keys,
                 db_idx,
@@ -227,25 +260,11 @@ impl Shard {
                 ack,
             } => {
                 self.active_tx = Some(tx_id);
-                self.journal_store_value(&key, value.as_ref(), expire_at, sticky, db_idx, tx_id);
-                match value {
-                    Some(v) => {
-                        let db = self.ensure_db(db_idx);
-                        db.insert(&key, v);
-                        match expire_at {
-                            Some(at) => db.set_expiry(&key, at, now_ms()),
-                            None => db.clear_expiry(&key),
-                        }
-                        db.set_sticky_flag(&key, sticky);
-                    }
-                    None => {
-                        self.ensure_db(db_idx).remove(&key);
-                    }
-                }
-                self.flush_invalidations();
+                self.store_value(tx_id, &key, value, expire_at, sticky, db_idx);
                 let _ = ack.send(());
             }
             ShardMsg::ScriptOp {
+                tx_id,
                 args,
                 owned_key_idxs,
                 first_key_idx,
@@ -262,12 +281,16 @@ impl Shard {
                     db_idx,
                     owns_all_keys,
                     conn_id,
-                    0,
+                    tx_id,
                     track_keys,
                 );
                 let _ = result_tx.send(result);
             }
-            ShardMsg::ScriptBatch { cmds, result_tx } => {
+            ShardMsg::ScriptBatch {
+                tx_id,
+                cmds,
+                result_tx,
+            } => {
                 // The shard is locked by the script's transaction, so every
                 // entry runs inline in order and the results go back as one
                 // reply (one squashed hop, like `MultiCommandSquasher`).
@@ -281,12 +304,22 @@ impl Shard {
                             c.db_idx,
                             c.owns_all_keys,
                             c.conn_id,
-                            0,
+                            tx_id,
                             c.track_keys,
                         )
                     })
                     .collect();
                 let _ = result_tx.send(results);
+            }
+            ShardMsg::RunScript { req, result_tx } => self.run_script(&req, &result_tx),
+            ShardMsg::ScriptGc { ack } => {
+                // `ScriptMgr::GCCmd`: a full GC over this shard's interpreter.
+                // The ack may lag behind a running script: this message is only
+                // dequeued once the current run returns to the message loop.
+                if let Some(sandbox) = &self.sandbox {
+                    let _ = sandbox.run_gc();
+                }
+                let _ = ack.send(());
             }
             ShardMsg::EnableJournal { enabled } => {
                 if enabled && self.journal.is_none() {
@@ -965,6 +998,297 @@ impl Shard {
             .collect();
         CmdResult::Ok(RespValue::Array(entries))
     }
+
+    /// Release the shard lock for `tx_id`: clear `active_tx`, drain queued
+    /// singles and watch queries, and drop any leftover tx context.
+    fn unlock_tx(&mut self, tx_id: u64) {
+        if self.active_tx == Some(tx_id) {
+            self.active_tx = None;
+            while self.active_tx.is_none() {
+                match self.pending_singles.pop_front() {
+                    Some(op) => self.execute_single(&op),
+                    None => break,
+                }
+            }
+            while let Some((keys, db_idx, tx)) = self.pending_watches.pop_front() {
+                self.run_watch_query(&keys, db_idx, &tx);
+            }
+        }
+        self.tx_ctx.remove(&tx_id);
+    }
+
+    /// A raw store/delete performed on behalf of a command or script (e.g.
+    /// BITOP's destination key), recorded in the journal under `tx_id`.
+    fn store_value(
+        &mut self,
+        tx_id: u64,
+        key: &[u8],
+        value: Option<crate::core::PrimeValue>,
+        expire_at: Option<u64>,
+        sticky: bool,
+        db_idx: usize,
+    ) {
+        self.journal_store_value(key, value.as_ref(), expire_at, sticky, db_idx, tx_id);
+        match value {
+            Some(v) => {
+                let db = self.ensure_db(db_idx);
+                db.insert(key, v);
+                match expire_at {
+                    Some(at) => db.set_expiry(key, at, now_ms()),
+                    None => db.clear_expiry(key),
+                }
+                db.set_sticky_flag(key, sticky);
+            }
+            None => {
+                self.ensure_db(db_idx).remove(key);
+            }
+        }
+        self.flush_invalidations();
+    }
+
+    /// Run a script (`EVAL`/`EVALSHA`/`FCALL`) on this shard's interpreter and
+    /// send the outcome back on `result_tx`. The interpreter is taken out of
+    /// `self` so the dispatch context can borrow the whole `Shard`.
+    fn run_script(&mut self, req: &ScriptRunRequest, result_tx: &mpsc::Sender<ScriptRunResult>) {
+        let Some(sandbox) = self.sandbox.take() else {
+            let _ = result_tx.send(ScriptRunResult {
+                result: Err("ERR internal: no script interpreter".into()),
+                num_commands: 0,
+                slow_commands: 0,
+            });
+            return;
+        };
+        let (result, num_commands, slow_commands) = self.run_script_inner(&sandbox, req);
+        self.sandbox = Some(sandbox);
+        let _ = result_tx.send(ScriptRunResult {
+            result,
+            num_commands,
+            slow_commands,
+        });
+    }
+
+    /// The body of [`run_script`], with the interpreter passed separately so
+    /// the dispatch context can borrow the whole shard.
+    fn run_script_inner(
+        &mut self,
+        sandbox: &SandboxedInterpreter,
+        req: &ScriptRunRequest,
+    ) -> (Result<RespValue, String>, usize, usize) {
+        let params = req.params;
+        let atomic = params.atomic;
+        let keys = &req.keys;
+
+        // FCALL: (re)load the function's library when the shard's cached sha
+        // differs (first FCALL or after `FUNCTION LOAD REPLACE`), purging
+        // callback names the new version dropped.
+        if let ScriptRunKind::Function {
+            lib_name,
+            lib_sha,
+            code,
+            ..
+        } = &req.kind
+            && self.loaded_libs.get(lib_name).map(|(sha, _)| sha) != Some(lib_sha)
+        {
+            let to_purge: Vec<String> = match self.loaded_libs.get(lib_name) {
+                Some((_, old_names)) => {
+                    let mgr = self.script_mgr.lock().unwrap();
+                    old_names
+                        .iter()
+                        .filter(|n| mgr.function_lib(n).is_none())
+                        .cloned()
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+            sandbox.purge_functions(&to_purge);
+            let functions = match sandbox.load_function_lib(code) {
+                Ok(f) => f,
+                Err(e) => return (Err(e), 0, 0),
+            };
+            let names: Vec<String> = functions.into_iter().map(|f| f.name).collect();
+            self.loaded_libs
+                .insert(lib_name.clone(), (lib_sha.clone(), names));
+        }
+
+        // EVAL: compile the script into this shard's interpreter once, like the
+        // reference's per-thread `InterpreterManager` (`AddInternal`). The sha
+        // is content-addressed, so a cached hit implies an identical body.
+        if let ScriptRunKind::Eval { sha, body } = &req.kind
+            && !self.defined_scripts.contains(sha)
+        {
+            if let Err(e) = sandbox.define(sha, body) {
+                return (Err(e), 0, 0);
+            }
+            self.defined_scripts.insert(sha.clone());
+        }
+
+        // Install the KEYS/ARGV globals like the coordinator's EVAL path did
+        // (`SetGlobalArrayInternal`). EVAL reads them from the environment;
+        // FCALL passes the keys as callback arguments instead.
+        if let ScriptRunKind::Eval { .. } = &req.kind {
+            if let Err(e) = sandbox.set_global_array("KEYS", keys) {
+                return (Err(e), 0, 0);
+            }
+            if let Err(e) = sandbox.set_global_array("ARGV", &req.argv) {
+                return (Err(e), 0, 0);
+            }
+        }
+
+        // `DetermineMultiMode` (main_service.cc): atomic scripts lock their
+        // declared-key shards for the whole body (`LOCK_AHEAD`, or every shard
+        // in GLOBAL mode when undeclared keys are allowed); `disable-atomicity`
+        // scripts hold no locks up front — each subcommand locks its own shards
+        // only for the call.
+        let shards: Vec<usize> = if atomic {
+            let key_idxs: Vec<usize> = (0..keys.len()).collect();
+            let per = keys_per_shard(keys, &key_idxs, self.num_shards);
+            if params.undeclared_keys {
+                (0..self.num_shards).collect()
+            } else {
+                per.into_iter().map(|(s, _)| s).collect()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let ctx = ScriptCtx {
+            declared: keys.clone(),
+            undeclared_keys: params.undeclared_keys,
+            read_only: req.read_only,
+            num_shards: self.num_shards,
+            db_idx: req.db_idx,
+            conn_id: req.conn_id,
+            track_keys: req.track_keys,
+            atomic,
+            tx_id: req.tx_id,
+            locked_shards: Vec::new(),
+            pinned_shards: Vec::new(),
+            async_cmds: Vec::new(),
+            async_bytes: 0,
+            num_commands: 0,
+            slow_commands: 0,
+            slowlog_threshold_usec: req.slowlog_threshold_usec,
+        };
+
+        // `CallSHA` records the script's run duration in usec for SCRIPT LATENCY.
+        let float_as_int =
+            params.float_as_int || self.script_mgr.lock().unwrap().lua_resp2_legacy_float;
+        let (result, held, stats) = {
+            let kill = Arc::clone(&self.kill);
+            let mut dctx = ShardScriptDispatchCtx { shard: self, ctx };
+            if let Err(e) = dctx.ensure_locked(&shards) {
+                let held = std::mem::take(&mut dctx.ctx.locked_shards);
+                for s in held {
+                    dctx.shard.unlock_script_shard(dctx.ctx.tx_id, s);
+                }
+                return (Err(e), 0, 0);
+            }
+            let run = match &req.kind {
+                ScriptRunKind::Eval { sha, .. } => sandbox.run(sha, &mut dctx, float_as_int, &kill),
+                ScriptRunKind::Function { name, .. } => {
+                    sandbox.run_function(name, keys, &req.argv, &mut dctx, float_as_int, &kill)
+                }
+            };
+            // Force-flush pending `redis.acall` commands; a flush error
+            // overrides the script's own result (`FlushEvalAsyncCmds(true)`).
+            let flushed = dctx.flush();
+            let held = std::mem::take(&mut dctx.ctx.locked_shards);
+            let stats = (dctx.ctx.num_commands, dctx.ctx.slow_commands);
+            (
+                match flushed {
+                    Ok(()) => run,
+                    Err(e) => Err(e),
+                },
+                held,
+                stats,
+            )
+        };
+        for s in &held {
+            self.unlock_script_shard(req.tx_id, *s);
+        }
+        (result, stats.0, stats.1)
+    }
+
+    /// TxLock `shard` for a script's transaction, or take this shard's own
+    /// lock. Messages are FIFO per shard, so a lock is in effect before any
+    /// subsequent `script_op` to the same shard; the ack is still awaited to
+    /// detect a dead shard thread.
+    fn lock_script_shard(
+        &mut self,
+        tx_id: u64,
+        shard: usize,
+        conn_id: u64,
+        db_idx: usize,
+        track_keys: bool,
+    ) -> Result<(), String> {
+        if shard == self.id {
+            self.active_tx = Some(tx_id);
+            return Ok(());
+        }
+        let (ack_tx, ack_rx) = mpsc::channel();
+        self.peer_txs[shard]
+            .send(ShardMsg::TxLock {
+                tx_id,
+                conn_id,
+                seq: 0,
+                args: Vec::new(),
+                owned_key_idxs: Vec::new(),
+                first_key_idx: 0,
+                db_idx,
+                owns_all_keys: false,
+                track_keys,
+                ack: ack_tx,
+            })
+            .map_err(|_| "ERR internal: shard thread exited".to_string())?;
+        ack_rx
+            .recv()
+            .map_err(|_| "ERR internal: shard thread exited".to_string())
+    }
+
+    /// TxUnlock `shard` for a script's transaction (or this shard itself).
+    fn unlock_script_shard(&mut self, tx_id: u64, shard: usize) {
+        if shard == self.id {
+            self.unlock_tx(tx_id);
+        } else {
+            let _ = self.peer_txs[shard].send(ShardMsg::TxUnlock { tx_id });
+        }
+    }
+
+    /// Store (or delete) a key produced by a script subcommand on its shard.
+    /// The destination key is one of the subcommand's declared keys, so its
+    /// shard is already locked by the script's transaction (LOCK_AHEAD holds it
+    /// for the whole body; a NON_ATOMIC call holds it for the duration of the
+    /// call). The write is recorded under the script's `tx_id`.
+    fn perform_deferred_store(
+        &mut self,
+        key: &[u8],
+        value: Option<crate::core::PrimeValue>,
+        expire_at: Option<u64>,
+        sticky: bool,
+        db_idx: usize,
+        tx_id: u64,
+    ) {
+        let shard = shard_for_key(key, self.num_shards);
+        if shard == self.id {
+            self.store_value(tx_id, key, value, expire_at, sticky, db_idx);
+            return;
+        }
+        let (ack_tx, ack_rx) = mpsc::channel();
+        if self.peer_txs[shard]
+            .send(ShardMsg::StoreValue {
+                tx_id,
+                key: key.to_vec(),
+                value,
+                expire_at,
+                sticky,
+                db_idx,
+                ack: ack_tx,
+            })
+            .is_ok()
+        {
+            let _ = ack_rx.recv();
+        }
+    }
 }
 
 /// The members SPOP removed, from its reply (`SPOP key` -> one bulk,
@@ -999,4 +1323,793 @@ fn flush_invalidation_frame() -> Vec<u8> {
         RespValue::bulk("invalidate"),
         RespValue::Nil,
     ]))
+}
+
+// ---------------------------------------------------------------------------
+// Script execution
+// ---------------------------------------------------------------------------
+
+/// Per-run state a script's `redis.call`/`redis.pcall` subcommands need. Lives
+/// on the shard owning the script's first key, which runs the body and
+/// dispatches subcommands to itself inline and to peers over their channels.
+struct ScriptCtx {
+    /// Values of the declared KEYS (the script's lock tags).
+    declared: Vec<Vec<u8>>,
+    /// Whether subcommands may touch undeclared keys (allow-undeclared-keys).
+    undeclared_keys: bool,
+    /// `EVAL_RO` / `EVALSHA_RO` / `FCALL_RO`: reject any write subcommand.
+    read_only: bool,
+    num_shards: usize,
+    /// The DB all subcommands run in (the connection's selected DB).
+    db_idx: usize,
+    /// The connection running the script, forwarded to shards so the CLIENT
+    /// TRACKING read hook can attribute reads (`TrackIfNeeded`).
+    conn_id: u64,
+    /// Whether reads inside the script are tracked for this connection
+    /// (`ShouldTrackKeys` evaluated at EVAL dispatch time).
+    track_keys: bool,
+    /// `ScriptParams::atomic` (i.e. `DetermineMultiMode`): atomic scripts hold
+    /// their declared-key shards locked for the whole body (`LOCK_AHEAD`);
+    /// `disable-atomicity` scripts lock each subcommand's shards only for the
+    /// call (`NON_ATOMIC`).
+    atomic: bool,
+    /// `tx_id` shared by every lock the script's transaction takes.
+    tx_id: u64,
+    /// Shards currently TxLocked by this script (the transaction's lock set).
+    locked_shards: Vec<usize>,
+    /// Shards explicitly pinned via `dragonfly.lock`, surviving the per-call
+    /// release in non-atomic mode.
+    pinned_shards: Vec<usize>,
+    /// Pending `redis.acall`/`redis.apcall` commands batched for one squashed
+    /// flush (`ConnectionState::ScriptInfo::async_cmds`).
+    async_cmds: Vec<AsyncCmd>,
+    /// The batch's `used_mem` (`FlushEvalAsyncCmds`): every command's
+    /// `BackedArguments` heap + struct size plus a `StoredCmd` per slot, the
+    /// `--multi_eval_squash_buffer` budget.
+    async_bytes: usize,
+    /// `ConnectionState::ScriptInfo::stats.num_commands`: every subcommand the
+    /// script invoked, including squashed ones (main_service.cc:2109).
+    num_commands: usize,
+    /// `stats.slow_commands`: subcommands whose latency met the slowlog
+    /// threshold (conn_context.cc:351).
+    slow_commands: usize,
+    /// The slowlog threshold (usec) for this run (`log_slower_than_usec`).
+    slowlog_threshold_usec: u64,
+}
+
+/// A single pending async subcommand.
+struct AsyncCmd {
+    args: Vec<Vec<u8>>,
+    /// `acall` (true): the command's runtime error aborts the run; `apcall`
+    /// (false) suppresses per-command errors (`ReplyMode::ONLY_ERR` vs `NONE`).
+    abort_on_error: bool,
+}
+
+/// `--multi_eval_squash_buffer`: max bytes of queued async commands before the
+/// batch is flushed mid-script (`FLAGS_multi_eval_squash_buffer`, default 8096).
+const ASYNC_FLUSH_LIMIT: usize = 8096;
+
+/// Commands executed per squashed hop (`max_squash_cmd_num`, default 32): when
+/// a shard's accumulated batch reaches this many commands the accumulated hop
+/// runs (`SquashResult::SQUASHED_FULL`).
+const MAX_SQUASH_SIZE: usize = 32;
+
+/// `sizeof(cmn::BackedArguments)` in the reference: two `absl::InlinedVector`s
+/// (a `uint32_t` offsets array with inline capacity 5 and a `char` storage
+/// array with inline capacity 128) plus their heap pointers/sizes. Included in
+/// `StoredCmd::UsedMemory`.
+const BACKED_ARGS_STRUCT_SIZE: usize = 200;
+
+/// `sizeof(StoredCmd)` in the reference: command id pointer + `ParsedArgs`
+/// variant + `BackedArguments` unique_ptr + reply mode.
+const STORED_CMD_SIZE: usize = 48;
+
+/// `cmn::BackedArguments::kLenCap`: arguments stored inline before any heap
+/// allocation.
+const BACKED_ARGS_INLINE_ARGS: usize = 5;
+
+/// `cmn::BackedArguments::kStorageCap`: total argument bytes stored inline
+/// before any heap allocation.
+const BACKED_ARGS_INLINE_BYTES: usize = 128;
+
+/// Heap bytes `cmn::BackedArguments::HeapMemory` attributes to a command's
+/// tail arguments (excluding the command name, which `FindExtended` strips).
+/// Arguments that fit the inline buffer cost nothing; otherwise the cost is the
+/// offset array's `capacity * sizeof(uint32_t)` plus the storage capacity.
+fn backed_args_heap_cost(tail_args: &[Vec<u8>]) -> usize {
+    let bytes: usize = tail_args.iter().map(Vec::len).sum();
+    if tail_args.len() <= BACKED_ARGS_INLINE_ARGS && bytes <= BACKED_ARGS_INLINE_BYTES {
+        0
+    } else {
+        // `capacity` is approximated by the current size, as the reference
+        // charges the actual (possibly larger) capacity.
+        tail_args.len() * 4 + bytes
+    }
+}
+
+/// Routes a script subcommand to the shards owning its keys while the script's
+/// tx holds the declared-key locks. Runs on the shard owning the script's
+/// first key: subcommands on this shard execute inline via `run_exec`, the
+/// rest hop to peers over their channels.
+struct ShardScriptDispatchCtx<'a> {
+    shard: &'a mut Shard,
+    ctx: ScriptCtx,
+}
+
+impl ScriptDispatch for ShardScriptDispatchCtx<'_> {
+    fn dispatch(&mut self, args: Vec<Vec<u8>>) -> Result<RespValue, String> {
+        // `CallFromScript` (main_service.cc:2109) counts every invocation.
+        self.ctx.num_commands += 1;
+        // `FUNCTION KILL` from the IO thread: abort at the next dispatch
+        // boundary (mirrors the count hook, which cannot fire while a
+        // subcommand is dispatched from Rust).
+        if self.shard.kill.load(Ordering::Relaxed) {
+            return Err(FUNCTION_KILLED_ERR.to_string());
+        }
+        // A synchronous call flushes the pending async batch first; a flush
+        // error aborts this call too (`requested_abort` in TryEnqueueEvalAsyncCmd).
+        self.flush_pending(true)?;
+        let cmd = self.verify_script_cmd(&args)?;
+        // A NON_ATOMIC script (`disable-atomicity`) locks the subcommand's
+        // shards only for the call (`CallFromScript` -> `DispatchCommand` ->
+        // `ScheduleSingleHop`), releasing them again afterwards; atomic scripts
+        // already hold the declared-key shards for the whole body.
+        let started = Instant::now();
+        // FLAG_LOCAL subcommands (PING, ECHO, TIME, SELECT, ...) run on the
+        // connection thread in the reference too (`GenericFamily::Ping`,
+        // `GenericFamily::Select`), so execute them inline instead of routing
+        // them to a shard's `local_stub`.
+        if let Some(r) = self.script_local(cmd, &args) {
+            self.count_slow(started);
+            // An error reply must abort the script (`redis.call` raises on an
+            // error from `DispatchCommand`, lua_libs.cc `RedisCallCommand`).
+            return match r {
+                CmdResult::Err(e) => Err(e.message),
+                other => Ok(other.into_resp_value()),
+            };
+        }
+        if !self.ctx.atomic {
+            let shards = self.cmd_shards(cmd, &args);
+            self.ensure_locked(&shards)?;
+            let r = self.execute_script_cmd(cmd, &args);
+            self.release_unpinned();
+            self.count_slow(started);
+            return Ok(r.into_resp_value());
+        }
+        let r = self.execute_script_cmd(cmd, &args);
+        self.count_slow(started);
+        Ok(r.into_resp_value())
+    }
+
+    fn lock(&mut self, keys: Vec<Vec<u8>>) -> Result<(), String> {
+        self.ctx.num_commands += 1;
+        // `CallFromScript` LOCK: an atomic transaction is already locked ahead,
+        // so the call is a no-op.
+        if self.ctx.atomic {
+            return Ok(());
+        }
+        // The keys are already stringified (`key_backing`); lock their shards
+        // and pin them so the per-call release keeps them held
+        // (`StartMultiLockedAhead`).
+        let key_idxs: Vec<usize> = (0..keys.len()).collect();
+        let mut shards: Vec<usize> = Vec::new();
+        for (s, _) in keys_per_shard(&keys, &key_idxs, self.ctx.num_shards) {
+            if !shards.contains(&s) {
+                shards.push(s);
+            }
+        }
+        self.ensure_locked(&shards)?;
+        for &s in &shards {
+            if !self.ctx.pinned_shards.contains(&s) {
+                self.ctx.pinned_shards.push(s);
+            }
+        }
+        Ok(())
+    }
+
+    fn unlock(&mut self) -> Result<(), String> {
+        self.ctx.num_commands += 1;
+        // `CallFromScript` UNLOCK: flush the pending async batch, release every
+        // lock the transaction holds and continue non-atomically
+        // (`UnlockMulti(true)` + `StartMultiNonAtomic`).
+        self.flush_pending(true)?;
+        self.release_all();
+        self.ctx.pinned_shards.clear();
+        self.ctx.atomic = false;
+        Ok(())
+    }
+
+    fn dispatch_async(&mut self, args: Vec<Vec<u8>>, abort_on_error: bool) -> Result<(), String> {
+        self.ctx.num_commands += 1;
+        if command_for(&args).is_none() {
+            if abort_on_error {
+                // acall: an unknown command is fatal (`early_async_error` =
+                // `ReportUnknownCmd`, which uppercases and uses backticks). The
+                // pending batch is still flushed first, so its errors win.
+                self.flush_pending(true)?;
+                return Err(format!(
+                    "unknown command `{}`",
+                    String::from_utf8_lossy(&args[0]).to_ascii_uppercase()
+                ));
+            }
+            // apcall: drop the unknown command silently, but keep the budget.
+            return self.flush_pending(false);
+        }
+        // Full verification (NOSCRIPT, write-in-read-only, undeclared keys) is
+        // deferred to the flush, mirroring `VerifyCommandState` in
+        // `FlushEvalAsyncCmds` — so `pcall(redis.acall, ...)` cannot catch an
+        // error that only surfaces at the flush boundary.
+        // The byte cost mirrors the reference's `used_mem`: each command's
+        // `BackedArguments` heap + struct size, plus a `StoredCmd` per slot.
+        let tail: Vec<Vec<u8>> = args[1..].to_vec();
+        self.ctx.async_bytes +=
+            backed_args_heap_cost(&tail) + BACKED_ARGS_STRUCT_SIZE + STORED_CMD_SIZE;
+        self.ctx.async_cmds.push(AsyncCmd {
+            args,
+            abort_on_error,
+        });
+        self.flush_pending(false)
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        self.flush_pending(true)
+    }
+}
+
+impl ShardScriptDispatchCtx<'_> {
+    /// The shards owning a subcommand's keys (`keys_per_shard`), deduplicated.
+    fn cmd_shards(&self, cmd: &'static Command, args: &[Vec<u8>]) -> Vec<usize> {
+        let keys = extract_keys(cmd, args);
+        let mut out = Vec::new();
+        for (s, _) in keys_per_shard(args, &keys, self.ctx.num_shards) {
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+        out
+    }
+
+    /// TxLock the shards the script's transaction does not already hold,
+    /// recording them in `locked_shards`. Messages are FIFO per shard, so a
+    /// lock is in effect before any subsequent `script_op` to the same shard
+    /// without waiting for acks (`MultiSwitchCmd(EVAL)` +
+    /// `StartMultiLockedAhead` / a squashed hop's shard scheduling).
+    fn ensure_locked(&mut self, shards: &[usize]) -> Result<(), String> {
+        for &s in shards {
+            if self.ctx.locked_shards.contains(&s) {
+                continue;
+            }
+            self.shard.lock_script_shard(
+                self.ctx.tx_id,
+                s,
+                self.ctx.conn_id,
+                self.ctx.db_idx,
+                self.ctx.track_keys,
+            )?;
+            self.ctx.locked_shards.push(s);
+        }
+        Ok(())
+    }
+
+    /// Release the locks that were taken per-call (not pinned by
+    /// `dragonfly.lock`) — the NON_ATOMIC mode's per-subcommand scheduling.
+    fn release_unpinned(&mut self) {
+        let mut still = Vec::new();
+        for s in std::mem::take(&mut self.ctx.locked_shards) {
+            if self.ctx.pinned_shards.contains(&s) {
+                still.push(s);
+            } else {
+                self.shard.unlock_script_shard(self.ctx.tx_id, s);
+            }
+        }
+        self.ctx.locked_shards = still;
+    }
+
+    /// Release every lock the script's transaction holds (`UnlockMulti(true)`).
+    fn release_all(&mut self) {
+        for s in std::mem::take(&mut self.ctx.locked_shards) {
+            self.shard.unlock_script_shard(self.ctx.tx_id, s);
+        }
+    }
+
+    /// Execute the pending async batch as a squashed phase (`FlushEvalAsyncCmds`
+    /// + `MultiCommandSquasher::Execute` with `error_abort=true`).
+    ///
+    /// `force=false` only flushes when the byte budget is exhausted. Every
+    /// command is verified before any runs. Commands accumulate per shard and
+    /// run in one hop per shard (`ShardMsg::ScriptBatch`, dispatched in
+    /// parallel); when a shard's batch reaches `max_squash_size` the
+    /// accumulated hop runs; keyless and multi-shard commands run standalone
+    /// (flushing the accumulated hop first). An `acall` error in a hop aborts
+    /// the remaining batch (`error_abort`); standalone errors surface at the
+    /// end of the flush. `apcall` errors are suppressed (`ReplyMode::NONE`) and
+    /// the batch continues.
+    fn flush_pending(&mut self, force: bool) -> Result<(), String> {
+        if self.ctx.async_cmds.is_empty() {
+            return Ok(());
+        }
+        if !force && self.ctx.async_bytes < ASYNC_FLUSH_LIMIT {
+            return Ok(());
+        }
+        if self.shard.kill.load(Ordering::Relaxed) {
+            return Err(FUNCTION_KILLED_ERR.to_string());
+        }
+        for cmd in &self.ctx.async_cmds {
+            if let Err(e) = self.verify_script_cmd(&cmd.args) {
+                // The reference clears the batch on a verification error.
+                self.ctx.async_cmds.clear();
+                self.ctx.async_bytes = 0;
+                return Err(e);
+            }
+        }
+        let cmds = std::mem::take(&mut self.ctx.async_cmds);
+        self.ctx.async_bytes = 0;
+        let num_cmds = cmds.len();
+        let flush_started = Instant::now();
+
+        if !self.ctx.atomic {
+            // A NON_ATOMIC batch locks every shard it touches for the duration
+            // of the flush and releases them again afterwards (a squashed hop's
+            // shard scheduling).
+            let mut shards: Vec<usize> = Vec::new();
+            for cmd in &cmds {
+                let exec = command_for(&cmd.args).expect("verified async command");
+                for (s, _) in keys_per_shard(
+                    &cmd.args,
+                    &extract_keys(exec, &cmd.args),
+                    self.ctx.num_shards,
+                ) {
+                    if !shards.contains(&s) {
+                        shards.push(s);
+                    }
+                }
+            }
+            self.ensure_locked(&shards)?;
+        }
+
+        let mut batches: Vec<Vec<BatchEntry>> =
+            (0..self.ctx.num_shards).map(|_| Vec::new()).collect();
+        // Call positions accumulated in the current hop (for the in-order error
+        // scan), and the abort flag of every command by call position.
+        let mut hop_positions: Vec<usize> = Vec::new();
+        let mut abort_flags: Vec<bool> = Vec::with_capacity(cmds.len());
+        let mut results: Vec<Option<CmdResult>> = vec![None; cmds.len()];
+        let mut fatal: Option<String> = None;
+
+        for (pos, cmd) in cmds.into_iter().enumerate() {
+            abort_flags.push(cmd.abort_on_error);
+            let exec = command_for(&cmd.args).expect("verified async command");
+            let keys = extract_keys(exec, &cmd.args);
+            let per = keys_per_shard(&cmd.args, &keys, self.ctx.num_shards);
+            if per.len() == 1 {
+                let shard = per[0].0;
+                batches[shard].push(BatchEntry {
+                    pos,
+                    args: cmd.args,
+                    owned: per[0].1.clone(),
+                    first_key_idx: exec.key_range.first,
+                    owns_all_keys: true,
+                });
+                hop_positions.push(pos);
+                if batches[shard].len() >= MAX_SQUASH_SIZE {
+                    fatal = run_squash_hop(
+                        self.shard,
+                        self.ctx.tx_id,
+                        self.ctx.db_idx,
+                        self.ctx.conn_id,
+                        self.ctx.track_keys,
+                        &mut batches,
+                        &mut results,
+                        &abort_flags,
+                        &mut hop_positions,
+                    );
+                    if fatal.is_some() {
+                        break;
+                    }
+                }
+            } else {
+                // A keyless or multi-shard command cannot be squashed
+                // (`keys->NumArgs() == 0` or keys on ≥2 shards in `TrySquash`):
+                // flush the accumulated hop first, then run it standalone
+                // (`ExecuteStandalone`). Standalone runtime errors do not abort
+                // the remaining batch; they surface at the end.
+                fatal = run_squash_hop(
+                    self.shard,
+                    self.ctx.tx_id,
+                    self.ctx.db_idx,
+                    self.ctx.conn_id,
+                    self.ctx.track_keys,
+                    &mut batches,
+                    &mut results,
+                    &abort_flags,
+                    &mut hop_positions,
+                );
+                if fatal.is_some() {
+                    break;
+                }
+                let result = self
+                    .script_local(exec, &cmd.args)
+                    .unwrap_or_else(|| self.execute_script_cmd(exec, &cmd.args));
+                results[pos] = Some(result);
+            }
+        }
+        if fatal.is_none() {
+            fatal = run_squash_hop(
+                self.shard,
+                self.ctx.tx_id,
+                self.ctx.db_idx,
+                self.ctx.conn_id,
+                self.ctx.track_keys,
+                &mut batches,
+                &mut results,
+                &abort_flags,
+                &mut hop_positions,
+            );
+        }
+
+        // The first `acall` error in call order surfaces as the flush error;
+        // `apcall` errors are invisible (`ReplyMode::NONE`).
+        if fatal.is_none() {
+            for (pos, slot) in results.iter().enumerate() {
+                if abort_flags[pos]
+                    && let Some(CmdResult::Err(e)) = slot
+                {
+                    fatal = Some(e.message.clone());
+                    break;
+                }
+            }
+        }
+        if !self.ctx.atomic {
+            self.release_unpinned();
+        }
+        // `RecordLatency` (conn_context.cc:351) counts a script's slow
+        // subcommands: a squashed batch met the threshold as a whole, so every
+        // command in it counts.
+        let elapsed_usec = flush_started.elapsed().as_micros() as u64;
+        if elapsed_usec >= self.ctx.slowlog_threshold_usec {
+            self.ctx.slow_commands += num_cmds;
+        }
+        match fatal {
+            Some(msg) => Err(msg),
+            None => Ok(()),
+        }
+    }
+
+    /// `RecordLatency`: a subcommand that met the slowlog threshold counts
+    /// toward the script's `stats.slow_commands`.
+    fn count_slow(&mut self, started: Instant) {
+        let elapsed_usec = started.elapsed().as_micros() as u64;
+        if elapsed_usec >= self.ctx.slowlog_threshold_usec {
+            self.ctx.slow_commands += 1;
+        }
+    }
+
+    /// Validate a script subcommand before it touches a shard: known command,
+    /// arity, not NOSCRIPT/GLOBAL, no writes in read-only scripts, declared
+    /// keys.
+    fn verify_script_cmd(&self, args: &[Vec<u8>]) -> Result<&'static Command, String> {
+        let cmd = command_for(args).ok_or_else(|| {
+            // `ReportUnknownCmd` uppercases the name and wraps it in backticks
+            // (`unknown command \`FOO\``); the inline "ERR " keeps the port's
+            // error-table rendering byte-identical to the reference's.
+            format!(
+                "ERR unknown command `{}`",
+                String::from_utf8_lossy(&args[0]).to_ascii_uppercase()
+            )
+        })?;
+        // `DispatchCommand` (main_service.cc): GLOBAL_TRANS / NO_KEY_TRANSACTIONAL
+        // commands may run only when the script schedules globally or re-schedules
+        // per operation (GLOBAL / NON_ATOMIC); NOSCRIPT commands never run.
+        // `XGROUP HELP` resolves to the hidden `_XGROUP_HELP` command which is
+        // NOSCRIPT (command_registry.cc:347-352, issue #854), so scripts must be
+        // rejected even though the top-level XGROUP is not flagged — and before
+        // the arity check, since the rewritten command's arity is 2.
+        if args.len() == 2 && cmd.name == "XGROUP" && args[1].eq_ignore_ascii_case(b"HELP") {
+            return Err("This Redis command is not allowed from script".to_string());
+        }
+        // The reference's `DispatchCommand` arity check runs for script
+        // subcommands too; without it a keyless subcommand with too few args
+        // would reach the executor and panic (`GET` -> `owned_keys[0]`).
+        if let Some(e) = cmd.check_arity(args.len()) {
+            return Err(e);
+        }
+        if cmd.has_flag(FLAG_NOSCRIPT)
+            || (cmd.has_flag(FLAG_GLOBAL)
+                // MEMORY is READONLY|FAST in the reference (NOSCRIPT was
+                // dropped in #2382), so it runs from any script; the port flags
+                // it GLOBAL only so top-level `MEMORY USAGE` reaches every
+                // shard (`MemoryCmd::Usage` picks the key's shard internally).
+                && cmd.name != "MEMORY"
+                && self.ctx.atomic
+                && !self.ctx.undeclared_keys)
+        {
+            return Err("This Redis command is not allowed from script".to_string());
+        }
+        if self.ctx.read_only && cmd.has_flag(FLAG_WRITE) {
+            return Err("Write commands are not allowed from read-only scripts".to_string());
+        }
+        // `CheckKeysDeclared` runs only in LOCK_AHEAD mode (atomic without the
+        // allow-undeclared-keys flag): GLOBAL and NON_ATOMIC scripts schedule
+        // per operation, so undeclared keys are unrestricted.
+        let keys = extract_keys(cmd, args);
+        if self.ctx.atomic && !self.ctx.undeclared_keys {
+            for &ki in &keys {
+                if !self.ctx.declared.contains(&args[ki]) {
+                    return Err(format!(
+                        "script tried accessing undeclared key, key: {}",
+                        String::from_utf8_lossy(&args[ki])
+                    ));
+                }
+            }
+        }
+        Ok(cmd)
+    }
+
+    /// Run a FLAG_LOCAL subcommand on the run-shard. The reference executes
+    /// these on the connection thread (`GenericFamily::Ping`,
+    /// `GenericFamily::Echo`, `GenericFamily::Time`), so routing them to a
+    /// shard would hit `local_stub`'s "local command should not reach a shard"
+    /// error. Returns `None` for commands that must reach a shard.
+    fn script_local(&mut self, cmd: &'static Command, args: &[Vec<u8>]) -> Option<CmdResult> {
+        let resp = match cmd.name {
+            "PING" => crate::commands::exec::server::local_ping(args),
+            "ECHO" => crate::commands::exec::server::local_echo(args),
+            "TIME" => crate::commands::exec::server::local_time(args),
+            "LASTSAVE" => crate::commands::exec::server::local_lastsave(args),
+            "SELECT" => return Some(self.script_select(args)),
+            _ => return None,
+        };
+        Some(CmdResult::Ok(resp))
+    }
+
+    /// `GenericFamily::Select` (generic_family.cc:2439): parse and range-check
+    /// the target DB, accept a same-DB select as a noop, reject it for
+    /// LOCK_AHEAD (regular) scripts, and switch the script's DB for GLOBAL /
+    /// NON_ATOMIC scripts so subsequent subcommands target the new DB.
+    fn script_select(&mut self, args: &[Vec<u8>]) -> CmdResult {
+        let Some(index) = args.get(1).and_then(|a| crate::util::parse_i64(a)) else {
+            return CmdResult::err("ERR DB index is out of range");
+        };
+        if index < 0 || index as usize >= crate::server::MAX_DB {
+            return CmdResult::err("ERR DB index is out of range");
+        }
+        if self.ctx.db_idx == index as usize {
+            return CmdResult::ok(RespValue::Simple("OK".into()));
+        }
+        if self.ctx.atomic && !self.ctx.undeclared_keys {
+            return CmdResult::err("SELECT is not allowed in regular EXEC/EVAL");
+        }
+        self.ctx.db_idx = index as usize;
+        CmdResult::ok(RespValue::Simple("OK".into()))
+    }
+
+    /// Run one (already verified) subcommand: inline on the run-shard, or via
+    /// `ShardMsg::ScriptOp` to peers, merging partial results and resolving
+    /// deferred stores.
+    fn execute_script_cmd(&mut self, cmd: &'static Command, args: &[Vec<u8>]) -> CmdResult {
+        let keys = extract_keys(cmd, args);
+        let first_key_idx = cmd.key_range.first;
+        let mut parts = Vec::new();
+        if keys.is_empty() {
+            // A GLOBAL subcommand (MEMORY, DBSIZE, FLUSHALL, ...) runs on every
+            // shard like the top-level GLOBAL dispatch (event_loop.rs), so the
+            // merge can pick the shard that owns a `MEMORY USAGE` key; other
+            // keyless commands validate/reply from shard 0.
+            let shards: Vec<usize> = if cmd.has_flag(FLAG_GLOBAL) {
+                (0..self.ctx.num_shards).collect()
+            } else {
+                vec![0]
+            };
+            for s in shards {
+                let result = self.run_script_op(s, args.to_owned(), vec![], first_key_idx, true);
+                parts.push(ShardPart {
+                    shard: s,
+                    owned_key_idxs: vec![],
+                    result,
+                });
+            }
+        } else {
+            for (s, owned) in keys_per_shard(args, &keys, self.ctx.num_shards) {
+                // A subcommand whose keys all live on one shard journals the
+                // full tail; split keys journal reduced args per shard.
+                let owns_all_keys = owned.len() == keys.len();
+                let result = self.run_script_op(
+                    s,
+                    args.to_owned(),
+                    owned.clone(),
+                    first_key_idx,
+                    owns_all_keys,
+                );
+                parts.push(ShardPart {
+                    shard: s,
+                    owned_key_idxs: owned,
+                    result,
+                });
+            }
+        }
+        let merged = if parts.len() > 1 {
+            match cmd.merge {
+                Some(m) => m(&parts, args, &keys, now_ms()),
+                None => parts[0].result.clone(),
+            }
+        } else {
+            parts[0].result.clone()
+        };
+        match merged {
+            CmdResult::DeferredStore { key, value, reply } => {
+                self.shard.perform_deferred_store(
+                    &key,
+                    value,
+                    None,
+                    false,
+                    self.ctx.db_idx,
+                    self.ctx.tx_id,
+                );
+                CmdResult::Ok(reply)
+            }
+            CmdResult::DeferredStores { stores, reply } => {
+                for (key, value, expire_at, sticky) in stores {
+                    self.shard.perform_deferred_store(
+                        &key,
+                        value,
+                        expire_at,
+                        sticky,
+                        self.ctx.db_idx,
+                        self.ctx.tx_id,
+                    );
+                }
+                CmdResult::Ok(reply)
+            }
+            CmdResult::Blocked => CmdResult::Ok(RespValue::Nil),
+            other => other,
+        }
+    }
+
+    /// Execute a subcommand on `shard`: inline on the run-shard, or via
+    /// `ShardMsg::ScriptOp` to a peer. The target shard is locked by the
+    /// script's transaction, so the subcommand executes immediately.
+    fn run_script_op(
+        &mut self,
+        shard: usize,
+        args: Vec<Vec<u8>>,
+        owned: Vec<usize>,
+        first_key_idx: usize,
+        owns_all_keys: bool,
+    ) -> CmdResult {
+        if shard == self.shard.id {
+            return self.shard.run_exec(
+                &args,
+                &owned,
+                first_key_idx,
+                self.ctx.db_idx,
+                owns_all_keys,
+                self.ctx.conn_id,
+                self.ctx.tx_id,
+                self.ctx.track_keys,
+            );
+        }
+        let (result_tx, result_rx) = mpsc::channel();
+        if self.shard.peer_txs[shard]
+            .send(ShardMsg::ScriptOp {
+                tx_id: self.ctx.tx_id,
+                args,
+                owned_key_idxs: owned,
+                first_key_idx,
+                db_idx: self.ctx.db_idx,
+                owns_all_keys,
+                conn_id: self.ctx.conn_id,
+                track_keys: self.ctx.track_keys,
+                result_tx,
+            })
+            .is_err()
+        {
+            return CmdResult::err("ERR internal: shard thread exited");
+        }
+        result_rx
+            .recv()
+            .unwrap_or_else(|_| CmdResult::err("ERR internal: shard thread exited"))
+    }
+}
+
+/// One squashed-batch entry destined for a specific shard, keeping its call
+/// position so results reassemble in script order.
+struct BatchEntry {
+    pos: usize,
+    args: Vec<Vec<u8>>,
+    owned: Vec<usize>,
+    first_key_idx: usize,
+    owns_all_keys: bool,
+}
+
+/// Run one squashed hop: every shard with queued entries executes them in a
+/// single message (`ShardMsg::ScriptBatch`, dispatched in parallel). Results
+/// are reassembled by call position; the first `acall` error in call order is
+/// returned (`error_abort` in `ExecuteSquashed`). The whole hop runs even when
+/// it contains an error, mirroring the reference's shard-side execution.
+/// Clears the batches and the hop position list.
+#[allow(clippy::too_many_arguments)]
+fn run_squash_hop(
+    shard: &mut Shard,
+    tx_id: u64,
+    db_idx: usize,
+    conn_id: u64,
+    track_keys: bool,
+    batches: &mut [Vec<BatchEntry>],
+    results: &mut [Option<CmdResult>],
+    abort_flags: &[bool],
+    hop_positions: &mut Vec<usize>,
+) -> Option<String> {
+    let mut hops: Vec<(usize, mpsc::Receiver<Vec<CmdResult>>)> = Vec::new();
+    for (s, entries) in batches.iter().enumerate() {
+        if entries.is_empty() {
+            continue;
+        }
+        if s == shard.id {
+            // The run-shard's own batch executes inline below.
+            continue;
+        }
+        let (result_tx, result_rx) = mpsc::channel();
+        if shard.peer_txs[s]
+            .send(ShardMsg::ScriptBatch {
+                tx_id,
+                cmds: entries
+                    .iter()
+                    .map(|e| ScriptBatchEntry {
+                        args: e.args.clone(),
+                        owned_key_idxs: e.owned.clone(),
+                        first_key_idx: e.first_key_idx,
+                        db_idx,
+                        owns_all_keys: e.owns_all_keys,
+                        conn_id,
+                        track_keys,
+                    })
+                    .collect(),
+                result_tx,
+            })
+            .is_err()
+        {
+            return Some("ERR internal: shard thread exited".into());
+        }
+        hops.push((s, result_rx));
+    }
+    // Run the run-shard's own batch inline while the peers process theirs.
+    if let Some(entries) = batches.get(shard.id) {
+        for entry in entries {
+            let result = shard.run_exec(
+                &entry.args,
+                &entry.owned,
+                entry.first_key_idx,
+                db_idx,
+                entry.owns_all_keys,
+                conn_id,
+                tx_id,
+                track_keys,
+            );
+            results[entry.pos] = Some(result);
+        }
+    }
+    for (s, rx) in hops {
+        match rx.recv() {
+            Ok(per_shard) => {
+                for (entry, result) in batches[s].iter().zip(per_shard) {
+                    results[entry.pos] = Some(result);
+                }
+            }
+            Err(_) => {
+                for entry in &batches[s] {
+                    results[entry.pos] = Some(CmdResult::err("ERR internal: shard thread exited"));
+                }
+            }
+        }
+    }
+    batches.iter_mut().for_each(Vec::clear);
+    let positions = std::mem::take(hop_positions);
+    for pos in positions {
+        if abort_flags[pos]
+            && let Some(CmdResult::Err(e)) = &results[pos]
+        {
+            return Some(e.message.clone());
+        }
+    }
+    None
 }
